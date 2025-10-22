@@ -6,7 +6,24 @@
 	objectVersion = 77;
 	objects = {
 
+/* Begin PBXBuildFile section */
+		855E38602EA94A620029C420 /* FoundationModels.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 855E385F2EA94A620029C420 /* FoundationModels.framework */; };
+		855E38622EA94A730029C420 /* NaturalLanguage.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 855E38612EA94A730029C420 /* NaturalLanguage.framework */; };
+		855E38642EA94AF40029C420 /* libsqlite3.tbd in Frameworks */ = {isa = PBXBuildFile; fileRef = 855E38632EA94AE60029C420 /* libsqlite3.tbd */; };
+		855E38662EA94C630029C420 /* libcompression.tbd in Frameworks */ = {isa = PBXBuildFile; fileRef = 855E38652EA94C630029C420 /* libcompression.tbd */; };
+		855E38692EA94F460029C420 /* MLX in Frameworks */ = {isa = PBXBuildFile; productRef = 855E38682EA94F460029C420 /* MLX */; };
+		855E386B2EA94F460029C420 /* MLXFast in Frameworks */ = {isa = PBXBuildFile; productRef = 855E386A2EA94F460029C420 /* MLXFast */; };
+		855E386D2EA94F460029C420 /* MLXLinalg in Frameworks */ = {isa = PBXBuildFile; productRef = 855E386C2EA94F460029C420 /* MLXLinalg */; };
+		855E386F2EA94F460029C420 /* MLXNN in Frameworks */ = {isa = PBXBuildFile; productRef = 855E386E2EA94F460029C420 /* MLXNN */; };
+		858DA3262EA956AC00A44B2F /* MLXLLM in Frameworks */ = {isa = PBXBuildFile; productRef = 858DA3252EA956AC00A44B2F /* MLXLLM */; };
+		858DA3282EA956AC00A44B2F /* MLXLMCommon in Frameworks */ = {isa = PBXBuildFile; productRef = 858DA3272EA956AC00A44B2F /* MLXLMCommon */; };
+/* End PBXBuildFile section */
+
 /* Begin PBXFileReference section */
+		855E385F2EA94A620029C420 /* FoundationModels.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = FoundationModels.framework; path = System/Library/Frameworks/FoundationModels.framework; sourceTree = SDKROOT; };
+		855E38612EA94A730029C420 /* NaturalLanguage.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = NaturalLanguage.framework; path = System/Library/Frameworks/NaturalLanguage.framework; sourceTree = SDKROOT; };
+		855E38632EA94AE60029C420 /* libsqlite3.tbd */ = {isa = PBXFileReference; lastKnownFileType = "sourcecode.text-based-dylib-definition"; name = libsqlite3.tbd; path = usr/lib/libsqlite3.tbd; sourceTree = SDKROOT; };
+		855E38652EA94C630029C420 /* libcompression.tbd */ = {isa = PBXFileReference; lastKnownFileType = "sourcecode.text-based-dylib-definition"; name = libcompression.tbd; path = usr/lib/libcompression.tbd; sourceTree = SDKROOT; };
 		85B3C57D2EA943560060BCEC /* Hal Universal.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = "Hal Universal.app"; sourceTree = BUILT_PRODUCTS_DIR; };
 /* End PBXFileReference section */
 
@@ -23,16 +40,38 @@
 			isa = PBXFrameworksBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
+				858DA3282EA956AC00A44B2F /* MLXLMCommon in Frameworks */,
+				858DA3262EA956AC00A44B2F /* MLXLLM in Frameworks */,
+				855E386B2EA94F460029C420 /* MLXFast in Frameworks */,
+				855E386D2EA94F460029C420 /* MLXLinalg in Frameworks */,
+				855E386F2EA94F460029C420 /* MLXNN in Frameworks */,
+				855E38662EA94C630029C420 /* libcompression.tbd in Frameworks */,
+				855E38642EA94AF40029C420 /* libsqlite3.tbd in Frameworks */,
+				855E38622EA94A730029C420 /* NaturalLanguage.framework in Frameworks */,
+				855E38692EA94F460029C420 /* MLX in Frameworks */,
+				855E38602EA94A620029C420 /* FoundationModels.framework in Frameworks */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
 /* End PBXFrameworksBuildPhase section */
 
 /* Begin PBXGroup section */
+		855E385E2EA94A620029C420 /* Frameworks */ = {
+			isa = PBXGroup;
+			children = (
+				855E38652EA94C630029C420 /* libcompression.tbd */,
+				855E38632EA94AE60029C420 /* libsqlite3.tbd */,
+				855E38612EA94A730029C420 /* NaturalLanguage.framework */,
+				855E385F2EA94A620029C420 /* FoundationModels.framework */,
+			);
+			name = Frameworks;
+			sourceTree = "<group>";
+		};
 		85B3C5742EA943560060BCEC = {
 			isa = PBXGroup;
 			children = (
 				85B3C57F2EA943560060BCEC /* Hal Universal */,
+				855E385E2EA94A620029C420 /* Frameworks */,
 				85B3C57E2EA943560060BCEC /* Products */,
 			);
 			sourceTree = "<group>";
@@ -65,6 +104,12 @@
 			);
 			name = "Hal Universal";
 			packageProductDependencies = (
+				855E38682EA94F460029C420 /* MLX */,
+				855E386A2EA94F460029C420 /* MLXFast */,
+				855E386C2EA94F460029C420 /* MLXLinalg */,
+				855E386E2EA94F460029C420 /* MLXNN */,
+				858DA3252EA956AC00A44B2F /* MLXLLM */,
+				858DA3272EA956AC00A44B2F /* MLXLMCommon */,
 			);
 			productName = "Hal Universal";
 			productReference = 85B3C57D2EA943560060BCEC /* Hal Universal.app */;
@@ -82,6 +127,7 @@
 				TargetAttributes = {
 					85B3C57C2EA943560060BCEC = {
 						CreatedOnToolsVersion = 26.0.1;
+						LastSwiftMigration = 2600;
 					};
 				};
 			};
@@ -94,6 +140,10 @@
 			);
 			mainGroup = 85B3C5742EA943560060BCEC;
 			minimizedProjectReferenceProxies = 1;
+			packageReferences = (
+				855E38672EA94F460029C420 /* XCRemoteSwiftPackageReference "mlx-swift" */,
+				858DA3242EA956AC00A44B2F /* XCRemoteSwiftPackageReference "mlx-swift-examples" */,
+			);
 			preferredProjectObjectVersion = 77;
 			productRefGroup = 85B3C57E2EA943560060BCEC /* Products */;
 			projectDirPath = "";
@@ -251,6 +301,7 @@
 			buildSettings = {
 				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
 				ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME = AccentColor;
+				CLANG_ENABLE_MODULES = YES;
 				CODE_SIGN_STYLE = Automatic;
 				CURRENT_PROJECT_VERSION = 1;
 				DEVELOPMENT_TEAM = FBUNBDS7R7;
@@ -272,6 +323,7 @@
 				SWIFT_APPROACHABLE_CONCURRENCY = YES;
 				SWIFT_DEFAULT_ACTOR_ISOLATION = MainActor;
 				SWIFT_EMIT_LOC_STRINGS = YES;
+				SWIFT_OPTIMIZATION_LEVEL = "-Onone";
 				SWIFT_UPCOMING_FEATURE_MEMBER_IMPORT_VISIBILITY = YES;
 				SWIFT_VERSION = 5.0;
 				TARGETED_DEVICE_FAMILY = "1,2";
@@ -283,6 +335,7 @@
 			buildSettings = {
 				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
 				ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME = AccentColor;
+				CLANG_ENABLE_MODULES = YES;
 				CODE_SIGN_STYLE = Automatic;
 				CURRENT_PROJECT_VERSION = 1;
 				DEVELOPMENT_TEAM = FBUNBDS7R7;
@@ -332,6 +385,58 @@
 			defaultConfigurationName = Release;
 		};
 /* End XCConfigurationList section */
+
+/* Begin XCRemoteSwiftPackageReference section */
+		855E38672EA94F460029C420 /* XCRemoteSwiftPackageReference "mlx-swift" */ = {
+			isa = XCRemoteSwiftPackageReference;
+			repositoryURL = "https://github.com/ml-explore/mlx-swift";
+			requirement = {
+				kind = upToNextMajorVersion;
+				minimumVersion = 0.29.1;
+			};
+		};
+		858DA3242EA956AC00A44B2F /* XCRemoteSwiftPackageReference "mlx-swift-examples" */ = {
+			isa = XCRemoteSwiftPackageReference;
+			repositoryURL = "https://github.com/ml-explore/mlx-swift-examples";
+			requirement = {
+				kind = upToNextMajorVersion;
+				minimumVersion = 2.29.1;
+			};
+		};
+/* End XCRemoteSwiftPackageReference section */
+
+/* Begin XCSwiftPackageProductDependency section */
+		855E38682EA94F460029C420 /* MLX */ = {
+			isa = XCSwiftPackageProductDependency;
+			package = 855E38672EA94F460029C420 /* XCRemoteSwiftPackageReference "mlx-swift" */;
+			productName = MLX;
+		};
+		855E386A2EA94F460029C420 /* MLXFast */ = {
+			isa = XCSwiftPackageProductDependency;
+			package = 855E38672EA94F460029C420 /* XCRemoteSwiftPackageReference "mlx-swift" */;
+			productName = MLXFast;
+		};
+		855E386C2EA94F460029C420 /* MLXLinalg */ = {
+			isa = XCSwiftPackageProductDependency;
+			package = 855E38672EA94F460029C420 /* XCRemoteSwiftPackageReference "mlx-swift" */;
+			productName = MLXLinalg;
+		};
+		855E386E2EA94F460029C420 /* MLXNN */ = {
+			isa = XCSwiftPackageProductDependency;
+			package = 855E38672EA94F460029C420 /* XCRemoteSwiftPackageReference "mlx-swift" */;
+			productName = MLXNN;
+		};
+		858DA3252EA956AC00A44B2F /* MLXLLM */ = {
+			isa = XCSwiftPackageProductDependency;
+			package = 858DA3242EA956AC00A44B2F /* XCRemoteSwiftPackageReference "mlx-swift-examples" */;
+			productName = MLXLLM;
+		};
+		858DA3272EA956AC00A44B2F /* MLXLMCommon */ = {
+			isa = XCSwiftPackageProductDependency;
+			package = 858DA3242EA956AC00A44B2F /* XCRemoteSwiftPackageReference "mlx-swift-examples" */;
+			productName = MLXLMCommon;
+		};
+/* End XCSwiftPackageProductDependency section */
 	};
 	rootObject = 85B3C5752EA943560060BCEC /* Project object */;
 }
