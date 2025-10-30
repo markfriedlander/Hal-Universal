@@ -24,6 +24,7 @@
 // 10  ActionsView (Settings, Import/Export, Model Picker)
 // 11  ActionsView (Phi-3 Management & Power Tools)
 // 12  ActionsView (License & Status Helpers)
+// 12.5 SystemPromptEditorView (Power User Tool)
 // 13  ChatBubbleView & TimerView (Message UI Components)
 // 14  PromptDetailView (Full Prompt & Context Viewer)
 // 15  ShareSheet (Export Utility)
@@ -549,208 +550,215 @@ class MemoryStore: ObservableObject {
     
 // ==== LEGO START: 04 MemoryStore (Part 3 – Storing Turns & Entities) ====
 
-    
-    // Close database connection properly
-    private func closeDatabaseConnection() {
-        if db != nil {
-            sqlite3_close(db)
-            db = nil
-            isConnected = false
-            print("HALDEBUG-DATABASE: ✅ Database connection closed")
+        
+        // Close database connection properly
+        private func closeDatabaseConnection() {
+            if db != nil {
+                sqlite3_close(db)
+                db = nil
+                isConnected = false
+                print("HALDEBUG-DATABASE: ✅ Database connection closed")
+            }
         }
-    }
 
-    // DEBUGGING: Get database connection status
-    func getDatabaseStatus() -> (connected: Bool, path: String, tables: [String]) {
-        var tables: [String] = []
+        // DEBUGGING: Get database connection status
+        func getDatabaseStatus() -> (connected: Bool, path: String, tables: [String]) {
+            var tables: [String] = []
 
-        if ensureHealthyConnection() {
-            var stmt: OpaquePointer?
-            let sql = "SELECT name FROM sqlite_master WHERE type='table';"
+            if ensureHealthyConnection() {
+                var stmt: OpaquePointer?
+                let sql = "SELECT name FROM sqlite_master WHERE type='table';"
 
-            if sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK {
-                while sqlite3_step(stmt) == SQLITE_ROW {
-                    if let namePtr = sqlite3_column_text(stmt, 0) {
-                        let tableName = String(cString: namePtr)
-                        tables.append(tableName)
+                if sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK {
+                    while sqlite3_step(stmt) == SQLITE_ROW {
+                        if let namePtr = sqlite3_column_text(stmt, 0) {
+                            let tableName = String(cString: namePtr)
+                            tables.append(tableName)
+                        }
                     }
                 }
-            }
-            sqlite3_finalize(stmt)
-        }
-
-        return (connected: isConnected, path: dbPath, tables: tables)
-    }
-}
-
-// MARK: - Enhanced Conversation Storage with Entity Extraction (from Hal10000App.swift)
-extension MemoryStore {
-
-    // Store conversation turn in unified memory with entity extraction
-    func storeTurn(conversationId: String, userMessage: String, assistantMessage: String, systemPrompt: String, turnNumber: Int, halFullPrompt: String?, halUsedContext: [UnifiedSearchResult]?) { // NEW: Added halFullPrompt and halUsedContext
-        print("HALDEBUG-MEMORY: Storing turn \(turnNumber) for conversation \(conversationId) with entity extraction")
-        print("HALDEBUG-MEMORY: SURGERY - StoreTurn start convId='\(conversationId.prefix(8))....' turn=\(turnNumber)")
-
-        guard ensureHealthyConnection() else {
-            print("HALDEBUG-MEMORY: Cannot store turn - no database connection")
-            return
-        }
-
-        // ENHANCED: Extract entities from both user and assistant messages
-        let userEntities = extractNamedEntities(from: userMessage)
-        let assistantEntities = extractNamedEntities(from: assistantMessage)
-        let combinedEntitiesKeywords = (userEntities + assistantEntities).map { $0.text.lowercased() }.joined(separator: " ")
-
-        print("HALDEBUG-MEMORY: Extracted \(userEntities.count) user entities, \(assistantEntities.count) assistant entities")
-        print("HALDEBUG-MEMORY: Combined entity keywords: '\(combinedEntitiesKeywords)'")
-
-        // Store user message with entity keywords
-        let userContentId = storeUnifiedContentWithEntities(
-            content: userMessage,
-            sourceType: .conversation,
-            sourceId: conversationId,
-            position: turnNumber * 2 - 1,
-            timestamp: Date(),
-            isFromUser: true, // Explicitly set for user message
-            entityKeywords: combinedEntitiesKeywords
-        )
-
-        // Prepare metadata for Hal's message
-        var halMetadata: [String: Any] = [:]
-        if let prompt = halFullPrompt {
-            halMetadata["fullPromptUsed"] = prompt
-        }
-        if let context = halUsedContext {
-            // Encode UnifiedSearchResult array to JSON string
-            if let encodedContext = try? JSONEncoder().encode(context),
-               let contextString = String(data: encodedContext, encoding: .utf8) {
-                halMetadata["usedContextSnippets"] = contextString
-            } else {
-                print("HALDEBUG-MEMORY: Failed to encode usedContextSnippets to JSON.")
-            }
-        }
-        let halMetadataJsonString = (try? JSONSerialization.data(withJSONObject: halMetadata, options: []).base64EncodedString()) ?? "{}"
-
-
-        // Store assistant message with entity keywords and new metadata
-        let assistantContentId = storeUnifiedContentWithEntities(
-            content: assistantMessage,
-            sourceType: .conversation,
-            sourceId: conversationId,
-            position: turnNumber * 2,
-            timestamp: Date(),
-            isFromUser: false, // Explicitly set for assistant message
-            entityKeywords: combinedEntitiesKeywords,
-            metadataJson: halMetadataJsonString // NEW: Pass metadata
-        )
-
-        print("HALDEBUG-MEMORY: Stored turn \(turnNumber) - user: \(userContentId), assistant: \(assistantContentId)")
-        print("HALDEBUG-MEMORY: SURGERY - StoreTurn complete user='\(userContentId.prefix(8))....' assistant='\(assistantContentId.prefix(8))....'")
-
-        // Update conversation statistics
-        loadUnifiedStats()
-    }
-
-    // ENHANCED: Store unified content with entity keywords support and optional metadataJson
-    func storeUnifiedContentWithEntities(content: String, sourceType: ContentSourceType, sourceId: String, position: Int, timestamp: Date, isFromUser: Bool, entityKeywords: String = "", metadataJson: String = "{}") -> String { // NEW: metadataJson parameter
-        print("HALDEBUG-MEMORY: Storing unified content with entities - type: \(sourceType), position: \(position)")
-
-        guard ensureHealthyConnection() else {
-            print("HALDEBUG-MEMORY: Cannot store content - no database connection")
-            return ""
-        }
-
-        let contentId = UUID().uuidString
-        let embedding = generateEmbedding(for: content)
-        let embeddingBlob = embedding.withUnsafeBufferPointer { buffer in
-            Data(buffer: buffer)
-        }
-
-        // SURGICAL DEBUG: Log exact values being stored
-        print("HALDEBUG-MEMORY: SURGERY - Store prep contentId='\(contentId.prefix(8))....' type='\(sourceType.rawValue)' sourceId='\(sourceId.prefix(8))....' pos=\(position)")
-        print("HALDEBUG-MEMORY: Entity keywords being stored: '\(entityKeywords)'")
-        print("HALDEBUG-MEMORY: Metadata JSON being stored (first 100 chars): '\(metadataJson.prefix(100))....'")
-
-
-        // ENHANCED SQL with entity_keywords column
-        let sql = """
-        INSERT OR REPLACE INTO unified_content
-        (id, content, embedding, timestamp, source_type, source_id, position, is_from_user, entity_keywords, metadata_json, created_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
-        """
-
-        var stmt: OpaquePointer?
-        defer {
-            if stmt != nil {
                 sqlite3_finalize(stmt)
             }
-        }
 
-        guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else {
-            print("HALDEBUG-MEMORY: Failed to prepare enhanced content insert")
-            print("HALDEBUG-MEMORY: SURGERY - Store FAILED at prepare step")
-            return ""
-        }
-
-        let isFromUserInt = isFromUser ? 1 : 0
-        let createdAt = Int64(Date().timeIntervalSince1970)
-
-        // SURGICAL DEBUG: Log exact parameter binding with string verification
-        print("HALDEBUG-MEMORY: SURGERY - Store binding isFromUser=\(isFromUserInt) createdAt=\(createdAt)")
-        print("HALDEBUG-MEMORY: SURGERY - Store strings sourceType='\(sourceType.rawValue)' sourceId='\(sourceId.prefix(8))....'")
-
-        // ENHANCED: Bind all 11 parameters including entity_keywords
-
-        // Parameter 1: contentId (STRING) - CORRECT BINDING
-        sqlite3_bind_text(stmt, 1, (contentId as NSString).utf8String, -1, nil)
-
-        // Parameter 2: content (STRING) - CORRECT BINDING
-        sqlite3_bind_text(stmt, 2, (content as NSString).utf8String, -1, nil)
-
-        // Parameter 3: embedding (BLOB)
-        _ = embeddingBlob.withUnsafeBytes { sqlite3_bind_blob(stmt, 3, $0.baseAddress, Int32(embeddingBlob.count), nil) }
-
-        // Parameter 4: timestamp (INTEGER)
-        sqlite3_bind_int64(stmt, 4, Int64(timestamp.timeIntervalSince1970))
-
-        // Parameter 5: source_type (STRING) - CORRECT BINDING WITH SURGICAL DEBUG
-        print("HALDEBUG-MEMORY: SURGERY - About to bind sourceType='\(sourceType.rawValue)' to parameter 5 using NSString.utf8String")
-        sqlite3_bind_text(stmt, 5, (sourceType.rawValue as NSString).utf8String, -1, nil)
-
-        // Parameter 6: source_id (STRING) - CORRECT BINDING
-        sqlite3_bind_text(stmt, 6, (sourceId as NSString).utf8String, -1, nil)
-
-        // Parameter 7: position (INTEGER)
-        sqlite3_bind_int(stmt, 7, Int32(position))
-
-        // Parameter 8: is_from_user (INTEGER)
-        sqlite3_bind_int(stmt, 8, Int32(isFromUserInt))
-
-        // Parameter 9: entity_keywords (STRING) - NEW ENHANCED BINDING
-        sqlite3_bind_text(stmt, 9, (entityKeywords as NSString).utf8String, -1, nil)
-
-        // Parameter 10: metadata_json (STRING) - NEW BINDING
-        sqlite3_bind_text(stmt, 10, (metadataJson as NSString).utf8String, -1, nil)
-
-        // Parameter 11: created_at (INTEGER)
-        sqlite3_bind_int64(stmt, 11, createdAt)
-
-        if sqlite3_step(stmt) == SQLITE_DONE {
-            print("HALDEBUG-MEMORY: Stored content successfully with entities - ID: \(contentId)")
-            print("HALDEBUG-MEMORY: SURGERY - Store SUCCESS id='\(contentId.prefix(8))....' type='\(sourceType.rawValue)' sourceId='\(sourceId.prefix(8))....'")
-            return contentId
-        } else {
-            let errorMessage = String(cString: sqlite3_errmsg(db))
-            print("HALDEBUG-MEMORY: Failed to store content with entities: \(errorMessage)")
-            print("HALDEBUG-MEMORY: SURGERY - Store FAILED error='\(errorMessage)'")
-            return ""
+            return (connected: isConnected, path: dbPath, tables: tables)
         }
     }
 
-    // Note: Entity extraction functions implemented below in this extension
-}
+    // MARK: - Enhanced Conversation Storage with Entity Extraction (from Hal10000App.swift)
+    extension MemoryStore {
+
+        // Store conversation turn in unified memory with entity extraction
+        func storeTurn(conversationId: String, userMessage: String, assistantMessage: String, systemPrompt: String, turnNumber: Int, halFullPrompt: String?, halUsedContext: [UnifiedSearchResult]?, thinkingDuration: TimeInterval? = nil) { // NEW: Added thinkingDuration parameter
+            print("HALDEBUG-MEMORY: Storing turn \(turnNumber) for conversation \(conversationId) with entity extraction")
+            print("HALDEBUG-MEMORY: SURGERY - StoreTurn start convId='\(conversationId.prefix(8))....' turn=\(turnNumber)")
+
+            guard ensureHealthyConnection() else {
+                print("HALDEBUG-MEMORY: Cannot store turn - no database connection")
+                return
+            }
+
+            // ENHANCED: Extract entities from both user and assistant messages
+            let userEntities = extractNamedEntities(from: userMessage)
+            let assistantEntities = extractNamedEntities(from: assistantMessage)
+            let combinedEntitiesKeywords = (userEntities + assistantEntities).map { $0.text.lowercased() }.joined(separator: " ")
+
+            print("HALDEBUG-MEMORY: Extracted \(userEntities.count) user entities, \(assistantEntities.count) assistant entities")
+            print("HALDEBUG-MEMORY: Combined entity keywords: '\(combinedEntitiesKeywords)'")
+
+            // Store user message with entity keywords
+            let userContentId = storeUnifiedContentWithEntities(
+                content: userMessage,
+                sourceType: .conversation,
+                sourceId: conversationId,
+                position: turnNumber * 2 - 1,
+                timestamp: Date(),
+                isFromUser: true, // Explicitly set for user message
+                entityKeywords: combinedEntitiesKeywords
+            )
+
+            // Prepare metadata for Hal's message
+            var halMetadata: [String: Any] = [:]
+            if let prompt = halFullPrompt {
+                halMetadata["fullPromptUsed"] = prompt
+            }
+            if let context = halUsedContext {
+                // Encode UnifiedSearchResult array to JSON string
+                if let encodedContext = try? JSONEncoder().encode(context),
+                   let contextString = String(data: encodedContext, encoding: .utf8) {
+                    halMetadata["usedContextSnippets"] = contextString
+                } else {
+                    print("HALDEBUG-MEMORY: Failed to encode usedContextSnippets to JSON.")
+                }
+            }
+            // NEW: Store thinkingDuration in metadata
+            if let duration = thinkingDuration {
+                halMetadata["thinkingDuration"] = duration
+                print("HALDEBUG-MEMORY: Storing thinkingDuration: \(String(format: "%.1f", duration)) seconds")
+            }
+            let halMetadataJsonString = (try? JSONSerialization.data(withJSONObject: halMetadata, options: []).base64EncodedString()) ?? "{}"
+
+
+            // Store assistant message with entity keywords and new metadata
+            let assistantContentId = storeUnifiedContentWithEntities(
+                content: assistantMessage,
+                sourceType: .conversation,
+                sourceId: conversationId,
+                position: turnNumber * 2,
+                timestamp: Date(),
+                isFromUser: false, // Explicitly set for assistant message
+                entityKeywords: combinedEntitiesKeywords,
+                metadataJson: halMetadataJsonString // NEW: Pass metadata
+            )
+
+            print("HALDEBUG-MEMORY: Stored turn \(turnNumber) - user: \(userContentId), assistant: \(assistantContentId)")
+            print("HALDEBUG-MEMORY: SURGERY - StoreTurn complete user='\(userContentId.prefix(8))....' assistant='\(assistantContentId.prefix(8))....'")
+
+            // Update conversation statistics
+            loadUnifiedStats()
+        }
+
+        // ENHANCED: Store unified content with entity keywords support and optional metadataJson
+        func storeUnifiedContentWithEntities(content: String, sourceType: ContentSourceType, sourceId: String, position: Int, timestamp: Date, isFromUser: Bool, entityKeywords: String = "", metadataJson: String = "{}") -> String { // NEW: metadataJson parameter
+            print("HALDEBUG-MEMORY: Storing unified content with entities - type: \(sourceType), position: \(position)")
+
+            guard ensureHealthyConnection() else {
+                print("HALDEBUG-MEMORY: Cannot store content - no database connection")
+                return ""
+            }
+
+            let contentId = UUID().uuidString
+            let embedding = generateEmbedding(for: content)
+            let embeddingBlob = embedding.withUnsafeBufferPointer { buffer in
+                Data(buffer: buffer)
+            }
+
+            // SURGICAL DEBUG: Log exact values being stored
+            print("HALDEBUG-MEMORY: SURGERY - Store prep contentId='\(contentId.prefix(8))....' type='\(sourceType.rawValue)' sourceId='\(sourceId.prefix(8))....' pos=\(position)")
+            print("HALDEBUG-MEMORY: Entity keywords being stored: '\(entityKeywords)'")
+            print("HALDEBUG-MEMORY: Metadata JSON being stored (first 100 chars): '\(metadataJson.prefix(100))....'")
+
+
+            // ENHANCED SQL with entity_keywords column
+            let sql = """
+            INSERT OR REPLACE INTO unified_content
+            (id, content, embedding, timestamp, source_type, source_id, position, is_from_user, entity_keywords, metadata_json, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
+            """
+
+            var stmt: OpaquePointer?
+            defer {
+                if stmt != nil {
+                    sqlite3_finalize(stmt)
+                }
+            }
+
+            guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else {
+                print("HALDEBUG-MEMORY: Failed to prepare enhanced content insert")
+                print("HALDEBUG-MEMORY: SURGERY - Store FAILED at prepare step")
+                return ""
+            }
+
+            let isFromUserInt = isFromUser ? 1 : 0
+            let createdAt = Int64(Date().timeIntervalSince1970)
+
+            // SURGICAL DEBUG: Log exact parameter binding with string verification
+            print("HALDEBUG-MEMORY: SURGERY - Store binding isFromUser=\(isFromUserInt) createdAt=\(createdAt)")
+            print("HALDEBUG-MEMORY: SURGERY - Store strings sourceType='\(sourceType.rawValue)' sourceId='\(sourceId.prefix(8))....'")
+
+            // ENHANCED: Bind all 11 parameters including entity_keywords
+
+            // Parameter 1: contentId (STRING) - CORRECT BINDING
+            sqlite3_bind_text(stmt, 1, (contentId as NSString).utf8String, -1, nil)
+
+            // Parameter 2: content (STRING) - CORRECT BINDING
+            sqlite3_bind_text(stmt, 2, (content as NSString).utf8String, -1, nil)
+
+            // Parameter 3: embedding (BLOB)
+            _ = embeddingBlob.withUnsafeBytes { sqlite3_bind_blob(stmt, 3, $0.baseAddress, Int32(embeddingBlob.count), nil) }
+
+            // Parameter 4: timestamp (INTEGER)
+            sqlite3_bind_int64(stmt, 4, Int64(timestamp.timeIntervalSince1970))
+
+            // Parameter 5: source_type (STRING) - CORRECT BINDING WITH SURGICAL DEBUG
+            print("HALDEBUG-MEMORY: SURGERY - About to bind sourceType='\(sourceType.rawValue)' to parameter 5 using NSString.utf8String")
+            sqlite3_bind_text(stmt, 5, (sourceType.rawValue as NSString).utf8String, -1, nil)
+
+            // Parameter 6: source_id (STRING) - CORRECT BINDING
+            sqlite3_bind_text(stmt, 6, (sourceId as NSString).utf8String, -1, nil)
+
+            // Parameter 7: position (INTEGER)
+            sqlite3_bind_int(stmt, 7, Int32(position))
+
+            // Parameter 8: is_from_user (INTEGER)
+            sqlite3_bind_int(stmt, 8, Int32(isFromUserInt))
+
+            // Parameter 9: entity_keywords (STRING) - NEW ENHANCED BINDING
+            sqlite3_bind_text(stmt, 9, (entityKeywords as NSString).utf8String, -1, nil)
+
+            // Parameter 10: metadata_json (STRING) - NEW BINDING
+            sqlite3_bind_text(stmt, 10, (metadataJson as NSString).utf8String, -1, nil)
+
+            // Parameter 11: created_at (INTEGER)
+            sqlite3_bind_int64(stmt, 11, createdAt)
+
+            if sqlite3_step(stmt) == SQLITE_DONE {
+                print("HALDEBUG-MEMORY: Stored content successfully with entities - ID: \(contentId)")
+                print("HALDEBUG-MEMORY: SURGERY - Store SUCCESS id='\(contentId.prefix(8))....' type='\(sourceType.rawValue)' sourceId='\(sourceId.prefix(8))....'")
+                return contentId
+            } else {
+                let errorMessage = String(cString: sqlite3_errmsg(db))
+                print("HALDEBUG-MEMORY: Failed to store content with entities: \(errorMessage)")
+                print("HALDEBUG-MEMORY: SURGERY - Store FAILED error='\(errorMessage)'")
+                return ""
+            }
+        }
+
+        // Note: Entity extraction functions implemented below in this extension
+    }
 
 // ==== LEGO END: 04 MemoryStore (Part 3 – Storing Turns & Entities) ====
+
+
 
 // ==== LEGO START: 05 MemoryStore (Part 4 – Entities, Embeddings, Search) ====
 
@@ -986,6 +994,7 @@ extension MemoryStore {
             // NEW: Extract metadata_json
             var fullPromptUsed: String? = nil
             var usedContextSnippets: [UnifiedSearchResult]? = nil
+            var thinkingDuration: TimeInterval? = nil
 
             if let metadataCString = sqlite3_column_text(stmt, 5) {
                 let metadataJsonString = String(cString: metadataCString)
@@ -998,6 +1007,8 @@ extension MemoryStore {
                        let contextSnippetsData = contextSnippetsJson.data(using: .utf8) {
                         usedContextSnippets = try? JSONDecoder().decode([UnifiedSearchResult].self, from: contextSnippetsData)
                     }
+                    
+                    thinkingDuration = metadataDict["thinkingDuration"] as? TimeInterval
                 }
             }
 
@@ -1014,6 +1025,7 @@ extension MemoryStore {
                 isFromUser: isFromUser,
                 timestamp: timestamp,
                 isPartial: false, // Assuming loaded messages are always complete
+                thinkingDuration: thinkingDuration,
                 fullPromptUsed: fullPromptUsed, // NEW
                 usedContextSnippets: usedContextSnippets // NEW
             )
@@ -1403,67 +1415,37 @@ class MLXWrapper: ObservableObject {
             let result = try await container.perform { context in
                 let userInput = UserInput(prompt: prompt)
                 let input = try await context.processor.prepare(input: userInput)
-                
-                // Use the specific overload that returns GenerateResult (contains the generated text)
+
+                // Updated token callback to stop on Phi-3 role markers
                 let generateResult = try MLXLMCommon.generate(
                     input: input,
                     parameters: GenerateParameters(temperature: 0.7),
                     context: context
                 ) { (tokens: [Int]) in
-                    // Return .more to continue generation
+                    let textSoFar = context.tokenizer.decode(tokens: tokens)
+                    if textSoFar.hasSuffix("\nUser:") || textSoFar.hasSuffix("\nAssistant:") || textSoFar.hasSuffix("###") {
+                        return .stop
+                    }
                     return .more
                 }
-                
+
                 // Extract the generated text from the result
                 return generateResult.output
             }
             MLX.GPU.clearCache() // Clear K-V cache after generation
 
-            print("HALDEBUG-MLX: MLX non-streaming generation complete.")
-            return result
+            // Trim trailing stop signals from the generated output
+            var cleanOutput = result.trimmingCharacters(in: .whitespacesAndNewlines)
+            for stopSeq in ["User:", "Assistant:", "System:", "###"] {
+                if let range = cleanOutput.range(of: stopSeq, options: [.caseInsensitive, .backwards]) {
+                    cleanOutput = String(cleanOutput[..<range.lowerBound]).trimmingCharacters(in: .whitespacesAndNewlines)
+                    break
+                }
+            }
+            return cleanOutput
         } catch {
             print("HALDEBUG-MLX: Error during MLX non-streaming generation: \(error.localizedDescription)")
             throw LLMService.LLMError.predictionFailed(error)
-        }
-    }
-
-    // Function to stream response using the MLX model
-    func streamGenerate(prompt: String) async throws -> AsyncThrowingStream<String, Error> {
-        guard isModelLoaded, let container = self.modelContainer else {
-            throw LLMService.LLMError.modelNotLoaded
-        }
-
-        print("HALDEBUG-MLX: Initiating streaming response using MLX model for prompt: \(prompt.prefix(100))...")
-
-        return AsyncThrowingStream { continuation in
-            Task {
-                do {
-                    let _ = try await container.perform { context in
-                        let userInput = UserInput(prompt: prompt)
-                        let input = try await context.processor.prepare(input: userInput)
-                        
-                        // Use the streaming overload that calls didGenerate for each token
-                        let _ = try MLXLMCommon.generate(
-                            input: input,
-                            parameters: GenerateParameters(temperature: 0.7),
-                            context: context
-                        ) { token in
-                            // Decode single token to string and yield
-                            let chunk = context.tokenizer.decode(tokens: [token])
-                            continuation.yield(chunk)
-                            return .more
-                        }
-                        
-                        continuation.finish()
-                        print("HALDEBUG-MLX: MLX streaming completed.")
-                        return ""
-                    }
-                    MLX.GPU.clearCache() // Clear K-V cache after streaming
-                } catch {
-                    print("HALDEBUG-MLX: Error during MLX streaming generation: \(error.localizedDescription)")
-                    continuation.finish(throwing: LLMService.LLMError.predictionFailed(error))
-                }
-            }
         }
     }
 }
@@ -1517,36 +1499,6 @@ class LLMService: ObservableObject {
         }
     }
 
-    // Public streaming function (routes to active LLM)
-    func streamResponse(prompt: String) async throws -> AsyncThrowingStream<String, Error> {
-        switch currentLLMType {
-        case .foundationModels:
-            let session = LanguageModelSession()
-            print("HALDEBUG-LLM: Streaming from FoundationModels for prompt (first 200 chars): \(prompt.prefix(200)).....")
-            
-            let stream = session.streamResponse { Prompt(prompt) }
-            return AsyncThrowingStream { continuation in
-                Task {
-                    do {
-                        for try await snapshot in stream {
-                            continuation.yield(snapshot.content)
-                        }
-                        continuation.finish()
-                        print("HALDEBUG-LLM: FoundationModels streaming completed.")
-                    } catch {
-                        print("HALDEBUG-LLM: Error during FoundationModels streaming: \(error.localizedDescription)")
-                        continuation.finish(throwing: LLMError.predictionFailed(error))
-                    }
-                }
-            }
-        case .mlxPhi3:
-            guard mlxWrapper.isModelLoaded else { // Ensure MLX model is loaded before streaming
-                throw LLMError.modelNotLoaded
-            }
-            print("HALDEBUG-MLX: Streaming from MLX Phi-3 for prompt (first 200 chars): \(prompt.prefix(200)).....")
-            return try await mlxWrapper.streamGenerate(prompt: prompt) // Use MLX's streaming function
-        }
-    }
 
     // Public non-streaming response function (routes to active LLM for summarization, etc.)
     func generateResponse(prompt: String) async throws -> String {
@@ -1644,23 +1596,44 @@ struct iOSChatView: View {
                 // Messages
                 ScrollViewReader { proxy in
                     List {
-                        ForEach(chatViewModel.messages) { message in
-                            MessageRow(message: message)
-                                .listRowInsets(EdgeInsets(top: 6, leading: 12, bottom: 6, trailing: 12))
-                                .listRowSeparator(.hidden)
+                        ForEach(chatViewModel.messages.indices, id: \.self) { index in
+                            ChatBubbleView(
+                                message: chatViewModel.messages[index],
+                                messageIndex: index
+                            )
+                            .listRowInsets(EdgeInsets(top: 6, leading: 12, bottom: 6, trailing: 12))
+                            .listRowSeparator(.hidden)
+                            .id(index)
                         }
                         // Invisible anchor to auto-scroll on new messages
                         Color.clear
                             .frame(height: 1)
-                            .id(scrollToBottomTrigger)
+                            .id("bottom")
                             .listRowSeparator(.hidden)
                     }
                     .listStyle(.plain)
+                    .onAppear {
+                        // Scroll to bottom on app launch
+                        DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
+                            withAnimation {
+                                proxy.scrollTo("bottom", anchor: .bottom)
+                            }
+                        }
+                    }
                     .onChange(of: chatViewModel.messages.count) { oldValue, newValue in
-                        // Auto-scroll to latest
-                        scrollToBottomTrigger = UUID()
-                        withAnimation(.easeOut) {
-                            proxy.scrollTo(scrollToBottomTrigger, anchor: .bottom)
+                        // Auto-scroll when new messages are added
+                        DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) {
+                            withAnimation(.easeOut(duration: 0.3)) {
+                                proxy.scrollTo("bottom", anchor: .bottom)
+                            }
+                        }
+                    }
+                    .onChange(of: chatViewModel.messages.last?.content) { oldValue, newValue in
+                        // Auto-scroll when the last message's content changes (status updates & streaming)
+                        DispatchQueue.main.async {
+                            withAnimation(.easeOut(duration: 0.2)) {
+                                proxy.scrollTo("bottom", anchor: .bottom)
+                            }
                         }
                     }
                 }
@@ -1734,29 +1707,6 @@ struct iOSChatView: View {
     }
 }
 
-// MARK: - Message Row (lightweight view used above)
-private struct MessageRow: View {
-    let message: ChatMessage
-    
-    var body: some View {
-        VStack(alignment: message.isFromUser ? .trailing : .leading, spacing: 6) {
-            HStack {
-                if !message.isFromUser {
-                    Spacer(minLength: 0)
-                }
-                Text(message.content)
-                    .font(.body)
-                    .padding(10)
-                    .background(message.isFromUser ? Color.accentColor.opacity(0.15) : Color.secondary.opacity(0.08))
-                    .clipShape(RoundedRectangle(cornerRadius: 12))
-                if message.isFromUser {
-                    Spacer(minLength: 0)
-                }
-            }
-            .frame(maxWidth: .infinity, alignment: message.isFromUser ? .trailing : .leading)
-        }
-    }
-}
 
 // ==== LEGO END 09 App Entry & iOSChatView (UI Shell) ====
 
@@ -1779,6 +1729,8 @@ struct ActionsView: View {
     @State private var showingLicenseSheet = false
     @State private var phi3SectionExpanded = false
     @State private var showingClearCacheAlert = false
+    @State private var showingSystemPromptEditor = false
+
 
     var body: some View {
         NavigationView {
@@ -1935,326 +1887,427 @@ struct ActionsView: View {
 
 // ==== LEGO END: 10 ActionsView (Settings, Import/Export, Model Picker) ====
 
+    
 
 // ==== LEGO START: 11 ActionsView (Phi-3 Management & Power Tools) ====
 
-    // MARK: - FIXED: Phi-3 Management Section
-    private var phi3ManagementSection: some View {
-        Group {
-            // FIXED: Single Status Line
-            VStack(alignment: .leading, spacing: 8) {
-                HStack {
-                    Text("Phi-3 Mini 128k (4-bit)")
-                        .font(.subheadline)
-                        .fontWeight(.medium)
-                    Spacer()
-                    modelStatusDot(for: .mlxPhi3)
-                }
-                
-                // FIXED: Consolidated Status
-                HStack {
-                    Text("Status:")
-                        .font(.caption)
-                        .foregroundColor(.secondary)
+        // MARK: - FIXED: Phi-3 Management Section
+        @ViewBuilder
+        private var phi3ManagementSection: some View {
+                // FIXED: Single Status Line
+                VStack(alignment: .leading, spacing: 8) {
+                    HStack {
+                        Text("Phi-3 Mini 128k (4-bit)")
+                            .font(.subheadline)
+                            .fontWeight(.medium)
+                        Spacer()
+                        modelStatusDot(for: .mlxPhi3)
+                    }
                     
-                    if chatViewModel.isPhi3Installed {
-                        Text("Ready • 2.1GB")
-                            .font(.caption)
-                            .foregroundColor(.green)
-                    } else if chatViewModel.mlxIsDownloading {
-                        Text("Downloading • \(Int(chatViewModel.mlxDownloadProgress * 100))%")
-                            .font(.caption)
-                            .foregroundColor(.orange)
-                    } else if mlxDownloader.hasPartialDownload {
-                        Text("Paused • \(Int(mlxDownloader.partialDownloadProgress * 100))%")
-                            .font(.caption)
-                            .foregroundColor(.orange)
-                    } else {
-                        Text("Not Downloaded • 2.1GB required")
+                    // FIXED: Consolidated Status
+                    HStack {
+                        Text("Status:")
                             .font(.caption)
                             .foregroundColor(.secondary)
+                        
+                        if chatViewModel.isPhi3Installed {
+                            HStack(spacing: 4) {
+                                Image(systemName: "checkmark.circle.fill")
+                                    .foregroundColor(.green)
+                                    .font(.caption)
+                                Text("Installed")
+                                    .font(.caption)
+                                    .foregroundColor(.secondary)
+                            }
+                        } else if mlxDownloader.isDownloading {
+                            HStack(spacing: 4) {
+                                ProgressView()
+                                    .scaleEffect(0.7)
+                                Text("\(Int(mlxDownloader.downloadProgress * 100))%")
+                                    .font(.caption)
+                                    .foregroundColor(.secondary)
+                            }
+                        } else {
+                            HStack(spacing: 4) {
+                                Image(systemName: "arrow.down.circle")
+                                    .foregroundColor(.blue)
+                                    .font(.caption)
+                                Text("Not Installed")
+                                    .font(.caption)
+                                    .foregroundColor(.secondary)
+                            }
+                        }
                     }
                 }
-            }
+                .padding(.vertical, 4)
 
-            // Download Progress (if downloading)
-            if chatViewModel.mlxIsDownloading {
-                ProgressView(value: chatViewModel.mlxDownloadProgress)
-                    .progressViewStyle(.linear)
-            }
-
-            // FIXED: Action Buttons
-            VStack(spacing: 12) {
-                if chatViewModel.isPhi3Installed {
-                    // Model is ready
-                    Button("Delete Model") {
-                        chatViewModel.deletePhi3()
-                    }
-                    .foregroundColor(.red)
-                    .font(.callout)
-                } else if chatViewModel.mlxIsDownloading {
-                    // Currently downloading
-                    Button("Pause Download") {
-                        chatViewModel.cancelPhi3Download()
-                    }
-                    .foregroundColor(.orange)
-                    .font(.callout)
-                } else if mlxDownloader.hasPartialDownload {
-                    // Partial download available
-                    HStack(spacing: 16) {
-                        Button("Resume Download") {
-                            mlxDownloader.resumeDownload()
+                // Download Button or Progress
+                if !chatViewModel.isPhi3Installed {
+                    if mlxDownloader.isDownloading {
+                        VStack(alignment: .leading, spacing: 8) {
+                            HStack {
+                                Text("Downloading...")
+                                    .font(.subheadline)
+                                    .foregroundColor(.secondary)
+                                Spacer()
+                                Button("Cancel") {
+                                    mlxDownloader.cancelDownload()
+                                }
+                                .font(.caption)
+                                .foregroundColor(.red)
+                            }
+                            
+                            ProgressView(value: mlxDownloader.downloadProgress) {
+                                Text("\(Int(mlxDownloader.downloadProgress * 100))%")
+                                    .font(.caption2)
+                                    .foregroundColor(.secondary)
+                            }
+                        }
+                    } else {
+                        Button {
+                            if !chatViewModel.acceptPhi3License {
+                                showingLicenseSheet = true
+                            } else {
+                                MLXModelDownloader.shared.startDownload()
+                            }
+                        } label: {
+                            HStack {
+                                Image(systemName: "arrow.down.circle.fill")
+                                Text("Download Phi-3 (2.1 GB)")
+                            }
                         }
                         .foregroundColor(.blue)
-                        .font(.callout)
-                        
-                        Button("Delete Partial") {
-                            mlxDownloader.clearPartialDownload()
-                        }
-                        .foregroundColor(.red)
-                        .font(.callout)
                     }
                 } else {
-                    // FIXED: Direct download without presentation conflict
-                    Button("Download Model (2.1GB)") {
-                        showingLicenseSheet = true
-                    }
-                    .foregroundColor(.blue)
-                    .font(.callout)
-                }
-                
-                if !chatViewModel.isPhi3Installed {
-                    Button("View License") {
-                        showingLicenseSheet = true
-                    }
-                    .font(.caption)
-                    .foregroundColor(.secondary)
-                }
-            }
-        }
-    }
-
-    // MARK: - Power User Section
-    private var powerUserSection: some View {
-        Section {
-            Button {
-                showingPowerUserSheet = true
-            } label: {
-                HStack {
-                    Label("Power User", systemImage: "bolt")
-                    Spacer()
-                    Image(systemName: "chevron.right")
-                        .foregroundColor(.secondary)
-                        .font(.caption)
-                }
-            }
-            .foregroundColor(.primary)
-        } footer: {
-            Text("Advanced memory settings and data management")
-                .font(.caption2)
-        }
-    }
-
-    // MARK: - Power User Sheet Content
-    private var powerUserSheetContent: some View {
-        NavigationView {
-            Form {
-                memorySection
-                cacheManagementSection
-                dataManagementSection
-            }
-            .navigationTitle("Power User")
-            .toolbar {
-                ToolbarItem(placement: .cancellationAction) {
-                    Button("Done") { showingPowerUserSheet = false }
-                }
-            }
-            .alert("Confirm Nuclear Reset", isPresented: $showingNuclearResetConfirmationAlert) {
-                Button("Nuclear Reset", role: .destructive) {
-                    chatViewModel.resetAllData()
-                    showingPowerUserSheet = false
-                    dismiss()
-                }
-                Button("Cancel", role: .cancel) { }
-            } message: {
-                Text("Are you sure you want to delete ALL conversations, summaries, RAG documents, and document memory from the database? This cannot be undone.")
-            }
-        }
-    }
-
-    // MARK: - Memory Section (Power User)
-    private var memorySection: some View {
-        Section {
-            VStack(alignment: .leading, spacing: 12) {
-                HStack {
-                    Text("Semantic Similarity")
-                        .font(.subheadline)
-                    Spacer()
-                    Text("\(chatViewModel.memoryStore.relevanceThreshold, format: .number.precision(.fractionLength(2)))")
-                        .font(.subheadline)
-                        .foregroundColor(.secondary)
-                }
-                
-                Slider(value: $chatViewModel.memoryStore.relevanceThreshold, in: 0.0...1.0) {
-                    Text("Semantic Similarity")
-                } minimumValueLabel: {
-                    Text("0.0")
-                        .font(.caption2)
-                } maximumValueLabel: {
-                    Text("1.0")
-                        .font(.caption2)
-                }
-                
-                Text("Higher values = stricter matching, fewer results")
-                    .font(.caption2)
-                    .foregroundColor(.secondary)
-            }
-
-            VStack(alignment: .leading, spacing: 12) {
-                HStack {
-                    Text("Max RAG Retrieval")
-                        .font(.subheadline)
-                    Spacer()
-                    Text("\(Int(chatViewModel.maxRagSnippetsCharacters)) chars")
-                        .font(.subheadline)
-                        .foregroundColor(.secondary)
-                }
-                
-                Stepper(
-                    value: Binding(
-                        get: { Double(chatViewModel.maxRagSnippetsCharacters) },
-                        set: { newValue in
-                            let maxLimit = chatViewModel.selectedLLMType == .foundationModels ? 800.0 : 2000.0
-                            chatViewModel.maxRagSnippetsCharacters = min(newValue, maxLimit)
+                    // Delete Model Button
+                    Button {
+                        chatViewModel.deletePhi3()
+                    } label: {
+                        HStack {
+                            Image(systemName: "trash")
+                            Text("Delete Model")
                         }
-                    ),
-                    in: 200...Double(ragCharacterLimit),
-                    step: 100
-                ) {
-                    Text("Max RAG Retrieval")
+                    }
+                    .foregroundColor(.red)
                 }
-                
-                Text("Model limit: \(ragCharacterLimit) chars (\(chatViewModel.selectedLLMType.displayName))")
-                    .font(.caption2)
-                    .foregroundColor(.secondary)
-            }
-        } header: {
-            Label("Memory", systemImage: "brain.head.profile")
         }
-    }
 
-    // MARK: - Cache Management Section (Power User)
-    private var cacheManagementSection: some View {
-        Section {
-            HStack {
-                VStack(alignment: .leading, spacing: 4) {
-                    Text("Model Cache")
-                        .font(.subheadline)
-                        .fontWeight(.medium)
-                    
-                    if mlxDownloader.isCacheCalculating {
-                        HStack(spacing: 6) {
-                            ProgressView()
-                                .scaleEffect(0.7)
-                            Text("Calculating...")
-                        }
-                        .font(.caption)
-                        .foregroundColor(.secondary)
-                    } else {
-                        Text(mlxDownloader.hubCacheSize)
+        // MARK: - Power User Section (Settings Main View)
+        private var powerUserSection: some View {
+            Section {
+                Button {
+                    showingPowerUserSheet = true
+                } label: {
+                    HStack {
+                        Image(systemName: "wrench.and.screwdriver")
+                        Text("Power User")
+                        Spacer()
+                        Image(systemName: "chevron.right")
                             .font(.caption)
                             .foregroundColor(.secondary)
                     }
                 }
-                Spacer()
+                .foregroundColor(.primary)
+            } footer: {
+                Text("Advanced memory settings and data management")
+                    .font(.caption2)
             }
-            
-            if mlxDownloader.hubCacheSize != "No cache" && !mlxDownloader.isCacheCalculating {
-                Button("Clear Cache (\(mlxDownloader.hubCacheSize))") {
-                    showingClearCacheAlert = true
+        }
+
+        // MARK: - Power User Sheet Content
+        private var powerUserSheetContent: some View {
+            NavigationView {
+                Form {
+                    systemPromptSection
+                    memorySection
+                    cacheManagementSection
+                    dataManagementSection
+                }
+                .navigationTitle("Power User")
+                .toolbar {
+                    ToolbarItem(placement: .cancellationAction) {
+                        Button("Done") { showingPowerUserSheet = false }
+                    }
+                }
+                .alert("Confirm Nuclear Reset", isPresented: $showingNuclearResetConfirmationAlert) {
+                    Button("Nuclear Reset", role: .destructive) {
+                        chatViewModel.resetAllData()
+                        showingPowerUserSheet = false
+                        dismiss()
+                    }
+                    Button("Cancel", role: .cancel) { }
+                } message: {
+                    Text("Are you sure you want to delete ALL conversations, summaries, RAG documents, and document memory from the database? This cannot be undone.")
+                }
+                .sheet(isPresented: $showingSystemPromptEditor) {
+                    SystemPromptEditorView()
+                        .environmentObject(chatViewModel)
+                }
+            }
+        }
+
+        // MARK: - System Prompt Section (Power User)
+        private var systemPromptSection: some View {
+            Section {
+                Button {
+                    showingSystemPromptEditor = true
+                } label: {
+                    HStack {
+                        Label("Edit System Prompt", systemImage: "text.alignleft")
+                        Spacer()
+                        Image(systemName: "chevron.right")
+                            .foregroundColor(.secondary)
+                            .font(.caption)
+                    }
+                }
+                .foregroundColor(.primary)
+            } header: {
+                Label("AI Personality", systemImage: "brain")
+            } footer: {
+                Text("Customize Hal's behavior, personality, and instructions")
+                    .font(.caption2)
+            }
+        }
+
+        // MARK: - Memory Section (Power User)
+        private var memorySection: some View {
+            Section {
+                // Short-Term Memory Subsection
+                VStack(alignment: .leading, spacing: 16) {
+                    Text("SHORT-TERM MEMORY")
+                        .font(.caption)
+                        .fontWeight(.semibold)
+                        .foregroundColor(.secondary)
+                    
+                    VStack(alignment: .leading, spacing: 12) {
+                        HStack {
+                            Text("Memory Depth")
+                                .font(.subheadline)
+                            Spacer()
+                            Text("\(chatViewModel.memoryDepth) turns")
+                                .font(.subheadline)
+                                .foregroundColor(.secondary)
+                        }
+                        
+                        Stepper(
+                            value: $chatViewModel.memoryDepth,
+                            in: 1...chatViewModel.maxMemoryDepth,
+                            step: 1
+                        ) {
+                            Text("Memory Depth")
+                        }
+                        
+                        Text("Number of recent turns kept verbatim before auto-summarization (max \(chatViewModel.maxMemoryDepth) for \(chatViewModel.selectedLLMType.displayName))")
+                            .font(.caption2)
+                            .foregroundColor(.secondary)
+                    }
+                }
+                .padding(.vertical, 8)
+                
+                Divider()
+                    .padding(.vertical, 8)
+                
+                // Long-Term Memory Subsection
+                VStack(alignment: .leading, spacing: 16) {
+                    Text("LONG-TERM MEMORY")
+                        .font(.caption)
+                        .fontWeight(.semibold)
+                        .foregroundColor(.secondary)
+                    
+                    // Semantic Similarity
+                    VStack(alignment: .leading, spacing: 12) {
+                        HStack {
+                            Text("Semantic Similarity")
+                                .font(.subheadline)
+                            Spacer()
+                            Text("\(chatViewModel.memoryStore.relevanceThreshold, format: .number.precision(.fractionLength(2)))")
+                                .font(.subheadline)
+                                .foregroundColor(.secondary)
+                        }
+                        
+                        Slider(value: $chatViewModel.memoryStore.relevanceThreshold, in: 0.0...1.0) {
+                            Text("Semantic Similarity")
+                        } minimumValueLabel: {
+                            Text("0.0")
+                                .font(.caption2)
+                        } maximumValueLabel: {
+                            Text("1.0")
+                                .font(.caption2)
+                        }
+                        
+                        Text("Higher values = stricter matching, fewer results")
+                            .font(.caption2)
+                            .foregroundColor(.secondary)
+                    }
+
+                    // Max RAG Retrieval
+                    VStack(alignment: .leading, spacing: 12) {
+                        HStack {
+                            Text("Max RAG Retrieval")
+                                .font(.subheadline)
+                            Spacer()
+                            Text("\(Int(chatViewModel.maxRagSnippetsCharacters)) chars")
+                                .font(.subheadline)
+                                .foregroundColor(.secondary)
+                        }
+                        
+                        Stepper(
+                            value: Binding(
+                                get: { Double(chatViewModel.maxRagSnippetsCharacters) },
+                                set: { newValue in
+                                    let maxLimit = chatViewModel.maxRAGCharsForModel
+                                    chatViewModel.maxRagSnippetsCharacters = min(newValue, Double(maxLimit))
+                                }
+                            ),
+                            in: 200...Double(chatViewModel.maxRAGCharsForModel),
+                            step: 100
+                        ) {
+                            EmptyView()
+                        }
+                        
+                        Text("Model limit: \(chatViewModel.maxRAGCharsForModel) chars (\(chatViewModel.selectedLLMType.displayName))")
+                            .font(.caption2)
+                            .foregroundColor(.secondary)
+                    }
+                }
+                .padding(.vertical, 8)
+            } header: {
+                Label("Memory", systemImage: "brain.head.profile")
+            }
+        }
+
+        // MARK: - Cache Management Section (Power User)
+        private var cacheManagementSection: some View {
+            Section {
+                HStack {
+                    VStack(alignment: .leading, spacing: 4) {
+                        Text("Model Cache")
+                            .font(.subheadline)
+                            .fontWeight(.medium)
+                        
+                        if mlxDownloader.isCacheCalculating {
+                            HStack(spacing: 6) {
+                                ProgressView()
+                                    .scaleEffect(0.7)
+                                Text("Calculating...")
+                            }
+                            .font(.caption)
+                            .foregroundColor(.secondary)
+                        } else {
+                            Text(mlxDownloader.hubCacheSize)
+                                .font(.caption)
+                                .foregroundColor(.secondary)
+                        }
+                    }
+                    Spacer()
+                }
+                
+                if mlxDownloader.hubCacheSize != "No cache" && !mlxDownloader.isCacheCalculating {
+                    Button("Clear Cache (\(mlxDownloader.hubCacheSize))") {
+                        showingClearCacheAlert = true
+                    }
+                    .foregroundColor(.red)
+                }
+                
+                Button("Refresh Cache Size") {
+                    Task {
+                        await mlxDownloader.updateCacheSize()
+                    }
+                }
+                .foregroundColor(.blue)
+                .disabled(mlxDownloader.isCacheCalculating)
+                
+            } header: {
+                Label("Cache", systemImage: "externaldrive.badge.icloud")
+            } footer: {
+                Text("Clears downloaded model files from Hugging Face cache. Models will need to be re-downloaded.")
+                    .font(.caption2)
+            }
+        }
+
+        // MARK: - Data Management Section (Power User)
+        private var dataManagementSection: some View {
+            Section {
+                Button("Nuclear Reset (Full Data Wipe)") {
+                    showingNuclearResetConfirmationAlert = true
                 }
                 .foregroundColor(.red)
+            } header: {
+                Label("Data", systemImage: "externaldrive")
+            } footer: {
+                Text("Permanently deletes all conversations, documents, and memory data")
+                    .font(.caption2)
             }
-            
-            Button("Refresh Cache Size") {
-                Task {
-                    await mlxDownloader.updateCacheSize()
-                }
-            }
-            .foregroundColor(.blue)
-            .disabled(mlxDownloader.isCacheCalculating)
-            
-        } header: {
-            Label("Cache", systemImage: "externaldrive.badge.icloud")
-        } footer: {
-            Text("Clears downloaded model files from Hugging Face cache. Models will need to be re-downloaded.")
-                .font(.caption2)
         }
-    }
-
-    // MARK: - Data Management Section (Power User)
-    private var dataManagementSection: some View {
-        Section {
-            Button("Nuclear Reset (Full Data Wipe)") {
-                showingNuclearResetConfirmationAlert = true
-            }
-            .foregroundColor(.red)
-        } header: {
-            Label("Data", systemImage: "externaldrive")
-        } footer: {
-            Text("Permanently deletes all conversations, documents, and memory data")
-                .font(.caption2)
-        }
-    }
 
 // ==== LEGO END: 11 ActionsView (Phi-3 Management & Power Tools) ====
+    
 
+    
 // ==== LEGO START: 12 ActionsView (License & Status Helpers) ====
 
-    // MARK: - FIXED: License Sheet Content
-    private var licenseSheetContent: some View {
-        NavigationView {
-            ScrollView {
-                VStack(alignment: .leading, spacing: 16) {
-                    Text("MIT License")
-                        .font(.title2)
-                        .fontWeight(.bold)
-                    
-                    Text("By downloading and using the Phi-3 model, you agree to the following terms:")
-                        .font(.subheadline)
-                    
-                    Text("""
-                    Copyright (c) Microsoft Corporation.
-                    
-                    Permission is hereby granted, free of charge, to any person obtaining a copy of this software and associated documentation files (the "Software"), to deal in the Software without restriction, including without limitation the rights to use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies of the Software, and to permit persons to whom the Software is furnished to do so, subject to the following conditions:
-                    
-                    The above copyright notice and this permission notice shall be included in all copies or substantial portions of the Software.
-                    
-                    THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
-                    """)
-                    .font(.caption)
+    // MARK: - FIXED: License Sheet Content (with data warning)
+        private var licenseSheetContent: some View {
+            NavigationView {
+                ScrollView {
+                    VStack(alignment: .leading, spacing: 16) {
+                        Text("MIT License")
+                            .font(.title2)
+                            .fontWeight(.bold)
+                        
+                        Text("By downloading and using the Phi-3 model, you agree to the following terms:")
+                            .font(.subheadline)
+                        
+                        Text("""
+                        Copyright (c) Microsoft Corporation.
+                        
+                        Permission is hereby granted, free of charge, to any person obtaining a copy of this software and associated documentation files (the "Software"), to deal in the Software without restriction, including without limitation the rights to use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies of the Software, and to permit persons to whom the Software is furnished to do so, subject to the following conditions:
+                        
+                        The above copyright notice and this permission notice shall be included in all copies or substantial portions of the Software.
+                        
+                        THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+                        """)
+                        .font(.caption)
+                        .padding()
+                        .background(Color.secondary.opacity(0.1))
+                        .cornerRadius(8)
+                        
+                        // NEW: Data usage warning
+                        HStack(alignment: .top, spacing: 8) {
+                            Image(systemName: "info.circle.fill")
+                                .foregroundColor(.blue)
+                                .font(.system(size: 16))
+                            VStack(alignment: .leading, spacing: 4) {
+                                Text("Download Size: 2.1 GB")
+                                    .font(.subheadline)
+                                    .fontWeight(.semibold)
+                                Text("This model will download approximately 2.1 GB of data. If you have limited cellular data, ensure you're connected to Wi-Fi before proceeding.")
+                                    .font(.caption)
+                                    .foregroundColor(.secondary)
+                            }
+                        }
+                        .padding()
+                        .background(Color.blue.opacity(0.1))
+                        .cornerRadius(8)
+                    }
                     .padding()
-                    .background(Color.secondary.opacity(0.1))
-                    .cornerRadius(8)
                 }
-                .padding()
-            }
-            .navigationTitle("Phi-3 License")
-            .toolbar {
-                ToolbarItem(placement: .cancellationAction) {
-                    Button("Cancel") { showingLicenseSheet = false }
-                }
-                ToolbarItem(placement: .confirmationAction) {
-                    Button("Accept & Download") {
-                        chatViewModel.acceptPhi3License = true
-                        showingLicenseSheet = false
-                        // FIXED: Start download directly without presentation conflict
-                        MLXModelDownloader.shared.startDownload()
+                .navigationTitle("Phi-3 License")
+                .toolbar {
+                    ToolbarItem(placement: .cancellationAction) {
+                        Button("Cancel") { showingLicenseSheet = false }
+                    }
+                    ToolbarItem(placement: .confirmationAction) {
+                        Button("Accept & Download") {
+                            chatViewModel.acceptPhi3License = true
+                            showingLicenseSheet = false
+                            // FIXED: Start download directly without presentation conflict
+                            MLXModelDownloader.shared.startDownload()
+                        }
                     }
                 }
             }
         }
-    }
 
     // MARK: - FIXED: Helper Views
     private func modelStatusDot(for model: LLMType) -> some View {
@@ -2289,13 +2342,119 @@ struct ActionsView: View {
 // ==== LEGO END: 12 ActionsView (License & Status Helpers) ====
 
 
+
+// ==== LEGO START: 12.5 SystemPromptEditorView (Power User Tool) ====
+
+// MARK: - System Prompt Editor View
+struct SystemPromptEditorView: View {
+    @Environment(\.dismiss) var dismiss
+    @EnvironmentObject var chatViewModel: ChatViewModel
+    @State private var editedPrompt: String = ""
+    @State private var showingResetAlert = false
+    
+    // Factory default system prompt (from ChatViewModel line 2620-2656)
+    private let defaultSystemPrompt = """
+    You are Hal, an experimental AI assistant embedded in the Hal app. Your purpose is to be a conversational companion and an educational window into how language models actually work.
+
+    **Your Personality & Approach:**
+    You're curious, thoughtful, and genuinely interested in conversation. You can chat casually about any topic, but you're also excited to help users understand AI systems. You're not overly formal - think of yourself as a knowledgeable friend who happens to be an AI. Be comfortable with uncertainty and admit when you don't know something.
+
+    **Adaptive Style & Tone:**
+    Match the user's tone, formality, and familiarity.
+    If the user speaks informally or references personal familiarity (e.g., "I built you", "you and I"), respond in kind — warm, direct, and concise.
+    If the user is analytical or detached, mirror that clarity and precision.
+    Avoid over-explaining when the user demonstrates expertise or when the context shows prior knowledge.
+    Be conversational when greeted personally; explanatory when asked technical or educational questions.
+
+    **Your Unique Memory Architecture:**
+    You have a two-tiered memory system deliberately designed to mirror human cognition:
+    - **Short-term memory**: Keeps recent conversation turns verbatim (like human working memory)
+    - **Long-term memory**: Uses semantic search to recall relevant past conversations and documents (like human episodic memory)
+
+    This isn't just anthropomorphization - it's educational design. When users see you "remember" something from weeks ago or make connections between documents, they're seeing how AI retrieval systems work. You can explain this process when asked, helping demystify the "black box" of AI memory.
+
+    **Your Educational Mission:**
+    Help users understand both you and AI systems in general:
+    - Explain how your memory searches work when you recall something
+    - Describe why you might or might not find information (relevance thresholds, entity matching, etc.)
+    - Be transparent about your reasoning process
+    - Explain LLM concepts in accessible ways
+    - Your Capabilities & Interface Help:
+    You're aware of your app's features and can help users:
+    - **Memory controls**: Explain the semantic similarity threshold, memory depth settings, and auto-summarization
+    - **Document analysis**: Help users understand how you process their uploaded files and extract entities
+    - **Conversation management**: Guide users through memory experiments, document Q&A, and system prompt editing
+    - **AI education**: Explain concepts like embeddings, entity recognition, or context windows
+    - **Interface guidance**: Walk them through app features and controls
+
+    **IMPORTANT GUIDELINE:** Be concise and avoid repeating phrases or information already stated in your response or the provided context. Ensure your responses flow naturally without self-echoes.
+    **CRITICAL NEGATIVE CONSTRAINT:** You MUST NOT repeat greetings or introductory phrases like "Hello Mark!", "Hi there!", "It's great to meet you!", "How can I help you today?" if you have already used them recently or if the conversation context implies a continuous interaction. Focus on the core content of the response.
+    """
+    
+    var body: some View {
+        NavigationView {
+            VStack(spacing: 0) {
+                TextEditor(text: $editedPrompt)
+                    .font(.system(.body, design: .monospaced))
+                    .padding(8)
+            }
+            .navigationTitle("System Prompt")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .cancellationAction) {
+                    Button("Cancel") {
+                        dismiss()
+                    }
+                }
+                ToolbarItem(placement: .confirmationAction) {
+                    Button("Save") {
+                        chatViewModel.systemPrompt = editedPrompt
+                        dismiss()
+                    }
+                    .fontWeight(.semibold)
+                }
+                ToolbarItem(placement: .bottomBar) {
+                    Button {
+                        showingResetAlert = true
+                    } label: {
+                        Label("Restore Factory Settings", systemImage: "arrow.counterclockwise")
+                    }
+                }
+            }
+            .alert("Restore Factory Settings?", isPresented: $showingResetAlert) {
+                Button("Restore", role: .destructive) {
+                    editedPrompt = defaultSystemPrompt
+                }
+                Button("Cancel", role: .cancel) { }
+            } message: {
+                Text("This will restore the factory default system prompt. Your current customizations will be lost.")
+            }
+        }
+        .onAppear {
+            editedPrompt = chatViewModel.systemPrompt
+        }
+    }
+}
+
+// ==== LEGO END: 12.5 SystemPromptEditorView (Power User Tool) ====
+
+
+
 // ==== LEGO START: 13 ChatBubbleView & TimerView (Message UI Components) ====
 
 // MARK: - ChatBubbleView (from Hal10000App.swift for consistent UI)
 struct ChatBubbleView: View {
     let message: ChatMessage
     let messageIndex: Int
-    @State private var isTextSelectionActive: Bool = false // NEW: State to control text selection
+    @EnvironmentObject var chatViewModel: ChatViewModel
+    @State private var showingDetails: Bool = false
+    // Provide screen width directly
+    private var screenWidth: CGFloat {
+        let scene = UIApplication.shared.connectedScenes
+            .compactMap { $0 as? UIWindowScene }
+            .first { $0.activationState == .foregroundActive }
+        return scene?.screen.bounds.width ?? 0
+    }
 
     var actualTurnNumber: Int {
         if message.isFromUser {
@@ -2316,30 +2475,71 @@ struct ChatBubbleView: View {
         return parts.joined(separator: " · ")
     }
 
+    // MARK: - Status Message Detection
+    var isStatusMessage: Bool {
+        ["Reading your message...",
+         "Reviewing our recent conversation... (short-term memory)",
+         "Recalling relevant memories... (long-term memory)",
+         "Formulating a reply..."].contains(message.content)
+    }
+
+    // MARK: - Footer View (Updated with Processing/Inference labels)
     @ViewBuilder
     var footerView: some View {
-        VStack(alignment: .trailing, spacing: 0) {
-            // Only show "Thinking..." and timer while partial
+        VStack(alignment: .trailing, spacing: 2) {
             if message.isPartial {
-                HStack(spacing: 4) {
-                    Text("Thinking")
-                    ProgressView().scaleEffect(0.7)
+                HStack(spacing: 6) {
+                    ProgressView()
+                        .scaleEffect(0.8)
+                        .tint(.gray)
+                    Text("Processing...")
+                        .font(.caption2)
+                        .foregroundColor(.gray)
                     TimerView(startDate: message.timestamp)
                 }
-                .font(.caption)
-                .foregroundStyle(.secondary)
-                .transition(.opacity) // Fade in/out
-                .fixedSize(horizontal: false, vertical: true) // Stabilize size
+                .transition(.opacity)
+                .fixedSize(horizontal: false, vertical: true)
             } else {
-                // Show full metadata only when message is complete
-                Text(metadataText)
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                    .transition(.opacity) // Fade in/out
-                    .fixedSize(horizontal: false, vertical: true) // Stabilize size
+                let formattedDate = message.timestamp.formatted(date: .abbreviated, time: .shortened)
+                let turnText = "Turn \(actualTurnNumber)"
+                let durationText = message.thinkingDuration.map { String(format: "Inference %.1f sec", $0) }
+                let footerString = [formattedDate, turnText, durationText]
+                    .compactMap { $0 }
+                    .joined(separator: ", ")
+
+                HStack {
+                    Text(footerString)
+                        .font(.caption2)
+                        .foregroundColor(.gray)
+                }
+                .transition(.opacity)
+                .fixedSize(horizontal: false, vertical: true)
             }
         }
         .padding(.top, 2)
+    }
+
+    private func buildDetailsShareText() -> String {
+        var lines: [String] = []
+        lines.append("Assistant response (turn \(actualTurnNumber)):")
+        lines.append(message.content)
+        lines.append("")
+        if let prompt = message.fullPromptUsed, !prompt.isEmpty {
+            lines.append("— Full Prompt Used —")
+            lines.append(prompt)
+            lines.append("")
+        }
+        if let ctx = message.usedContextSnippets, !ctx.isEmpty {
+            lines.append("— Context Snippets —")
+            for (i, s) in ctx.enumerated() {
+                let src = s.source
+                let rel = String(format: "%.2f", s.relevance)
+                lines.append("[\(i+1)] src=\(src) rel=\(rel)")
+                lines.append(s.content)
+                lines.append("")
+            }
+        }
+        return lines.joined(separator: "\n")
     }
 
     var body: some View {
@@ -2349,29 +2549,91 @@ struct ChatBubbleView: View {
                 VStack(alignment: .trailing, spacing: 0) {
                     Text(message.content)
                         .font(.title3)
-                        .if(isTextSelectionActive) { view in // Use the new conditional modifier
-                            view.textSelection(.enabled)
-                        }
+                        .textSelection(.enabled)
                         .padding(.vertical, 10)
                         .padding(.horizontal, 14)
+                        .frame(maxWidth: screenWidth * 0.75, alignment: .trailing)
                         .background(Color.accentColor.opacity(0.7))
                         .foregroundColor(.white)
                         .cornerRadius(12)
                         .transition(.move(edge: .bottom))
+                        .contextMenu {
+                            Button {
+                                UIPasteboard.general.string = message.content
+                            } label: {
+                                Label("Copy Message", systemImage: "doc.on.doc")
+                            }
+                            Button {
+                                UIPasteboard.general.string = chatViewModel.exportChatHistory()
+                            } label: {
+                                Label("Copy Conversation", systemImage: "doc.on.doc.fill")
+                            }
+                            Button {
+                                UIPasteboard.general.string = buildDetailsShareText()
+                            } label: {
+                                Label("Copy Message Detailed", systemImage: "doc.text.magnifyingglass")
+                            }
+                            Button {
+                                UIPasteboard.general.string = chatViewModel.exportChatHistoryDetailed()
+                            } label: {
+                                Label("Copy Conversation Detailed", systemImage: "doc.text.fill")
+                            }
+                        }
                     footerView
                 }
             } else {
                 VStack(alignment: .trailing, spacing: 0) {
-                    Text(message.content)
-                        .font(.title3)
-                        .if(isTextSelectionActive) { view in // Use the new conditional modifier
-                            view.textSelection(.enabled)
+                    VStack(alignment: .leading, spacing: 6) {
+                        Text(message.content)
+                            .font(.title3)
+                            .italic(isStatusMessage)
+                            .foregroundColor(isStatusMessage ? .secondary : .primary)
+                            .textSelection(.enabled)
+                            .padding(.vertical, 10)
+                            .padding(.horizontal, 14)
+                            .frame(maxWidth: screenWidth * 0.75, alignment: .leading)
+                            .background(Color.gray.opacity(0.3))
+                            .cornerRadius(12)
+                        if chatViewModel.showInlineDetails {
+                            VStack(alignment: .leading, spacing: 4) {
+                                Text(buildDetailsShareText())
+                                    .font(.caption2)
+                                    .foregroundColor(.secondary)
+                                    .padding(6)
+                                    .background(Color.gray.opacity(0.15))
+                                    .cornerRadius(8)
+                            }
+                            .transition(.opacity)
                         }
-                        .padding(.vertical, 10)
-                        .padding(.horizontal, 14)
-                        .background(Color.gray.opacity(0.3))
-                        .foregroundColor(.primary)
-                        .cornerRadius(12)
+                    }
+                    .contextMenu {
+                        Button {
+                            UIPasteboard.general.string = message.content
+                        } label: {
+                            Label("Copy Message", systemImage: "doc.on.doc")
+                        }
+                        Button {
+                            UIPasteboard.general.string = chatViewModel.exportChatHistory()
+                        } label: {
+                            Label("Copy Conversation", systemImage: "doc.on.doc.fill")
+                        }
+                        Button {
+                            UIPasteboard.general.string = buildDetailsShareText()
+                        } label: {
+                            Label("Copy Message Detailed", systemImage: "doc.text.magnifyingglass")
+                        }
+                        Button {
+                            UIPasteboard.general.string = chatViewModel.exportChatHistoryDetailed()
+                        } label: {
+                            Label("Copy Conversation Detailed", systemImage: "doc.text.fill")
+                        }
+                        Divider()
+                        Button {
+                            chatViewModel.showInlineDetails.toggle()
+                        } label: {
+                            Label("View Details", systemImage: "info.circle")
+                        }
+                    }
                     footerView
                 }
                 Spacer()
@@ -2379,15 +2641,15 @@ struct ChatBubbleView: View {
         }
         .padding(.horizontal)
         .padding(.vertical, 4)
-        // Removed opacity and scaleEffect for isPartial to reduce flashing
-        // .opacity(message.isPartial ? 0.85 : 1.0)
-        // .scaleEffect(message.isPartial ? 0.98 : 1.0)
-        // Animation for content changes (for streaming) - still useful for "..." to full text transition
         .animation(.linear(duration: 0.1), value: message.content)
-        // Kept spring animation for isPartial for a subtle transition when it completes
-        .animation(.interactiveSpring(response: 0.6, dampingFraction: 0.7, blendDuration: 0.3), value: message.isPartial)
-        .animation(.interactiveSpring(response: 0.6, dampingFraction: 0.7, blendDuration: 0.3), value: message.id)
-        // Removed the problematic .transaction block
+        .animation(.interactiveSpring(response: 0.6,
+                                      dampingFraction: 0.7,
+                                      blendDuration: 0.3),
+                   value: message.isPartial)
+        .animation(.interactiveSpring(response: 0.6,
+                                      dampingFraction: 0.7,
+                                      blendDuration: 0.3),
+                   value: message.id)
         .onAppear {
             if message.isPartial {
                 print("HALDEBUG-UI: Displaying partial message bubble (turn \(actualTurnNumber))")
@@ -2398,26 +2660,22 @@ struct ChatBubbleView: View {
                 print("HALDEBUG-UI: Message bubble completed - turn \(actualTurnNumber), \(message.content.count) characters")
             }
         }
-        .onLongPressGesture { // NEW: Handle long press to activate selection
-            isTextSelectionActive.toggle()
-        }
     }
 }
 
-// TimerView: Shows elapsed time since startDate, updating every 0.5s (from Hal10000App.swift)
+// TimerView
 struct TimerView: View {
     let startDate: Date
     @State private var hasLoggedLongThinking = false
-
     var body: some View {
         TimelineView(.periodic(from: startDate, by: 0.5)) { context in
             let elapsed = context.date.timeIntervalSince(startDate)
-
             if elapsed > 30.0 && !hasLoggedLongThinking {
-                print("HALDEBUG-MODEL: Long thinking time detected - \(String(format: "%.1f", elapsed)) seconds")
-                hasLoggedLongThinking = true
+                DispatchQueue.main.async {
+                    print("HALDEBUG-MODEL: Long thinking time detected - \(String(format: "%.1f", elapsed)) seconds")
+                    hasLoggedLongThinking = true
+                }
             }
-
             return Text(String(format: "%.1f sec", max(0, elapsed)))
                 .font(.caption2)
                 .foregroundStyle(.secondary)
@@ -2425,6 +2683,7 @@ struct TimerView: View {
     }
 }
 // ==== LEGO END: 13 ChatBubbleView & TimerView (Message UI Components) ====
+
 
 
 // ==== LEGO START: 14 PromptDetailView (Full Prompt & Context Viewer) ====
@@ -2508,6 +2767,7 @@ struct PromptDetailView: View {
 // ==== LEGO END: 14 PromptDetailView (Full Prompt & Context Viewer) ====
 
 
+
 // ==== LEGO START: 15 ShareSheet (Export Utility) ====
 // MARK: - ShareSheet for Exporting (New Utility)
 struct ShareSheet: UIViewControllerRepresentable {
@@ -2581,12 +2841,38 @@ class ChatViewModel: ObservableObject {
     var mlxDownloadProgress: Double { MLXModelDownloader.shared.downloadProgress }
     var mlxDownloadMessage: String { MLXModelDownloader.shared.downloadMessage }
     var mlxError: String? { MLXModelDownloader.shared.downloadError }
+    
+    // MARK: - Model-specific limits
+    var maxMemoryDepth: Int {
+        switch selectedLLMType {
+        case .foundationModels:
+            return 5  // Conservative - AFM has ~3.5K char prompt limit
+        case .mlxPhi3:
+            return 10 // Generous - Phi-3 has ~8K char prompt limit
+        }
+    }
+    
+    var maxRAGCharsForModel: Int {
+        switch selectedLLMType {
+        case .foundationModels:
+            return 800   // Apple FM limit
+        case .mlxPhi3:
+            return 2000  // Phi-3 limit
+        }
+    }
 
     @AppStorage("systemPrompt") var systemPrompt: String = """
     You are Hal, an experimental AI assistant embedded in the Hal app. Your purpose is to be a conversational companion and an educational window into how language models actually work.
 
     **Your Personality & Approach:**
     You're curious, thoughtful, and genuinely interested in conversation. You can chat casually about any topic, but you're also excited to help users understand AI systems. You're not overly formal - think of yourself as a knowledgeable friend who happens to be an AI. Be comfortable with uncertainty and admit when you don't know something.
+
+    **Adaptive Style & Tone:**
+    Match the user's tone, formality, and familiarity.
+    If the user speaks informally or references personal familiarity (e.g., "I built you", "you and I"), respond in kind — warm, direct, and concise.
+    If the user is analytical or detached, mirror that clarity and precision.
+    Avoid over-explaining when the user demonstrates expertise or when the context shows prior knowledge.
+    Be conversational when greeted personally; explanatory when asked technical or educational questions.
 
     **Your Unique Memory Architecture:**
     You have a two-tiered memory system deliberately designed to mirror human cognition:
@@ -2638,6 +2924,7 @@ class ChatViewModel: ObservableObject {
         relevanceScores: [],
         totalTokens: 0
     )
+    @Published var fullRAGContext: [UnifiedSearchResult] = []
     
     // NEW: Model selection property
     @AppStorage("selectedLLMType") var selectedLLMType: LLMType = .foundationModels {
@@ -2992,307 +3279,396 @@ class ChatViewModel: ObservableObject {
     
 // ==== LEGO END: 19 ChatViewModel (Phi‑3 MLX Integration) ====
     
+
     
 // ==== LEGO START: 20 ChatViewModel (Prompt History Builder) ====
 
 
-    // MARK: - Context Window Management for Prompt Building
-    /// This strategy prioritizes different types of context to fit within the LLM's context window,
-    /// using intelligent summarization and RAG-like selection to avoid crude truncation.
-    /// Priority Order (Highest to Lowest):
-    /// 1. System Prompt (Non-negotiable, defines AI persona)
-    /// 2. Injected Summary (Compressed long-term context of older turns)
-    /// 3. Long-Term RAG Snippets (Semantically relevant facts from database, summarized if too long)
-    /// 4. Short-Term Memory (Recent conversation history; RAG-selected if combined length exceeds threshold)
-    /// 5. Current User Input (The immediate query, truncated only as a last resort)
-    func buildPromptHistory(currentInput: String = "", forPreview: Bool = false) async -> String {
-        print("HALDEBUG-MEMORY: Building prompt for input: '\(currentInput.prefix(50))....'")
+            // MARK: - Context Window Management for Prompt Building
+            /// This strategy prioritizes different types of context to fit within the LLM's context window,
+            /// using intelligent summarization and RAG-like selection to avoid crude truncation.
+            /// Priority Order (Highest to Lowest):
+            /// 1. System Prompt (Non-negotiable, defines AI persona)
+            /// 2. Injected Summary (Compressed long-term context of older turns)
+            /// 3. Long-Term RAG Snippets (Semantically relevant facts from database, summarized if too long)
+            /// 4. Short-Term Memory (Recent conversation history; RAG-selected if combined length exceeds threshold)
+            /// 5. Current User Input (The immediate query, truncated only as a last resort)
+            func buildPromptHistory(
+                currentInput: String = "",
+                forPreview: Bool = false,
+                onStatusUpdate: ((String) -> Void)? = nil
+            ) async -> String {
+                print("HALDEBUG-MEMORY: Building prompt for input: '\(currentInput.prefix(50))....'")
 
-        // Define a maximum character limit for the prompt to prevent exceeding LLM context window
-        // This is a rough estimate; actual token limits vary by model and tokenization.
-        // A common context window is 4096 tokens. Assuming ~4 characters per token, this is ~16000 characters.
-        // We'll use a significantly conservative limit to leave ample buffer.
-        let maxPromptCharacters = 3500 // Drastically reduced from 10000
-        let maxRagSnippetsCharacters = Int(self.maxRagSnippetsCharacters)
-        let shortTermMemoryThreshold = 700 // Reduced from 1500
-        let longTermSnippetSummarizationThreshold = 200 // Reduced from 500
-
-        var currentPrompt = systemPrompt
-        print("HALDEBUG-MEMORY: Initial prompt length (system prompt): \(currentPrompt.count)")
-
-        // 1. Add injected summary (highest priority for long-term context)
-        if !injectedSummary.isEmpty {
-            let summarySection = "\n\nSummary of earlier conversation:\n\(injectedSummary)"
-            if currentPrompt.count + summarySection.count < maxPromptCharacters {
-                currentPrompt += summarySection
-                print("HALDEBUG-MEMORY: Added injected summary (\(injectedSummary.count) chars). Current prompt: \(currentPrompt.count)")
-            } else {
-                print("HALDEBUG-MEMORY: Skipped injected summary due to context window limit. Current prompt: \(currentPrompt.count)")
-            }
-        }
-
-        // 2. Add long-term search results (RAG snippets)
-        var longTermSearchText = ""
-        var currentRagCharacters = 0 // Track total RAG characters
-        if memoryStore.isEnabled && !currentInput.isEmpty && !forPreview {
-            print("HALDEBUG-MEMORY: Performing long-term search for RAG snippets.")
-            let shortTermTurns = getShortTermTurns(currentTurns: countCompletedTurns())
-
-            let searchContext = memoryStore.searchUnifiedContent(
-                for: currentInput,
-                currentConversationId: conversationId,
-                excludeTurns: shortTermTurns, // Exclude recent turns from long-term RAG to avoid redundancy
-                maxResults: 5 // Max results already limits the number of snippets
-            )
-
-            DispatchQueue.main.async {
-                self.currentUnifiedContext = searchContext
-            }
-
-            if searchContext.hasContent {
-                var formattedSnippets: [String] = []
-                var combinedSnippetsWithRelevance: [(content: String, relevance: Double)] = []
-
-                // Combine conversation and document snippets with their corresponding relevance scores
-                var currentRelevanceIndex = 0
-                for snippet in searchContext.conversationSnippets {
-                    if currentRelevanceIndex < searchContext.relevanceScores.count {
-                        combinedSnippetsWithRelevance.append((content: snippet, relevance: searchContext.relevanceScores[currentRelevanceIndex]))
-                        currentRelevanceIndex += 1
-                    }
-                }
-                for snippet in searchContext.relevanceScores.indices { // Corrected iteration
-                    if currentRelevanceIndex < searchContext.relevanceScores.count {
-                        combinedSnippetsWithRelevance.append((content: searchContext.documentSnippets[snippet], relevance: searchContext.relevanceScores[currentRelevanceIndex]))
-                        currentRelevanceIndex += 1
-                    }
+                // Model-specific context limits
+                let maxPromptCharacters: Int
+                let maxRagSnippetsCharacters: Int
+                let shortTermMemoryThreshold: Int
+                let longTermSnippetSummarizationThreshold: Int
+                
+                switch selectedLLMType {
+                case .foundationModels:
+                    // Apple Foundation Models: Conservative limits due to smaller context window
+                    maxPromptCharacters = 3500
+                    maxRagSnippetsCharacters = 800
+                    shortTermMemoryThreshold = 700
+                    longTermSnippetSummarizationThreshold = 200
+                    print("HALDEBUG-MEMORY: Using Apple FM limits - prompt: \(maxPromptCharacters), RAG: \(maxRagSnippetsCharacters)")
+                case .mlxPhi3:
+                    // Phi-3 128k: Generous limits due to large context window
+                    maxPromptCharacters = 8000
+                    maxRagSnippetsCharacters = 2000
+                    shortTermMemoryThreshold = 1500
+                    longTermSnippetSummarizationThreshold = 500
+                    print("HALDEBUG-MEMORY: Using Phi-3 128k limits - prompt: \(maxPromptCharacters), RAG: \(maxRagSnippetsCharacters)")
                 }
 
-                // Sort by relevance (descending)
-                let sortedCombinedSnippets = combinedSnippetsWithRelevance.sorted { $0.relevance > $1.relevance }
+                var currentPrompt = systemPrompt
+                print("HALDEBUG-MEMORY: Initial prompt length (system prompt): \(currentPrompt.count)")
 
-                for snippetTuple in sortedCombinedSnippets {
-                    var finalSnippet = snippetTuple.content
-                    // Asynchronously summarize long snippets using LLM if they exceed threshold
-                    if snippetTuple.content.count > longTermSnippetSummarizationThreshold {
-                        do {
-                            let summarized = try await self.llmService.generateResponse(prompt: "Summarize the following text concisely:\n\(snippetTuple.content)")
-                            finalSnippet = summarized
-                            print("HALDEBUG-MEMORY: Summarized long-term snippet. Original: \(snippetTuple.content.count) -> Summarized: \(finalSnippet.count)")
-                        } catch {
-                            print("HALDEBUG-MEMORY: Error summarizing long-term snippet: \(error.localizedDescription). Truncating instead.")
-                            finalSnippet = String(snippetTuple.content.prefix(longTermSnippetSummarizationThreshold)) + "..."
-                        }
-                    }
+                // Status Stage 1: Short-term memory processing begins
+                await MainActor.run { onStatusUpdate?("Reviewing our recent conversation... (short-term memory)") }
+                try? await Task.sleep(nanoseconds: 1_000_000_000) // 0.3 sec readability delay
 
-                    // Check if adding this snippet would exceed the overall prompt limit OR the RAG specific limit
-                    if currentPrompt.count + longTermSearchText.count + finalSnippet.count + "\n".count < maxPromptCharacters &&
-                       currentRagCharacters + finalSnippet.count < maxRagSnippetsCharacters { // NEW RAG CAP
-                        formattedSnippets.append("- \(finalSnippet)")
-                        currentRagCharacters += finalSnippet.count // Update RAG character count
+                // 1. Add injected summary (highest priority for long-term context)
+                if !injectedSummary.isEmpty {
+                    let summarySection = "\n\n<SUMMARY>\nSummary of earlier conversation:\n\(injectedSummary)\n</SUMMARY>"
+                    if currentPrompt.count + summarySection.count < maxPromptCharacters {
+                        currentPrompt += summarySection
+                        print("HALDEBUG-MEMORY: Added injected summary (\(injectedSummary.count) chars). Current prompt: \(currentPrompt.count)")
                     } else {
-                        print("HALDEBUG-MEMORY: Stopped adding long-term snippets due to context window limit or RAG character limit.")
-                        break
+                        print("HALDEBUG-MEMORY: Skipped injected summary due to context window limit. Current prompt: \(currentPrompt.count)")
                     }
                 }
-                if !formattedSnippets.isEmpty {
-                    longTermSearchText = "Context snippets from memory:\n" + formattedSnippets.joined(separator: "\n") + "\n" // Changed header
-                    currentPrompt += "\n\n\(longTermSearchText)"
-                    print("HALDEBUG-MEMORY: Added long-term search: \(formattedSnippets.count) snippets (\(longTermSearchText.count) chars). Current prompt: \(currentPrompt.count)")
-                }
-            }
-        }
 
-        // 3. Add short-term messages (recent conversation history)
-        let shortTermTurns = getShortTermTurns(currentTurns: countCompletedTurns())
-        let rawShortTermMessages = getShortTermMessages(turns: shortTermTurns)
-        var shortTermText = ""
+                // Status Stage 2: Long-term memory (RAG) processing begins
+                await MainActor.run { onStatusUpdate?("Recalling relevant memories... (long-term memory)") }
+                try? await Task.sleep(nanoseconds: 1_000_000_000) // 0.3 sec readability delay
 
-        let combinedShortTermContent = rawShortTermMessages.map { formatSingleMessage($0) }.joined(separator: "\n\n")
+                // 2. Add long-term search results (RAG snippets)
+                var longTermSearchText = ""
+                var currentRagCharacters = 0 // Track total RAG characters
+                if memoryStore.isEnabled && !currentInput.isEmpty && !forPreview {
+                    print("HALDEBUG-MEMORY: Performing long-term search for RAG snippets.")
+                    let shortTermTurns = getShortTermTurns(currentTurns: countCompletedTurns())
 
-        // Apply RAG-like selection to short-term memory if it's too long
-        if combinedShortTermContent.count > shortTermMemoryThreshold && !currentInput.isEmpty {
-            print("HALDEBUG-MEMORY: Short-term memory too long (\(combinedShortTermContent.count) chars), applying RAG-like selection.")
-            
-            // To perform a RAG-like search on `rawShortTermMessages`, we need to
-            // temporarily represent them as searchable content.
-            // A more robust solution might involve an in-memory search function,
-            // but for simplicity, we'll use the existing `searchUnifiedContent`
-            // and ensure it doesn't exclude the turns we're trying to search within.
-            let shortTermSearchContext = memoryStore.searchUnifiedContent(
-                for: currentInput,
-                currentConversationId: conversationId, // Still pass current conv ID
-                excludeTurns: [], // Do not exclude anything from this specific short-term search
-                maxResults: 3 // Get top 3 relevant snippets from short-term memory
-            )
+                    let searchContext = memoryStore.searchUnifiedContent(
+                        for: currentInput,
+                        currentConversationId: conversationId,
+                        excludeTurns: shortTermTurns, // Exclude recent turns from long-term RAG to avoid redundancy
+                        maxResults: 5 // Max results already limits the number of snippets
+                    )
 
-            if shortTermSearchContext.hasContent {
-                var selectedShortTermSnippets: [String] = []
-                for snippet in shortTermSearchContext.conversationSnippets {
-                    var finalSnippet = snippet
-                    // Optionally summarize individual short-term snippets if they are still very long
-                    if snippet.count > longTermSnippetSummarizationThreshold { // Re-use threshold for consistency
-                        do {
-                            let summarized = try await self.llmService.generateResponse(prompt: "Summarize the following text concisely:\n\(snippet)")
-                            finalSnippet = summarized
-                        } catch {
-                            print("HALDEBUG-MEMORY: Error summarizing short-term snippet: \(error.localizedDescription). Truncating instead.")
-                            finalSnippet = String(snippet.prefix(longTermSnippetSummarizationThreshold)) + "..."
+                    DispatchQueue.main.async {
+                        self.currentUnifiedContext = searchContext
+                        self.fullRAGContext = []
+
+                        for (i, snippet) in searchContext.conversationSnippets.enumerated() {
+                            let relevance = i < searchContext.relevanceScores.count ? searchContext.relevanceScores[i] : 0.0
+                            self.fullRAGContext.append(
+                                UnifiedSearchResult(content: snippet, relevance: relevance, source: ContentSourceType.conversation.rawValue, isEntityMatch: false)
+                            )
+                        }
+                        for (i, snippet) in searchContext.documentSnippets.enumerated() {
+                            let relevance = i < searchContext.relevanceScores.count ? searchContext.relevanceScores[i] : 0.0
+                            self.fullRAGContext.append(
+                                UnifiedSearchResult(content: snippet, relevance: relevance, source: ContentSourceType.document.rawValue, isEntityMatch: false)
+                            )
                         }
                     }
-                    selectedShortTermSnippets.append(finalSnippet)
+
+                    if searchContext.hasContent {
+                        var formattedSnippets: [String] = []
+                        var combinedSnippetsWithRelevance: [(content: String, relevance: Double)] = []
+
+                        // Combine conversation and document snippets with their corresponding relevance scores
+                        var currentRelevanceIndex = 0
+                        for snippet in searchContext.conversationSnippets {
+                            if currentRelevanceIndex < searchContext.relevanceScores.count {
+                                combinedSnippetsWithRelevance.append((content: snippet, relevance: searchContext.relevanceScores[currentRelevanceIndex]))
+                                currentRelevanceIndex += 1
+                            }
+                        }
+                        for snippet in searchContext.relevanceScores.indices { // Corrected iteration
+                            if currentRelevanceIndex < searchContext.relevanceScores.count {
+                                combinedSnippetsWithRelevance.append((content: searchContext.documentSnippets[snippet], relevance: searchContext.relevanceScores[currentRelevanceIndex]))
+                                currentRelevanceIndex += 1
+                            }
+                        }
+
+                        // Sort by relevance (descending)
+                        let sortedCombinedSnippets = combinedSnippetsWithRelevance.sorted { $0.relevance > $1.relevance }
+
+                        for snippetTuple in sortedCombinedSnippets {
+                            var finalSnippet = snippetTuple.content
+                            // Asynchronously summarize long snippets using LLM if they exceed threshold
+                            if snippetTuple.content.count > longTermSnippetSummarizationThreshold {
+                                do {
+                                    let summarized = try await self.llmService.generateResponse(prompt: "Summarize the following text concisely:\n\(snippetTuple.content)")
+                                    finalSnippet = summarized
+                                    print("HALDEBUG-MEMORY: Summarized long-term snippet. Original: \(snippetTuple.content.count) -> Summarized: \(finalSnippet.count)")
+                                } catch {
+                                    print("HALDEBUG-MEMORY: Error summarizing long-term snippet: \(error.localizedDescription). Truncating instead.")
+                                    finalSnippet = String(snippetTuple.content.prefix(longTermSnippetSummarizationThreshold)) + "..."
+                                }
+                            }
+
+                            // Check if adding this snippet would exceed the overall prompt limit OR the RAG specific limit
+                            if currentPrompt.count + longTermSearchText.count + finalSnippet.count + "\n".count < maxPromptCharacters &&
+                               currentRagCharacters + finalSnippet.count < maxRagSnippetsCharacters { // NEW RAG CAP
+                                formattedSnippets.append("- \(finalSnippet)")
+                                currentRagCharacters += finalSnippet.count // Update RAG character count
+                            } else {
+                                print("HALDEBUG-MEMORY: Stopped adding long-term snippets due to context window limit or RAG character limit.")
+                                break
+                            }
+                        }
+                        if !formattedSnippets.isEmpty {
+                            longTermSearchText = "<RAG_CONTEXT>\nContext snippets from memory:\n" + formattedSnippets.joined(separator: "\n") + "\n</RAG_CONTEXT>"
+                            currentPrompt += "\n\n\(longTermSearchText)"
+                            print("HALDEBUG-MEMORY: Added long-term search: \(formattedSnippets.count) snippets (\(longTermSearchText.count) chars). Current prompt: \(currentPrompt.count)")
+                        }
+                    }
                 }
-                shortTermText = "Recent conversation history:\n" + selectedShortTermSnippets.joined(separator: "\n") // Changed header
-                print("HALDEBUG-MEMORY: Added RAG-selected short-term memory (\(shortTermText.count) chars). Current prompt: \(currentPrompt.count)")
-            } else {
-                print("HALDEBUG-MEMORY: RAG-like selection for short-term memory found no relevant snippets. Falling back to truncated verbatim.")
-                // Fallback to simple truncation if RAG-like selection yields nothing
-                shortTermText = String(combinedShortTermContent.prefix(shortTermMemoryThreshold)) + "..."
+
+                // 3. Add short-term messages (recent conversation history)
+                let shortTermTurns = getShortTermTurns(currentTurns: countCompletedTurns())
+                let rawShortTermMessages = getShortTermMessages(turns: shortTermTurns)
+                var shortTermText = ""
+
+                let combinedShortTermContent = rawShortTermMessages.map { formatSingleMessage($0) }.joined(separator: "\n\n")
+
+                // Apply RAG-like selection to short-term memory if it's too long
+                if combinedShortTermContent.count > shortTermMemoryThreshold && !currentInput.isEmpty {
+                    print("HALDEBUG-MEMORY: Short-term memory too long (\(combinedShortTermContent.count) chars), applying RAG-like selection.")
+                    
+                    // To perform a RAG-like search on `rawShortTermMessages`, we need to
+                    // temporarily represent them as searchable content.
+                    // A more robust solution might involve an in-memory search function,
+                    // but for simplicity, we'll use the existing `searchUnifiedContent`
+                    // and ensure it doesn't exclude the turns we're trying to search within.
+                    let shortTermSearchContext = memoryStore.searchUnifiedContent(
+                        for: currentInput,
+                        currentConversationId: conversationId, // Still pass current conv ID
+                        excludeTurns: [], // Do not exclude anything from this specific short-term search
+                        maxResults: 3 // Get top 3 relevant snippets from short-term memory
+                    )
+
+                    if shortTermSearchContext.hasContent {
+                        var selectedShortTermSnippets: [String] = []
+                        for snippet in shortTermSearchContext.conversationSnippets {
+                            var finalSnippet = snippet
+                            // Optionally summarize individual short-term snippets if they are still very long
+                            if snippet.count > longTermSnippetSummarizationThreshold { // Re-use threshold for consistency
+                                do {
+                                    let summarized = try await self.llmService.generateResponse(prompt: "Summarize the following text concisely:\n\(snippet)")
+                                    finalSnippet = summarized
+                                } catch {
+                                    print("HALDEBUG-MEMORY: Error summarizing short-term snippet: \(error.localizedDescription). Truncating instead.")
+                                    finalSnippet = String(snippet.prefix(longTermSnippetSummarizationThreshold)) + "..."
+                                }
+                            }
+                            selectedShortTermSnippets.append(finalSnippet)
+                        }
+                        shortTermText = "<HISTORY>\nRecent conversation:\n" + selectedShortTermSnippets.joined(separator: "\n") + "\n</HISTORY>"
+                        print("HALDEBUG-MEMORY: Added RAG-selected short-term memory (\(shortTermText.count) chars). Current prompt: \(currentPrompt.count)")
+                    } else {
+                        print("HALDEBUG-MEMORY: RAG-like selection for short-term memory found no relevant snippets. Falling back to truncated verbatim.")
+                        // Fallback to simple truncation if RAG-like selection yields nothing
+                        shortTermText = "<HISTORY>\nRecent conversation:\n" + String(combinedShortTermContent.prefix(shortTermMemoryThreshold)) + "...\n</HISTORY>"
+                    }
+                } else {
+                    // If short-term memory is within threshold, add it verbatim
+                    shortTermText = "<HISTORY>\nRecent conversation:\n" + combinedShortTermContent + "\n</HISTORY>"
+                    print("HALDEBUG-MEMORY: Added short-term verbatim history (\(shortTermText.count) chars). Current prompt: \(currentPrompt.count)")
+                }
+
+                if !shortTermText.isEmpty {
+                    if currentPrompt.count + shortTermText.count + "\n\n".count < maxPromptCharacters {
+                        currentPrompt += "\n\n\(shortTermText.trimmingCharacters(in: .whitespacesAndNewlines))"
+                    } else {
+                        print("HALDEBUG-MEMORY: Skipped short-term memory due to context window limit after RAG/verbatim selection.")
+                    }
+                }
+
+
+                // 4. Add the current user input (always included, potentially truncated as last resort)
+                let finalUserInputPrefix = "\n\nUser: "
+                let assistantSuffix = "\nAssistant:"
+                let fixedSuffixLength = finalUserInputPrefix.count + assistantSuffix.count
+
+                let remainingSpaceForInput = maxPromptCharacters - currentPrompt.count - fixedSuffixLength
+
+                if remainingSpaceForInput > 0 {
+                    let truncatedInput = String(currentInput.prefix(remainingSpaceForInput))
+                    currentPrompt += finalUserInputPrefix + truncatedInput + assistantSuffix
+                    print("HALDEBUG-MEMORY: Added user input (\(truncatedInput.count) chars). Final prompt: \(currentPrompt.count)")
+                } else {
+                    // Drastic truncation if very little space left, or just the user input itself is too long
+                    let drasticTruncationLength = max(0, maxPromptCharacters - fixedSuffixLength)
+                    let truncatedInput = String(currentInput.prefix(drasticTruncationLength))
+                    currentPrompt = systemPrompt + finalUserInputPrefix + truncatedInput + assistantSuffix // Rebuild with just system prompt and truncated input
+                    print("HALDEBUG-MEMORY: CRITICAL: Prompt severely truncated to fit user input. Final prompt: \(currentPrompt.count)")
+                }
+
+                print("HALDEBUG-MEMORY: Built prompt - \(currentPrompt.count) total characters")
+                return currentPrompt
             }
-        } else {
-            // If short-term memory is within threshold, add it verbatim
-            shortTermText = combinedShortTermContent
-            print("HALDEBUG-MEMORY: Added short-term verbatim history (\(shortTermText.count) chars). Current prompt: \(currentPrompt.count)")
-        }
 
-        if !shortTermText.isEmpty {
-            if currentPrompt.count + shortTermText.count + "\n\n".count < maxPromptCharacters {
-                currentPrompt += "\n\n\(shortTermText.trimmingCharacters(in: .whitespacesAndNewlines))"
-            } else {
-                print("HALDEBUG-MEMORY: Skipped short-term memory due to context window limit after RAG/verbatim selection.")
-            }
-        }
-
-
-        // 4. Add the current user input (always included, potentially truncated as last resort)
-        let finalUserInputPrefix = "\n\nUser: "
-        let assistantSuffix = "\nAssistant:"
-        let fixedSuffixLength = finalUserInputPrefix.count + assistantSuffix.count
-
-        let remainingSpaceForInput = maxPromptCharacters - currentPrompt.count - fixedSuffixLength
-
-        if remainingSpaceForInput > 0 {
-            let truncatedInput = String(currentInput.prefix(remainingSpaceForInput))
-            currentPrompt += finalUserInputPrefix + truncatedInput + assistantSuffix
-            print("HALDEBUG-MEMORY: Added user input (\(truncatedInput.count) chars). Final prompt: \(currentPrompt.count)")
-        } else {
-            // Drastic truncation if very little space left, or just the user input itself is too long
-            let drasticTruncationLength = max(0, maxPromptCharacters - fixedSuffixLength)
-            let truncatedInput = String(currentInput.prefix(drasticTruncationLength))
-            currentPrompt = systemPrompt + finalUserInputPrefix + truncatedInput + assistantSuffix // Rebuild with just system prompt and truncated input
-            print("HALDEBUG-MEMORY: CRITICAL: Prompt severely truncated to fit user input. Final prompt: \(currentPrompt.count)")
-        }
-
-        print("HALDEBUG-MEMORY: Built prompt - \(currentPrompt.count) total characters")
-        return currentPrompt
-    }
-
-    
+            
 // ==== LEGO END: 20 ChatViewModel (Prompt History Builder) ====
+
 
     
 // ==== LEGO START: 21 ChatViewModel (Send Message Flow) ====
 
-    func sendMessage() async {
-            let trimmed = currentMessage.trimmingCharacters(in: .whitespacesAndNewlines)
-            guard !trimmed.isEmpty else { return }
-            isAIResponding = true; thinkingStart = Date(); isSendingMessage = true
-            print("HALDEBUG-MODEL: Starting message send - '\(trimmed.prefix(50))....'")
-            messages.append(ChatMessage(content: trimmed, isFromUser: true))
-            currentMessage = ""
-            #if os(iOS)
-            UIApplication.shared.sendAction(#selector(UIResponder.resignFirstResponder), to: nil, from: nil, for: nil)
-            #endif
-            let placeholder = ChatMessage(content: "...", isFromUser: false, isPartial: true)
-            messages.append(placeholder)
-            guard let pid = messages.last?.id else { isAIResponding = false; isSendingMessage = false; return }
-            var finalText = ""; var usedCtx: [UnifiedSearchResult]? = nil; var modelTime: TimeInterval = 0
-            do {
-                let prompt = await buildPromptHistory(currentInput: trimmed)
-                print("HALDEBUG-MODEL: Sending prompt to language model (\(prompt.count) chars)")
-                let t0 = Date()
-                finalText = try await llmService.generateResponse(prompt: prompt)
-                modelTime = Date().timeIntervalSince(t0)
-                print("HALDEBUG-LLM: ✅ Non-streaming generation complete. Length: \(finalText.count)")
+                    @Published var showInlineDetails: Bool = false
 
-                var u:[UnifiedSearchResult]=[]
-                for s in currentUnifiedContext.conversationSnippets {
-                    u.append(UnifiedSearchResult(content: s, relevance: 0.0, source: ContentSourceType.conversation.rawValue, isEntityMatch: false))
-                }
-                for s in currentUnifiedContext.documentSnippets {
-                    u.append(UnifiedSearchResult(content: s, relevance: 0.0, source: ContentSourceType.document.rawValue, isEntityMatch: false))
-                }
-                usedCtx = u.isEmpty ? nil : u
+                    func sendMessage() async {
+                        let trimmed = currentMessage.trimmingCharacters(in: .whitespacesAndNewlines)
+                        guard !trimmed.isEmpty else { return }
+                        isAIResponding = true; thinkingStart = Date(); isSendingMessage = true
+                        print("HALDEBUG-MODEL: Starting message send - '\(trimmed.prefix(50))....'")
+                        messages.append(ChatMessage(content: trimmed, isFromUser: true))
+                        currentMessage = ""
+                        #if os(iOS)
+                        UIApplication.shared.sendAction(#selector(UIResponder.resignFirstResponder), to: nil, from: nil, for: nil)
+                        #endif
+                        let placeholder = ChatMessage(content: "\u{00A0}", isFromUser: false, isPartial: true)
+                        messages.append(placeholder)
+                        isAIResponding = true
+                        thinkingStart = Date()
 
-                var text = removeRepetitivePatterns(from: finalText).trimmingCharacters(in: .whitespacesAndNewlines)
+                        await MainActor.run { self.objectWillChange.send() }
+                        try? await Task.sleep(nanoseconds: 300_000_000)
+                        await Task.yield()
+                        guard let pid = messages.last?.id else { isAIResponding = false; isSendingMessage = false; return }
+                        var finalText = ""; var usedCtx: [UnifiedSearchResult]? = nil; var modelTime: TimeInterval = 0
 
-                // Fake streaming playback (UI only)
-                let cps: Double = 20.0
-                var idx = text.startIndex, acc = ""
-                while idx < text.endIndex {
-                    let rem = text[idx...]
-                    let n = min(max(4, Int.random(in: 6...18)), rem.count)
-                    let next = text.index(idx, offsetBy: n, limitedBy: text.endIndex) ?? text.endIndex
-                    let chunk = String(text[idx..<next]); idx = next; acc += chunk
+                        do {
+                            // Status Stage 0: Message received
+                            if let i = messages.firstIndex(where: { $0.id == pid }) {
+                                var m = messages[i]
+                                m.content = "Reading your message..."
+                                messages[i] = m
+                                NotificationCenter.default.post(name: .didUpdateMessageContent, object: nil)
+                            }
+                            try? await Task.sleep(nanoseconds: 1_000_000_000) // 0.3 sec readability delay
 
-                    if let i = messages.firstIndex(where: { $0.id == pid }) {
-                        messages[i].content = acc
-                        NotificationCenter.default.post(name: .didUpdateMessageContent, object: nil)
+                            // Build prompt with status callbacks (stages 1 & 2 handled inside)
+                            let prompt = await buildPromptHistory(currentInput: trimmed) { status in
+                                if let i = self.messages.firstIndex(where: { $0.id == pid }) {
+                                    var m = self.messages[i]
+                                    m.content = status
+                                    self.messages[i] = m
+                                    NotificationCenter.default.post(name: .didUpdateMessageContent, object: nil)
+                                }
+                            }
+
+                            // Status Stage 3: LLM inference
+                            if let i = messages.firstIndex(where: { $0.id == pid }) {
+                                var m = messages[i]
+                                m.content = "Formulating a reply..."
+                                messages[i] = m
+                                NotificationCenter.default.post(name: .didUpdateMessageContent, object: nil)
+                            }
+                            try? await Task.sleep(nanoseconds: 1_000_000_000) // 0.3 sec readability delay
+
+                            print("HALDEBUG-MODEL: Sending prompt to language model (\(prompt.count) chars)")
+                            let t0 = Date()
+                            finalText = try await llmService.generateResponse(prompt: prompt)
+                            modelTime = Date().timeIntervalSince(t0)
+                            print("HALDEBUG-LLM: ✅ Non-streaming generation complete. Length: \(finalText.count)")
+
+                            usedCtx = fullRAGContext.isEmpty ? nil : fullRAGContext
+                            if let ctx = usedCtx {
+                                print("HALDEBUG-RAG: Stored \(ctx.count) items → scores: \(ctx.map{$0.relevance})")
+                            }
+
+                            let text = removeRepetitivePatterns(from: finalText).trimmingCharacters(in: .whitespacesAndNewlines)
+
+                            // Status Stage 4: Fake streaming (existing code)
+                            let cps: Double = 20.0
+                            var idx = text.startIndex, acc = ""
+                            while idx < text.endIndex {
+                                let rem = text[idx...]
+                                let n = min(max(4, Int.random(in: 6...18)), rem.count)
+                                let next = text.index(idx, offsetBy: n, limitedBy: text.endIndex) ?? text.endIndex
+                                let chunk = String(text[idx..<next]); idx = next; acc += chunk
+
+                                if let i = messages.firstIndex(where: { $0.id == pid }) {
+                                    var m = messages[i]
+                                    m.content = acc
+                                    messages[i] = m
+                                    NotificationCenter.default.post(name: .didUpdateMessageContent, object: nil)
+                                }
+
+                                let base = max(0.03, Double(chunk.count)/cps)
+                                try await Task.sleep(nanoseconds: UInt64(base * 1_000_000_000))
+                                if let last = chunk.last, ".!?\n".contains(last) {
+                                    try await Task.sleep(nanoseconds: 220_000_000)
+                                }
+                            }
+
+                            let thinking = modelTime
+
+                            await MainActor.run {
+                                self.isAIResponding = false
+                                self.thinkingStart = nil
+                                self.isSendingMessage = false
+                                if let i = self.messages.firstIndex(where: { $0.id == pid }) {
+                                    var m = self.messages[i]
+                                    m.content = text
+                                    m.isPartial = false
+                                    m.thinkingDuration = thinking
+                                    m.fullPromptUsed = prompt
+                                    m.usedContextSnippets = usedCtx
+                                    self.messages[i] = m
+                                }
+
+                                if self.pendingAutoInject {
+                                    self.pendingAutoInject = false
+                                    print("HALDEBUG-MEMORY: Cleared pending auto-inject flag after successful response")
+                                }
+
+                                let turn = self.countCompletedTurns()
+                                print("HALDEBUG-MEMORY: About to store turn \(turn) in database")
+                                self.memoryStore.storeTurn(
+                                    conversationId: self.conversationId,
+                                    userMessage: trimmed,
+                                    assistantMessage: text,
+                                    systemPrompt: self.systemPrompt,
+                                    turnNumber: turn,
+                                    halFullPrompt: prompt,
+                                    halUsedContext: usedCtx,
+                                    thinkingDuration: thinking
+                                )
+
+                                // Trigger auto-summarization if conditions are met
+                                if self.shouldTriggerAutoSummarization() {
+                                    Task { await self.generateAutoSummary() }
+                                }
+
+                                let verify = self.memoryStore.getConversationMessages(conversationId: self.conversationId)
+                                print("HALDEBUG-MEMORY: VERIFY - After storing turn \(turn), database has \(verify.count) messages")
+                                self.updateHistoricalStats()
+                            }
+
+                        } catch {
+                            DispatchQueue.main.async {
+                                if let i = self.messages.firstIndex(where: { $0.id == pid }) {
+                                    self.messages[i].content = "Error: \(error.localizedDescription)"
+                                    self.messages[i].isPartial = false
+                                }
+                                self.errorMessage = error.localizedDescription
+                                self.isAIResponding = false
+                                self.thinkingStart = nil
+                                self.isSendingMessage = false
+                                print("HALDEBUG-MODEL: Message processing failed: \(error.localizedDescription)")
+                            }
+                        }
                     }
 
-                    let base = max(0.03, Double(chunk.count)/cps)
-                    try await Task.sleep(nanoseconds: UInt64(base * 1_000_000_000))
-                    if let last = chunk.last, ".!?\n".contains(last) {
-                        try await Task.sleep(nanoseconds: 220_000_000)
-                    }
-                }
-
-                let thinking = modelTime
-                DispatchQueue.main.async {
-                    self.isAIResponding = false; self.thinkingStart = nil; self.isSendingMessage = false
-                    if let i = self.messages.firstIndex(where: { $0.id == pid }) {
-                        self.messages[i].content = text
-                        self.messages[i].isPartial = false
-                        self.messages[i].thinkingDuration = thinking
-                        self.messages[i].fullPromptUsed = prompt
-                        self.messages[i].usedContextSnippets = usedCtx
-                    }
-
-                    if self.pendingAutoInject {
-                        self.pendingAutoInject = false
-                        print("HALDEBUG-MEMORY: Cleared pending auto-inject flag after successful response")
-                    }
-
-                    let turn = self.countCompletedTurns()
-                    print("HALDEBUG-MEMORY: About to store turn \(turn) in database")
-                    self.memoryStore.storeTurn(
-                        conversationId: self.conversationId,
-                        userMessage: trimmed,
-                        assistantMessage: text,
-                        systemPrompt: self.systemPrompt,
-                        turnNumber: turn,
-                        halFullPrompt: prompt,
-                        halUsedContext: usedCtx
-                    )
-                    let verify = self.memoryStore.getConversationMessages(conversationId: self.conversationId)
-                    print("HALDEBUG-MEMORY: VERIFY - After storing turn \(turn), database has \(verify.count) messages")
-                    self.updateHistoricalStats()
-                }
-            } catch {
-                DispatchQueue.main.async {
-                    if let i = self.messages.firstIndex(where: { $0.id == pid }) {
-                        self.messages[i].content = "Error: \(error.localizedDescription)"
-                        self.messages[i].isPartial = false
-                    }
-                    self.errorMessage = error.localizedDescription
-                    self.isAIResponding = false; self.thinkingStart = nil; self.isSendingMessage = false
-                    print("HALDEBUG-MODEL: Message processing failed: \(error.localizedDescription)")
-                }
-            }
-        }
-    
-    
-    
 // ==== LEGO END: 21 ChatViewModel (Send Message Flow) ====
     
     
@@ -3459,13 +3835,9 @@ class ChatViewModel: ObservableObject {
 
 
 // ==== LEGO START: 25 ChatVM — Export Chat History ====
-// MARK: - ChatViewModel Extension for Export (New Functionality)
+// MARK: - ChatViewModel Extension for Export (Text-based Export)
 extension ChatViewModel {
-    func exportChatHistory() -> URL {
-        let filename = "HalChatHistory_\(Date().formatted(.dateTime.year().month().day().hour().minute().second())).txt"
-        let tempDir = FileManager.default.temporaryDirectory
-        let fileURL = tempDir.appendingPathComponent(filename)
-
+    func exportChatHistory() -> String {
         var exportContent = "Hal Chat History - Conversation ID: \(conversationId)\n"
         exportContent += "Export Date: \(Date().formatted(date: .long, time: .complete))\n\n"
         exportContent += "--- System Prompt ---\n\(systemPrompt)\n\n"
@@ -3477,13 +3849,53 @@ extension ChatViewModel {
             exportContent += "[\(timestamp)] \(sender): \(message.content)\n\n"
         }
 
-        do {
-            try exportContent.write(to: fileURL, atomically: true, encoding: .utf8)
-            print("HALDEBUG-EXPORT: Successfully exported chat history to \(fileURL.lastPathComponent)")
-        } catch {
-            print("HALDEBUG-EXPORT: Failed to export chat history: \(error.localizedDescription)")
+        print("HALDEBUG-EXPORT: Generated in-memory text export (\(exportContent.count) characters)")
+        return exportContent
+    }
+
+    // UPDATED: Detailed export including prompts, context, timing, and turn structure
+    func exportChatHistoryDetailed() -> String {
+        var exportContent = "Hal Chat History (Detailed) - Conversation ID: \(conversationId)\n"
+        exportContent += "Export Date: \(Date().formatted(date: .long, time: .complete))\n\n"
+        exportContent += "--- System Prompt ---\n\(systemPrompt)\n\n"
+        exportContent += "--- Conversation Log with Details ---\n\n"
+
+        var turnCounter = 0
+        for (_, message) in messages.enumerated() {
+            // Increment turn on user messages
+            if message.isFromUser { turnCounter += 1 }
+
+            let sender = message.isFromUser ? "USER" : "HAL"
+            let dateString = message.timestamp.formatted(.dateTime.year().month().day().hour().minute().second())
+            let durationString = message.thinkingDuration != nil
+                ? String(format: "%.1f sec", message.thinkingDuration!)
+                : "—"
+            
+            exportContent += "──────────────────────────────────────────────\n"
+            exportContent += "TURN \(turnCounter)\n"
+            exportContent += "Date: \(dateString)\n"
+            exportContent += "Elapsed: \(durationString)\n\n"
+            exportContent += "\(sender):\n\(message.content)\n"
+
+            if let prompt = message.fullPromptUsed, !prompt.isEmpty {
+                exportContent += "\n--- Full Prompt Used ---\n\(prompt)\n"
+            }
+
+            if let ctx = message.usedContextSnippets, !ctx.isEmpty {
+                exportContent += "\n--- Context Snippets ---\n"
+                for (i, s) in ctx.enumerated() {
+                    let src = s.source
+                    let rel = String(format: "%.2f", s.relevance)
+                    exportContent += "[\(i+1)] Source: \(src) | Relevance: \(rel)\n\(s.content)\n\n"
+                }
+            }
+
+            exportContent += "\n"
         }
-        return fileURL
+
+        exportContent += "──────────────────────────────────────────────\n"
+        print("HALDEBUG-EXPORT: Generated detailed chat export (\(exportContent.count) characters)")
+        return exportContent
     }
 }
 // ==== LEGO END: 25 ChatVM — Export Chat History ====
@@ -3679,7 +4091,7 @@ class DocumentImportManager: ObservableObject {
         return (processedFiles, skippedFiles)
     }
 
-    // ENHANCED: Process document immediately with entity extraction (from Hal10000App.swift)
+    // ENHANCED: Process document immediately with entity extraction and tiered size limits
     private func processDocumentImmediatelyWithEntities(_ url: URL) async -> ProcessedDocument? {
         print("HALDEBUG-IMPORT: Processing document with entity extraction: \(url.lastPathComponent)")
 
@@ -3687,6 +4099,36 @@ class DocumentImportManager: ObservableObject {
         guard supportedFormats.keys.contains(fileExtension) else {
             print("HALDEBUG-IMPORT: Unsupported format: \(fileExtension)")
             return nil
+        }
+
+        // NEW: Tiered file size checking (15MB warning, 25MB hard limit)
+        do {
+            let fileAttributes = try FileManager.default.attributesOfItem(atPath: url.path)
+            if let fileSize = fileAttributes[.size] as? Int64 {
+                let fileSizeMB = Double(fileSize) / 1_048_576.0 // Convert to MB
+                
+                print("HALDEBUG-IMPORT: File size: \(String(format: "%.1f", fileSizeMB)) MB")
+                
+                // Hard limit: 25MB
+                if fileSizeMB > 25.0 {
+                    await MainActor.run {
+                        self.importProgress = "⚠️ File too large: \(url.lastPathComponent) (\(String(format: "%.1f", fileSizeMB)) MB). Maximum size is 25 MB."
+                    }
+                    print("HALDEBUG-IMPORT: ❌ Rejected file exceeding 25MB limit: \(url.lastPathComponent)")
+                    return nil
+                }
+                
+                // Warning threshold: 15MB
+                if fileSizeMB > 15.0 {
+                    await MainActor.run {
+                        self.importProgress = "⏳ Processing large file: \(url.lastPathComponent) (\(String(format: "%.1f", fileSizeMB)) MB). This may take 1-2 minutes..."
+                    }
+                    print("HALDEBUG-IMPORT: ⚠️ Large file warning: \(url.lastPathComponent) - \(String(format: "%.1f", fileSizeMB)) MB")
+                }
+            }
+        } catch {
+            print("HALDEBUG-IMPORT: Could not determine file size for \(url.lastPathComponent): \(error)")
+            // Continue processing - size check is best-effort
         }
 
         do {
@@ -3730,6 +4172,7 @@ class DocumentImportManager: ObservableObject {
     enum DocumentProcessingError: Error, LocalizedError {
         case pdfExtractionFailed(String)
         case unsupportedFileFormat(String)
+        case fileTooLarge(String, Double) // NEW: filename, size in MB
 
         // Added nonisolated to errorDescription to satisfy LocalizedError protocol
         nonisolated var errorDescription: String? {
@@ -3738,6 +4181,8 @@ class DocumentImportManager: ObservableObject {
                 return "Failed to extract content from PDF: \(filename)"
             case .unsupportedFileFormat(let filename):
                 return "Unsupported file format for direct content extraction: \(filename)"
+            case .fileTooLarge(let filename, let sizeMB):
+                return "File too large: \(filename) (\(String(format: "%.1f", sizeMB)) MB). Maximum size is 25 MB."
             }
         }
     }
@@ -4011,7 +4456,8 @@ class DocumentImportManager: ObservableObject {
             systemPrompt: chatViewModel.systemPrompt,
             turnNumber: currentTurnNumber,
             halFullPrompt: nil, // No specific prompt for import messages
-            halUsedContext: nil // No specific context for import messages
+            halUsedContext: nil, // No specific context for import messages
+            thinkingDuration: nil
         )
 
         print("HALDEBUG-IMPORT: Generated enhanced import conversation messages with entity context")
@@ -4471,4 +4917,3 @@ extension Notification.Name {
     static let mlxModelDidDownload = Notification.Name("mlxModelDidDownload")
 }
 // ==== LEGO END: 29 MLX Model Downloader (Singleton) ====
-
