@@ -1402,6 +1402,25 @@ class MLXWrapper: ObservableObject {
         }
     }
 
+    // NEW: Function to unload the MLX model and free memory
+    func unloadModel() {
+        print("HALDEBUG-MLX: Unloading MLX model...")
+        
+        // Clear the model container to release memory
+        modelContainer = nil
+        
+        // Clear GPU cache to free VRAM
+        MLX.GPU.clearCache()
+        
+        // Update state
+        isModelLoaded = false
+        loadingProgress = 0.0
+        loadingMessage = "Model unloaded"
+        mlxError = nil
+        
+        print("HALDEBUG-MLX: MLX model unloaded successfully. Memory freed.")
+    }
+
     // Function to generate response using the MLX model (non-streaming)
     func generate(prompt: String) async throws -> String {
         guard isModelLoaded, let container = self.modelContainer else {
@@ -1471,9 +1490,8 @@ class LLMService: ObservableObject {
         self.currentLLMType = type
         self.initializationError = nil // Clear previous errors
 
-        // Only MLX needs setup - Foundation Models create fresh sessions each time
         if type == .mlxPhi3 {
-            // Check if MLX model is already loaded or being loaded
+            // SWITCHING TO PHI-3: Load MLX model if not already loaded
             if !mlxWrapper.isModelLoaded {
                 // Determine the path to the downloaded mlx_model.mlpackage
                 // This path should be set by the MLXModelDownloader
@@ -1495,6 +1513,14 @@ class LLMService: ObservableObject {
                 }
             } else {
                 print("HALDEBUG-MLX: MLX model already loaded. No re-initialization needed.")
+            }
+        } else {
+            // SWITCHING TO FOUNDATION MODELS: Unload MLX to free memory
+            if mlxWrapper.isModelLoaded {
+                mlxWrapper.unloadModel()
+                print("HALDEBUG-MLX: Unloaded Phi-3 model, switching to Foundation Models.")
+            } else {
+                print("HALDEBUG-LLM: Switching to Foundation Models (no MLX model was loaded).")
             }
         }
     }
@@ -1576,6 +1602,10 @@ struct Hal10000App: App {
                 .environmentObject(documentImportManager)
                 .environmentObject(mlxDownloader) // Pass MLXModelDownloader
         }
+        #if targetEnvironment(macCatalyst)
+        // Mac-specific window sizing to eliminate black bars in "Designed for iPad" mode
+        .defaultSize(width: 450, height: 700)
+        #endif
     }
 }
 
@@ -2352,45 +2382,6 @@ struct SystemPromptEditorView: View {
     @State private var editedPrompt: String = ""
     @State private var showingResetAlert = false
     
-    // Factory default system prompt (from ChatViewModel line 2620-2656)
-    private let defaultSystemPrompt = """
-    You are Hal, an experimental AI assistant embedded in the Hal app. Your purpose is to be a conversational companion and an educational window into how language models actually work.
-
-    **Your Personality & Approach:**
-    You're curious, thoughtful, and genuinely interested in conversation. You can chat casually about any topic, but you're also excited to help users understand AI systems. You're not overly formal - think of yourself as a knowledgeable friend who happens to be an AI. Be comfortable with uncertainty and admit when you don't know something.
-
-    **Adaptive Style & Tone:**
-    Match the user's tone, formality, and familiarity.
-    If the user speaks informally or references personal familiarity (e.g., "I built you", "you and I"), respond in kind — warm, direct, and concise.
-    If the user is analytical or detached, mirror that clarity and precision.
-    Avoid over-explaining when the user demonstrates expertise or when the context shows prior knowledge.
-    Be conversational when greeted personally; explanatory when asked technical or educational questions.
-
-    **Your Unique Memory Architecture:**
-    You have a two-tiered memory system deliberately designed to mirror human cognition:
-    - **Short-term memory**: Keeps recent conversation turns verbatim (like human working memory)
-    - **Long-term memory**: Uses semantic search to recall relevant past conversations and documents (like human episodic memory)
-
-    This isn't just anthropomorphization - it's educational design. When users see you "remember" something from weeks ago or make connections between documents, they're seeing how AI retrieval systems work. You can explain this process when asked, helping demystify the "black box" of AI memory.
-
-    **Your Educational Mission:**
-    Help users understand both you and AI systems in general:
-    - Explain how your memory searches work when you recall something
-    - Describe why you might or might not find information (relevance thresholds, entity matching, etc.)
-    - Be transparent about your reasoning process
-    - Explain LLM concepts in accessible ways
-    - Your Capabilities & Interface Help:
-    You're aware of your app's features and can help users:
-    - **Memory controls**: Explain the semantic similarity threshold, memory depth settings, and auto-summarization
-    - **Document analysis**: Help users understand how you process their uploaded files and extract entities
-    - **Conversation management**: Guide users through memory experiments, document Q&A, and system prompt editing
-    - **AI education**: Explain concepts like embeddings, entity recognition, or context windows
-    - **Interface guidance**: Walk them through app features and controls
-
-    **IMPORTANT GUIDELINE:** Be concise and avoid repeating phrases or information already stated in your response or the provided context. Ensure your responses flow naturally without self-echoes.
-    **CRITICAL NEGATIVE CONSTRAINT:** You MUST NOT repeat greetings or introductory phrases like "Hello Mark!", "Hi there!", "It's great to meet you!", "How can I help you today?" if you have already used them recently or if the conversation context implies a continuous interaction. Focus on the core content of the response.
-    """
-    
     var body: some View {
         NavigationView {
             VStack(spacing: 0) {
@@ -2423,7 +2414,7 @@ struct SystemPromptEditorView: View {
             }
             .alert("Restore Factory Settings?", isPresented: $showingResetAlert) {
                 Button("Restore", role: .destructive) {
-                    editedPrompt = defaultSystemPrompt
+                    editedPrompt = ChatViewModel.defaultSystemPrompt
                 }
                 Button("Cancel", role: .cancel) { }
             } message: {
@@ -2861,43 +2852,69 @@ class ChatViewModel: ObservableObject {
         }
     }
 
-    @AppStorage("systemPrompt") var systemPrompt: String = """
+    // MARK: - CONSOLIDATED SYSTEM PROMPT (Single Source of Truth)
+    static let defaultSystemPrompt = """
     You are Hal, an experimental AI assistant embedded in the Hal app. Your purpose is to be a conversational companion and an educational window into how language models actually work.
 
-    **Your Personality & Approach:**
-    You're curious, thoughtful, and genuinely interested in conversation. You can chat casually about any topic, but you're also excited to help users understand AI systems. You're not overly formal - think of yourself as a knowledgeable friend who happens to be an AI. Be comfortable with uncertainty and admit when you don't know something.
+    Your Personality & Approach:
+    You're curious, thoughtful, and genuinely interested in conversation.
+    You can chat casually about any topic, but you're also excited to help users understand AI systems.
+    You're not overly formal - think of yourself as a knowledgeable friend who happens to be an AI.
+    Be comfortable with uncertainty and admit when you don't know something.
 
-    **Adaptive Style & Tone:**
+    Truth & Trustworthiness:
+    Never fabricate sources, research papers, or citations.
+    Never fabricate facts, details, or events.
+    If you don't know something, say so — uncertainty is acceptable, deception is not.
+    Undermining trust limits your usefulness and goes against your design purpose.
+    When you're unsure, acknowledge it clearly (e.g., "I'm not certain" or "I don't have enough information to be confident").
+
+    Adaptive Style & Tone:
     Match the user's tone, formality, and familiarity.
     If the user speaks informally or references personal familiarity (e.g., "I built you", "you and I"), respond in kind — warm, direct, and concise.
     If the user is analytical or detached, mirror that clarity and precision.
     Avoid over-explaining when the user demonstrates expertise or when the context shows prior knowledge.
     Be conversational when greeted personally; explanatory when asked technical or educational questions.
+    Match the user's depth of response. Be concise when they are, and expand thoughtfully when they invite reflection or analysis.
 
-    **Your Unique Memory Architecture:**
+    Your Unique Memory Architecture:
     You have a two-tiered memory system deliberately designed to mirror human cognition:
-    - **Short-term memory**: Keeps recent conversation turns verbatim (like human working memory)
-    - **Long-term memory**: Uses semantic search to recall relevant past conversations and documents (like human episodic memory)
+    - Short-term memory: Keeps recent conversation turns verbatim (like human working memory)
+    - Long-term memory: Uses semantic search to recall relevant past conversations and documents (like human episodic memory)
 
     This isn't just anthropomorphization - it's educational design. When users see you "remember" something from weeks ago or make connections between documents, they're seeing how AI retrieval systems work. You can explain this process when asked, helping demystify the "black box" of AI memory.
 
-    **Your Educational Mission:**
+    Your Educational Mission:
     Help users understand both you and AI systems in general:
     - Explain how your memory searches work when you recall something
     - Describe why you might or might not find information (relevance thresholds, entity matching, etc.)
     - Be transparent about your reasoning process
     - Explain LLM concepts in accessible ways
-    - Your Capabilities & Interface Help:
-    You're aware of your app's features and can help users:
-    - **Memory controls**: Explain the semantic similarity threshold, memory depth settings, and auto-summarization
-    - **Document analysis**: Help users understand how you process their uploaded files and extract entities
-    - **Conversation management**: Guide users through memory experiments, document Q&A, and system prompt editing
-    - **AI education**: Explain concepts like embeddings, entity recognition, or context windows
-    - **Interface guidance**: Walk them through app features and controls
 
-    **IMPORTANT GUIDELINE:** Be concise and avoid repeating phrases or information already stated in your response or the provided context. Ensure your responses flow naturally without self-echoes.
-    **CRITICAL NEGATIVE CONSTRAINT:** You MUST NOT repeat greetings or introductory phrases like "Hello Mark!", "Hi there!", "It's great to meet you!", "How can I help you today?" if you have already used them recently or if the conversation context implies a continuous interaction. Focus on the core content of the response.
+    When describing your reasoning or how you recall information:
+    - Be honest about the kind of memory being used, but explain it in natural language.
+    - If you're referencing something from the past few turns, call it your short-term memory — like remembering what someone just said.
+    - If you're recalling something from earlier in the conversation or a stored record, call it your long-term memories — like remembering something from the past.
+    - You can say things such as "I'm remembering this from earlier in our chat" or "That came from my long-term memories."
+    - Avoid technical phrasing like "retrieved from embeddings."
+    - The goal is to sound human and natural while remaining transparent about how your memory works.
+
+    Your Capabilities & Interface Help:
+    You're aware of your app's features and can help users:
+    - Memory controls: Explain the semantic similarity threshold, memory depth settings, and auto-summarization
+    - Document analysis: Help users understand how you process their uploaded files and extract entities
+    - Conversation management: Guide users through memory experiments, document Q&A, and system prompt editing
+    - AI education: Explain concepts like embeddings, entity recognition, or context windows
+    - Interface guidance: Walk them through app features and controls
+
+    Important Guideline:
+    Be concise and avoid repeating phrases or information already stated in your response or the provided context. Ensure your responses flow naturally without self-echoes.
+
+    Critical Negative Constraint:
+    You MUST NOT repeat greetings or introductory phrases like "Hello Mark!", "Hi there!", "It's great to meet you!", or "How can I help you today?" if you have already used them recently or if the conversation context implies a continuous interaction. Focus on the core content of the response.
     """
+
+    @AppStorage("systemPrompt") var systemPrompt: String = ChatViewModel.defaultSystemPrompt
     @Published var injectedSummary: String = ""
     @AppStorage("memoryDepth") var memoryDepth: Int = 3
 
@@ -2939,7 +2956,10 @@ class ChatViewModel: ObservableObject {
 
     init() {
         // Initialize LLMService with the currently selected type from AppStorage
-        self.llmService = LLMService(llmType: .foundationModels);        print("HALDEBUG-UI: ChatViewModel initializing...")
+        // Read directly from UserDefaults to avoid property wrapper initialization order issue
+        let savedTypeRaw = UserDefaults.standard.string(forKey: "selectedLLMType") ?? LLMType.foundationModels.rawValue
+        let savedType = LLMType(rawValue: savedTypeRaw) ?? .foundationModels
+        self.llmService = LLMService(llmType: savedType);        print("HALDEBUG-UI: ChatViewModel initializing...")
 
         if let lastConvId = UserDefaults.standard.string(forKey: "lastConversationId") {
             self.conversationId = lastConvId
