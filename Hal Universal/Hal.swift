@@ -3304,238 +3304,242 @@ class ChatViewModel: ObservableObject {
 // ==== LEGO START: 20 ChatViewModel (Prompt History Builder) ====
 
 
-            // MARK: - Context Window Management for Prompt Building
-            /// This strategy prioritizes different types of context to fit within the LLM's context window,
-            /// using intelligent summarization and RAG-like selection to avoid crude truncation.
-            /// Priority Order (Highest to Lowest):
-            /// 1. System Prompt (Non-negotiable, defines AI persona)
-            /// 2. Injected Summary (Compressed long-term context of older turns)
-            /// 3. Long-Term RAG Snippets (Semantically relevant facts from database, summarized if too long)
-            /// 4. Short-Term Memory (Recent conversation history; RAG-selected if combined length exceeds threshold)
-            /// 5. Current User Input (The immediate query, truncated only as a last resort)
-            func buildPromptHistory(
-                currentInput: String = "",
-                forPreview: Bool = false,
-                onStatusUpdate: ((String) -> Void)? = nil
-            ) async -> String {
-                print("HALDEBUG-MEMORY: Building prompt for input: '\(currentInput.prefix(50))....'")
+                // MARK: - Context Window Management for Prompt Building
+                /// This strategy prioritizes different types of context to fit within the LLM's context window,
+                /// using intelligent summarization and RAG-like selection to avoid crude truncation.
+                /// Priority Order (Highest to Lowest):
+                /// 1. System Prompt (Non-negotiable, defines AI persona)
+                /// 2. Injected Summary (Compressed long-term context of older turns)
+                /// 3. Long-Term RAG Snippets (Semantically relevant facts from database, summarized if too long)
+                /// 4. Short-Term Memory (Recent conversation history; RAG-selected if combined length exceeds threshold)
+                /// 5. Current User Input (The immediate query, truncated only as a last resort)
+                func buildPromptHistory(
+                    currentInput: String = "",
+                    forPreview: Bool = false,
+                    onStatusUpdate: ((String) -> Void)? = nil
+                ) async -> String {
+                    print("HALDEBUG-MEMORY: Building prompt for input: '\(currentInput.prefix(50))....'")
 
-                // Model-specific context limits
-                let maxPromptCharacters: Int
-                let maxRagSnippetsCharacters: Int
-                let shortTermMemoryThreshold: Int
-                let longTermSnippetSummarizationThreshold: Int
-                
-                switch selectedLLMType {
-                case .foundationModels:
-                    // Apple Foundation Models: Conservative limits due to smaller context window
-                    maxPromptCharacters = 3500
-                    maxRagSnippetsCharacters = 800
-                    shortTermMemoryThreshold = 700
-                    longTermSnippetSummarizationThreshold = 200
-                    print("HALDEBUG-MEMORY: Using Apple FM limits - prompt: \(maxPromptCharacters), RAG: \(maxRagSnippetsCharacters)")
-                case .mlxPhi3:
-                    // Phi-3 128k: Generous limits due to large context window
-                    maxPromptCharacters = 8000
-                    maxRagSnippetsCharacters = 2000
-                    shortTermMemoryThreshold = 1500
-                    longTermSnippetSummarizationThreshold = 500
-                    print("HALDEBUG-MEMORY: Using Phi-3 128k limits - prompt: \(maxPromptCharacters), RAG: \(maxRagSnippetsCharacters)")
-                }
-
-                var currentPrompt = systemPrompt
-                print("HALDEBUG-MEMORY: Initial prompt length (system prompt): \(currentPrompt.count)")
-
-                // Status Stage 1: Short-term memory processing begins
-                await MainActor.run { onStatusUpdate?("Reviewing our recent conversation... (short-term memory)") }
-                try? await Task.sleep(nanoseconds: 1_000_000_000) // 0.3 sec readability delay
-
-                // 1. Add injected summary (highest priority for long-term context)
-                if !injectedSummary.isEmpty {
-                    let summarySection = "\n\n<SUMMARY>\nSummary of earlier conversation:\n\(injectedSummary)\n</SUMMARY>"
-                    if currentPrompt.count + summarySection.count < maxPromptCharacters {
-                        currentPrompt += summarySection
-                        print("HALDEBUG-MEMORY: Added injected summary (\(injectedSummary.count) chars). Current prompt: \(currentPrompt.count)")
-                    } else {
-                        print("HALDEBUG-MEMORY: Skipped injected summary due to context window limit. Current prompt: \(currentPrompt.count)")
-                    }
-                }
-
-                // Status Stage 2: Long-term memory (RAG) processing begins
-                await MainActor.run { onStatusUpdate?("Recalling relevant memories... (long-term memory)") }
-                try? await Task.sleep(nanoseconds: 1_000_000_000) // 0.3 sec readability delay
-
-                // 2. Add long-term search results (RAG snippets)
-                var longTermSearchText = ""
-                var currentRagCharacters = 0 // Track total RAG characters
-                if memoryStore.isEnabled && !currentInput.isEmpty && !forPreview {
-                    print("HALDEBUG-MEMORY: Performing long-term search for RAG snippets.")
-                    let shortTermTurns = getShortTermTurns(currentTurns: countCompletedTurns())
-
-                    let searchContext = memoryStore.searchUnifiedContent(
-                        for: currentInput,
-                        currentConversationId: conversationId,
-                        excludeTurns: shortTermTurns, // Exclude recent turns from long-term RAG to avoid redundancy
-                        maxResults: 5 // Max results already limits the number of snippets
-                    )
-
-                    DispatchQueue.main.async {
-                        self.currentUnifiedContext = searchContext
-                        self.fullRAGContext = []
-
-                        for (i, snippet) in searchContext.conversationSnippets.enumerated() {
-                            let relevance = i < searchContext.relevanceScores.count ? searchContext.relevanceScores[i] : 0.0
-                            self.fullRAGContext.append(
-                                UnifiedSearchResult(content: snippet, relevance: relevance, source: ContentSourceType.conversation.rawValue, isEntityMatch: false)
-                            )
-                        }
-                        for (i, snippet) in searchContext.documentSnippets.enumerated() {
-                            let relevance = i < searchContext.relevanceScores.count ? searchContext.relevanceScores[i] : 0.0
-                            self.fullRAGContext.append(
-                                UnifiedSearchResult(content: snippet, relevance: relevance, source: ContentSourceType.document.rawValue, isEntityMatch: false)
-                            )
-                        }
-                    }
-
-                    if searchContext.hasContent {
-                        var formattedSnippets: [String] = []
-                        var combinedSnippetsWithRelevance: [(content: String, relevance: Double)] = []
-
-                        // Combine conversation and document snippets with their corresponding relevance scores
-                        var currentRelevanceIndex = 0
-                        for snippet in searchContext.conversationSnippets {
-                            if currentRelevanceIndex < searchContext.relevanceScores.count {
-                                combinedSnippetsWithRelevance.append((content: snippet, relevance: searchContext.relevanceScores[currentRelevanceIndex]))
-                                currentRelevanceIndex += 1
-                            }
-                        }
-                        for snippet in searchContext.relevanceScores.indices { // Corrected iteration
-                            if currentRelevanceIndex < searchContext.relevanceScores.count {
-                                combinedSnippetsWithRelevance.append((content: searchContext.documentSnippets[snippet], relevance: searchContext.relevanceScores[currentRelevanceIndex]))
-                                currentRelevanceIndex += 1
-                            }
-                        }
-
-                        // Sort by relevance (descending)
-                        let sortedCombinedSnippets = combinedSnippetsWithRelevance.sorted { $0.relevance > $1.relevance }
-
-                        for snippetTuple in sortedCombinedSnippets {
-                            var finalSnippet = snippetTuple.content
-                            // Asynchronously summarize long snippets using LLM if they exceed threshold
-                            if snippetTuple.content.count > longTermSnippetSummarizationThreshold {
-                                do {
-                                    let summarized = try await self.llmService.generateResponse(prompt: "Summarize the following text concisely:\n\(snippetTuple.content)")
-                                    finalSnippet = summarized
-                                    print("HALDEBUG-MEMORY: Summarized long-term snippet. Original: \(snippetTuple.content.count) -> Summarized: \(finalSnippet.count)")
-                                } catch {
-                                    print("HALDEBUG-MEMORY: Error summarizing long-term snippet: \(error.localizedDescription). Truncating instead.")
-                                    finalSnippet = String(snippetTuple.content.prefix(longTermSnippetSummarizationThreshold)) + "..."
-                                }
-                            }
-
-                            // Check if adding this snippet would exceed the overall prompt limit OR the RAG specific limit
-                            if currentPrompt.count + longTermSearchText.count + finalSnippet.count + "\n".count < maxPromptCharacters &&
-                               currentRagCharacters + finalSnippet.count < maxRagSnippetsCharacters { // NEW RAG CAP
-                                formattedSnippets.append("- \(finalSnippet)")
-                                currentRagCharacters += finalSnippet.count // Update RAG character count
-                            } else {
-                                print("HALDEBUG-MEMORY: Stopped adding long-term snippets due to context window limit or RAG character limit.")
-                                break
-                            }
-                        }
-                        if !formattedSnippets.isEmpty {
-                            longTermSearchText = "<RAG_CONTEXT>\nContext snippets from memory:\n" + formattedSnippets.joined(separator: "\n") + "\n</RAG_CONTEXT>"
-                            currentPrompt += "\n\n\(longTermSearchText)"
-                            print("HALDEBUG-MEMORY: Added long-term search: \(formattedSnippets.count) snippets (\(longTermSearchText.count) chars). Current prompt: \(currentPrompt.count)")
-                        }
-                    }
-                }
-
-                // 3. Add short-term messages (recent conversation history)
-                let shortTermTurns = getShortTermTurns(currentTurns: countCompletedTurns())
-                let rawShortTermMessages = getShortTermMessages(turns: shortTermTurns)
-                var shortTermText = ""
-
-                let combinedShortTermContent = rawShortTermMessages.map { formatSingleMessage($0) }.joined(separator: "\n\n")
-
-                // Apply RAG-like selection to short-term memory if it's too long
-                if combinedShortTermContent.count > shortTermMemoryThreshold && !currentInput.isEmpty {
-                    print("HALDEBUG-MEMORY: Short-term memory too long (\(combinedShortTermContent.count) chars), applying RAG-like selection.")
+                    // Model-specific context limits
+                    let maxPromptCharacters: Int
+                    let maxRagSnippetsCharacters: Int
+                    let shortTermMemoryThreshold: Int
+                    let longTermSnippetSummarizationThreshold: Int
                     
-                    // To perform a RAG-like search on `rawShortTermMessages`, we need to
-                    // temporarily represent them as searchable content.
-                    // A more robust solution might involve an in-memory search function,
-                    // but for simplicity, we'll use the existing `searchUnifiedContent`
-                    // and ensure it doesn't exclude the turns we're trying to search within.
-                    let shortTermSearchContext = memoryStore.searchUnifiedContent(
-                        for: currentInput,
-                        currentConversationId: conversationId, // Still pass current conv ID
-                        excludeTurns: [], // Do not exclude anything from this specific short-term search
-                        maxResults: 3 // Get top 3 relevant snippets from short-term memory
-                    )
+                    switch selectedLLMType {
+                    case .foundationModels:
+                        // Apple Foundation Models: Conservative limits due to smaller context window
+                        maxPromptCharacters = 3500
+                        maxRagSnippetsCharacters = 800
+                        shortTermMemoryThreshold = 700
+                        longTermSnippetSummarizationThreshold = 200
+                        print("HALDEBUG-MEMORY: Using Apple FM limits - prompt: \(maxPromptCharacters), RAG: \(maxRagSnippetsCharacters)")
+                    case .mlxPhi3:
+                        // Phi-3 128k: Generous limits due to large context window
+                        maxPromptCharacters = 8000
+                        maxRagSnippetsCharacters = 2000
+                        shortTermMemoryThreshold = 1500
+                        longTermSnippetSummarizationThreshold = 500
+                        print("HALDEBUG-MEMORY: Using Phi-3 128k limits - prompt: \(maxPromptCharacters), RAG: \(maxRagSnippetsCharacters)")
+                    }
 
-                    if shortTermSearchContext.hasContent {
-                        var selectedShortTermSnippets: [String] = []
-                        for snippet in shortTermSearchContext.conversationSnippets {
-                            var finalSnippet = snippet
-                            // Optionally summarize individual short-term snippets if they are still very long
-                            if snippet.count > longTermSnippetSummarizationThreshold { // Re-use threshold for consistency
-                                do {
-                                    let summarized = try await self.llmService.generateResponse(prompt: "Summarize the following text concisely:\n\(snippet)")
-                                    finalSnippet = summarized
-                                } catch {
-                                    print("HALDEBUG-MEMORY: Error summarizing short-term snippet: \(error.localizedDescription). Truncating instead.")
-                                    finalSnippet = String(snippet.prefix(longTermSnippetSummarizationThreshold)) + "..."
+                    var currentPrompt = systemPrompt
+                    print("HALDEBUG-MEMORY: Initial prompt length (system prompt): \(currentPrompt.count)")
+
+                    // Status Stage 1: Short-term memory processing begins
+                    await MainActor.run { onStatusUpdate?("Reviewing our recent conversation... (short-term memory)") }
+                    try? await Task.sleep(nanoseconds: 1_000_000_000) // 0.3 sec readability delay
+
+                    // 1. Add injected summary (highest priority for long-term context)
+                    if !injectedSummary.isEmpty {
+                        let summarySection = "\n\n<SUMMARY>\nSummary of earlier conversation:\n\(injectedSummary)\n</SUMMARY>"
+                        if currentPrompt.count + summarySection.count < maxPromptCharacters {
+                            currentPrompt += summarySection
+                            print("HALDEBUG-MEMORY: Added injected summary (\(injectedSummary.count) chars). Current prompt: \(currentPrompt.count)")
+                        } else {
+                            print("HALDEBUG-MEMORY: Skipped injected summary due to context window limit. Current prompt: \(currentPrompt.count)")
+                        }
+                    }
+
+                    // Status Stage 2: Long-term memory (RAG) processing begins
+                    await MainActor.run { onStatusUpdate?("Recalling relevant memories... (long-term memory)") }
+                    try? await Task.sleep(nanoseconds: 1_000_000_000) // 0.3 sec readability delay
+
+                    // 2. Add long-term search results (RAG snippets)
+                    var longTermSearchText = ""
+                    var currentRagCharacters = 0 // Track total RAG characters
+                    if memoryStore.isEnabled && !currentInput.isEmpty && !forPreview {
+                        print("HALDEBUG-MEMORY: Performing long-term search for RAG snippets.")
+                        let shortTermTurns = getShortTermTurns(currentTurns: countCompletedTurns())
+
+                        let searchContext = memoryStore.searchUnifiedContent(
+                            for: currentInput,
+                            currentConversationId: conversationId,
+                            excludeTurns: shortTermTurns, // Exclude recent turns from long-term RAG to avoid redundancy
+                            maxResults: 5 // Max results already limits the number of snippets
+                        )
+
+                        DispatchQueue.main.async {
+                            self.currentUnifiedContext = searchContext
+                            self.fullRAGContext = []
+
+                            for (i, snippet) in searchContext.conversationSnippets.enumerated() {
+                                let relevance = i < searchContext.relevanceScores.count ? searchContext.relevanceScores[i] : 0.0
+                                self.fullRAGContext.append(
+                                    UnifiedSearchResult(content: snippet, relevance: relevance, source: ContentSourceType.conversation.rawValue, isEntityMatch: false)
+                                )
+                            }
+                            for (i, snippet) in searchContext.documentSnippets.enumerated() {
+                                let relevance = i < searchContext.relevanceScores.count ? searchContext.relevanceScores[i] : 0.0
+                                self.fullRAGContext.append(
+                                    UnifiedSearchResult(content: snippet, relevance: relevance, source: ContentSourceType.document.rawValue, isEntityMatch: false)
+                                )
+                            }
+                        }
+
+                        if searchContext.hasContent {
+                            var formattedSnippets: [String] = []
+                            var combinedSnippetsWithRelevance: [(content: String, relevance: Double)] = []
+
+                            // Combine conversation and document snippets with their corresponding relevance scores
+                            var currentRelevanceIndex = 0
+                            for snippet in searchContext.conversationSnippets {
+                                if currentRelevanceIndex < searchContext.relevanceScores.count {
+                                    combinedSnippetsWithRelevance.append((content: snippet, relevance: searchContext.relevanceScores[currentRelevanceIndex]))
+                                    currentRelevanceIndex += 1
                                 }
                             }
-                            selectedShortTermSnippets.append(finalSnippet)
+                            for snippet in searchContext.relevanceScores.indices { // Corrected iteration
+                                if currentRelevanceIndex < searchContext.relevanceScores.count {
+                                    combinedSnippetsWithRelevance.append((content: searchContext.documentSnippets[snippet], relevance: searchContext.relevanceScores[currentRelevanceIndex]))
+                                    currentRelevanceIndex += 1
+                                }
+                            }
+
+                            // Sort by relevance (descending)
+                            let sortedCombinedSnippets = combinedSnippetsWithRelevance.sorted { $0.relevance > $1.relevance }
+
+                            for snippetTuple in sortedCombinedSnippets {
+                                var finalSnippet = snippetTuple.content
+                                // Asynchronously summarize long snippets using LLM if they exceed threshold
+                                if snippetTuple.content.count > longTermSnippetSummarizationThreshold {
+                                    do {
+                                        let summarized = try await self.llmService.generateResponse(prompt: "Summarize the following text concisely:\n\(snippetTuple.content)")
+                                        finalSnippet = summarized
+                                        print("HALDEBUG-MEMORY: Summarized long-term snippet. Original: \(snippetTuple.content.count) -> Summarized: \(finalSnippet.count)")
+                                    } catch {
+                                        print("HALDEBUG-MEMORY: Error summarizing long-term snippet: \(error.localizedDescription). Truncating instead.")
+                                        finalSnippet = String(snippetTuple.content.prefix(longTermSnippetSummarizationThreshold)) + "..."
+                                    }
+                                }
+
+                                // Check if adding this snippet would exceed the overall prompt limit OR the RAG specific limit
+                                if currentPrompt.count + longTermSearchText.count + finalSnippet.count + "\n".count < maxPromptCharacters &&
+                                   currentRagCharacters + finalSnippet.count < maxRagSnippetsCharacters { // NEW RAG CAP
+                                    formattedSnippets.append("- \(finalSnippet)")
+                                    currentRagCharacters += finalSnippet.count // Update RAG character count
+                                } else {
+                                    print("HALDEBUG-MEMORY: Stopped adding long-term snippets due to context window limit or RAG character limit.")
+                                    break
+                                }
+                            }
+                            if !formattedSnippets.isEmpty {
+                                longTermSearchText = "<RAG_CONTEXT>\nContext snippets from memory:\n" + formattedSnippets.joined(separator: "\n") + "\n</RAG_CONTEXT>"
+                                currentPrompt += "\n\n\(longTermSearchText)"
+                                print("HALDEBUG-MEMORY: Added long-term search: \(formattedSnippets.count) snippets (\(longTermSearchText.count) chars). Current prompt: \(currentPrompt.count)")
+                            }
                         }
-                        shortTermText = "<HISTORY>\nRecent conversation:\n" + selectedShortTermSnippets.joined(separator: "\n") + "\n</HISTORY>"
-                        print("HALDEBUG-MEMORY: Added RAG-selected short-term memory (\(shortTermText.count) chars). Current prompt: \(currentPrompt.count)")
-                    } else {
-                        print("HALDEBUG-MEMORY: RAG-like selection for short-term memory found no relevant snippets. Falling back to truncated verbatim.")
-                        // Fallback to simple truncation if RAG-like selection yields nothing
-                        shortTermText = "<HISTORY>\nRecent conversation:\n" + String(combinedShortTermContent.prefix(shortTermMemoryThreshold)) + "...\n</HISTORY>"
                     }
-                } else {
-                    // If short-term memory is within threshold, add it verbatim
-                    shortTermText = "<HISTORY>\nRecent conversation:\n" + combinedShortTermContent + "\n</HISTORY>"
-                    print("HALDEBUG-MEMORY: Added short-term verbatim history (\(shortTermText.count) chars). Current prompt: \(currentPrompt.count)")
-                }
 
-                if !shortTermText.isEmpty {
-                    if currentPrompt.count + shortTermText.count + "\n\n".count < maxPromptCharacters {
-                        currentPrompt += "\n\n\(shortTermText.trimmingCharacters(in: .whitespacesAndNewlines))"
+                    // 3. Add short-term messages (recent conversation history)
+                    let shortTermTurns = getShortTermTurns(currentTurns: countCompletedTurns())
+                    let rawShortTermMessages = getShortTermMessages(turns: shortTermTurns)
+                    var shortTermText = ""
+
+                    let combinedShortTermContent = rawShortTermMessages.map { formatSingleMessage($0) }.joined(separator: "\n\n")
+
+                    // Apply RAG-like selection to short-term memory if it's too long
+                    if combinedShortTermContent.count > shortTermMemoryThreshold && !currentInput.isEmpty {
+                        print("HALDEBUG-MEMORY: Short-term memory too long (\(combinedShortTermContent.count) chars), applying RAG-like selection.")
+                        
+                        // To perform a RAG-like search on `rawShortTermMessages`, we need to
+                        // temporarily represent them as searchable content.
+                        // A more robust solution might involve an in-memory search function,
+                        // but for simplicity, we'll use the existing `searchUnifiedContent`
+                        // and ensure it doesn't exclude the turns we're trying to search within.
+                        let shortTermSearchContext = memoryStore.searchUnifiedContent(
+                            for: currentInput,
+                            currentConversationId: conversationId, // Still pass current conv ID
+                            excludeTurns: [], // Do not exclude anything from this specific short-term search
+                            maxResults: 3 // Get top 3 relevant snippets from short-term memory
+                        )
+
+                        if shortTermSearchContext.hasContent {
+                            var selectedShortTermSnippets: [String] = []
+                            for snippet in shortTermSearchContext.conversationSnippets {
+                                var finalSnippet = snippet
+                                // Optionally summarize individual short-term snippets if they are still very long
+                                if snippet.count > longTermSnippetSummarizationThreshold { // Re-use threshold for consistency
+                                    do {
+                                        let summarized = try await self.llmService.generateResponse(prompt: "Summarize the following text concisely:\n\(snippet)")
+                                        finalSnippet = summarized
+                                    } catch {
+                                        print("HALDEBUG-MEMORY: Error summarizing short-term snippet: \(error.localizedDescription). Truncating instead.")
+                                        finalSnippet = String(snippet.prefix(longTermSnippetSummarizationThreshold)) + "..."
+                                    }
+                                }
+                                selectedShortTermSnippets.append(finalSnippet)
+                            }
+                            shortTermText = "<HISTORY>\nRecent conversation:\n" + selectedShortTermSnippets.joined(separator: "\n") + "\n</HISTORY>"
+                            print("HALDEBUG-MEMORY: Added RAG-selected short-term memory (\(shortTermText.count) chars). Current prompt: \(currentPrompt.count)")
+                        } else {
+                            print("HALDEBUG-MEMORY: RAG-like selection for short-term memory found no relevant snippets. Falling back to truncated verbatim.")
+                            // Fallback to simple truncation if RAG-like selection yields nothing
+                            shortTermText = "<HISTORY>\nRecent conversation:\n" + String(combinedShortTermContent.prefix(shortTermMemoryThreshold)) + "...\n</HISTORY>"
+                        }
                     } else {
-                        print("HALDEBUG-MEMORY: Skipped short-term memory due to context window limit after RAG/verbatim selection.")
+                        // FIXED: Only add HISTORY tags if there's actual content to prevent LLM hallucinations
+                        if !combinedShortTermContent.isEmpty {
+                            shortTermText = "<HISTORY>\nRecent conversation:\n" + combinedShortTermContent + "\n</HISTORY>"
+                            print("HALDEBUG-MEMORY: Added short-term verbatim history (\(shortTermText.count) chars). Current prompt: \(currentPrompt.count)")
+                        } else {
+                            print("HALDEBUG-MEMORY: No short-term history to add (first turn or empty conversation).")
+                        }
                     }
+
+                    if !shortTermText.isEmpty {
+                        if currentPrompt.count + shortTermText.count + "\n\n".count < maxPromptCharacters {
+                            currentPrompt += "\n\n\(shortTermText.trimmingCharacters(in: .whitespacesAndNewlines))"
+                        } else {
+                            print("HALDEBUG-MEMORY: Skipped short-term memory due to context window limit after RAG/verbatim selection.")
+                        }
+                    }
+
+
+                    // 4. Add the current user input (always included, potentially truncated as last resort)
+                    let finalUserInputPrefix = "\n\nUser: "
+                    let assistantSuffix = "\nAssistant:"
+                    let fixedSuffixLength = finalUserInputPrefix.count + assistantSuffix.count
+
+                    let remainingSpaceForInput = maxPromptCharacters - currentPrompt.count - fixedSuffixLength
+
+                    if remainingSpaceForInput > 0 {
+                        let truncatedInput = String(currentInput.prefix(remainingSpaceForInput))
+                        currentPrompt += finalUserInputPrefix + truncatedInput + assistantSuffix
+                        print("HALDEBUG-MEMORY: Added user input (\(truncatedInput.count) chars). Final prompt: \(currentPrompt.count)")
+                    } else {
+                        // Drastic truncation if very little space left, or just the user input itself is too long
+                        let drasticTruncationLength = max(0, maxPromptCharacters - fixedSuffixLength)
+                        let truncatedInput = String(currentInput.prefix(drasticTruncationLength))
+                        currentPrompt = systemPrompt + finalUserInputPrefix + truncatedInput + assistantSuffix // Rebuild with just system prompt and truncated input
+                        print("HALDEBUG-MEMORY: CRITICAL: Prompt severely truncated to fit user input. Final prompt: \(currentPrompt.count)")
+                    }
+
+                    print("HALDEBUG-MEMORY: Built prompt - \(currentPrompt.count) total characters")
+                    return currentPrompt
                 }
 
-
-                // 4. Add the current user input (always included, potentially truncated as last resort)
-                let finalUserInputPrefix = "\n\nUser: "
-                let assistantSuffix = "\nAssistant:"
-                let fixedSuffixLength = finalUserInputPrefix.count + assistantSuffix.count
-
-                let remainingSpaceForInput = maxPromptCharacters - currentPrompt.count - fixedSuffixLength
-
-                if remainingSpaceForInput > 0 {
-                    let truncatedInput = String(currentInput.prefix(remainingSpaceForInput))
-                    currentPrompt += finalUserInputPrefix + truncatedInput + assistantSuffix
-                    print("HALDEBUG-MEMORY: Added user input (\(truncatedInput.count) chars). Final prompt: \(currentPrompt.count)")
-                } else {
-                    // Drastic truncation if very little space left, or just the user input itself is too long
-                    let drasticTruncationLength = max(0, maxPromptCharacters - fixedSuffixLength)
-                    let truncatedInput = String(currentInput.prefix(drasticTruncationLength))
-                    currentPrompt = systemPrompt + finalUserInputPrefix + truncatedInput + assistantSuffix // Rebuild with just system prompt and truncated input
-                    print("HALDEBUG-MEMORY: CRITICAL: Prompt severely truncated to fit user input. Final prompt: \(currentPrompt.count)")
-                }
-
-                print("HALDEBUG-MEMORY: Built prompt - \(currentPrompt.count) total characters")
-                return currentPrompt
-            }
-
-            
+                
 // ==== LEGO END: 20 ChatViewModel (Prompt History Builder) ====
 
 
