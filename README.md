@@ -2,71 +2,96 @@
 
 **Private. Powerful. Personal.**
 
-Hal Universal is an on-device AI assistant for macOS and iOS powered by Apple Foundation Models.  
-All inference runs locally — no cloud calls, no analytics, and no data collection.
+Hal Universal is an on-device AI assistant for iOS 26, iPadOS 26, and macOS 26.  
+It combines Apple Foundation Models with the fully local MLX Phi-3 model to deliver fast, private conversational intelligence built for Apple Silicon.
+
+When Hal runs with **Apple Foundation Models (AFM)**, inference can occur entirely on your device when offline, but may occur in **Apple’s Private Cloud Compute** when connected to Wi‑Fi or cellular. Private Cloud Compute means that your prompts are encrypted in transit and processed only in short‑lived, non‑persistent memory on Apple‑controlled servers that meet the same security guarantees as on‑device execution. Apple states that no data is retained after processing.
+
+For users who prefer complete local operation, AFM runs **100% on-device** when the device’s radios are disabled.
+- **iPhone / iPad:** Turn on Airplane Mode and turn Wi‑Fi off  
+- **Mac:** Turn Wi‑Fi off and disconnect Ethernet  
+
+When offline, AFM is fully local.  
+When using **Phi (MLX)**, Hal is **always** fully on-device, regardless of connectivity.
 
 ---
 
 ### 🧠 Overview
 
-Hal Universal is a transparent, privacy-first AI companion built for Apple platforms.  
-It combines Apple’s **Foundation Models** and **MLX Phi-3** with a fully local memory engine — offering conversational intelligence that stays entirely on your device.
+Hal Universal was built for two purposes:  
+**to be a thoughtful, private companion for reflection and creativity**, and  
+**to help users understand how modern LLMs actually work.**
+
+Hal exposes the mechanics of AI—memory, recency, decay, tokens, and reasoning—so the black box becomes visible. Everything happens locally on your device, with full transparency.
 
 ---
 
 ### 🚀 How to Use
 
 1. **Start a Chat**  
-   Type any message in the chat bar. Hal responds instantly using your selected on-device model.
+   Type any message in the chat bar and Hal responds instantly using your selected model.
 
 2. **Switch Models**  
-   Tap the model selector to toggle between:  
-   - 🧩 **Apple Foundation Model (AFM)** — balanced and contextually natural  
-   - ⚙️ **Phi-3 (MLX)** — fast, efficient, and self-contained on your device
+   Tap the model selector to choose between:  
+   - **Apple Foundation Models (AFM)** — natural, balanced, and privacy‑protected via Apple’s on‑device and PCC execution  
+   - **Phi‑3 (MLX)** — fast, efficient, and fully local on Apple Silicon
 
 3. **Memory & Context**  
-   Hal remembers the flow of conversation within your session.  
-   Older turns are summarized and stored locally in a private SQLite database — never uploaded or synced.
+   Hal maintains local, on‑device context using a timestamp‑aware memory system.  
+   It weighs recency and semantic relevance, applies decay (half‑life), and stores important information in a private local SQLite database.
 
 4. **Settings**  
-   Adjust memory depth, recall scope, and other tuning preferences directly within the app.
+   In **Power User Settings**, you can control:
+   - Memory depth  
+   - Recency weighting  
+   - Semantic importance  
+   - Half‑life decay  
+   - Temperature (creativity vs determinism)  
+   - RAG and similarity settings  
+   - Model selection  
+   - Restore Defaults  
+
+   All changes appear directly in the chat for transparency.
 
 ---
 
 ### 🧩 Key Features
 
-- 🔒 **100 % On-Device AI** — Never connects to cloud inference or third-party APIs  
-- 🧠 **Dual-Model System** — Switch between AFM and Phi-3 seamlessly  
-- 🗂️ **Private Local Memory** — SQLite-backed conversation storage for transparency and control  
-- 💬 **Readable Summaries** — See what Hal remembers at a glance  
-- 💡 **Universal Build** — Runs natively on macOS and iOS  
+- 🔒 **Local‑First Design** — Phi‑3 always runs fully on‑device; AFM runs locally when offline  
+- 🧠 **Timestamp‑Aware Memory** — recency, semantic weighting, and half‑life  
+- 🔥 **Temperature Control** — steer Hal toward precision or creativity  
+- 🔄 **Restore Defaults** — one tap resets all tuning settings  
+- 🧩 **AFM + Phi Model Switching**  
+- 🪶 **Detailed Token View** — see token usage per message  
+- 📐 **Cross‑Platform Parity** — unified behavior across iOS, iPadOS, and macOS  
+- 🪟 **Resizeable Mac Window**  
+- 📄 **Clear Document Upload Status**  
+- ⌨️ **Improved Keyboard Dismissal** on iOS/iPadOS  
 
 ---
 
 ### 🧰 Troubleshooting & Maintenance
 
-If you ever experience unexpected behavior or model loading issues, Hal Universal includes two simple maintenance tools:
-
-#### 1. 🔄 Reset / “DB Nuke”
-Clears Hal’s local SQLite database and resets all memory and chat history.  
-This is a full local reset — no data is ever uploaded or synced.  
-Downloaded models remain intact.
+#### 1. 🔄 Reset (“DB Nuke”)
+Clears Hal’s local SQLite database and all memory.  
+No data is uploaded or synced.  
+Models remain installed.
 
 #### 2. 🧹 Model Removal & Redownload
 If a model fails to load or perform as expected:
 - Open **Settings → Manage Models**  
-- Tap **Delete Phi-3** (or **Remove AFM Cache**) to clear local model files  
-- Tap **Download** to redownload a fresh copy from Apple’s model repository  
+- Delete Phi‑3 or remove AFM cache  
+- Redownload fresh copies from Apple’s model repository  
 
-These actions operate entirely on-device and never contact external servers except to download the Phi-3 model.
+Phi‑3 downloads locally only; AFM updates are handled through Apple frameworks.
 
 ---
 
 ### 🛡️ Privacy Policy
 
 Hal Universal does **not collect, store, or share any personal data.**  
-All inference and memory operations occur on your device.  
-The app does not transmit any information externally.
+All inference, memory, and processing occur locally on your device.  
+The app does not transmit your data externally.
 
 ---
 
@@ -74,11 +99,12 @@ The app does not transmit any information externally.
 
 For questions, feedback, or privacy concerns:  
 **Mark Friedlander**  
-📧 *[insert your email address]*  
+📧 *markfriedlander@yahoo.com*  
 
 ---
 
 ### 📄 Version
 
-Hal Universal 1.0  
+Hal Universal  
+**1.5**  
 November 2025

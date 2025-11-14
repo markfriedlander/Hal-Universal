@@ -17,6 +17,7 @@
 		855E386F2EA94F460029C420 /* MLXNN in Frameworks */ = {isa = PBXBuildFile; productRef = 855E386E2EA94F460029C420 /* MLXNN */; };
 		858DA3262EA956AC00A44B2F /* MLXLLM in Frameworks */ = {isa = PBXBuildFile; productRef = 858DA3252EA956AC00A44B2F /* MLXLLM */; };
 		858DA3282EA956AC00A44B2F /* MLXLMCommon in Frameworks */ = {isa = PBXBuildFile; productRef = 858DA3272EA956AC00A44B2F /* MLXLMCommon */; };
+		85C74A1B2EC6EC4600C52EF5 /* README.md in Resources */ = {isa = PBXBuildFile; fileRef = 85C74A1A2EC6EC4500C52EF5 /* README.md */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXFileReference section */
@@ -25,6 +26,7 @@
 		855E38632EA94AE60029C420 /* libsqlite3.tbd */ = {isa = PBXFileReference; lastKnownFileType = "sourcecode.text-based-dylib-definition"; name = libsqlite3.tbd; path = usr/lib/libsqlite3.tbd; sourceTree = SDKROOT; };
 		855E38652EA94C630029C420 /* libcompression.tbd */ = {isa = PBXFileReference; lastKnownFileType = "sourcecode.text-based-dylib-definition"; name = libcompression.tbd; path = usr/lib/libcompression.tbd; sourceTree = SDKROOT; };
 		85B3C57D2EA943560060BCEC /* Hal Universal.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = "Hal Universal.app"; sourceTree = BUILT_PRODUCTS_DIR; };
+		85C74A1A2EC6EC4500C52EF5 /* README.md */ = {isa = PBXFileReference; lastKnownFileType = net.daringfireball.markdown; path = README.md; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
 /* Begin PBXFileSystemSynchronizedRootGroup section */
@@ -70,6 +72,7 @@
 		85B3C5742EA943560060BCEC = {
 			isa = PBXGroup;
 			children = (
+				85C74A1A2EC6EC4500C52EF5 /* README.md */,
 				85B3C57F2EA943560060BCEC /* Hal Universal */,
 				855E385E2EA94A620029C420 /* Frameworks */,
 				85B3C57E2EA943560060BCEC /* Products */,
@@ -159,6 +162,7 @@
 			isa = PBXResourcesBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
+				85C74A1B2EC6EC4600C52EF5 /* README.md in Resources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
