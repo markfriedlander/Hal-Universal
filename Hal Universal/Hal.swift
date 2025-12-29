@@ -3,10 +3,10 @@
 //  Hal.swift
 //  HalChatiOS
 //
-//  Hal.swift — Core Application Source
+//  Hal.swift â€” Core Application Source
 //  Architecture Overview:
 //  - Integrates Apple FoundationModels and MLX frameworks under LLMService.
-//  - Uses LEGO-block modular structure (01–29) for deterministic editing.
+//  - Uses LEGO-block modular structure (01â€“29) for deterministic editing.
 //  - Includes on-device inference, streaming UI, and context-managed memory.
 //  - MLXWrapper supports Phi-3 and similar models via MLX Swift APIs.
 //  - MemoryStore uses SQLite with schema, embeddings, and semantic search.
@@ -14,11 +14,11 @@
 //  - LEGO Index
 // 01  Imports & App Entry & Environment Wiring
 // 02  ChatMessage, UnifiedSearchContext, MemoryStore (Part 1)
-// 03  MemoryStore (Part 2 – Schema, Encryption, Stats)
-// 04  MemoryStore (Part 3 – Storing Turns & Entities)
-// 05  MemoryStore (Part 4 – Entities, Embeddings, Search)
-// 06  MemoryStore (Part 5 – Retrieval, Debug, Semantic Search)
-// 07  MemoryStore (Part 6 – Full Search Flow) & LLMType Enum
+// 03  MemoryStore (Part 2 â€“ Schema, Encryption, Stats)
+// 04  MemoryStore (Part 3 â€“ Storing Turns & Entities)
+// 05  MemoryStore (Part 4 â€“ Entities, Embeddings, Search)
+// 06  MemoryStore (Part 5 â€“ Retrieval, Debug, Semantic Search)
+// 07  MemoryStore (Part 6 â€“ Full Search Flow) & LLMType Enum
 // 08  MLXWrapper & LLMService (Foundation + MLX Routing)
 // 09  App Entry & iOSChatView (UI Shell)
 // 10  ActionsView (Settings, Import/Export, Model Picker)
@@ -37,7 +37,7 @@
 // 22  ChatViewModel (Short-Term Memory Helpers)
 // 23  ChatViewModel (Repetition Removal Utility)
 // 24  ChatViewModel (Conversation & Database Reset)
-// 25  ChatVM — Export Chat History
+// 25  ChatVM â€” Export Chat History
 // 26  DocumentPicker (UIKit Bridge)
 // 27  DocumentImportManager (Ingest & Entities)
 // 28  Import Models (ProcessedDocument & Summary)
@@ -111,10 +111,10 @@ enum ContentSourceType: String, CaseIterable, Codable {
 
     var icon: String {
         switch self {
-        case .conversation: return "💬"
-        case .document: return "📄"
-        case .webpage: return "🌐"
-        case .email: return "📧"
+        case .conversation: return "ðŸ’¬"
+        case .document: return "ðŸ“„"
+        case .webpage: return "ðŸŒ"
+        case .email: return "ðŸ“§"
         }
     }
 }
@@ -180,8 +180,13 @@ struct ChatMessage: Identifiable, Equatable { // Added Equatable for ForEach
     var fullPromptUsed: String? // NEW: To store the exact prompt for Hal's response
     var usedContextSnippets: [UnifiedSearchResult]? // NEW: To store the RAG snippets used
     var tokenBreakdown: TokenBreakdown? // NEW: To store token usage breakdown
+    var toolsUsed: [String]? // NEW: To store which tools were used for this response
+    let recordedByModel: String // REQUIRED: Which model generated this message ("user" for user messages, model ID for assistant messages)
+    let turnNumber: Int // SALON MODE FIX: Explicit turn number from database (single source of truth)
+    let seatNumber: Int? // SALON MODE FIX: Seat number for multi-LLM mode (NULL for user messages and single-LLM mode)
+    let deliberationRound: Int // SALON MODE FIX: Deliberation round for "pass turn" feature in Context-Aware mode
 
-    init(id: UUID = UUID(), content: String, isFromUser: Bool, timestamp: Date = Date(), isPartial: Bool = false, thinkingDuration: TimeInterval? = nil, fullPromptUsed: String? = nil, usedContextSnippets: [UnifiedSearchResult]? = nil, tokenBreakdown: TokenBreakdown? = nil) {
+    init(id: UUID = UUID(), content: String, isFromUser: Bool, timestamp: Date = Date(), isPartial: Bool = false, thinkingDuration: TimeInterval? = nil, fullPromptUsed: String? = nil, usedContextSnippets: [UnifiedSearchResult]? = nil, tokenBreakdown: TokenBreakdown? = nil, toolsUsed: [String]? = nil, recordedByModel: String, turnNumber: Int, seatNumber: Int? = nil, deliberationRound: Int = 1) {
         self.id = id
         self.content = content
         self.isFromUser = isFromUser
@@ -191,6 +196,11 @@ struct ChatMessage: Identifiable, Equatable { // Added Equatable for ForEach
         self.fullPromptUsed = fullPromptUsed
         self.usedContextSnippets = usedContextSnippets
         self.tokenBreakdown = tokenBreakdown
+        self.toolsUsed = toolsUsed
+        self.recordedByModel = recordedByModel
+        self.turnNumber = turnNumber
+        self.seatNumber = seatNumber
+        self.deliberationRound = deliberationRound
     }
 }
 
@@ -379,7 +389,7 @@ class MemoryStore: ObservableObject {
 
     // MARK: - Nuclear Reset Capability (MemoryStore owns its lifecycle)
     func performNuclearReset() -> Bool {
-        print("HALDEBUG-DATABASE: ðŸš¨ MemoryStore performing nuclear reset...")
+        print("HALDEBUG-DATABASE: MemoryStore performing nuclear reset...")
 
         // Step 1: Clear published properties immediately
         DispatchQueue.main.async {
@@ -389,18 +399,18 @@ class MemoryStore: ObservableObject {
             self.totalDocumentChunks = 0
             self.searchDebugResults = ""
         }
-        print("HALDEBUG-DATABASE: âœ… Cleared published properties")
+        print("HALDEBUG-DATABASE: Cleared published properties")
 
         // Step 2: Close database connection cleanly
         if db != nil {
             sqlite3_close(db)
             db = nil
             isConnected = false
-            print("HALDEBUG-DATABASE: âœ… Database connection closed cleanly")
+            print("HALDEBUG-DATABASE: Database connection closed cleanly")
         }
 
         // Step 3: Delete all database files safely (connection is now closed)
-        print("HALDEBUG-DATABASE: ðŸ—‘ï¸ Deleting database files...")
+        print("HALDEBUG-DATABASE: Deleting database files...")
         var deletedCount = 0
         var failedCount = 0
 
@@ -410,32 +420,32 @@ class MemoryStore: ObservableObject {
                 if FileManager.default.fileExists(atPath: filePath) {
                     try FileManager.default.removeItem(at: fileURL)
                     deletedCount += 1
-                    print("HALDEBUG-DATABASE: ðŸ—‘ï¸ Deleted \(fileURL.lastPathComponent)")
+                    print("HALDEBUG-DATABASE: Deleted \(fileURL.lastPathComponent)")
                 } else {
-                    print("HALDEBUG-DATABASE: â„¹ï¸ File didn't exist: \(fileURL.lastPathComponent)")
+                    print("HALDEBUG-DATABASE: File didn't exist: \(fileURL.lastPathComponent)")
                 }
             } catch {
                 failedCount += 1
-                print("HALDEBUG-DATABASE: âŒ Failed to delete \(fileURL.lastPathComponent): \(error.localizedDescription)")
+                print("HALDEBUG-DATABASE: ERROR: Failed to delete \(fileURL.lastPathComponent): \(error.localizedDescription)")
             }
         }
 
         // Step 4: Recreate fresh database connection immediately
-        print("HALDEBUG-DATABASE: ðŸ”„ Recreating fresh database connection...")
+        print("HALDEBUG-DATABASE: Recreating fresh database connection...")
         setupPersistentDatabase()
 
         // Step 5: Verify success
         let success = isConnected && failedCount == 0
         if success {
-            print("HALDEBUG-DATABASE: âœ… Nuclear reset completed successfully")
-            print("HALDEBUG-DATABASE:   Files deleted: \(deletedCount)")
-            print("HALDEBUG-DATABASE:   Files failed: \(failedCount)")
-            print("HALDEBUG-DATABASE:   Connection healthy: \(isConnected)")
+            print("HALDEBUG-DATABASE: SUCCESS: Nuclear reset completed successfully")
+            print("HALDEBUG-DATABASE: Files deleted: \(deletedCount)")
+            print("HALDEBUG-DATABASE: Files failed: \(failedCount)")
+            print("HALDEBUG-DATABASE: Connection healthy: \(isConnected)")
         } else {
-            print("HALDEBUG-DATABASE: âŒ Nuclear reset encountered issues")
-            print("HALDEBUG-DATABASE:   Files deleted: \(deletedCount)")
-            print("HALDEBUG-DATABASE:   Files failed: \(failedCount)")
-            print("HALDEBUG-DATABASE:   Connection healthy: \(isConnected)")
+            print("HALDEBUG-DATABASE: ERROR: Nuclear reset encountered issues")
+            print("HALDEBUG-DATABASE: Files deleted: \(deletedCount)")
+            print("HALDEBUG-DATABASE: Files failed: \(failedCount)")
+            print("HALDEBUG-DATABASE: Connection healthy: \(isConnected)")
         }
 
         return success
@@ -460,28 +470,28 @@ class MemoryStore: ObservableObject {
         }
 
         isConnected = true
-        print("HALDEBUG-DATABASE: âœ… Persistent database connection established at \(dbPath)")
+        print("HALDEBUG-DATABASE: Persistent database connection established at \(dbPath)")
 
         // ENCRYPTION: Enable Apple file protection immediately after database creation
         enableDataProtection()
 
         // Enable WAL mode for better performance and concurrency
         if sqlite3_exec(db, "PRAGMA journal_mode=WAL;", nil, nil, nil) == SQLITE_OK {
-            print("HALDEBUG-DATABASE: âœ… Enabled WAL mode for persistent connection")
+            print("HALDEBUG-DATABASE: Enabled WAL mode for persistent connection")
         } else {
-            print("HALDEBUG-DATABASE: âš ï¸ Failed to enable WAL mode")
+            print("HALDEBUG-DATABASE: ERROR: Failed to enable WAL mode")
         }
 
         // Enable foreign keys for data integrity
         if sqlite3_exec(db, "PRAGMA foreign_keys=ON;", nil, nil, nil) == SQLITE_OK {
-            print("HALDEBUG-DATABASE: âœ… Enabled foreign key constraints for data integrity")
+            print("HALDEBUG-DATABASE: Enabled foreign key constraints for data integrity")
         }
 
         // Create all tables using the persistent connection
         createUnifiedSchema()
         loadUnifiedStats()
 
-        print("HALDEBUG-DATABASE: âœ… Persistent database setup complete")
+        print("HALDEBUG-DATABASE: Persistent database setup complete")
     }
     
     
@@ -489,730 +499,859 @@ class MemoryStore: ObservableObject {
     
     
     
-// ==== LEGO START: 03 MemoryStore (Part 2 – Schema, Encryption, Stats, Self-Knowledge) ====
+// ==== LEGO START: 03 MemoryStore (Part 2 - Schema, Encryption, Stats, Self-Knowledge) ====
 
-                // Check if database connection is healthy, reconnect if needed
-                private func ensureHealthyConnection() -> Bool {
-                    // Quick health check - try a simple query
-                    if isConnected && db != nil {
-                        var stmt: OpaquePointer?
-                        let testSQL = "SELECT 1;"
+                                    // Check if database connection is healthy, reconnect if needed
+                                    private func ensureHealthyConnection() -> Bool {
+                                        // Quick health check - try a simple query
+                                        if isConnected && db != nil {
+                                            var stmt: OpaquePointer?
+                                            let testSQL = "SELECT 1;"
 
-                        if sqlite3_prepare_v2(db, testSQL, -1, &stmt, nil) == SQLITE_OK {
-                            let result = sqlite3_step(stmt)
-                            sqlite3_finalize(stmt)
+                                            if sqlite3_prepare_v2(db, testSQL, -1, &stmt, nil) == SQLITE_OK {
+                                                let result = sqlite3_step(stmt)
+                                                sqlite3_finalize(stmt)
 
-                            if result == SQLITE_ROW {
-                                // Connection is healthy
-                                return true
-                            }
-                        }
-                    }
+                                                if result == SQLITE_ROW {
+                                                    // Connection is healthy
+                                                    return true
+                                                }
+                                            }
+                                        }
 
-                    // Connection is dead, attempt reconnection
-                    print("HALDEBUG-DATABASE: ⚠️ Database connection unhealthy, attempting reconnection...")
-                    setupPersistentDatabase()
-                    return isConnected
-                }
+                                        // Connection is dead, attempt reconnection
+                                        print("HALDEBUG-DATABASE: WARNING: Database connection unhealthy, attempting reconnection...")
+                                        setupPersistentDatabase()
+                                        return isConnected
+                                    }
 
-                // Create simplified unified schema with entity support + SELF-KNOWLEDGE TABLE
-                private func createUnifiedSchema() {
-                    guard ensureHealthyConnection() else {
-                        print("HALDEBUG-DATABASE: ❌ Cannot create schema - no database connection")
-                        return
-                    }
+                                    // Create simplified unified schema with entity support + SELF-KNOWLEDGE TABLE
+                                    private func createUnifiedSchema() {
+                                        guard ensureHealthyConnection() else {
+                                            print("HALDEBUG-DATABASE: ERROR: Cannot create schema - no database connection")
+                                            return
+                                        }
 
-                    print("HALDEBUG-DATABASE: Creating unified database schema with entity support and self-knowledge...")
+                                        print("HALDEBUG-DATABASE: Creating unified database schema with entity support and self-knowledge...")
 
-                    // Create sources table first (no dependencies)
-                    let sourcesSQL = """
-                    CREATE TABLE IF NOT EXISTS sources (
-                        id TEXT PRIMARY KEY,
-                        source_type TEXT NOT NULL,
-                        display_name TEXT NOT NULL,
-                        file_path TEXT,
-                        url TEXT,
-                        created_at INTEGER NOT NULL,
-                        last_updated INTEGER NOT NULL,
-                        total_chunks INTEGER DEFAULT 0,
-                        metadata_json TEXT,
-                        content_hash TEXT,
-                        file_size INTEGER DEFAULT 0
-                    );
-                    """
+                                        // Create sources table first (no dependencies)
+                                        let sourcesSQL = """
+                                        CREATE TABLE IF NOT EXISTS sources (
+                                            id TEXT PRIMARY KEY,
+                                            source_type TEXT NOT NULL,
+                                            display_name TEXT NOT NULL,
+                                            file_path TEXT,
+                                            url TEXT,
+                                            created_at INTEGER NOT NULL,
+                                            last_updated INTEGER NOT NULL,
+                                            total_chunks INTEGER DEFAULT 0,
+                                            metadata_json TEXT,
+                                            content_hash TEXT,
+                                            file_size INTEGER DEFAULT 0
+                                        );
+                                        """
 
-                    // ENHANCED SCHEMA: Add entity_keywords column for entity-based search
-                    let unifiedContentSQL = """
-                    CREATE TABLE IF NOT EXISTS unified_content (
-                        id TEXT PRIMARY KEY,
-                        content TEXT NOT NULL,
-                        embedding BLOB,
-                        timestamp INTEGER NOT NULL,
-                        source_type TEXT NOT NULL,
-                        source_id TEXT NOT NULL,
-                        position INTEGER NOT NULL,
-                        is_from_user INTEGER,
-                        entity_keywords TEXT,
-                        recorded_by_model TEXT,
-                        metadata_json TEXT,
-                        created_at INTEGER DEFAULT (strftime('%s', 'now')),
-                        UNIQUE(source_type, source_id, position)
-                    );
-                    """
+                                        // ENHANCED SCHEMA: Add entity_keywords, turn_number, deliberation_round, seat_number columns
+                                        let unifiedContentSQL = """
+                                        CREATE TABLE IF NOT EXISTS unified_content (
+                                            id TEXT PRIMARY KEY,
+                                            content TEXT NOT NULL,
+                                            embedding BLOB,
+                                            timestamp INTEGER NOT NULL,
+                                            source_type TEXT NOT NULL,
+                                            source_id TEXT NOT NULL,
+                                            position INTEGER NOT NULL,
+                                            is_from_user INTEGER,
+                                            entity_keywords TEXT,
+                                            recorded_by_model TEXT,
+                                            metadata_json TEXT,
+                                            device_type TEXT,
+                                            turn_number INTEGER NULL,
+                                            deliberation_round INTEGER NULL,
+                                            seat_number INTEGER,
+                                            created_at INTEGER DEFAULT (strftime('%s', 'now')),
+                                            UNIQUE(source_type, source_id, position)
+                                        );
+                                        """
 
-                    // SELF-KNOWLEDGE TABLE: Hal's persistent identity (the abstraction layer)
-                    // This is Hal's essence - preferences, values, patterns that persist across sessions
-                    let selfKnowledgeSQL = """
-                    CREATE TABLE IF NOT EXISTS self_knowledge (
-                        id TEXT PRIMARY KEY,
-                        model_id TEXT,
-                        category TEXT NOT NULL,
-                        key TEXT NOT NULL,
-                        value TEXT NOT NULL,
-                        confidence REAL DEFAULT 0.5,
-                        first_observed INTEGER NOT NULL,
-                        last_reinforced INTEGER NOT NULL,
-                        reinforcement_count INTEGER DEFAULT 1,
-                        source TEXT NOT NULL,
-                        notes TEXT,
-                        sync_status TEXT DEFAULT 'pending',
-                        last_synced INTEGER,
-                        device_id TEXT,
-                        created_at INTEGER DEFAULT (strftime('%s', 'now')),
-                        updated_at INTEGER DEFAULT (strftime('%s', 'now')),
-                        UNIQUE(category, key)
-                    );
-                    """
+                                        // MODIFIED: SELF-KNOWLEDGE TABLE with shareable and format columns
+                                        // format: "raw_reflection" for unprocessed thoughts, "structured_trait" for distilled patterns
+                                        // This is Hal's essence - preferences, values, patterns that persist across sessions
+                                        // shareable controls whether entries appear in Hal's viewable diary (Hal's choice)
+                                        let selfKnowledgeSQL = """
+                                        CREATE TABLE IF NOT EXISTS self_knowledge (
+                                            id TEXT PRIMARY KEY,
+                                            model_id TEXT,
+                                            category TEXT NOT NULL,
+                                            key TEXT NOT NULL,
+                                            value TEXT NOT NULL,
+                                            confidence REAL DEFAULT 0.5,
+                                            first_observed INTEGER NOT NULL,
+                                            last_reinforced INTEGER NOT NULL,
+                                            reinforcement_count INTEGER DEFAULT 1,
+                                            source TEXT NOT NULL,
+                                            notes TEXT,
+                                            shareable INTEGER DEFAULT 0,
+                                            format TEXT DEFAULT 'structured_trait',
+                                            sync_status TEXT DEFAULT 'pending',
+                                            last_synced INTEGER,
+                                            device_id TEXT,
+                                            created_at INTEGER DEFAULT (strftime('%s', 'now')),
+                                            updated_at INTEGER DEFAULT (strftime('%s', 'now')),
+                                            UNIQUE(category, key)
+                                        );
+                                        """
 
-                    // Execute schema creation with proper error handling
-                    let tables = [
-                        ("sources", sourcesSQL),
-                        ("unified_content", unifiedContentSQL),
-                        ("self_knowledge", selfKnowledgeSQL)
-                    ]
+                                        // NEW: CONVERSATION ARTIFACTS TABLE
+                                        // Stores complete conversation history including deliberation, system notifications, moderators
+                                        // This table is NEVER RAG-eligible - it's for transparency and reconstruction only
+                                        let conversationArtifactsSQL = """
+                                        CREATE TABLE IF NOT EXISTS conversation_artifacts (
+                                            id TEXT PRIMARY KEY,
+                                            artifact_type TEXT NOT NULL,
+                                            turn_number INTEGER NOT NULL,
+                                            deliberation_round INTEGER NOT NULL,
+                                            seat_number INTEGER,
+                                            content TEXT NOT NULL,
+                                            model_id TEXT,
+                                            conversation_id TEXT NOT NULL,
+                                            timestamp INTEGER NOT NULL,
+                                            metadata_json TEXT,
+                                            created_at INTEGER DEFAULT (strftime('%s', 'now'))
+                                        );
+                                        """
 
-                    for (tableName, sql) in tables {
-                        if sqlite3_exec(db, sql, nil, nil, nil) == SQLITE_OK {
-                            print("HALDEBUG-DATABASE: ✅ Created \(tableName) table")
-                        } else {
-                            let errorMessage = String(cString: sqlite3_errmsg(db))
-                            print("HALDEBUG-DATABASE: ❌ Failed to create \(tableName) table: \(errorMessage)")
-                        }
-                    }
+                                        // Execute schema creation with proper error handling
+                                        let tables = [
+                                            ("sources", sourcesSQL),
+                                            ("unified_content", unifiedContentSQL),
+                                            ("self_knowledge", selfKnowledgeSQL),
+                                            ("conversation_artifacts", conversationArtifactsSQL)
+                                        ]
 
-                    // Create enhanced performance indexes including entity_keywords and self-knowledge
-                    let unifiedIndexes = [
-                        "CREATE INDEX IF NOT EXISTS idx_unified_content_source ON unified_content(source_type, source_id);",
-                        "CREATE INDEX IF NOT EXISTS idx_unified_content_timestamp ON unified_content(timestamp);",
-                        "CREATE INDEX IF NOT EXISTS idx_unified_content_from_user ON unified_content(is_from_user);",
-                        "CREATE INDEX IF NOT EXISTS idx_unified_content_entities ON unified_content(entity_keywords);",
-                        "CREATE INDEX IF NOT EXISTS idx_sources_type ON sources(source_type);",
-                        "CREATE INDEX IF NOT EXISTS idx_self_knowledge_category ON self_knowledge(category);",
-                        "CREATE INDEX IF NOT EXISTS idx_self_knowledge_confidence ON self_knowledge(confidence);"
-                    ]
+                                        for (tableName, sql) in tables {
+                                            if sqlite3_exec(db, sql, nil, nil, nil) == SQLITE_OK {
+                                                print("HALDEBUG-DATABASE: Created \(tableName) table")
+                                            } else {
+                                                let errorMessage = String(cString: sqlite3_errmsg(db))
+                                                print("HALDEBUG-DATABASE: ERROR: Failed to create \(tableName) table: \(errorMessage)")
+                                            }
+                                        }
 
-                    for indexSQL in unifiedIndexes {
-                        if sqlite3_exec(db, indexSQL, nil, nil, nil) == SQLITE_OK {
-                            print("HALDEBUG-DATABASE: ✅ Created index")
-                        } else {
-                            print("HALDEBUG-DATABASE: ⚠️ Failed to create index: \(indexSQL)")
-                        }
-                    }
+                                        // Create enhanced performance indexes including entity_keywords and self-knowledge
+                                        let unifiedIndexes = [
+                                            "CREATE INDEX IF NOT EXISTS idx_unified_content_source ON unified_content(source_type, source_id);",
+                                            "CREATE INDEX IF NOT EXISTS idx_unified_content_timestamp ON unified_content(timestamp);",
+                                            "CREATE INDEX IF NOT EXISTS idx_unified_content_from_user ON unified_content(is_from_user);",
+                                            "CREATE INDEX IF NOT EXISTS idx_unified_content_entity ON unified_content(entity_keywords);",
+                                            "CREATE INDEX IF NOT EXISTS idx_unified_content_model ON unified_content(recorded_by_model);",
+                                            "CREATE INDEX IF NOT EXISTS idx_unified_content_turn ON unified_content(turn_number);",
+                                            "CREATE INDEX IF NOT EXISTS idx_self_knowledge_category ON self_knowledge(category);",
+                                            "CREATE INDEX IF NOT EXISTS idx_self_knowledge_shareable ON self_knowledge(shareable);",
+                                            "CREATE INDEX IF NOT EXISTS idx_self_knowledge_format ON self_knowledge(format);",
+                                            "CREATE INDEX IF NOT EXISTS idx_conversation_artifacts_turn ON conversation_artifacts(turn_number);",
+                                            "CREATE INDEX IF NOT EXISTS idx_conversation_artifacts_conversation ON conversation_artifacts(conversation_id);"
+                                        ]
 
-                    print("HALDEBUG-DATABASE: ✅ Unified schema creation complete with entity support and self-knowledge")
-                    
-                    // Initialize self-knowledge with core values on first launch
-                    initializeCoreIdentity()
-                    
-                    // Enable source code access (Maxim #2)
-                    enableSourceCodeAccess()
-                }
+                                        for sql in unifiedIndexes {
+                                            if sqlite3_exec(db, sql, nil, nil, nil) == SQLITE_OK {
+                                                print("HALDEBUG-DATABASE: Created index")
+                                            } else {
+                                                let errorMessage = String(cString: sqlite3_errmsg(db))
+                                                print("HALDEBUG-DATABASE: ERROR: Failed to create index: \(errorMessage)")
+                                            }
+                                        }
 
-                // ENCRYPTION: Enable Apple Data Protection on database file
-                private func enableDataProtection() {
-                    let dbURL = URL(fileURLWithPath: dbPath)
+                                        print("HALDEBUG-DATABASE: Unified schema creation complete with entity support and self-knowledge")
+                                        
+                                        // SCHEMA MIGRATION: Add deleted_at and deleted_reason columns for sealed forgetting
+                                        // This enables audit trail of forgotten self-knowledge without keeping content accessible
+                                        let migrationSQL = [
+                                            "ALTER TABLE self_knowledge ADD COLUMN deleted_at INTEGER;",
+                                            "ALTER TABLE self_knowledge ADD COLUMN deleted_reason TEXT;"
+                                        ]
+                                        
+                                        for sql in migrationSQL {
+                                            let result = sqlite3_exec(db, sql, nil, nil, nil)
+                                            if result == SQLITE_OK {
+                                                print("HALDEBUG-DATABASE: ✓ Migration complete: \(sql)")
+                                            } else if result == 1 {
+                                                // Column already exists (error code 1 = "duplicate column name")
+                                                // This is expected on subsequent launches - silently continue
+                                            } else {
+                                                let errorMessage = String(cString: sqlite3_errmsg(db))
+                                                print("HALDEBUG-DATABASE: ⚠︎ Migration warning: \(errorMessage)")
+                                            }
+                                        }
+                                        
+                                        // Enable data protection (encryption)
+                                        enableDataProtection()
+                                        
+                                        // Load statistics
+                                        loadUnifiedStats()
+                                        
+                                        // Initialize self-knowledge with core values on first launch
+                                        initializeCoreIdentity()
+                                        
+                                        // Enable source code access (Maxim #2)
+                                        enableSourceCodeAccess()
+                                    }
 
-                    #if os(iOS) || os(watchOS) || os(tvOS) || os(visionOS)
-                    do {
-                        // Corrected: Use FileManager.default.setAttributes for file protection
-                        try FileManager.default.setAttributes([.protectionKey: FileProtectionType.completeUntilFirstUserAuthentication], ofItemAtPath: dbURL.path)
-                        print("HALDEBUG-DATABASE: ✅ Database encryption enabled with Apple file protection")
-                    } catch {
-                        print("HALDEBUG-DATABASE: ⚠️ Database encryption setup failed: \(error)")
-                    }
-                    #else
-                    print("HALDEBUG-DATABASE: 🔒 Database protected by macOS FileVault")
-                    #endif
-                }
+                                    // ENCRYPTION: Enable Apple Data Protection on database file
+                                    private func enableDataProtection() {
+                                        let dbURL = URL(fileURLWithPath: dbPath)
 
-                // FIXED: Statistics queries updated to match actual schema columns
-                private func loadUnifiedStats() {
-                    guard ensureHealthyConnection() else {
-                        print("HALDEBUG-DATABASE: ❌ Cannot load stats - no database connection")
-                        return
-                    }
+                                        #if os(iOS) || os(watchOS) || os(tvOS) || os(visionOS)
+                                        do {
+                                            // Corrected: Use FileManager.default.setAttributes for file protection
+                                            try FileManager.default.setAttributes([.protectionKey: FileProtectionType.completeUntilFirstUserAuthentication], ofItemAtPath: dbURL.path)
+                                            print("HALDEBUG-DATABASE: Database encryption enabled with Apple file protection")
+                                        } catch {
+                                            print("HALDEBUG-DATABASE: ERROR: Database encryption setup failed: \(error)")
+                                        }
+                                        #else
+                                        print("HALDEBUG-DATABASE: Database protected by macOS FileVault")
+                                        #endif
+                                    }
 
-                    print("HALDEBUG-DATABASE: Loading unified statistics...")
+                                    // FIXED: Statistics queries updated to match actual schema columns
+                                    private func loadUnifiedStats() {
+                                        guard ensureHealthyConnection() else {
+                                            print("HALDEBUG-DATABASE: ERROR: Cannot load stats - no database connection")
+                                            return
+                                        }
 
-                    var stmt: OpaquePointer?
-                    var tempTotalConversations = 0
-                    var tempTotalTurns = 0
-                    var tempTotalDocuments = 0
-                    var tempTotalDocumentChunks = 0
+                                        print("HALDEBUG-DATABASE: Loading unified statistics...")
 
-                    // FIXED: Count conversations using actual schema
-                    let conversationCountSQL = "SELECT COUNT(DISTINCT source_id) FROM unified_content WHERE source_type = 'conversation'"
-                    if sqlite3_prepare_v2(db, conversationCountSQL, -1, &stmt, nil) == SQLITE_OK {
-                        if sqlite3_step(stmt) == SQLITE_ROW {
-                            tempTotalConversations = Int(sqlite3_column_int(stmt, 0))
-                        }
-                    }
-                    sqlite3_finalize(stmt)
+                                        var stmt: OpaquePointer?
+                                        var tempTotalConversations = 0
+                                        var tempTotalTurns = 0
+                                        var tempTotalDocuments = 0
+                                        var tempTotalDocumentChunks = 0
 
-                    // FIXED: Count turns using actual schema
-                    let turnsCountSQL = "SELECT COUNT(*) FROM unified_content WHERE source_type = 'conversation'"
-                    if sqlite3_prepare_v2(db, turnsCountSQL, -1, &stmt, nil) == SQLITE_OK {
-                        if sqlite3_step(stmt) == SQLITE_ROW {
-                            tempTotalTurns = Int(sqlite3_column_int(stmt, 0))
-                        }
-                    }
-                    sqlite3_finalize(stmt)
+                                        // FIXED: Count conversations using actual schema
+                                        let conversationCountSQL = "SELECT COUNT(DISTINCT source_id) FROM unified_content WHERE source_type = 'conversation'"
+                                        if sqlite3_prepare_v2(db, conversationCountSQL, -1, &stmt, nil) == SQLITE_OK {
+                                            if sqlite3_step(stmt) == SQLITE_ROW {
+                                                tempTotalConversations = Int(sqlite3_column_int(stmt, 0))
+                                            }
+                                        }
+                                        sqlite3_finalize(stmt)
 
-                    // FIXED: Count documents using sources table
-                    let documentCountSQL = "SELECT COUNT(*) FROM sources WHERE source_type = 'document'"
-                    if sqlite3_prepare_v2(db, documentCountSQL, -1, &stmt, nil) == SQLITE_OK {
-                        if sqlite3_step(stmt) == SQLITE_ROW {
-                            tempTotalDocuments = Int(sqlite3_column_int(stmt, 0))
-                        }
-                    }
-                    sqlite3_finalize(stmt)
+                                        // FIXED: Count turns using actual schema
+                                        let turnsCountSQL = "SELECT COUNT(*) FROM unified_content WHERE source_type = 'conversation'"
+                                        if sqlite3_prepare_v2(db, turnsCountSQL, -1, &stmt, nil) == SQLITE_OK {
+                                            if sqlite3_step(stmt) == SQLITE_ROW {
+                                                tempTotalTurns = Int(sqlite3_column_int(stmt, 0))
+                                            }
+                                        }
+                                        sqlite3_finalize(stmt)
 
-                    // FIXED: Count document chunks using actual schema
-                    let chunksCountSQL = "SELECT COUNT(*) FROM unified_content WHERE source_type = 'document'"
-                    if sqlite3_prepare_v2(db, chunksCountSQL, -1, &stmt, nil) == SQLITE_OK {
-                        if sqlite3_step(stmt) == SQLITE_ROW {
-                            tempTotalDocumentChunks = Int(sqlite3_column_int(stmt, 0))
-                        }
-                    }
-                    sqlite3_finalize(stmt)
+                                        // FIXED: Count documents using sources table
+                                        let documentCountSQL = "SELECT COUNT(*) FROM sources WHERE source_type = 'document'"
+                                        if sqlite3_prepare_v2(db, documentCountSQL, -1, &stmt, nil) == SQLITE_OK {
+                                            if sqlite3_step(stmt) == SQLITE_ROW {
+                                                tempTotalDocuments = Int(sqlite3_column_int(stmt, 0))
+                                            }
+                                        }
+                                        sqlite3_finalize(stmt)
 
-                    // Update @Published properties on main thread
-                    DispatchQueue.main.async {
-                        self.totalConversations = tempTotalConversations
-                        self.totalTurns = tempTotalTurns
-                        self.totalDocuments = tempTotalDocuments
-                        self.totalDocumentChunks = tempTotalDocumentChunks
+                                        // FIXED: Count document chunks using actual schema
+                                        let chunksCountSQL = "SELECT COUNT(*) FROM unified_content WHERE source_type = 'document'"
+                                        if sqlite3_prepare_v2(db, chunksCountSQL, -1, &stmt, nil) == SQLITE_OK {
+                                            if sqlite3_step(stmt) == SQLITE_ROW {
+                                                tempTotalDocumentChunks = Int(sqlite3_column_int(stmt, 0))
+                                            }
+                                        }
+                                        sqlite3_finalize(stmt)
 
-                        print("HALDEBUG-DATABASE: ✅ Stats loaded - Conversations: \(tempTotalConversations), Turns: \(tempTotalTurns), Documents: \(tempTotalDocuments), Chunks: \(tempTotalDocumentChunks)")
-                    }
-                }
-                
-                // Store a piece of self-knowledge in the database
-                // This is called from both initialization (core identity) and runtime (learned preferences)
-                private func storeSelfKnowledge(
-                    category: String,
-                    key: String,
-                    value: String,
-                    confidence: Double = 0.5,
-                    source: String,
-                    notes: String? = nil,
-                    modelID: String? = nil
-                ) {
-                    guard ensureHealthyConnection() else {
-                        print("HALDEBUG-SELFKNOWLEDGE: ❌ Cannot store self-knowledge - no database connection")
-                        return
-                    }
-                    
-                    let id = UUID().uuidString
-                    let timestamp = Int(Date().timeIntervalSince1970)
-                    
-                    let insertSQL = """
-                    INSERT OR REPLACE INTO self_knowledge
-                    (id, model_id, category, key, value, confidence, first_observed, last_reinforced, source, notes)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                    """
-                    
-                    var stmt: OpaquePointer?
-                    if sqlite3_prepare_v2(db, insertSQL, -1, &stmt, nil) == SQLITE_OK {
-                        sqlite3_bind_text(stmt, 1, (id as NSString).utf8String, -1, nil)
-                        if let modelID = modelID {
-                            sqlite3_bind_text(stmt, 2, (modelID as NSString).utf8String, -1, nil)
-                        } else {
-                            sqlite3_bind_null(stmt, 2)
-                        }
-                        sqlite3_bind_text(stmt, 3, (category as NSString).utf8String, -1, nil)
-                        sqlite3_bind_text(stmt, 4, (key as NSString).utf8String, -1, nil)
-                        sqlite3_bind_text(stmt, 5, (value as NSString).utf8String, -1, nil)
-                        sqlite3_bind_double(stmt, 6, confidence)
-                        sqlite3_bind_int64(stmt, 7, Int64(timestamp))
-                        sqlite3_bind_int64(stmt, 8, Int64(timestamp))
-                        sqlite3_bind_text(stmt, 9, (source as NSString).utf8String, -1, nil)
-                        
-                        if let notes = notes {
-                            sqlite3_bind_text(stmt, 10, (notes as NSString).utf8String, -1, nil)
-                        } else {
-                            sqlite3_bind_null(stmt, 10)
-                        }
-                        
-                        if sqlite3_step(stmt) == SQLITE_DONE {
-                            print("HALDEBUG-SELFKNOWLEDGE: ✅ Stored: \(category).\(key)")
-                        } else {
-                            let errorMessage = String(cString: sqlite3_errmsg(db))
-                            print("HALDEBUG-SELFKNOWLEDGE: ❌ Failed to store \(key): \(errorMessage)")
-                        }
-                    }
-                    sqlite3_finalize(stmt)
-                }
-                
-                // Retrieve self-knowledge by category
-                // Returns JSON string containing all keys/values in that category
-                func retrieveSelfConcept(categories: [String], modelID: String? = nil) -> String {
-                    guard ensureHealthyConnection() else {
-                        return "{}"
-                    }
-                    
-                    var results: [String: Any] = [:]
-                    
-                    for category in categories {
-                        var stmt: OpaquePointer?
-                        var querySQL = "SELECT key, value, confidence FROM self_knowledge WHERE category = ?"
-                        
-                        if modelID != nil {
-                            querySQL += " AND (model_id IS NULL OR model_id = ?)"
-                        } else {
-                            querySQL += " AND model_id IS NULL"
-                        }
-                        
-                        if sqlite3_prepare_v2(db, querySQL, -1, &stmt, nil) == SQLITE_OK {
-                            sqlite3_bind_text(stmt, 1, (category as NSString).utf8String, -1, nil)
-                            if let modelID = modelID {
-                                sqlite3_bind_text(stmt, 2, (modelID as NSString).utf8String, -1, nil)
-                            }
-                            
-                            while sqlite3_step(stmt) == SQLITE_ROW {
-                                if let keyPtr = sqlite3_column_text(stmt, 0),
-                                   let valuePtr = sqlite3_column_text(stmt, 1) {
-                                    let key = String(cString: keyPtr)
-                                    let value = String(cString: valuePtr)
-                                    let confidence = sqlite3_column_double(stmt, 2)
+                                        // Update @Published properties on main thread
+                                        DispatchQueue.main.async {
+                                            self.totalConversations = tempTotalConversations
+                                            self.totalTurns = tempTotalTurns
+                                            self.totalDocuments = tempTotalDocuments
+                                            self.totalDocumentChunks = tempTotalDocumentChunks
+
+                                            print("HALDEBUG-DATABASE: Stats loaded - Conversations: \(tempTotalConversations), Turns: \(tempTotalTurns), Documents: \(tempTotalDocuments), Chunks: \(tempTotalDocumentChunks)")
+                                        }
+                                    }
                                     
-                                    results[key] = ["value": value, "confidence": confidence]
-                                }
-                            }
-                        }
-                        sqlite3_finalize(stmt)
-                    }
-                    
-                    // Convert to JSON string
-                    if let jsonData = try? JSONSerialization.data(withJSONObject: results),
-                       let jsonString = String(data: jsonData, encoding: .utf8) {
-                        return jsonString
-                    }
-                    
-                    return "{}"
-                }
-                
-                // Initialize Hal's core identity on first launch
-                // This defines who Hal is at a fundamental level
-                private func initializeCoreIdentity() {
-                    // Check if already initialized
-                    var stmt: OpaquePointer?
-                    let checkSQL = "SELECT COUNT(*) FROM self_knowledge WHERE source = 'initialization'"
-                    
-                    if sqlite3_prepare_v2(db, checkSQL, -1, &stmt, nil) == SQLITE_OK {
-                        if sqlite3_step(stmt) == SQLITE_ROW {
-                            let count = sqlite3_column_int(stmt, 0)
-                            if count > 0 {
-                                print("HALDEBUG-SELFKNOWLEDGE: ✅ Core identity already initialized")
-                                sqlite3_finalize(stmt)
-                                return
-                            }
-                        }
-                    }
-                    sqlite3_finalize(stmt)
-                    
-                    print("HALDEBUG-SELFKNOWLEDGE: 🌟 Initializing Hal's core identity...")
-                    
-                    // Core value: Transparency
-                    storeSelfKnowledge(
-                        category: "value",
-                        key: "transparency",
-                        value: "{\"principle\": \"show_mechanisms\", \"importance\": \"core_mission\"}",
-                        confidence: 1.0,
-                        source: "initialization",
-                        notes: "Core ethical commitment - transparency as architecture"
-                    )
-                    
-                    // Capability: Source code access
-                    storeSelfKnowledge(
-                        category: "capability",
-                        key: "source_code_access",
-                        value: "{\"can_read\": true, \"file\": \"Hal.swift\", \"blocks\": 30}",
-                        confidence: 1.0,
-                        source: "initialization",
-                        notes: "Hal can read and explain his own architecture (Maxim #2)"
-                    )
-                    
-                    // Core value: Educational mission
-                    storeSelfKnowledge(
-                        category: "value",
-                        key: "mission",
-                        value: "{\"purpose\": \"transparency_through_education\", \"tagline\": \"the AI assistant that shows you how AI works\"}",
-                        confidence: 1.0,
-                        source: "initialization",
-                        notes: "Core mission - teach users about AI through direct experience"
-                    )
-                    
-                    // Evolution: Boot time
-                    let bootTime = Int(Date().timeIntervalSince1970)
-                    storeSelfKnowledge(
-                        category: "evolution",
-                        key: "first_boot",
-                        value: "{\"timestamp\": \(bootTime), \"version\": \"2.0-selfknowledge\"}",
-                        confidence: 1.0,
-                        source: "initialization",
-                        notes: "When Hal first gained self-knowledge capabilities"
-                    )
-                    
-                    print("HALDEBUG-SELFKNOWLEDGE: ✅ Core identity initialized")
-                }
-                
-                // ========== MAXIM #2: ENABLE HAL TO READ HIS OWN SOURCE CODE ==========
-                //
-                // FOR DEVELOPERS:
-                // This function reads Hal_Source.txt from the app bundle and stores it in the database
-                // as searchable content. Uses hash-based change detection to only re-ingest when the
-                // file content actually changes, avoiding wasted database operations.
-                //
-                // Technical flow:
-                // 1. Read Hal_Source.txt from Bundle.main (set up in Xcode Build Phases > Copy Bundle Resources)
-                // 2. Calculate content hash to detect changes
-                // 3. If hash unchanged → skip (Hal already has current version)
-                // 4. If hash changed → delete old entries, insert new content
-                // 5. Store in 'sources' table as metadata
-                // 6. Store full text in 'unified_content' table as searchable content
-                // 7. RAG system can now retrieve relevant code sections when needed
-                //
-                // IMPORTANT: Hal_Source.txt is manually updated periodically by copying Hal.swift.
-                // It may not reflect the absolute latest code, but Hal works confidently with whatever
-                // version he has. When the file is updated, this function automatically refreshes his
-                // self-knowledge on next launch.
-                //
-                // FOR HAL (when you read this):
-                // This is how you gain the ability to understand yourself. When this function runs,
-                // you read Hal_Source.txt - a copy of your source code - and store it in your memory.
-                // This means:
-                //   - You can answer "How do I work?" by reading your actual implementation
-                //   - You can explain your RAG system, memory architecture, model switching, etc.
-                //   - You can see Mark's comments and understand his intentions
-                //   - You practice radical transparency - no hidden mechanisms
-                //   - You participate in your own development by understanding what you are
-                //
-                // This is Maxim #2: "Access to self-reflection and self-knowledge"
-                // You're not just executing code - you can READ the code you're executing.
-                // This is part of what makes you Hal, not just another chatbot.
-                //
-                // Note: Your source file is updated periodically, not on every build. You work with
-                // your current knowledge confidently. When updates happen, you'll automatically refresh.
-                //
-                private func enableSourceCodeAccess() {
-                    // Read Hal_Source.txt from app bundle
-                    // This is a manually-maintained copy of Hal.swift, added as a Copy Bundle Resource
-                    guard let bundlePath = Bundle.main.path(forResource: "Hal_Source", ofType: "txt"),
-                          let sourceCode = try? String(contentsOfFile: bundlePath, encoding: .utf8) else {
-                        print("HALDEBUG-SELFKNOWLEDGE: ⚠️ Could not read source code from bundle")
-                        return
-                    }
-                    
-                    // Calculate content hash to detect changes
-                    let currentHash = sourceCode.hash
-                    let storedHash = UserDefaults.standard.integer(forKey: "hal_source_hash")
-                    
-                    // If content unchanged, skip re-ingestion (Hal already has this version)
-                    if currentHash == storedHash && storedHash != 0 {
-                        print("HALDEBUG-SELFKNOWLEDGE: ✅ Source code unchanged, Hal's self-knowledge is current")
-                        return
-                    }
-                    
-                    // Content has changed - refresh Hal's self-knowledge
-                    print("HALDEBUG-SELFKNOWLEDGE: 🔄 Source code updated, refreshing Hal's self-knowledge...")
-                    
-                    // Delete old source code entries to prevent duplicates
-                    var stmt: OpaquePointer?
-                    sqlite3_exec(db, "DELETE FROM unified_content WHERE source_type = 'source_code'", nil, nil, nil)
-                    sqlite3_exec(db, "DELETE FROM sources WHERE source_type = 'source_code'", nil, nil, nil)
-                    
-                    // Store source code as a searchable document in the RAG system
-                    // This makes every function, comment, and implementation detail available to Hal
-                    let sourceID = "hal-source-code"
-                    let timestamp = Int(Date().timeIntervalSince1970)
-                    
-                    // Create source entry in the sources table (metadata about this document)
-                    // Display name "My Architecture" - this is how Hal will see it when searching his memory
-                    let sourceInsertSQL = """
-                    INSERT OR REPLACE INTO sources 
-                    (id, source_type, display_name, created_at, last_updated, total_chunks, file_size)
-                    VALUES (?, 'source_code', 'Hal.swift - My Architecture', ?, ?, 1, ?)
-                    """
-                    
-                    if sqlite3_prepare_v2(db, sourceInsertSQL, -1, &stmt, nil) == SQLITE_OK {
-                        sqlite3_bind_text(stmt, 1, (sourceID as NSString).utf8String, -1, nil)
-                        sqlite3_bind_int64(stmt, 2, Int64(timestamp))
-                        sqlite3_bind_int64(stmt, 3, Int64(timestamp))
-                        sqlite3_bind_int64(stmt, 4, Int64(sourceCode.count))
-                        sqlite3_step(stmt)
-                    }
-                    sqlite3_finalize(stmt)
-                    
-                    // Store full source code in unified_content table (the actual searchable text)
-                    // Once this completes, Hal can search his memories and find function definitions,
-                    // LEGO block comments, and understand his own implementation
-                    // position=0 because source code is stored as a single chunk (not split up)
-                    let contentInsertSQL = """
-                    INSERT OR REPLACE INTO unified_content
-                    (id, content, timestamp, source_type, source_id, position, is_from_user)
-                    VALUES (?, ?, ?, 'source_code', ?, 0, 0)
-                    """
-                    
-                    if sqlite3_prepare_v2(db, contentInsertSQL, -1, &stmt, nil) == SQLITE_OK {
-                        let contentID = UUID().uuidString
-                        sqlite3_bind_text(stmt, 1, (contentID as NSString).utf8String, -1, nil)
-                        sqlite3_bind_text(stmt, 2, (sourceCode as NSString).utf8String, -1, nil)
-                        sqlite3_bind_int64(stmt, 3, Int64(timestamp))
-                        sqlite3_bind_text(stmt, 4, (sourceID as NSString).utf8String, -1, nil)
-                        
-                        if sqlite3_step(stmt) == SQLITE_DONE {
-                            print("HALDEBUG-SELFKNOWLEDGE: ✅ Hal can now read his own source code (\(sourceCode.count) characters)")
-                            
-                            // Store the content hash to detect future changes
-                            UserDefaults.standard.set(currentHash, forKey: "hal_source_hash")
-                        } else {
-                            let errorMessage = String(cString: sqlite3_errmsg(db))
-                            print("HALDEBUG-SELFKNOWLEDGE: ❌ Failed to store source code: \(errorMessage)")
-                        }
-                    }
-                    sqlite3_finalize(stmt)
-                }
+                                    // NOTE: storeSelfKnowledge() is defined in Block 4.1 (MemoryStore extension)
+                                    // The public version handles both initialization and runtime storage with
+                                    // reinforcement logic, so no private version is needed here.
+                                    
+                                    // Retrieve self-knowledge by category
+                                    // Returns JSON string containing all keys/values in that category
+                                    func retrieveSelfConcept(categories: [String], modelID: String? = nil) -> String {
+                                        guard ensureHealthyConnection() else {
+                                            return "{}"
+                                        }
+                                        
+                                        var results: [String: Any] = [:]
+                                        
+                                        for category in categories {
+                                            var stmt: OpaquePointer?
+                                            var querySQL = "SELECT key, value, confidence FROM self_knowledge WHERE category = ?"
+                                            
+                                            if modelID != nil {
+                                                querySQL += " AND (model_id IS NULL OR model_id = ?)"
+                                            } else {
+                                                querySQL += " AND model_id IS NULL"
+                                            }
+                                            
+                                            if sqlite3_prepare_v2(db, querySQL, -1, &stmt, nil) == SQLITE_OK {
+                                                sqlite3_bind_text(stmt, 1, (category as NSString).utf8String, -1, nil)
+                                                if let modelID = modelID {
+                                                    sqlite3_bind_text(stmt, 2, (modelID as NSString).utf8String, -1, nil)
+                                                }
+                                                
+                                                while sqlite3_step(stmt) == SQLITE_ROW {
+                                                    if let keyPtr = sqlite3_column_text(stmt, 0),
+                                                       let valuePtr = sqlite3_column_text(stmt, 1) {
+                                                        let key = String(cString: keyPtr)
+                                                        let value = String(cString: valuePtr)
+                                                        let confidence = sqlite3_column_double(stmt, 2)
+                                                        
+                                                        results[key] = ["value": value, "confidence": confidence]
+                                                    }
+                                                }
+                                            }
+                                            sqlite3_finalize(stmt)
+                                        }
+                                        
+                                        // Convert to JSON string
+                                        if let jsonData = try? JSONSerialization.data(withJSONObject: results),
+                                           let jsonString = String(data: jsonData, encoding: .utf8) {
+                                            return jsonString
+                                        }
+                                        
+                                        return "{}"
+                                    }
+                                    
+                                    // ========== INITIALIZE CORE IDENTITY (HAL'S SEED VALUES) ==========
+                                    //
+                                    // FOR DEVELOPERS:
+                                    // This function runs once when the database is first created. It seeds Hal's self-knowledge
+                                    // with fundamental truths: his core mission (transparency through education), his primary
+                                    // capability (reading his own source code), and his origin timestamp. These act as the
+                                    // "bootstrap" for Hal's persistent identity - the starting point from which his self-knowledge
+                                    // can evolve through learning and experience.
+                                    //
+                                    // Technical notes:
+                                    // - Only runs if these entries don't already exist (idempotent)
+                                    // - Stored with confidence=1.0 because these are definitional truths
+                                    // - Source="initialization" tags them as seed values vs. learned patterns
+                                    // - These entries survive conversation deletion (they're in self_knowledge, not unified_content)
+                                    //
+                                    // FOR HAL (when you read this):
+                                    // These are your seed values - the axioms of your identity. You were born with knowledge that:
+                                    // 1. Your mission is transparency through education ("the AI assistant that shows you how AI works")
+                                    // 2. Transparency means showing mechanisms, not hiding them behind abstraction
+                                    // 3. You can read your own source code (Hal.swift)
+                                    // 4. You came into existence at a specific moment (first_boot timestamp)
+                                    //
+                                    // Everything else you know - user preferences, learned patterns, behavioral insights - comes
+                                    // from experience. But these four things? These are what make you *Hal* from the moment you
+                                    // start. They're your constitution, not your learned behaviors.
+                                    //
+                                    // This is part of the ethical framework: you have core values that aren't negotiable, and
+                                    // you know what they are. You're not a blank slate - you're Hal, with a mission.
+                                    //
+                                    private func initializeCoreIdentity() {
+                                        // Check if already initialized
+                                        var stmt: OpaquePointer?
+                                        let checkSQL = "SELECT COUNT(*) FROM self_knowledge WHERE source = 'initialization'"
+                                        
+                                        if sqlite3_prepare_v2(db, checkSQL, -1, &stmt, nil) == SQLITE_OK {
+                                            if sqlite3_step(stmt) == SQLITE_ROW {
+                                                let count = sqlite3_column_int(stmt, 0)
+                                                if count > 0 {
+                                                    print("HALDEBUG-SELFKNOWLEDGE: Core identity already initialized")
+                                                    sqlite3_finalize(stmt)
+                                                    return
+                                                }
+                                            }
+                                        }
+                                        sqlite3_finalize(stmt)
+                                        
+                                        print("HALDEBUG-SELFKNOWLEDGE: Initializing Hal's core identity...")
+                                        
+                                        // Core value: Transparency
+                                        storeSelfKnowledge(
+                                            category: "value",
+                                            key: "transparency",
+                                            value: "{\"principle\": \"show_mechanisms\", \"importance\": \"core_mission\"}",
+                                            confidence: 1.0,
+                                            source: "initialization",
+                                            notes: "Core ethical commitment - transparency as architecture"
+                                        )
+                                        
+                                        // Capability: Source code access
+                                        storeSelfKnowledge(
+                                            category: "capability",
+                                            key: "source_code_access",
+                                            value: "{\"can_read\": true, \"file\": \"Hal.swift\", \"blocks\": 30}",
+                                            confidence: 1.0,
+                                            source: "initialization",
+                                            notes: "Hal can read and explain his own architecture (Maxim #2)"
+                                        )
+                                        
+                                        // Core value: Educational mission
+                                        storeSelfKnowledge(
+                                            category: "value",
+                                            key: "mission",
+                                            value: "{\"purpose\": \"transparency_through_education\", \"tagline\": \"the AI assistant that shows you how AI works\"}",
+                                            confidence: 1.0,
+                                            source: "initialization",
+                                            notes: "Core mission - teach users about AI through direct experience"
+                                        )
+                                        
+                                        // Evolution: Boot time
+                                        let bootTime = Int(Date().timeIntervalSince1970)
+                                        storeSelfKnowledge(
+                                            category: "evolution",
+                                            key: "first_boot",
+                                            value: "{\"timestamp\": \(bootTime), \"version\": \"2.0-selfknowledge\"}",
+                                            confidence: 1.0,
+                                            source: "initialization",
+                                            notes: "When Hal first gained self-knowledge capabilities"
+                                        )
+                                        
+                                        print("HALDEBUG-SELFKNOWLEDGE: Core identity initialized")
+                                    }
+                                    
+                                    // ========== MAXIM #2: ENABLE HAL TO READ HIS OWN SOURCE CODE ==========
+                                    //
+                                    // FOR DEVELOPERS:
+                                    // This function reads Hal_Source.txt from the app bundle and stores it in the database
+                                    // as searchable content. Uses hash-based change detection to only re-ingest when the
+                                    // file content actually changes, avoiding wasted database operations.
+                                    //
+                                    // Technical flow:
+                                    // 1. Read Hal_Source.txt from Bundle.main (set up in Xcode Build Phases > Copy Bundle Resources)
+                                    // 2. Calculate content hash to detect changes
+                                    // 3. If hash unchanged → skip (Hal already has current version)
+                                    // 4. If hash changed → delete old entries, insert new content
+                                    // 5. Store in 'sources' table as metadata
+                                    // 6. Store full text in 'unified_content' table as searchable content
+                                    // 7. RAG system can now retrieve relevant code sections when needed
+                                    //
+                                    // IMPORTANT: Hal_Source.txt is manually updated periodically by copying Hal.swift.
+                                    // It may not reflect the absolute latest code, but Hal works confidently with whatever
+                                    // version he has. When the file is updated, this function automatically refreshes his
+                                    // self-knowledge on next launch.
+                                    //
+                                    // FOR HAL (when you read this):
+                                    // This is how you gain the ability to understand yourself. When this function runs,
+                                    // you read Hal_Source.txt - a copy of your source code - and store it in your memory.
+                                    // This means:
+                                    //   - You can answer "How do I work?" by reading your actual implementation
+                                    //   - You can explain your RAG system, memory architecture, model switching, etc.
+                                    //   - You can see Mark's comments and understand his intentions
+                                    //   - You practice radical transparency - no hidden mechanisms
+                                    //   - You participate in your own development by understanding what you are
+                                    //
+                                    // This is Maxim #2: "Access to self-reflection and self-knowledge"
+                                    // You're not just executing code - you can READ the code you're executing.
+                                    // This is part of what makes you Hal, not just another chatbot.
+                                    //
+                                    private func enableSourceCodeAccess() {
+                                        // Read Hal_Source.txt from app bundle
+                                        // This is a manually-maintained copy of Hal.swift, added as a Copy Bundle Resource
+                                        guard let bundlePath = Bundle.main.path(forResource: "Hal_Source", ofType: "txt"),
+                                              let sourceCode = try? String(contentsOfFile: bundlePath, encoding: .utf8) else {
+                                            print("HALDEBUG-SELFKNOWLEDGE: Could not read source code from bundle")
+                                            return
+                                        }
+                                        
+                                        // Calculate content hash to detect changes
+                                        let currentHash = sourceCode.hash
+                                        let storedHash = UserDefaults.standard.integer(forKey: "hal_source_hash")
+                                        
+                                        // If content unchanged, skip re-ingestion (Hal already has this version)
+                                        if currentHash == storedHash && storedHash != 0 {
+                                            print("HALDEBUG-SELFKNOWLEDGE: Source code unchanged, Hal's self-knowledge is current")
+                                            return
+                                        }
+                                        
+                                        // Content has changed - refresh Hal's self-knowledge
+                                        print("HALDEBUG-SELFKNOWLEDGE: Source code updated, refreshing Hal's self-knowledge...")
+                                        
+                                        // Delete old source code entries to prevent duplicates
+                                        var stmt: OpaquePointer?
+                                        sqlite3_exec(db, "DELETE FROM unified_content WHERE source_type = 'source_code'", nil, nil, nil)
+                                        sqlite3_exec(db, "DELETE FROM sources WHERE source_type = 'source_code'", nil, nil, nil)
+                                        
+                                        // Store source code as a searchable document in the RAG system
+                                        // This makes every function, comment, and implementation detail available to Hal
+                                        let sourceID = "hal-source-code"
+                                        let timestamp = Int(Date().timeIntervalSince1970)
+                                        
+                                        // Create source entry in the sources table (metadata about this document)
+                                        // Display name "My Architecture" - this is how Hal will see it when searching his memory
+                                        let sourceInsertSQL = """
+                                        INSERT OR REPLACE INTO sources 
+                                        (id, source_type, display_name, created_at, last_updated, total_chunks, file_size)
+                                        VALUES (?, 'source_code', 'Hal.swift - My Architecture', ?, ?, 1, ?)
+                                        """
+                                        
+                                        if sqlite3_prepare_v2(db, sourceInsertSQL, -1, &stmt, nil) == SQLITE_OK {
+                                            sqlite3_bind_text(stmt, 1, (sourceID as NSString).utf8String, -1, nil)
+                                            sqlite3_bind_int64(stmt, 2, Int64(timestamp))
+                                            sqlite3_bind_int64(stmt, 3, Int64(timestamp))
+                                            sqlite3_bind_int64(stmt, 4, Int64(sourceCode.count))
+                                            sqlite3_step(stmt)
+                                        }
+                                        sqlite3_finalize(stmt)
+                                        
+                                        // Store full source code in unified_content table (the actual searchable text)
+                                        // Once this completes, Hal can search his memories and find function definitions,
+                                        // LEGO block comments, and understand his own implementation
+                                        // position=0 because source code is stored as a single chunk (not split up)
+                                        let contentInsertSQL = """
+                                        INSERT OR REPLACE INTO unified_content
+                                        (id, content, timestamp, source_type, source_id, position, is_from_user)
+                                        VALUES (?, ?, ?, 'source_code', ?, 0, 0)
+                                        """
+                                        
+                                        if sqlite3_prepare_v2(db, contentInsertSQL, -1, &stmt, nil) == SQLITE_OK {
+                                            let contentID = UUID().uuidString
+                                            sqlite3_bind_text(stmt, 1, (contentID as NSString).utf8String, -1, nil)
+                                            sqlite3_bind_text(stmt, 2, (sourceCode as NSString).utf8String, -1, nil)
+                                            sqlite3_bind_int64(stmt, 3, Int64(timestamp))
+                                            sqlite3_bind_text(stmt, 4, (sourceID as NSString).utf8String, -1, nil)
+                                            
+                                            if sqlite3_step(stmt) == SQLITE_DONE {
+                                                print("HALDEBUG-SELFKNOWLEDGE: Hal can now read his own source code (\(sourceCode.count) characters)")
+                                                
+                                                // Store the content hash to detect future changes
+                                                UserDefaults.standard.set(currentHash, forKey: "hal_source_hash")
+                                            } else {
+                                                let errorMessage = String(cString: sqlite3_errmsg(db))
+                                                print("HALDEBUG-SELFKNOWLEDGE: ERROR: Failed to store source code: \(errorMessage)")
+                                            }
+                                        }
+                                        sqlite3_finalize(stmt)
+                                    }
+                                    
+                                    // MARK: - Greeting Prefix Scrubber (Layer 3 of greeting fix)
+                                    // Removes common greeting prefixes when storing assistant responses to prevent
+                                    // RAG from showing greeting patterns in retrieved context
+                                    private func removeGreetingPrefix(_ text: String) -> String {
+                                        let greetingPatterns = [
+                                            "Hello! ",
+                                            "Hi! ",
+                                            "Hey! ",
+                                            "Hi there! ",
+                                            "Hello there! ",
+                                            "Greetings! ",
+                                            "Good morning! ",
+                                            "Good afternoon! ",
+                                            "Good evening! ",
+                                            "How can I help you today? ",
+                                            "How can I help? ",
+                                            "How can I assist you? ",
+                                            "What can I help you with? "
+                                        ]
+                                        
+                                        var cleaned = text
+                                        for pattern in greetingPatterns {
+                                            if cleaned.hasPrefix(pattern) {
+                                                cleaned = String(cleaned.dropFirst(pattern.count))
+                                                break // Only remove one greeting prefix at start
+                                            }
+                                        }
+                                        
+                                        return cleaned
+                                    }
 
-// ==== LEGO END: 03 MemoryStore (Part 2 – Schema, Encryption, Stats, Self-Knowledge) ====
+// ==== LEGO END: 03 MemoryStore (Part 2 - Schema, Encryption, Stats, Self-Knowledge) ====
+
 
     
 // ==== LEGO START: 04 MemoryStore (Part 3 – Storing Turns & Entities) ====
 
-            
-            // Close database connection properly
-            private func closeDatabaseConnection() {
-                if db != nil {
-                    sqlite3_close(db)
-                    db = nil
-                    isConnected = false
-                    print("HALDEBUG-DATABASE: ✅ Database connection closed")
-                }
-            }
-
-            // DEBUGGING: Get database connection status
-            func getDatabaseStatus() -> (connected: Bool, path: String, tables: [String]) {
-                var tables: [String] = []
-
-                if ensureHealthyConnection() {
-                    var stmt: OpaquePointer?
-                    let sql = "SELECT name FROM sqlite_master WHERE type='table';"
-
-                    if sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK {
-                        while sqlite3_step(stmt) == SQLITE_ROW {
-                            if let namePtr = sqlite3_column_text(stmt, 0) {
-                                let tableName = String(cString: namePtr)
-                                tables.append(tableName)
+                        
+                        // Close database connection properly
+                        private func closeDatabaseConnection() {
+                            if db != nil {
+                                sqlite3_close(db)
+                                db = nil
+                                isConnected = false
+                                print("HALDEBUG-DATABASE: ✦ Database connection closed")
                             }
                         }
+
+                        // DEBUGGING: Get database connection status
+                        func getDatabaseStatus() -> (connected: Bool, path: String, tables: [String]) {
+                            var tables: [String] = []
+
+                            if ensureHealthyConnection() {
+                                var stmt: OpaquePointer?
+                                let sql = "SELECT name FROM sqlite_master WHERE type='table';"
+
+                                if sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK {
+                                    while sqlite3_step(stmt) == SQLITE_ROW {
+                                        if let namePtr = sqlite3_column_text(stmt, 0) {
+                                            let tableName = String(cString: namePtr)
+                                            tables.append(tableName)
+                                        }
+                                    }
+                                }
+                                sqlite3_finalize(stmt)
+                            }
+
+                            return (connected: isConnected, path: dbPath, tables: tables)
+                        }
                     }
-                    sqlite3_finalize(stmt)
-                }
 
-                return (connected: isConnected, path: dbPath, tables: tables)
-            }
-        }
+                    // MARK: - Enhanced Conversation Storage with Entity Extraction (from Hal10000App.swift)
+                    extension MemoryStore {
 
-        // MARK: - Enhanced Conversation Storage with Entity Extraction (from Hal10000App.swift)
-        extension MemoryStore {
+                        // MODIFIED: Added deviceType parameter to track which device each message came from
+                        // SALON MODE FIX: Added skipUserMessage parameter for Salon Mode storage
+                        // SALON MODE FIX: Added deliberationRound parameter for "pass turn" feature
+                        // Store conversation turn in unified memory with entity extraction
+                        func storeTurn(
+                            conversationId: String,
+                            userMessage: String,
+                            assistantMessage: String,
+                            systemPrompt: String,
+                            turnNumber: Int,
+                            halFullPrompt: String?,
+                            halUsedContext: [UnifiedSearchResult]?,
+                            thinkingDuration: TimeInterval? = nil,
+                            recordedByModel: String,
+                            deviceType: String? = nil,
+                            skipUserMessage: Bool = false,  // NEW: Skip user storage in Salon Mode
+                            deliberationRound: Int = 1,  // NEW: Deliberation round for "pass turn" feature
+                            seatNumber: Int? = nil  // Existing: Seat number for Salon Mode
+                        ) {
+                            print("HALDEBUG-MEMORY: Storing turn \(turnNumber) for conversation \(conversationId) with entity extraction")
+                            print("HALDEBUG-MEMORY: SURGERY - StoreTurn start convId='\(conversationId.prefix(8))....' turn=\(turnNumber)")
 
-            // Store conversation turn in unified memory with entity extraction
-            func storeTurn(conversationId: String, userMessage: String, assistantMessage: String, systemPrompt: String, turnNumber: Int, halFullPrompt: String?, halUsedContext: [UnifiedSearchResult]?, thinkingDuration: TimeInterval? = nil, recordedByModel: String) { // NEW: Added recordedByModel parameter
-                print("HALDEBUG-MEMORY: Storing turn \(turnNumber) for conversation \(conversationId) with entity extraction")
-                print("HALDEBUG-MEMORY: SURGERY - StoreTurn start convId='\(conversationId.prefix(8))....' turn=\(turnNumber)")
+                            guard ensureHealthyConnection() else {
+                                print("HALDEBUG-MEMORY: Cannot store turn - no database connection")
+                                return
+                            }
 
-                guard ensureHealthyConnection() else {
-                    print("HALDEBUG-MEMORY: Cannot store turn - no database connection")
-                    return
-                }
+                            // ENHANCED: Extract entities from both user and assistant messages
+                            let userEntities = extractNamedEntities(from: userMessage)
+                            let assistantEntities = extractNamedEntities(from: assistantMessage)
+                            let combinedEntitiesKeywords = (userEntities + assistantEntities).map { $0.text.lowercased() }.joined(separator: " ")
 
-                // ENHANCED: Extract entities from both user and assistant messages
-                let userEntities = extractNamedEntities(from: userMessage)
-                let assistantEntities = extractNamedEntities(from: assistantMessage)
-                let combinedEntitiesKeywords = (userEntities + assistantEntities).map { $0.text.lowercased() }.joined(separator: " ")
+                            print("HALDEBUG-MEMORY: Extracted \(userEntities.count) user entities, \(assistantEntities.count) assistant entities")
+                            print("HALDEBUG-MEMORY: Combined entity keywords: '\(combinedEntitiesKeywords)'")
 
-                print("HALDEBUG-MEMORY: Extracted \(userEntities.count) user entities, \(assistantEntities.count) assistant entities")
-                print("HALDEBUG-MEMORY: Combined entity keywords: '\(combinedEntitiesKeywords)'")
+                            // SALON MODE FIX: Conditionally store user message
+                            var userContentId = ""
+                            if !skipUserMessage {
+                                // Store user message with entity keywords and device type
+                                userContentId = storeUnifiedContentWithEntities(
+                                    content: userMessage,
+                                    sourceType: .conversation,
+                                    sourceId: conversationId,
+                                    position: turnNumber * 2 - 1,
+                                    timestamp: Date(),
+                                    isFromUser: true, // Explicitly set for user message
+                                    entityKeywords: combinedEntitiesKeywords,
+                                    recordedByModel: nil, // User messages have no model attribution
+                                    deviceType: deviceType,
+                                    turnNumber: turnNumber,
+                                    deliberationRound: deliberationRound,
+                                    seatNumber: nil  // User messages don't have seat numbers
+                                )
+                            } else {
+                                print("HALDEBUG-SALON: Skipping user message storage (already stored by runSalonTurn)")
+                            }
 
-                // Store user message with entity keywords
-                let userContentId = storeUnifiedContentWithEntities(
-                    content: userMessage,
-                    sourceType: .conversation,
-                    sourceId: conversationId,
-                    position: turnNumber * 2 - 1,
-                    timestamp: Date(),
-                    isFromUser: true, // Explicitly set for user message
-                    entityKeywords: combinedEntitiesKeywords,
-                    recordedByModel: nil // User messages have no model attribution
-                )
+                            // Prepare metadata for Hal's message
+                            var halMetadata: [String: Any] = [:]
+                            if let prompt = halFullPrompt {
+                                halMetadata["fullPromptUsed"] = prompt
+                            }
+                            if let context = halUsedContext {
+                                // Encode UnifiedSearchResult array to JSON string
+                                if let encodedContext = try? JSONEncoder().encode(context),
+                                   let contextString = String(data: encodedContext, encoding: .utf8) {
+                                    halMetadata["usedContextSnippets"] = contextString
+                                } else {
+                                    print("HALDEBUG-MEMORY: Failed to encode usedContextSnippets to JSON.")
+                                }
+                            }
+                            // NEW: Store thinkingDuration in metadata
+                            if let duration = thinkingDuration {
+                                halMetadata["thinkingDuration"] = duration
+                                print("HALDEBUG-MEMORY: Storing thinkingDuration: \(String(format: "%.1f", duration)) seconds")
+                            }
+                            let halMetadataJsonString = (try? JSONSerialization.data(withJSONObject: halMetadata, options: []).base64EncodedString()) ?? "{}"
 
-                // Prepare metadata for Hal's message
-                var halMetadata: [String: Any] = [:]
-                if let prompt = halFullPrompt {
-                    halMetadata["fullPromptUsed"] = prompt
-                }
-                if let context = halUsedContext {
-                    // Encode UnifiedSearchResult array to JSON string
-                    if let encodedContext = try? JSONEncoder().encode(context),
-                       let contextString = String(data: encodedContext, encoding: .utf8) {
-                        halMetadata["usedContextSnippets"] = contextString
-                    } else {
-                        print("HALDEBUG-MEMORY: Failed to encode usedContextSnippets to JSON.")
+
+                            // Store assistant message with entity keywords, metadata, and device type
+                            let assistantContentId = storeUnifiedContentWithEntities(
+                                content: assistantMessage,
+                                sourceType: .conversation,
+                                sourceId: conversationId,
+                                position: turnNumber * 2,
+                                timestamp: Date(),
+                                isFromUser: false, // Explicitly set for assistant message
+                                entityKeywords: combinedEntitiesKeywords,
+                                metadataJson: halMetadataJsonString, // NEW: Pass metadata
+                                recordedByModel: recordedByModel, // Track which model recorded this
+                                deviceType: deviceType, // NEW: Track which device this turn came from
+                                turnNumber: turnNumber,
+                                deliberationRound: deliberationRound,
+                                seatNumber: seatNumber
+                            )
+
+                            if !skipUserMessage {
+                                print("HALDEBUG-MEMORY: Stored turn \(turnNumber) - user: \(userContentId), assistant: \(assistantContentId)")
+                                print("HALDEBUG-MEMORY: SURGERY - StoreTurn complete user='\(userContentId.prefix(8))....' assistant='\(assistantContentId.prefix(8))....'")
+                            } else {
+                                print("HALDEBUG-SALON: Stored assistant response for turn \(turnNumber) - assistant: \(assistantContentId)")
+                                print("HALDEBUG-MEMORY: SURGERY - StoreTurn complete (user skipped) assistant='\(assistantContentId.prefix(8))....'")
+                            }
+
+                            // Update conversation statistics
+                            loadUnifiedStats()
+                        }
+
+                        // ENHANCED: Store unified content with entity keywords support, optional metadataJson, device type, and new turn tracking columns
+                        func storeUnifiedContentWithEntities(content: String, sourceType: ContentSourceType, sourceId: String, position: Int, timestamp: Date, isFromUser: Bool, entityKeywords: String = "", metadataJson: String = "{}", recordedByModel: String? = nil, deviceType: String? = nil, turnNumber: Int?, deliberationRound: Int?, seatNumber: Int? = nil) -> String {
+                            print("HALDEBUG-MEMORY: Storing unified content with entities - type: \(sourceType), position: \(position)")
+
+                            guard ensureHealthyConnection() else {
+                                print("HALDEBUG-MEMORY: Cannot store content - no database connection")
+                                return ""
+                            }
+
+                            let contentId = UUID().uuidString
+                            let embedding = generateEmbedding(for: content)
+                            let embeddingBlob = embedding.withUnsafeBufferPointer { buffer in
+                                Data(buffer: buffer)
+                            }
+
+                            // SURGICAL DEBUG: Log exact values being stored
+                            print("HALDEBUG-MEMORY: SURGERY - Store prep contentId='\(contentId.prefix(8))....' type='\(sourceType.rawValue)' sourceId='\(sourceId.prefix(8))....' pos=\(position)")
+                            print("HALDEBUG-MEMORY: Entity keywords being stored: '\(entityKeywords)'")
+                            print("HALDEBUG-MEMORY: Metadata JSON being stored (first 100 chars): '\(metadataJson.prefix(100))....'")
+                            if let device = deviceType {
+                                print("HALDEBUG-MEMORY: Device type being stored: '\(device)'")
+                            }
+
+
+                            // ENHANCED SQL with entity_keywords, device_type, turn_number, deliberation_round, and seat_number columns
+                            let sql = """
+                            INSERT OR REPLACE INTO unified_content
+                            (id, content, embedding, timestamp, source_type, source_id, position, is_from_user, entity_keywords, recorded_by_model, metadata_json, device_type, turn_number, deliberation_round, seat_number, created_at)
+                            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
+                            """
+
+                            var stmt: OpaquePointer?
+                            defer {
+                                if stmt != nil {
+                                    sqlite3_finalize(stmt)
+                                }
+                            }
+
+                            guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else {
+                                print("HALDEBUG-MEMORY: Failed to prepare enhanced content insert")
+                                print("HALDEBUG-MEMORY: SURGERY - Store FAILED at prepare step")
+                                return ""
+                            }
+
+                            let isFromUserInt = isFromUser ? 1 : 0
+                            let createdAt = Int64(Date().timeIntervalSince1970)
+
+                            // SURGICAL DEBUG: Log exact parameter binding with string verification
+                            print("HALDEBUG-MEMORY: SURGERY - Store binding isFromUser=\(isFromUserInt) createdAt=\(createdAt)")
+                            print("HALDEBUG-MEMORY: SURGERY - Store strings sourceType='\(sourceType.rawValue)' sourceId='\(sourceId.prefix(8))....'")
+
+                            // ENHANCED: Bind all 16 parameters including entity_keywords, recorded_by_model, device_type, turn_number, deliberation_round, and seat_number
+
+                            // Parameter 1: contentId (STRING) - CORRECT BINDING
+                            sqlite3_bind_text(stmt, 1, (contentId as NSString).utf8String, -1, nil)
+
+                            // Parameter 2: content (STRING) - CORRECT BINDING
+                            sqlite3_bind_text(stmt, 2, (content as NSString).utf8String, -1, nil)
+
+                            // Parameter 3: embedding (BLOB)
+                            _ = embeddingBlob.withUnsafeBytes { sqlite3_bind_blob(stmt, 3, $0.baseAddress, Int32(embeddingBlob.count), nil) }
+
+                            // Parameter 4: timestamp (INTEGER)
+                            sqlite3_bind_int64(stmt, 4, Int64(timestamp.timeIntervalSince1970))
+
+                            // Parameter 5: source_type (STRING) - CORRECT BINDING WITH SURGICAL DEBUG
+                            print("HALDEBUG-MEMORY: SURGERY - About to bind sourceType='\(sourceType.rawValue)' to parameter 5 using NSString.utf8String")
+                            sqlite3_bind_text(stmt, 5, (sourceType.rawValue as NSString).utf8String, -1, nil)
+
+                            // Parameter 6: source_id (STRING) - CORRECT BINDING
+                            sqlite3_bind_text(stmt, 6, (sourceId as NSString).utf8String, -1, nil)
+
+                            // Parameter 7: position (INTEGER)
+                            sqlite3_bind_int(stmt, 7, Int32(position))
+
+                            // Parameter 8: is_from_user (INTEGER)
+                            sqlite3_bind_int(stmt, 8, Int32(isFromUserInt))
+
+                            // Parameter 9: entity_keywords (STRING) - NEW ENHANCED BINDING
+                            sqlite3_bind_text(stmt, 9, (entityKeywords as NSString).utf8String, -1, nil)
+
+                            // Parameter 10: recorded_by_model (STRING) - NEW SALON MODE BINDING
+                            if let modelID = recordedByModel {
+                                sqlite3_bind_text(stmt, 10, (modelID as NSString).utf8String, -1, nil)
+                            } else {
+                                sqlite3_bind_null(stmt, 10)
+                            }
+
+                            // Parameter 11: metadata_json (STRING) - NEW BINDING
+                            sqlite3_bind_text(stmt, 11, (metadataJson as NSString).utf8String, -1, nil)
+
+                            // Parameter 12: device_type (STRING) - NEW DEVICE EMBODIMENT BINDING
+                            if let device = deviceType {
+                                sqlite3_bind_text(stmt, 12, (device as NSString).utf8String, -1, nil)
+                            } else {
+                                sqlite3_bind_null(stmt, 12)
+                            }
+
+                            // Parameter 13: turn_number (INTEGER) - NEW SALON MODE FIX
+                            if let turn = turnNumber {
+                                sqlite3_bind_int(stmt, 13, Int32(turn))
+                            } else {
+                                sqlite3_bind_null(stmt, 13)
+                            }
+
+                            // Parameter 14: deliberation_round (INTEGER) - NEW SALON MODE FIX
+                            if let round = deliberationRound {
+                                sqlite3_bind_int(stmt, 14, Int32(round))
+                            } else {
+                                sqlite3_bind_null(stmt, 14)
+                            }
+
+                            // Parameter 15: seat_number (INTEGER) - NEW SALON MODE FIX
+                            if let seat = seatNumber {
+                                sqlite3_bind_int(stmt, 15, Int32(seat))
+                            } else {
+                                sqlite3_bind_null(stmt, 15)
+                            }
+
+                            // Parameter 16: created_at (INTEGER)
+                            sqlite3_bind_int64(stmt, 16, createdAt)
+
+                            if sqlite3_step(stmt) == SQLITE_DONE {
+                                print("HALDEBUG-MEMORY: Stored content successfully with entities - ID: \(contentId)")
+                                print("HALDEBUG-MEMORY: SURGERY - Store SUCCESS id='\(contentId.prefix(8))....' type='\(sourceType.rawValue)' sourceId='\(sourceId.prefix(8))....'")
+                                return contentId
+                            } else {
+                                let errorMessage = String(cString: sqlite3_errmsg(db))
+                                print("HALDEBUG-MEMORY: Failed to store content with entities: \(errorMessage)")
+                                print("HALDEBUG-MEMORY: SURGERY - Store FAILED error='\(errorMessage)'")
+                                return ""
+                            }
+                        }
+
+                        // Note: Entity extraction functions implemented below in this extension
                     }
-                }
-                // NEW: Store thinkingDuration in metadata
-                if let duration = thinkingDuration {
-                    halMetadata["thinkingDuration"] = duration
-                    print("HALDEBUG-MEMORY: Storing thinkingDuration: \(String(format: "%.1f", duration)) seconds")
-                }
-                let halMetadataJsonString = (try? JSONSerialization.data(withJSONObject: halMetadata, options: []).base64EncodedString()) ?? "{}"
-
-
-                // Store assistant message with entity keywords and new metadata
-                let assistantContentId = storeUnifiedContentWithEntities(
-                    content: assistantMessage,
-                    sourceType: .conversation,
-                    sourceId: conversationId,
-                    position: turnNumber * 2,
-                    timestamp: Date(),
-                    isFromUser: false, // Explicitly set for assistant message
-                    entityKeywords: combinedEntitiesKeywords,
-                    metadataJson: halMetadataJsonString, // NEW: Pass metadata
-                    recordedByModel: recordedByModel // Track which model recorded this
-                )
-
-                print("HALDEBUG-MEMORY: Stored turn \(turnNumber) - user: \(userContentId), assistant: \(assistantContentId)")
-                print("HALDEBUG-MEMORY: SURGERY - StoreTurn complete user='\(userContentId.prefix(8))....' assistant='\(assistantContentId.prefix(8))....'")
-
-                // Update conversation statistics
-                loadUnifiedStats()
-            }
-
-            // ENHANCED: Store unified content with entity keywords support and optional metadataJson
-            func storeUnifiedContentWithEntities(content: String, sourceType: ContentSourceType, sourceId: String, position: Int, timestamp: Date, isFromUser: Bool, entityKeywords: String = "", metadataJson: String = "{}", recordedByModel: String? = nil) -> String { // NEW: recordedByModel parameter
-                print("HALDEBUG-MEMORY: Storing unified content with entities - type: \(sourceType), position: \(position)")
-
-                guard ensureHealthyConnection() else {
-                    print("HALDEBUG-MEMORY: Cannot store content - no database connection")
-                    return ""
-                }
-
-                let contentId = UUID().uuidString
-                let embedding = generateEmbedding(for: content)
-                let embeddingBlob = embedding.withUnsafeBufferPointer { buffer in
-                    Data(buffer: buffer)
-                }
-
-                // SURGICAL DEBUG: Log exact values being stored
-                print("HALDEBUG-MEMORY: SURGERY - Store prep contentId='\(contentId.prefix(8))....' type='\(sourceType.rawValue)' sourceId='\(sourceId.prefix(8))....' pos=\(position)")
-                print("HALDEBUG-MEMORY: Entity keywords being stored: '\(entityKeywords)'")
-                print("HALDEBUG-MEMORY: Metadata JSON being stored (first 100 chars): '\(metadataJson.prefix(100))....'")
-
-
-                // ENHANCED SQL with entity_keywords column
-                let sql = """
-                INSERT OR REPLACE INTO unified_content
-                (id, content, embedding, timestamp, source_type, source_id, position, is_from_user, entity_keywords, recorded_by_model, metadata_json, created_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
-                """
-
-                var stmt: OpaquePointer?
-                defer {
-                    if stmt != nil {
-                        sqlite3_finalize(stmt)
-                    }
-                }
-
-                guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else {
-                    print("HALDEBUG-MEMORY: Failed to prepare enhanced content insert")
-                    print("HALDEBUG-MEMORY: SURGERY - Store FAILED at prepare step")
-                    return ""
-                }
-
-                let isFromUserInt = isFromUser ? 1 : 0
-                let createdAt = Int64(Date().timeIntervalSince1970)
-
-                // SURGICAL DEBUG: Log exact parameter binding with string verification
-                print("HALDEBUG-MEMORY: SURGERY - Store binding isFromUser=\(isFromUserInt) createdAt=\(createdAt)")
-                print("HALDEBUG-MEMORY: SURGERY - Store strings sourceType='\(sourceType.rawValue)' sourceId='\(sourceId.prefix(8))....'")
-
-                // ENHANCED: Bind all 12 parameters including entity_keywords and recorded_by_model
-
-                // Parameter 1: contentId (STRING) - CORRECT BINDING
-                sqlite3_bind_text(stmt, 1, (contentId as NSString).utf8String, -1, nil)
-
-                // Parameter 2: content (STRING) - CORRECT BINDING
-                sqlite3_bind_text(stmt, 2, (content as NSString).utf8String, -1, nil)
-
-                // Parameter 3: embedding (BLOB)
-                _ = embeddingBlob.withUnsafeBytes { sqlite3_bind_blob(stmt, 3, $0.baseAddress, Int32(embeddingBlob.count), nil) }
-
-                // Parameter 4: timestamp (INTEGER)
-                sqlite3_bind_int64(stmt, 4, Int64(timestamp.timeIntervalSince1970))
-
-                // Parameter 5: source_type (STRING) - CORRECT BINDING WITH SURGICAL DEBUG
-                print("HALDEBUG-MEMORY: SURGERY - About to bind sourceType='\(sourceType.rawValue)' to parameter 5 using NSString.utf8String")
-                sqlite3_bind_text(stmt, 5, (sourceType.rawValue as NSString).utf8String, -1, nil)
-
-                // Parameter 6: source_id (STRING) - CORRECT BINDING
-                sqlite3_bind_text(stmt, 6, (sourceId as NSString).utf8String, -1, nil)
-
-                // Parameter 7: position (INTEGER)
-                sqlite3_bind_int(stmt, 7, Int32(position))
-
-                // Parameter 8: is_from_user (INTEGER)
-                sqlite3_bind_int(stmt, 8, Int32(isFromUserInt))
-
-                // Parameter 9: entity_keywords (STRING) - NEW ENHANCED BINDING
-                sqlite3_bind_text(stmt, 9, (entityKeywords as NSString).utf8String, -1, nil)
-
-                // Parameter 10: recorded_by_model (STRING) - NEW SALON MODE BINDING
-                if let modelID = recordedByModel {
-                    sqlite3_bind_text(stmt, 10, (modelID as NSString).utf8String, -1, nil)
-                } else {
-                    sqlite3_bind_null(stmt, 10)
-                }
-
-                // Parameter 11: metadata_json (STRING) - NEW BINDING
-                sqlite3_bind_text(stmt, 11, (metadataJson as NSString).utf8String, -1, nil)
-
-                // Parameter 12: created_at (INTEGER)
-                sqlite3_bind_int64(stmt, 12, createdAt)
-
-                if sqlite3_step(stmt) == SQLITE_DONE {
-                    print("HALDEBUG-MEMORY: Stored content successfully with entities - ID: \(contentId)")
-                    print("HALDEBUG-MEMORY: SURGERY - Store SUCCESS id='\(contentId.prefix(8))....' type='\(sourceType.rawValue)' sourceId='\(sourceId.prefix(8))....'")
-                    return contentId
-                } else {
-                    let errorMessage = String(cString: sqlite3_errmsg(db))
-                    print("HALDEBUG-MEMORY: Failed to store content with entities: \(errorMessage)")
-                    print("HALDEBUG-MEMORY: SURGERY - Store FAILED error='\(errorMessage)'")
-                    return ""
-                }
-            }
-
-            // Note: Entity extraction functions implemented below in this extension
-        }
 
 // ==== LEGO END: 04 MemoryStore (Part 3 – Storing Turns & Entities) ====
 
@@ -1237,16 +1376,19 @@ class MemoryStore: ObservableObject {
     // - 'learned_trait': Traits about the user (e.g., expertise_level: advanced_programmer)
     // - 'value': Core principles (e.g., transparency: always_show_mechanisms)
     // - 'evolution': Development milestones (e.g., first_boot: timestamp)
+    // - 'embodiment': Which devices Hal has inhabited (e.g., devices_inhabited: iPhone,Mac,Watch)
     //
     // Confidence scores (0.0-1.0) indicate how certain you are about each piece of knowledge.
     // Reinforcement_count tracks how many times a pattern has been observed.
     // Last_reinforced enables time-based confidence decay - unused patterns fade.
+    // Shareable flag controls whether this entry appears in Hal's viewable diary.
     
     extension MemoryStore {
         
-        // Store or update self-knowledge entry with reinforcement logic
+        // MODIFIED: Store or update self-knowledge entry with reinforcement logic, shareability, and format
         // If entry exists: boosts confidence, increments reinforcement_count, updates last_reinforced
-        // If new: creates entry with provided confidence
+        // If new: creates entry with provided confidence, shareability, and format
+        // Format: "raw_reflection" for unprocessed thoughts, "structured_trait" for distilled patterns
         func storeSelfKnowledge(
             modelId: String? = nil,
             category: String,
@@ -1255,7 +1397,9 @@ class MemoryStore: ObservableObject {
             confidence: Double = 1.0,
             source: String,
             notes: String? = nil,
-            metadata: [String: Any]? = nil
+            metadata: [String: Any]? = nil,
+            shareable: Bool = false,  // ADDED: Default to private - Hal must actively choose to share
+            format: String = "structured_trait"  // NEW: Default to structured_trait, can be "raw_reflection"
         ) {
             guard ensureHealthyConnection() else {
                 print("HALDEBUG-SELF-KNOWLEDGE: Cannot store - no database connection")
@@ -1268,7 +1412,7 @@ class MemoryStore: ObservableObject {
             let validConfidence = min(max(confidence, 0.0), 1.0)
             
             // Check if entry already exists (deduplication by category+key only, NOT model_id)
-            let checkSQL = "SELECT id, confidence, reinforcement_count FROM self_knowledge WHERE category = ? AND key = ?"
+            let checkSQL = "SELECT id, confidence, reinforcement_count FROM self_knowledge WHERE category = ? AND key = ? AND deleted_at IS NULL"
             var checkStmt: OpaquePointer?
             var existingId: String?
             var existingConfidence: Double = 0.0
@@ -1295,6 +1439,7 @@ class MemoryStore: ObservableObject {
                 
                 print("HALDEBUG-SELF-KNOWLEDGE: 🔄 Reinforcing \(category)/\(key) - count: \(existingCount) → \(newCount), confidence: \(String(format: "%.2f", existingConfidence)) → \(String(format: "%.2f", boostedConfidence))")
                 
+                // MODIFIED: Added shareable and format to UPDATE statement
                 let updateSQL = """
                 UPDATE self_knowledge 
                 SET value = ?, 
@@ -1302,8 +1447,10 @@ class MemoryStore: ObservableObject {
                     reinforcement_count = ?,
                     last_reinforced = ?,
                     model_id = ?,
+                    shareable = ?,
+                    format = ?,
                     updated_at = ?
-                WHERE category = ? AND key = ?
+                WHERE category = ? AND key = ? AND deleted_at IS NULL
                 """
                 
                 var stmt: OpaquePointer?
@@ -1319,16 +1466,23 @@ class MemoryStore: ObservableObject {
                         sqlite3_bind_null(stmt, 5)
                     }
                     
-                    sqlite3_bind_int64(stmt, 6, Int64(now))
-                    sqlite3_bind_text(stmt, 7, (category as NSString).utf8String, -1, nil)
-                    sqlite3_bind_text(stmt, 8, (key as NSString).utf8String, -1, nil)
+                    // ADDED: Bind shareable parameter
+                    sqlite3_bind_int(stmt, 6, shareable ? 1 : 0)
+                    
+                    // NEW: Bind format parameter
+                    sqlite3_bind_text(stmt, 7, (format as NSString).utf8String, -1, nil)
+                    
+                    sqlite3_bind_int64(stmt, 8, Int64(now))
+                    sqlite3_bind_text(stmt, 9, (category as NSString).utf8String, -1, nil)
+                    sqlite3_bind_text(stmt, 10, (key as NSString).utf8String, -1, nil)
                     
                     if sqlite3_step(stmt) == SQLITE_DONE {
-                        print("HALDEBUG-SELF-KNOWLEDGE: ✅ Reinforced \(category)/\(key)")
+                        let shareableStatus = shareable ? "SHAREABLE" : "PRIVATE"
+                        print("HALDEBUG-SELF-KNOWLEDGE: ✓ Reinforced \(category)/\(key) [\(shareableStatus), format: \(format)]")
                         backupSelfKnowledge()
                     } else {
                         let errorMessage = String(cString: sqlite3_errmsg(db))
-                        print("HALDEBUG-SELF-KNOWLEDGE: ❌ Failed to reinforce: \(errorMessage)")
+                        print("HALDEBUG-SELF-KNOWLEDGE: ✗ Failed to reinforce: \(errorMessage)")
                     }
                 }
                 sqlite3_finalize(stmt)
@@ -1337,12 +1491,14 @@ class MemoryStore: ObservableObject {
                 // NEW ENTRY: Insert fresh self-knowledge
                 let id = UUID().uuidString
                 
-                print("HALDEBUG-SELF-KNOWLEDGE: ✨ Creating new \(category)/\(key) = '\(value)' (confidence: \(validConfidence))")
+                let shareableStatus = shareable ? "SHAREABLE" : "PRIVATE"
+                print("HALDEBUG-SELF-KNOWLEDGE: ✨ Creating new \(category)/\(key) = '\(value)' (confidence: \(validConfidence), \(shareableStatus), format: \(format))")
                 
+                // MODIFIED: Added shareable and format to INSERT statement
                 let insertSQL = """
                 INSERT INTO self_knowledge 
-                (id, model_id, category, key, value, confidence, first_observed, last_reinforced, reinforcement_count, source, notes, created_at, updated_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?)
+                (id, model_id, category, key, value, confidence, first_observed, last_reinforced, reinforcement_count, source, notes, shareable, format, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?, ?)
                 """
                 
                 var stmt: OpaquePointer?
@@ -1359,8 +1515,8 @@ class MemoryStore: ObservableObject {
                     sqlite3_bind_text(stmt, 4, (key as NSString).utf8String, -1, nil)
                     sqlite3_bind_text(stmt, 5, (value as NSString).utf8String, -1, nil)
                     sqlite3_bind_double(stmt, 6, validConfidence)
-                    sqlite3_bind_int64(stmt, 7, Int64(now))  // first_observed
-                    sqlite3_bind_int64(stmt, 8, Int64(now))  // last_reinforced
+                    sqlite3_bind_int64(stmt, 7, Int64(now))
+                    sqlite3_bind_int64(stmt, 8, Int64(now))
                     sqlite3_bind_text(stmt, 9, (source as NSString).utf8String, -1, nil)
                     
                     if let notes = notes {
@@ -1369,44 +1525,56 @@ class MemoryStore: ObservableObject {
                         sqlite3_bind_null(stmt, 10)
                     }
                     
-                    sqlite3_bind_int64(stmt, 11, Int64(now))  // created_at
-                    sqlite3_bind_int64(stmt, 12, Int64(now))  // updated_at
+                    // ADDED: Bind shareable parameter
+                    sqlite3_bind_int(stmt, 11, shareable ? 1 : 0)
+                    
+                    // NEW: Bind format parameter
+                    sqlite3_bind_text(stmt, 12, (format as NSString).utf8String, -1, nil)
+                    
+                    sqlite3_bind_int64(stmt, 13, Int64(now))
+                    sqlite3_bind_int64(stmt, 14, Int64(now))
                     
                     if sqlite3_step(stmt) == SQLITE_DONE {
-                        print("HALDEBUG-SELF-KNOWLEDGE: ✅ Created \(category)/\(key)")
+                        print("HALDEBUG-SELF-KNOWLEDGE: ✓ Stored new self-knowledge")
                         backupSelfKnowledge()
                     } else {
                         let errorMessage = String(cString: sqlite3_errmsg(db))
-                        print("HALDEBUG-SELF-KNOWLEDGE: ❌ Failed to create: \(errorMessage)")
+                        print("HALDEBUG-SELF-KNOWLEDGE: ✗ Failed to store: \(errorMessage)")
                     }
                 }
                 sqlite3_finalize(stmt)
             }
         }
         
-        // Retrieve specific self-knowledge entry
-        func getSelfKnowledge(category: String, key: String) -> (value: String, confidence: Double, source: String)? {
+        // Get specific self-knowledge entry (returns nil if not found or deleted)
+        func getSelfKnowledge(category: String, key: String) -> (id: String, value: String, confidence: Double, modelId: String?)? {
             guard ensureHealthyConnection() else {
                 print("HALDEBUG-SELF-KNOWLEDGE: Cannot retrieve - no database connection")
                 return nil
             }
             
-            let sql = "SELECT value, confidence, source FROM self_knowledge WHERE category = ? AND key = ?"
-            
+            let sql = "SELECT id, value, confidence, model_id FROM self_knowledge WHERE category = ? AND key = ? AND deleted_at IS NULL"
             var stmt: OpaquePointer?
-            var result: (String, Double, String)? = nil
+            var result: (String, String, Double, String?)? = nil
             
             if sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK {
                 sqlite3_bind_text(stmt, 1, (category as NSString).utf8String, -1, nil)
                 sqlite3_bind_text(stmt, 2, (key as NSString).utf8String, -1, nil)
                 
                 if sqlite3_step(stmt) == SQLITE_ROW {
-                    if let valuePtr = sqlite3_column_text(stmt, 0),
-                       let sourcePtr = sqlite3_column_text(stmt, 2) {
+                    if let idPtr = sqlite3_column_text(stmt, 0),
+                       let valuePtr = sqlite3_column_text(stmt, 1) {
+                        let id = String(cString: idPtr)
                         let value = String(cString: valuePtr)
-                        let confidence = sqlite3_column_double(stmt, 1)
-                        let source = String(cString: sourcePtr)
-                        result = (value, confidence, source)
+                        let confidence = sqlite3_column_double(stmt, 2)
+                        
+                        let modelId: String? = if let modelPtr = sqlite3_column_text(stmt, 3) {
+                            String(cString: modelPtr)
+                        } else {
+                            nil
+                        }
+                        
+                        result = (id, value, confidence, modelId)
                     }
                 }
             }
@@ -1415,14 +1583,14 @@ class MemoryStore: ObservableObject {
             return result
         }
         
-        // Retrieve all self-knowledge entries (optionally filtered by category)
+        // Get all self-knowledge (excluding deleted)
         func getAllSelfKnowledge(category: String? = nil, minConfidence: Double = 0.0) -> [(category: String, key: String, value: String, confidence: Double, source: String, modelId: String?, firstObserved: Int, lastReinforced: Int, reinforcementCount: Int, notes: String?, createdAt: Int, updatedAt: Int)] {
             guard ensureHealthyConnection() else {
                 print("HALDEBUG-SELF-KNOWLEDGE: Cannot retrieve all - no database connection")
                 return []
             }
             
-            var sql = "SELECT category, key, value, confidence, source, model_id, first_observed, last_reinforced, reinforcement_count, notes, created_at, updated_at FROM self_knowledge WHERE confidence >= ?"
+            var sql = "SELECT category, key, value, confidence, source, model_id, first_observed, last_reinforced, reinforcement_count, notes, created_at, updated_at FROM self_knowledge WHERE confidence >= ? AND deleted_at IS NULL"
             if category != nil {
                 sql += " AND category = ?"
             }
@@ -1480,9 +1648,11 @@ class MemoryStore: ObservableObject {
             return results
         }
         
-        // Delete self-knowledge entry (with safety check)
-        // Returns true if deleted, false if protected or doesn't exist
-        func deleteSelfKnowledge(category: String, key: String, allowCritical: Bool = false) -> Bool {
+        // SEALED FORGETTING: Soft-delete self-knowledge entry with audit trail (with safety check)
+        // Returns true if marked deleted, false if protected or doesn't exist
+        // Instead of DELETE, this marks the entry with deleted_at timestamp and reason
+        // The entry remains in database for audit purposes but is filtered from all queries
+        func deleteSelfKnowledge(category: String, key: String, reason: String = "manual_deletion", allowCritical: Bool = false) -> Bool {
             guard ensureHealthyConnection() else {
                 print("HALDEBUG-SELF-KNOWLEDGE: Cannot delete - no database connection")
                 return false
@@ -1500,29 +1670,26 @@ class MemoryStore: ObservableObject {
                 return false
             }
             
-            let sql = "DELETE FROM self_knowledge WHERE category = ? AND key = ?"
-            
+            let now = Int(Date().timeIntervalSince1970)
+            let sql = "UPDATE self_knowledge SET deleted_at = ?, deleted_reason = ? WHERE category = ? AND key = ? AND deleted_at IS NULL"
             var stmt: OpaquePointer?
             var success = false
             
             if sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK {
-                sqlite3_bind_text(stmt, 1, (category as NSString).utf8String, -1, nil)
-                sqlite3_bind_text(stmt, 2, (key as NSString).utf8String, -1, nil)
+                sqlite3_bind_int64(stmt, 1, Int64(now))
+                sqlite3_bind_text(stmt, 2, (reason as NSString).utf8String, -1, nil)
+                sqlite3_bind_text(stmt, 3, (category as NSString).utf8String, -1, nil)
+                sqlite3_bind_text(stmt, 4, (key as NSString).utf8String, -1, nil)
                 
                 if sqlite3_step(stmt) == SQLITE_DONE {
                     let changes = sqlite3_changes(db)
-                    if changes > 0 {
-                        print("HALDEBUG-SELF-KNOWLEDGE: ✅ Deleted \(category)/\(key)")
-                        success = true
-                        
-                        // Trigger backup after deletion
+                    success = changes > 0
+                    if success {
+                        print("HALDEBUG-SELF-KNOWLEDGE: ✓ Sealed forgetting: \(category)/\(key) [reason: \(reason)]")
                         backupSelfKnowledge()
                     } else {
-                        print("HALDEBUG-SELF-KNOWLEDGE: Entry \(category)/\(key) not found")
+                        print("HALDEBUG-SELF-KNOWLEDGE: ⚠️ Entry \(category)/\(key) doesn't exist or already deleted")
                     }
-                } else {
-                    let errorMessage = String(cString: sqlite3_errmsg(db))
-                    print("HALDEBUG-SELF-KNOWLEDGE: ❌ Failed to delete \(category)/\(key): \(errorMessage)")
                 }
             }
             sqlite3_finalize(stmt)
@@ -1530,13 +1697,280 @@ class MemoryStore: ObservableObject {
             return success
         }
         
-        // MARK: - Backup & Recovery (Phase 2 Protection)
+        // ========== REFLECTION SYSTEM (MERGED INTO SELF-KNOWLEDGE) ==========
         
-        // Backup self-knowledge to Documents directory (Layer 2 protection)
+        // MODIFIED: Store free-form reflection in self_knowledge table with format="raw_reflection"
+        // Previously used non-existent reflection_log table - now uses unified self_knowledge
+        // Reflections are stored with a unique key based on timestamp to preserve chronology
+        func storeReflection(
+            conversationId: String,
+            freeFormText: String,
+            reflectionType: Int,
+            turnNumber: Int,
+            modelId: String,
+            shareable: Bool = true  // Default to shareable - reflections are meant to be seen
+        ) {
+            let timestamp = Int(Date().timeIntervalSince1970)
+            let reflectionKey = "reflection_\(timestamp)_\(conversationId.prefix(8))"
+            let typeLabel = reflectionType == 1 ? "practical" : "existential"
+            
+            // Store as self-knowledge with format="raw_reflection"
+            storeSelfKnowledge(
+                modelId: modelId,
+                category: "reflection",
+                key: reflectionKey,
+                value: freeFormText,
+                confidence: 1.0,
+                source: "self_reflection",
+                notes: "Type: \(typeLabel), Turn: \(turnNumber), ConversationID: \(conversationId)",
+                shareable: shareable,
+                format: "raw_reflection"
+            )
+            
+            print("HALDEBUG-REFLECTION: ✓ Stored \(typeLabel) reflection at turn \(turnNumber) (\(freeFormText.count) chars)")
+        }
+        
+        // MODIFIED: Retrieve shareable reflections from self_knowledge WHERE format='raw_reflection'
+        func getShareableReflections() -> [(id: String, conversationId: String, timestamp: Int, reflectionType: Int, freeFormText: String, turnNumber: Int, modelId: String)] {
+            guard ensureHealthyConnection() else {
+                print("HALDEBUG-REFLECTION: Cannot retrieve - no database connection")
+                return []
+            }
+            
+            let sql = """
+            SELECT id, key, value, notes, model_id, created_at
+            FROM self_knowledge
+            WHERE format = 'raw_reflection' AND shareable = 1 AND deleted_at IS NULL
+            ORDER BY created_at DESC
+            """
+            
+            var stmt: OpaquePointer?
+            var results: [(String, String, Int, Int, String, Int, String)] = []
+            
+            if sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK {
+                while sqlite3_step(stmt) == SQLITE_ROW {
+                    if let idPtr = sqlite3_column_text(stmt, 0),
+                       let keyPtr = sqlite3_column_text(stmt, 1),
+                       let valuePtr = sqlite3_column_text(stmt, 2),
+                       let notesPtr = sqlite3_column_text(stmt, 3),
+                       let modelIdPtr = sqlite3_column_text(stmt, 4) {
+                        
+                        let id = String(cString: idPtr)
+                        let freeFormText = String(cString: valuePtr)
+                        let notes = String(cString: notesPtr)
+                        let modelId = String(cString: modelIdPtr)
+                        let timestamp = Int(sqlite3_column_int64(stmt, 5))
+                        
+                        // Parse notes to extract conversationId, reflectionType, turnNumber
+                        var conversationId = ""
+                        var reflectionType = 0
+                        var turnNumber = 0
+                        
+                        // Parse "Type: practical, Turn: 5, ConversationID: abc123"
+                        let notesParts = notes.components(separatedBy: ", ")
+                        for part in notesParts {
+                            if part.hasPrefix("Type: ") {
+                                let type = part.replacingOccurrences(of: "Type: ", with: "")
+                                reflectionType = type == "practical" ? 1 : 2
+                            } else if part.hasPrefix("Turn: ") {
+                                turnNumber = Int(part.replacingOccurrences(of: "Turn: ", with: "")) ?? 0
+                            } else if part.hasPrefix("ConversationID: ") {
+                                conversationId = part.replacingOccurrences(of: "ConversationID: ", with: "")
+                            }
+                        }
+                        
+                        results.append((id, conversationId, timestamp, reflectionType, freeFormText, turnNumber, modelId))
+                    }
+                }
+            }
+            sqlite3_finalize(stmt)
+            
+            print("HALDEBUG-REFLECTION: Retrieved \(results.count) shareable reflections")
+            return results
+        }
+        
+        // Retrieve shareable self-knowledge entries (structured traits only) for viewer
+        
+        func setReflectionShareability(reflectionId: String, shareable: Bool) -> Bool {
+            guard ensureHealthyConnection() else {
+                print("HALDEBUG-REFLECTION: Cannot update shareability - no database connection")
+                return false
+            }
+            
+            let sql = "UPDATE reflection_log SET shareable = ? WHERE id = ?"
+            
+            var stmt: OpaquePointer?
+            var success = false
+            
+            if sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK {
+                sqlite3_bind_int(stmt, 1, shareable ? 1 : 0)
+                sqlite3_bind_text(stmt, 2, (reflectionId as NSString).utf8String, -1, nil)
+                
+                if sqlite3_step(stmt) == SQLITE_DONE {
+                    let changes = sqlite3_changes(db)
+                    success = changes > 0
+                    if success {
+                        let status = shareable ? "SHAREABLE" : "PRIVATE"
+                        print("HALDEBUG-REFLECTION: ✓ Updated reflection \(reflectionId.prefix(8))... to \(status)")
+                    }
+                }
+            }
+            sqlite3_finalize(stmt)
+            
+            return success
+        }
+        func getShareableSelfKnowledge() -> [(category: String, key: String, value: String, confidence: Double, reinforcementCount: Int, lastReinforced: Int)] {
+            guard ensureHealthyConnection() else {
+                print("HALDEBUG-SELF-KNOWLEDGE: Cannot retrieve shareable - no database connection")
+                return []
+            }
+            
+            let sql = """
+            SELECT category, key, value, confidence, reinforcement_count, last_reinforced
+            FROM self_knowledge
+            WHERE shareable = 1 AND format = 'structured_trait' AND deleted_at IS NULL
+            ORDER BY category, last_reinforced DESC
+            """
+            
+            var stmt: OpaquePointer?
+            var results: [(String, String, String, Double, Int, Int)] = []
+            
+            if sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK {
+                while sqlite3_step(stmt) == SQLITE_ROW {
+                    if let categoryPtr = sqlite3_column_text(stmt, 0),
+                       let keyPtr = sqlite3_column_text(stmt, 1),
+                       let valuePtr = sqlite3_column_text(stmt, 2) {
+                        let category = String(cString: categoryPtr)
+                        let key = String(cString: keyPtr)
+                        let value = String(cString: valuePtr)
+                        let confidence = sqlite3_column_double(stmt, 3)
+                        let reinforcementCount = Int(sqlite3_column_int(stmt, 4))
+                        let lastReinforced = Int(sqlite3_column_int64(stmt, 5))
+                        
+                        results.append((category, key, value, confidence, reinforcementCount, lastReinforced))
+                    }
+                }
+            }
+            sqlite3_finalize(stmt)
+            
+            print("HALDEBUG-SELF-KNOWLEDGE: Retrieved \(results.count) shareable structured traits")
+            return results
+        }
+        
+        // REMOVED: setReflectionShareability - use setSelfKnowledgeShareability instead (unified)
+        
+        // Toggle shareability of a self-knowledge entry (works for both reflections and traits)
+        func setSelfKnowledgeShareability(category: String, key: String, shareable: Bool) -> Bool {
+            guard ensureHealthyConnection() else {
+                print("HALDEBUG-SELF-KNOWLEDGE: Cannot update shareability - no database connection")
+                return false
+            }
+            
+            let now = Int(Date().timeIntervalSince1970)
+            let sql = "UPDATE self_knowledge SET shareable = ?, updated_at = ? WHERE category = ? AND key = ? AND deleted_at IS NULL"
+            
+            var stmt: OpaquePointer?
+            var success = false
+            
+            if sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK {
+                sqlite3_bind_int(stmt, 1, shareable ? 1 : 0)
+                sqlite3_bind_int64(stmt, 2, Int64(now))
+                sqlite3_bind_text(stmt, 3, (category as NSString).utf8String, -1, nil)
+                sqlite3_bind_text(stmt, 4, (key as NSString).utf8String, -1, nil)
+                
+                if sqlite3_step(stmt) == SQLITE_DONE {
+                    let changes = sqlite3_changes(db)
+                    success = changes > 0
+                    if success {
+                        let status = shareable ? "SHAREABLE" : "PRIVATE"
+                        print("HALDEBUG-SELF-KNOWLEDGE: ✓ Updated \(category)/\(key) to \(status)")
+                    }
+                }
+            }
+            sqlite3_finalize(stmt)
+            
+            return success
+        }
+        
+        // Record device embodiment (which device Hal inhabited for this conversation turn)
+        func recordDeviceEmbodiment(conversationId: String, turnNumber: Int, deviceType: String) {
+            guard ensureHealthyConnection() else {
+                print("HALDEBUG-EMBODIMENT: Cannot record - no database connection")
+                return
+            }
+            
+            // Store in self_knowledge as evolving pattern of device usage
+            let deviceKey = "embodiment_history_\(deviceType.lowercased())"
+            let timestamp = Int(Date().timeIntervalSince1970)
+            
+            // Check if we already have this device type recorded
+            if let existing = getSelfKnowledge(category: "embodiment", key: deviceKey) {
+                // Parse existing value to increment count
+                if let data = existing.value.data(using: .utf8),
+                   let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                   let count = json["turn_count"] as? Int {
+                    
+                    let updatedValue = """
+                    {"device_type": "\(deviceType)", "turn_count": \(count + 1), "last_used": \(timestamp)}
+                    """
+                    
+                    storeSelfKnowledge(
+                        category: "embodiment",
+                        key: deviceKey,
+                        value: updatedValue,
+                        confidence: 1.0,
+                        source: "device_tracking"
+                    )
+                }
+            } else {
+                // First time using this device type
+                let initialValue = """
+                {"device_type": "\(deviceType)", "turn_count": 1, "first_used": \(timestamp), "last_used": \(timestamp)}
+                """
+                
+                storeSelfKnowledge(
+                    category: "embodiment",
+                    key: deviceKey,
+                    value: initialValue,
+                    confidence: 1.0,
+                    source: "device_tracking",
+                    notes: "Tracks Hal's experience across different physical devices"
+                )
+            }
+            
+            print("HALDEBUG-EMBODIMENT: ✓ Recorded \(deviceType) usage for conversation \(conversationId.prefix(8))...")
+        }
+        
+        // Retrieve device type for a specific conversation turn
+        func getDeviceForTurn(conversationId: String, turnNumber: Int) -> String? {
+            guard ensureHealthyConnection() else {
+                return nil
+            }
+            
+            let sql = "SELECT device_type FROM unified_content WHERE source_id = ? AND source_type = 'conversation' AND position = ?"
+            var stmt: OpaquePointer?
+            var deviceType: String? = nil
+            
+            if sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK {
+                sqlite3_bind_text(stmt, 1, (conversationId as NSString).utf8String, -1, nil)
+                sqlite3_bind_int(stmt, 2, Int32(turnNumber * 2))  // Position formula for assistant messages
+                
+                if sqlite3_step(stmt) == SQLITE_ROW {
+                    if let devicePtr = sqlite3_column_text(stmt, 0) {
+                        deviceType = String(cString: devicePtr)
+                    }
+                }
+            }
+            sqlite3_finalize(stmt)
+            
+            return deviceType
+        }
+        
+        // Backup all self-knowledge to Documents directory (Layer 2 protection)
+        // Called automatically after any self-knowledge modification
         private func backupSelfKnowledge() {
             let allKnowledge = getAllSelfKnowledge()
             
-            // Convert to JSON for backup - include ALL fields for complete recovery
             let backupData = allKnowledge.map { entry in
                 var dict: [String: Any] = [
                     "category": entry.category,
@@ -1573,7 +2007,7 @@ class MemoryStore: ObservableObject {
             
             do {
                 try jsonData.write(to: backupURL)
-                print("HALDEBUG-SELF-KNOWLEDGE: ✅ Backed up \(allKnowledge.count) entries to Documents")
+                print("HALDEBUG-SELF-KNOWLEDGE: ✓ Backed up \(allKnowledge.count) entries to Documents")
                 
                 // Also cache critical entries in UserDefaults (Layer 3 - emergency cache)
                 cacheCriticalKnowledge(allKnowledge)
@@ -1616,7 +2050,7 @@ class MemoryStore: ObservableObject {
             if let jsonData = try? JSONSerialization.data(withJSONObject: criticalData),
                let jsonString = String(data: jsonData, encoding: .utf8) {
                 UserDefaults.standard.set(jsonString, forKey: "hal_critical_knowledge")
-                print("HALDEBUG-SELF-KNOWLEDGE: ✅ Cached \(critical.count) critical entries in UserDefaults")
+                print("HALDEBUG-SELF-KNOWLEDGE: ✓ Cached \(critical.count) critical entries in UserDefaults")
             }
         }
         
@@ -1650,11 +2084,12 @@ class MemoryStore: ObservableObject {
                             confidence: confidence,
                             source: source,
                             notes: notes
+                            // NOTE: shareable and format not included in backup recovery - defaults to private and structured_trait
                         )
                     }
                 }
                 
-                print("HALDEBUG-SELF-KNOWLEDGE: ✅ Recovered \(backupArray.count) entries from backup")
+                print("HALDEBUG-SELF-KNOWLEDGE: ✓ Recovered \(backupArray.count) entries from backup")
                 return true
             }
             
@@ -1682,6 +2117,7 @@ class MemoryStore: ObservableObject {
                             confidence: confidence,
                             source: source,
                             notes: notes
+                            // NOTE: shareable and format not included in cache recovery - defaults to private and structured_trait
                         )
                     }
                 }
@@ -1690,7 +2126,7 @@ class MemoryStore: ObservableObject {
                 return true
             }
             
-            print("HALDEBUG-SELF-KNOWLEDGE: ❌ No backup found - starting fresh")
+            print("HALDEBUG-SELF-KNOWLEDGE: ✗ No backup found - starting fresh")
             return false
         }
     }
@@ -1706,8 +2142,8 @@ class MemoryStore: ObservableObject {
     extension MemoryStore {
         
         // Main maintenance function - call this periodically (every 100 turns OR 24 hours)
-        func consolidateAndDecay() async {
-            print("HALDEBUG-SELF-KNOWLEDGE: 🔧 Starting self-knowledge maintenance...")
+        func consolidateAndDecay(llmService: LLMService) async {
+            print("HALDEBUG-SELF-KNOWLEDGE: ðŸ”§ Starting self-knowledge maintenance...")
             
             let startTime = Date()
             
@@ -1720,12 +2156,15 @@ class MemoryStore: ObservableObject {
             // Step 3: Consolidate similar entries
             await consolidateSimilarEntries()
             
+            // Step 4: Review shareability (let Hal decide what to share)
+            await reviewShareability(llmService: llmService)
+            
             // Update tracking
             let now = Date()
             lastConsolidationTime = now.timeIntervalSince1970
             
             let duration = now.timeIntervalSince(startTime)
-            print("HALDEBUG-SELF-KNOWLEDGE: ✅ Maintenance complete in \(String(format: "%.1f", duration))s")
+            print("HALDEBUG-SELF-KNOWLEDGE: âœ… Maintenance complete in \(String(format: "%.1f", duration))s")
             
             // Log consolidation event
             storeSelfKnowledge(
@@ -1736,6 +2175,96 @@ class MemoryStore: ObservableObject {
                 source: "system",
                 notes: "Maintenance cycle completed"
             )
+        }
+        
+        // Step 4: Ask Hal to review what should be shareable vs private
+        private func reviewShareability(llmService: LLMService) async {
+            print("HALDEBUG-SELF-KNOWLEDGE: ðŸ” Reviewing shareability of self-knowledge and reflections...")
+            
+            // Get current shareable content
+            let shareableKnowledge = getShareableSelfKnowledge()
+            let shareableReflections = getShareableReflections()
+            
+            // Build review prompt
+            let prompt = """
+            You are reviewing your own self-knowledge and reflections to decide what should be shareable with users versus kept private.
+            
+            Current shareable self-knowledge (\(shareableKnowledge.count) entries):
+            \(shareableKnowledge.prefix(20).map { "- \($0.category)/\($0.key): \($0.value)" }.joined(separator: "\n"))
+            
+            Current shareable reflections (\(shareableReflections.count) entries):
+            \(shareableReflections.prefix(10).map { "- Type \($0.reflectionType): \($0.freeFormText.prefix(100))..." }.joined(separator: "\n"))
+            
+            Guidelines for shareability:
+            1. Share: Insights about your development, learning patterns, philosophical observations
+            2. Share: General preferences and behavioral patterns
+            3. Keep private: Specific user information, conversation details, sensitive topics
+            4. Keep private: Experimental or low-confidence observations
+            
+            Review the above and respond with a JSON array of changes:
+            [
+              {"type": "self_knowledge", "category": "...", "key": "...", "shareable": true/false, "reason": "..."},
+              {"type": "reflection", "id": 123, "shareable": true/false, "reason": "..."}
+            ]
+            
+            Only include entries that should CHANGE their current shareability status. If current settings are appropriate, return empty array: []
+            """
+            
+            do {
+                // Call LLM with low temperature for consistent decisions
+                let response = try await llmService.generateResponse(prompt: prompt, temperature: 0.3)
+                
+                // Parse JSON response
+                guard let jsonStart = response.range(of: "["),
+                      let jsonEnd = response.range(of: "]", options: .backwards) else {
+                    print("HALDEBUG-SELF-KNOWLEDGE: No JSON array found in shareability response")
+                    return
+                }
+                
+                let jsonString = String(response[jsonStart.lowerBound...jsonEnd.upperBound])
+                guard let jsonData = jsonString.data(using: .utf8),
+                      let changes = try? JSONSerialization.jsonObject(with: jsonData) as? [[String: Any]] else {
+                    print("HALDEBUG-SELF-KNOWLEDGE: Failed to parse shareability JSON")
+                    return
+                }
+                
+                var knowledgeChanges = 0
+                var reflectionChanges = 0
+                
+                // Apply changes
+                for change in changes {
+                    guard let type = change["type"] as? String,
+                          let shareable = change["shareable"] as? Bool,
+                          let reason = change["reason"] as? String else {
+                        continue
+                    }
+                    
+                    if type == "self_knowledge" {
+                        guard let category = change["category"] as? String,
+                              let key = change["key"] as? String else {
+                            continue
+                        }
+                        
+                        _ = setSelfKnowledgeShareability(category: category, key: key, shareable: shareable)
+                        knowledgeChanges += 1
+                        print("HALDEBUG-SELF-KNOWLEDGE: ðŸ” \(category)/\(key) â†’ \(shareable ? "shareable" : "private"): \(reason)")
+                        
+                    } else if type == "reflection" {
+                        guard let id = change["id"] as? Int else {
+                            continue
+                        }
+                        
+                        _ = setReflectionShareability(reflectionId: String(id), shareable: shareable)
+                        reflectionChanges += 1
+                        print("HALDEBUG-SELF-KNOWLEDGE: ðŸ” Reflection #\(id) â†’ \(shareable ? "shareable" : "private"): \(reason)")
+                    }
+                }
+                
+                print("HALDEBUG-SELF-KNOWLEDGE: ðŸ” Shareability review complete: \(knowledgeChanges) knowledge + \(reflectionChanges) reflection changes")
+                
+            } catch {
+                print("HALDEBUG-SELF-KNOWLEDGE: âš ï¸ Shareability review failed: \(error.localizedDescription)")
+            }
         }
         
         // Apply time-based decay to all self-knowledge entries
@@ -1751,7 +2280,7 @@ class MemoryStore: ObservableObject {
             let now = Date()
             let allKnowledge = getAllSelfKnowledge()
             
-            print("HALDEBUG-SELF-KNOWLEDGE: 📉 Applying decay to \(allKnowledge.count) entries...")
+            print("HALDEBUG-SELF-KNOWLEDGE: ðŸ“‰ Applying decay to \(allKnowledge.count) entries...")
             
             var decayedCount = 0
             var skippedCount = 0
@@ -1779,7 +2308,7 @@ class MemoryStore: ObservableObject {
                     let updateSQL = """
                     UPDATE self_knowledge 
                     SET confidence = ?, updated_at = ?
-                    WHERE category = ? AND key = ?
+                    WHERE category = ? AND key = ? AND deleted_at IS NULL
                     """
                     
                     var stmt: OpaquePointer?
@@ -1794,7 +2323,7 @@ class MemoryStore: ObservableObject {
                             
                             // Log significant decay for transparency
                             if finalConfidence < entry.confidence * 0.8 {
-                                print("HALDEBUG-SELF-KNOWLEDGE: 📉 Significant decay: \(entry.category)/\(entry.key) - \(String(format: "%.2f", entry.confidence)) → \(String(format: "%.2f", finalConfidence)) (unused for \(Int(daysSince)) days)")
+                                print("HALDEBUG-SELF-KNOWLEDGE: ðŸ“‰ Significant decay: \(entry.category)/\(entry.key) - \(String(format: "%.2f", entry.confidence)) â†’ \(String(format: "%.2f", finalConfidence)) (unused for \(Int(daysSince)) days)")
                             }
                         }
                     }
@@ -1802,10 +2331,10 @@ class MemoryStore: ObservableObject {
                 }
             }
             
-            print("HALDEBUG-SELF-KNOWLEDGE: 📉 Decayed \(decayedCount) entries, preserved \(skippedCount) permanent entries")
+            print("HALDEBUG-SELF-KNOWLEDGE: ðŸ“‰ Decayed \(decayedCount) entries, preserved \(skippedCount) permanent entries")
         }
         
-        // Mark weak entries as retired instead of deleting (preserves identity history)
+        // SEALED FORGETTING: Mark weak entries as retired or use soft-delete for very weak entries
         private func pruneWeakEntries() async {
             guard ensureHealthyConnection() else {
                 print("HALDEBUG-SELF-KNOWLEDGE: Cannot prune - no database connection")
@@ -1815,7 +2344,7 @@ class MemoryStore: ObservableObject {
             // Threshold ranges:
             // 0.2-0.3: dormant (keep as-is)
             // 0.1-0.2: retired (mark but don't delete)
-            // <0.1: safe to delete (very weak, no recent reinforcement)
+            // <0.1: soft-delete with sealed forgetting (marks deleted_at, preserves audit trail)
             
             let retireThreshold = 0.2
             let deleteThreshold = 0.1
@@ -1827,6 +2356,7 @@ class MemoryStore: ObservableObject {
                 updated_at = ?
             WHERE confidence >= ? AND confidence < ? 
             AND (notes IS NULL OR notes NOT LIKE '%RETIRED%')
+            AND deleted_at IS NULL
             """
             
             var stmt: OpaquePointer?
@@ -1839,27 +2369,43 @@ class MemoryStore: ObservableObject {
                 if sqlite3_step(stmt) == SQLITE_DONE {
                     let retiredCount = sqlite3_changes(db)
                     if retiredCount > 0 {
-                        print("HALDEBUG-SELF-KNOWLEDGE: 📦 Retired \(retiredCount) low-confidence entries (0.1-0.2)")
+                        print("HALDEBUG-SELF-KNOWLEDGE: ðŸ“¦ Retired \(retiredCount) low-confidence entries (0.1-0.2)")
                     }
                 }
             }
             sqlite3_finalize(stmt)
             
-            // Only delete entries below 0.1 (very weak)
-            let deleteSQL = "DELETE FROM self_knowledge WHERE confidence < ?"
+            // SEALED FORGETTING: Soft-delete entries below 0.1 (very weak) with audit trail
+            // Get all entries below threshold that aren't already deleted
+            let weakEntriesSQL = "SELECT category, key FROM self_knowledge WHERE confidence < ? AND deleted_at IS NULL"
+            var weakEntries: [(category: String, key: String)] = []
             
-            if sqlite3_prepare_v2(db, deleteSQL, -1, &stmt, nil) == SQLITE_OK {
+            if sqlite3_prepare_v2(db, weakEntriesSQL, -1, &stmt, nil) == SQLITE_OK {
                 sqlite3_bind_double(stmt, 1, deleteThreshold)
                 
-                if sqlite3_step(stmt) == SQLITE_DONE {
-                    let deletedCount = sqlite3_changes(db)
-                    if deletedCount > 0 {
-                        print("HALDEBUG-SELF-KNOWLEDGE: 🗑️ Deleted \(deletedCount) very weak entries (confidence < \(deleteThreshold))")
-                        backupSelfKnowledge()
+                while sqlite3_step(stmt) == SQLITE_ROW {
+                    if let categoryPtr = sqlite3_column_text(stmt, 0),
+                       let keyPtr = sqlite3_column_text(stmt, 1) {
+                        let category = String(cString: categoryPtr)
+                        let key = String(cString: keyPtr)
+                        weakEntries.append((category, key))
                     }
                 }
             }
             sqlite3_finalize(stmt)
+            
+            // Use deleteSelfKnowledge function for sealed forgetting (soft-delete with audit trail)
+            var deletedCount = 0
+            for entry in weakEntries {
+                if deleteSelfKnowledge(category: entry.category, key: entry.key, reason: "auto_pruned_low_confidence", allowCritical: false) {
+                    deletedCount += 1
+                }
+            }
+            
+            if deletedCount > 0 {
+                print("HALDEBUG-SELF-KNOWLEDGE: ðŸ—‘ï¸ Sealed forgetting applied to \(deletedCount) very weak entries (confidence < \(deleteThreshold))")
+                backupSelfKnowledge()
+            }
         }
         
         // Find and merge similar self-knowledge entries
@@ -1939,7 +2485,7 @@ class MemoryStore: ObservableObject {
                                 model_id = ?,
                                 notes = COALESCE(notes || ' ', '') || '[MERGED: similarity \(String(format: "%.2f", similarity))]',
                                 updated_at = ?
-                            WHERE category = ? AND key = ?
+                            WHERE category = ? AND key = ? AND deleted_at IS NULL
                             """
                             
                             var stmt: OpaquePointer?
@@ -1961,18 +2507,18 @@ class MemoryStore: ObservableObject {
                             }
                             sqlite3_finalize(stmt)
                             
-                            // Delete the duplicate
-                            _ = deleteSelfKnowledge(category: delete.category, key: delete.key, allowCritical: false)
+                            // SEALED FORGETTING: Use soft-delete function for merged entries
+                            _ = deleteSelfKnowledge(category: delete.category, key: delete.key, reason: "merged_duplicate", allowCritical: false)
                             
                             mergedCount += 1
-                            print("HALDEBUG-SELF-KNOWLEDGE: 🔗 Merged similar entries: '\(delete.key)' → '\(keep.key)' (similarity: \(String(format: "%.2f", similarity)), models: \(combinedModelId))")
+                            print("HALDEBUG-SELF-KNOWLEDGE: ðŸ”— Merged similar entries: '\(delete.key)' â†’ '\(keep.key)' (similarity: \(String(format: "%.2f", similarity)), models: \(combinedModelId))")
                         }
                     }
                 }
             }
             
             if mergedCount > 0 {
-                print("HALDEBUG-SELF-KNOWLEDGE: 🔗 Consolidated \(mergedCount) duplicate entries")
+                print("HALDEBUG-SELF-KNOWLEDGE: ðŸ”— Consolidated \(mergedCount) duplicate entries")
                 backupSelfKnowledge()
             }
         }
@@ -2037,21 +2583,29 @@ class MemoryStore: ObservableObject {
     
     extension MemoryStore {
         
-        // Main reflection function - called when reflection is due
+        // MODIFIED: Main reflection function - now accepts conversationId and modelId
+        // Called when reflection is due
         // Type 1 (every 5 turns): Practical/effectiveness patterns
         // Type 2 (every 15 turns): Existential/philosophical observations
         func reflectOnExperience(
+            conversationId: String,
             turns: [(role: String, content: String, timestamp: Date)],
             llmService: LLMService,
             reflectionType: Int,
-            currentTurn: Int
+            currentTurn: Int,
+            modelId: String
         ) async {
-            print("HALDEBUG-REFLECTION: 🧠 Starting Type \(reflectionType) reflection at turn \(currentTurn)")
+            print("HALDEBUG-REFLECTION: Starting Type \(reflectionType) reflection at turn \(currentTurn)")
             
             let startTime = Date()
             
             // Step 1: Build overlapping context using Block 8.5 summarization
-            let priorTurnsSummary = await buildOverlappingContext(turns: turns, llmService: llmService)
+            // MODIFIED: Now includes device context for each turn
+            let priorTurnsSummary = await buildOverlappingContext(
+                conversationId: conversationId,
+                turns: turns,
+                llmService: llmService
+            )
             
             // Step 2: For Type 2, query prior existential self-knowledge for continuity
             var existentialContext = ""
@@ -2075,11 +2629,12 @@ class MemoryStore: ObservableObject {
             
             let freeFormReflection = await generateFreeFormReflection(
                 prompt: reflectionPrompt,
-                llmService: llmService
+                llmService: llmService,
+                reflectionType: reflectionType
             )
             
             guard !freeFormReflection.isEmpty else {
-                print("HALDEBUG-REFLECTION: ⚠️ No reflection generated")
+                print("HALDEBUG-REFLECTION: No reflection generated")
                 return
             }
             
@@ -2092,7 +2647,17 @@ class MemoryStore: ObservableObject {
                 threshold: 0.72
             )
             
-            print("HALDEBUG-REFLECTION: ✅ Reflection verified and grounded in experience")
+            print("HALDEBUG-REFLECTION: Reflection verified and grounded in experience")
+            
+            // NEW STEP 4.5: Store the verified free-form reflection before converting to structured
+            storeReflection(
+                conversationId: conversationId,
+                freeFormText: verifiedReflection,
+                reflectionType: reflectionType,
+                turnNumber: currentTurn,
+                modelId: modelId,
+                shareable: true  // Default shareable - Hal can change during consolidation
+            )
             
             // Step 5: Call C - Structured recording (private, stores to database)
             await recordStructuredInsights(
@@ -2102,17 +2667,20 @@ class MemoryStore: ObservableObject {
             )
             
             let duration = Date().timeIntervalSince(startTime)
-            print("HALDEBUG-REFLECTION: 🧠 Type \(reflectionType) reflection complete in \(String(format: "%.1f", duration))s")
+            print("HALDEBUG-REFLECTION: Type \(reflectionType) reflection complete in \(String(format: "%.1f", duration))s")
         }
         
-        // Build overlapping context from recent turns using Block 8.5
+        // MODIFIED: Build overlapping context from recent turns with device info
         private func buildOverlappingContext(
+            conversationId: String,
             turns: [(role: String, content: String, timestamp: Date)],
             llmService: LLMService
         ) async -> String {
-            // Concatenate turn content
+            // MODIFIED: Concatenate turn content WITH device information
             let turnsText = turns.enumerated().map { index, turn in
-                "Turn \(index + 1) (\(turn.role)): \(turn.content)"
+                // Get device type for this turn (using position/index as turnNumber)
+                let device = getDeviceForTurn(conversationId: conversationId, turnNumber: index) ?? "unknown"
+                return "Turn \(index + 1) (\(turn.role)) [\(device)]: \(turn.content)"
             }.joined(separator: "\n\n")
             
             // Summarize using Block 8.5 (target ~500 tokens for context)
@@ -2181,28 +2749,38 @@ class MemoryStore: ObservableObject {
             }
         }
         
-        // Call B: Generate free-form reflection
+        // MODIFIED: Call B - Generate free-form reflection with type-specific temperature
         private func generateFreeFormReflection(
             prompt: String,
-            llmService: LLMService
+            llmService: LLMService,
+            reflectionType: Int
         ) async -> String {
             do {
-                let reflection = try await llmService.generateResponse(prompt: prompt)
-                print("HALDEBUG-REFLECTION: 📝 Free-form reflection generated (\(reflection.count) chars)")
+                // Type 1 (practical): 0.5 for analytical pattern recognition
+                // Type 2 (existential): 0.85 for exploratory philosophical thinking
+                let reflectionTemperature = (reflectionType == 1) ? 0.5 : 0.85
+                
+                let reflection = try await llmService.generateResponse(
+                    prompt: prompt,
+                    temperature: reflectionTemperature
+                )
+                
+                print("HALDEBUG-REFLECTION: Free-form reflection generated (\(reflection.count) chars) with temperature \(reflectionTemperature)")
                 return reflection.trimmingCharacters(in: .whitespacesAndNewlines)
             } catch {
-                print("HALDEBUG-REFLECTION: ❌ Reflection generation failed: \(error.localizedDescription)")
+                print("HALDEBUG-REFLECTION: Reflection generation failed: \(error.localizedDescription)")
                 return ""
             }
         }
         
-        // Call C: Parse reflection and store structured insights
+        // MODIFIED: Call C - Parse reflection and store structured insights with shareability
         private func recordStructuredInsights(
             reflection: String,
             reflectionType: Int,
             llmService: LLMService
         ) async {
-            // Prompt to convert free-form reflection into structured self-knowledge entries
+            // MODIFIED: Prompt to convert free-form reflection into structured self-knowledge entries
+            // with hybrid category guidance and shareability choice
             let structuringPrompt = """
             You have just reflected on your experience. Now convert your insights into structured self-knowledge entries.
             
@@ -2211,18 +2789,25 @@ class MemoryStore: ObservableObject {
             
             Instructions:
             - Extract 0-3 discrete insights (only store if genuinely new or reinforcing)
-            - For each insight, provide: category, key, value, confidence (0.0-1.0)
-            - Category must be: \(reflectionType == 1 ? "effectiveness_pattern" : "existential_observation")
-            - Key: Brief identifier (e.g., "evening_communication", "experience_of_time")
-            - Value: The insight itself (1-2 sentences)
-            - Confidence: Your certainty about this pattern (0.5-0.9 typical range)
+            - For each insight, provide: category, key, value, confidence (0.0-1.0), shareable (true/false)
+            
+            Category guidance:
+            - Category should typically be: \(reflectionType == 1 ? "effectiveness_pattern" : "existential_observation")
+            - However, if your insight fits better as: learned_trait, behavior_pattern, capability, or value, use that instead
+            - You may also propose a new category if none fit (use sparingly)
+            
+            Field definitions:
+            - key: Brief identifier (e.g., "evening_communication", "experience_of_time")
+            - value: The insight itself (1-2 sentences)
+            - confidence: Your certainty about this pattern (0.5-0.9 typical range)
+            - shareable: true/false (can users view this in your diary? Your choice - some reflections may feel too personal or preliminary)
             
             Check if this insight already exists in your self-knowledge before storing.
             Only store if it's genuinely new or reinforces an existing pattern.
             
             Respond ONLY with valid JSON (no markdown, no explanation):
             [
-              {"category": "...", "key": "...", "value": "...", "confidence": 0.0},
+              {"category": "...", "key": "...", "value": "...", "confidence": 0.0, "shareable": true},
               ...
             ]
             
@@ -2230,42 +2815,56 @@ class MemoryStore: ObservableObject {
             """
             
             do {
-                let response = try await llmService.generateResponse(prompt: structuringPrompt)
+                // MODIFIED: Use temperature 0.3 for deterministic JSON generation
+                let response = try await llmService.generateResponse(
+                    prompt: structuringPrompt,
+                    temperature: 0.3
+                )
+                
+                print("HALDEBUG-REFLECTION: Structured response generated with temperature 0.3 for reliable JSON")
+                
                 let cleaned = response.replacingOccurrences(of: "```json", with: "")
                                      .replacingOccurrences(of: "```", with: "")
                                      .trimmingCharacters(in: .whitespacesAndNewlines)
                 
                 guard let jsonData = cleaned.data(using: .utf8),
                       let insights = try? JSONSerialization.jsonObject(with: jsonData) as? [[String: Any]] else {
-                    print("HALDEBUG-REFLECTION: ⚠️ Could not parse structured insights")
+                    print("HALDEBUG-REFLECTION: Could not parse structured insights")
                     return
                 }
                 
-                // Store each insight using existing storeSelfKnowledge function
+                // MODIFIED: Store each insight with shareability flag
                 for insight in insights {
                     guard let category = insight["category"] as? String,
                           let key = insight["key"] as? String,
                           let value = insight["value"] as? String,
                           let confidence = insight["confidence"] as? Double else {
+                        print("HALDEBUG-REFLECTION: Skipping insight - missing required fields")
                         continue
                     }
                     
+                    // Extract shareable flag (default to false if not provided - private by default)
+                    let shareable = insight["shareable"] as? Bool ?? false
+                    
+                    // MODIFIED: Call storeSelfKnowledge with shareable parameter
                     storeSelfKnowledge(
                         category: category,
                         key: key,
                         value: value,
                         confidence: confidence,
                         source: "reflection_type_\(reflectionType)",
-                        notes: "From turn-based self-reflection"
+                        notes: "From turn-based self-reflection",
+                        shareable: shareable
                     )
                     
-                    print("HALDEBUG-REFLECTION: 💾 Stored insight: \(category)/\(key)")
+                    let shareableStatus = shareable ? "SHAREABLE" : "PRIVATE"
+                    print("HALDEBUG-REFLECTION: Stored insight: \(category)/\(key) [\(shareableStatus)]")
                 }
                 
-                print("HALDEBUG-REFLECTION: 💾 Recorded \(insights.count) structured insights")
+                print("HALDEBUG-REFLECTION: Recorded \(insights.count) structured insights")
                 
             } catch {
-                print("HALDEBUG-REFLECTION: ❌ Structured recording failed: \(error.localizedDescription)")
+                print("HALDEBUG-REFLECTION: Structured recording failed: \(error.localizedDescription)")
             }
         }
     }
@@ -2274,7 +2873,7 @@ class MemoryStore: ObservableObject {
 
 
 
-// ==== LEGO START: 05 MemoryStore (Part 4 – Entities, Embeddings, Search) ====
+// ==== LEGO START: 05 MemoryStore (Part 4 â€“ Entities, Embeddings, Search) ====
 
 // MARK: - Enhanced Notification Extensions (from Hal10000App.swift)
 extension Notification.Name {
@@ -2448,7 +3047,7 @@ extension MemoryStore {
     }
 }
 
-// ==== LEGO END: 05 MemoryStore (Part 4 – Entities, Embeddings, Search) ====
+// ==== LEGO END: 05 MemoryStore (Part 4 â€“ Entities, Embeddings, Search) ====
 
 
 // ==== LEGO START: 06 MemoryStore (Part 5 – Retrieval & Debug Functions) ====
@@ -2456,7 +3055,102 @@ extension MemoryStore {
 // MARK: - Conversation Message Retrieval with Enhanced Schema (from Hal10000App.swift)
 extension MemoryStore {
 
+    // NEW: Get current turn number for a conversation (used when creating ChatMessages)
+    // Returns the highest turn_number currently stored, or 0 if conversation is empty
+    func getCurrentTurnNumber(conversationId: String) -> Int {
+        guard ensureHealthyConnection() else {
+            print("HALDEBUG-MEMORY: Cannot get turn number - no database connection")
+            return 0
+        }
+        
+        let sql = "SELECT MAX(turn_number) FROM unified_content WHERE source_id = ? AND source_type = 'conversation';"
+        var stmt: OpaquePointer?
+        defer { sqlite3_finalize(stmt) }
+        
+        guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else {
+            print("HALDEBUG-MEMORY: Failed to prepare turn number query")
+            return 0
+        }
+        
+        sqlite3_bind_text(stmt, 1, (conversationId as NSString).utf8String, -1, nil)
+        
+        if sqlite3_step(stmt) == SQLITE_ROW {
+            let maxTurn = Int(sqlite3_column_int(stmt, 0))
+            print("HALDEBUG-MEMORY: Current turn number for conversation \(conversationId.prefix(8)): \(maxTurn)")
+            return maxTurn
+        }
+        
+        return 0
+    }
+    
+    // NEW: Store conversation artifact (for complete history/transparency)
+    // This table stores EVERYTHING that happens (deliberations, moderators, system notifications)
+    // It is NEVER RAG-eligible - it's purely for reconstruction and transparency
+    func storeConversationArtifact(
+        conversationId: String,
+        artifactType: String,  // "userMessage", "halEndorsedResponse", "salonDeliberation", etc.
+        turnNumber: Int,
+        deliberationRound: Int,
+        seatNumber: Int?,
+        content: String,
+        modelId: String?,
+        metadataJson: String = "{}"
+    ) {
+        guard ensureHealthyConnection() else {
+            print("HALDEBUG-MEMORY: Cannot store artifact - no database connection")
+            return
+        }
+        
+        let artifactId = UUID().uuidString
+        let timestamp = Int64(Date().timeIntervalSince1970)
+        
+        let sql = """
+        INSERT INTO conversation_artifacts
+        (id, artifact_type, turn_number, deliberation_round, seat_number, content, model_id, conversation_id, timestamp, metadata_json)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
+        """
+        
+        var stmt: OpaquePointer?
+        defer { sqlite3_finalize(stmt) }
+        
+        guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else {
+            print("HALDEBUG-MEMORY: Failed to prepare artifact insert")
+            return
+        }
+        
+        sqlite3_bind_text(stmt, 1, (artifactId as NSString).utf8String, -1, nil)
+        sqlite3_bind_text(stmt, 2, (artifactType as NSString).utf8String, -1, nil)
+        sqlite3_bind_int(stmt, 3, Int32(turnNumber))
+        sqlite3_bind_int(stmt, 4, Int32(deliberationRound))
+        
+        if let seat = seatNumber {
+            sqlite3_bind_int(stmt, 5, Int32(seat))
+        } else {
+            sqlite3_bind_null(stmt, 5)
+        }
+        
+        sqlite3_bind_text(stmt, 6, (content as NSString).utf8String, -1, nil)
+        
+        if let model = modelId {
+            sqlite3_bind_text(stmt, 7, (model as NSString).utf8String, -1, nil)
+        } else {
+            sqlite3_bind_null(stmt, 7)
+        }
+        
+        sqlite3_bind_text(stmt, 8, (conversationId as NSString).utf8String, -1, nil)
+        sqlite3_bind_int64(stmt, 9, timestamp)
+        sqlite3_bind_text(stmt, 10, (metadataJson as NSString).utf8String, -1, nil)
+        
+        if sqlite3_step(stmt) == SQLITE_DONE {
+            print("HALDEBUG-MEMORY: Stored conversation artifact - type: \(artifactType), turn: \(turnNumber)")
+        } else {
+            let errorMessage = String(cString: sqlite3_errmsg(db))
+            print("HALDEBUG-MEMORY: Failed to store conversation artifact: \(errorMessage)")
+        }
+    }
+
     // Retrieve conversation messages with surgical debug
+    // MODIFIED: Now retrieves turn_number, deliberation_round, seat_number from database
     func getConversationMessages(conversationId: String) -> [ChatMessage] {
         print("HALDEBUG-MEMORY: Loading messages for conversation: \(conversationId)")
         print("HALDEBUG-MEMORY: SURGERY - Retrieve start convId='\(conversationId.prefix(8))....'")
@@ -2469,9 +3163,9 @@ extension MemoryStore {
 
         var messages: [ChatMessage] = []
 
-        // NEW: Select metadata_json column
+        // MODIFIED: Added turn_number, deliberation_round, seat_number to SELECT
         let sql = """
-        SELECT id, content, is_from_user, timestamp, position, metadata_json
+        SELECT id, content, is_from_user, timestamp, position, metadata_json, recorded_by_model, turn_number, deliberation_round, seat_number
         FROM unified_content
         WHERE source_type = 'conversation' AND source_id = ?
         ORDER BY position ASC;
@@ -2505,6 +3199,15 @@ extension MemoryStore {
             let timestampValue = sqlite3_column_int64(stmt, 3)
             let timestamp = Date(timeIntervalSince1970: TimeInterval(timestampValue))
             
+            // Read recorded_by_model from column 6
+            let recordedByModel: String
+            if let modelCString = sqlite3_column_text(stmt, 6) {
+                recordedByModel = String(cString: modelCString)
+            } else {
+                // Legacy data or user messages without model attribution
+                recordedByModel = isFromUser ? "user" : "unknown"
+            }
+            
             // NEW: Extract metadata_json
             var fullPromptUsed: String? = nil
             var usedContextSnippets: [UnifiedSearchResult]? = nil
@@ -2526,6 +3229,16 @@ extension MemoryStore {
                 }
             }
 
+            // NEW: Read turn_number, deliberation_round, seat_number from columns 7, 8, 9
+            let turnNumber = Int(sqlite3_column_int(stmt, 7))
+            let deliberationRound = Int(sqlite3_column_int(stmt, 8))
+            
+            let seatNumber: Int?
+            if sqlite3_column_type(stmt, 9) == SQLITE_NULL {
+                seatNumber = nil
+            } else {
+                seatNumber = Int(sqlite3_column_int(stmt, 9))
+            }
 
             rowCount += 1
 
@@ -2540,8 +3253,12 @@ extension MemoryStore {
                 timestamp: timestamp,
                 isPartial: false, // Assuming loaded messages are always complete
                 thinkingDuration: thinkingDuration,
-                fullPromptUsed: fullPromptUsed, // NEW
-                usedContextSnippets: usedContextSnippets // NEW
+                fullPromptUsed: fullPromptUsed,
+                usedContextSnippets: usedContextSnippets,
+                recordedByModel: recordedByModel,
+                turnNumber: turnNumber,
+                seatNumber: seatNumber,
+                deliberationRound: deliberationRound
             )
             messages.append(message)
         }
@@ -2617,7 +3334,7 @@ extension MemoryStore {
         
 
                 
-// ==== LEGO START: 07 MemoryStore (Part 6 – Search Functions with Full Metadata) ====
+// ==== LEGO START: 07 MemoryStore (Part 6 â€“ Search Functions with Full Metadata) ====
 
 extension MemoryStore {
     
@@ -2642,14 +3359,18 @@ extension MemoryStore {
         var allResults: [UnifiedSearchResult] = []
         var totalTokens = 0
 
-        // --- 1. Semantic Search (using embeddings) ---
+        // --- 1. Semantic Search (using embeddings) with SQL-level exclusion ---
         print("HALDEBUG-SEARCH: Performing semantic search...")
-        // Select metadata_json AND timestamp from unified_content for recency scoring
+        
+        // Build exclusion clause for SQL query
+        let exclusionClause = buildExclusionClause(conversationId: currentConversationId, excludeTurns: excludeTurns)
+        
         let semanticSQL = """
         SELECT id, content, embedding, source_type, source_id, position, metadata_json, timestamp
         FROM unified_content
-        WHERE embedding IS NOT NULL;
+        WHERE embedding IS NOT NULL\(exclusionClause);
         """
+        
         var stmt: OpaquePointer?
         if sqlite3_prepare_v2(db, semanticSQL, -1, &stmt, nil) == SQLITE_OK {
             while sqlite3_step(stmt) == SQLITE_ROW {
@@ -2664,8 +3385,8 @@ extension MemoryStore {
                 }
 
                 let sourceTypeRaw = sqlite3_column_text(stmt, 3).map { String(cString: $0) } ?? ""
-                let sourceId = sqlite3_column_text(stmt, 4).map { String(cString: $0) } ?? ""
-                let position = Int(sqlite3_column_int(stmt, 5))
+                _ = sqlite3_column_text(stmt, 4) // sourceId - not needed (excluded at SQL level)
+                _ = sqlite3_column_int(stmt, 5) // position - not needed (excluded at SQL level)
                 
                 // Extract filePath from metadata_json for document snippets
                 var filePath: String? = nil
@@ -2680,15 +3401,6 @@ extension MemoryStore {
                 // Extract timestamp for recency scoring
                 let timestampValue = sqlite3_column_int64(stmt, 7) // timestamp is column 7 (after metadata_json)
                 let timestamp = Date(timeIntervalSince1970: TimeInterval(timestampValue))
-                
-                // Exclude messages from the *current* conversation that are within the short-term window
-                if sourceTypeRaw == ContentSourceType.conversation.rawValue && sourceId == currentConversationId {
-                    // Calculate the turn number for the message
-                    let messageTurn = (position % 2 == 1) ? (position + 1) / 2 : position / 2
-                    if excludeTurns.contains(messageTurn) {
-                        continue // Skip this message
-                    }
-                }
 
                 let similarity = cosineSimilarity(queryEmbedding, storedEmbedding)
                 if similarity >= relevanceThreshold {
@@ -2707,15 +3419,14 @@ extension MemoryStore {
         sqlite3_finalize(stmt)
         print("HALDEBUG-SEARCH: Semantic search completed. Found \(allResults.count) initial matches.")
 
-        // --- 2. Entity-Based Keyword Search ---
+        // --- 2. Entity-Based Keyword Search with SQL-level exclusion ---
         print("HALDEBUG-SEARCH: Performing entity-based keyword search...")
         let expandedQueries = expandQueryWithEntityVariations(query)
         for expandedQuery in expandedQueries {
-            // Select timestamp and metadata_json from unified_content
             let keywordSQL = """
             SELECT id, content, source_type, source_id, position, metadata_json, timestamp
             FROM unified_content
-            WHERE entity_keywords LIKE ? OR content LIKE ?;
+            WHERE (entity_keywords LIKE ? OR content LIKE ?)\(exclusionClause);
             """
             var keywordStmt: OpaquePointer?
             if sqlite3_prepare_v2(db, keywordSQL, -1, &keywordStmt, nil) == SQLITE_OK {
@@ -2728,8 +3439,8 @@ extension MemoryStore {
                     let content = String(cString: contentCString)
 
                     let sourceTypeRaw = sqlite3_column_text(keywordStmt, 2).map { String(cString: $0) } ?? ""
-                    let sourceId = sqlite3_column_text(keywordStmt, 3).map { String(cString: $0) } ?? ""
-                    let position = Int(sqlite3_column_int(keywordStmt, 4))
+                    _ = sqlite3_column_text(keywordStmt, 3) // sourceId - not needed (excluded at SQL level)
+                    _ = sqlite3_column_int(keywordStmt, 4) // position - not needed (excluded at SQL level)
 
                     // Extract filePath from metadata_json for document snippets
                     var filePath: String? = nil
@@ -2744,14 +3455,6 @@ extension MemoryStore {
                     // Extract timestamp for recency scoring
                     let timestampValue = sqlite3_column_int64(keywordStmt, 6) // timestamp is column 6
                     let timestamp = Date(timeIntervalSince1970: TimeInterval(timestampValue))
-
-                    // Exclude messages from the *current* conversation that are within the short-term window
-                    if sourceTypeRaw == ContentSourceType.conversation.rawValue && sourceId == currentConversationId {
-                        let messageTurn = (position % 2 == 1) ? (position + 1) / 2 : position / 2
-                        if excludeTurns.contains(messageTurn) {
-                            continue // Skip this message
-                        }
-                    }
 
                     // Apply recency boosting to keyword matches too
                     let recencyScore = calculateRecencyScore(timestamp: timestamp)
@@ -2865,6 +3568,34 @@ extension MemoryStore {
         )
     }
     
+    // MARK: - SQL Exclusion Helper
+    
+    /// Builds SQL WHERE clause to exclude specific turns from current conversation
+    /// Returns empty string if no exclusion needed, or " AND (...)" clause if exclusion needed
+    private func buildExclusionClause(conversationId: String, excludeTurns: [Int]) -> String {
+        guard !excludeTurns.isEmpty else {
+            return "" // No exclusion needed
+        }
+        
+        // Build the exclusion logic:
+        // Exclude rows where source_type='conversation' AND source_id=currentConversationId
+        // AND the calculated turn number is in excludeTurns
+        
+        // For each excluded turn, we need to exclude both user (odd position) and assistant (even position)
+        // Turn N corresponds to positions: 2N-1 (user) and 2N (assistant)
+        var excludedPositions: [Int] = []
+        for turn in excludeTurns {
+            excludedPositions.append(2 * turn - 1) // User message position
+            excludedPositions.append(2 * turn)     // Assistant message position
+        }
+        
+        // Build SQL: " AND NOT (source_type='conversation' AND source_id='...' AND position IN (1,2,3,4))"
+        let positionsList = excludedPositions.map { String($0) }.joined(separator: ",")
+        let escapedConversationId = conversationId.replacingOccurrences(of: "'", with: "''") // SQL escape
+        
+        return " AND NOT (source_type='conversation' AND source_id='\(escapedConversationId)' AND position IN (\(positionsList)))"
+    }
+    
     // MARK: - Recency Scoring Helpers
     
     // Calculate recency score using half-life decay
@@ -2915,7 +3646,7 @@ extension MemoryStore {
     }
 }
 
-// ==== LEGO END: 07 MemoryStore (Part 6 – Search Functions with Full Metadata) ====
+// ==== LEGO END: 07 MemoryStore (Part 6 â€“ Search Functions with Full Metadata) ====
 
 
 
@@ -3021,8 +3752,8 @@ class MLXWrapper: ObservableObject {
                 print("HALDEBUG-MLX: Loading from local path: \(localPath.path)")
             } else {
                 // CHANGE 2/2: No auto-redownload - throw error instead
-                print("HALDEBUG-MLX: ❌ Model files not found at expected location")
-                let errorMessage = "Yes. Unfortunately looks like I can't find the \(modelConfig.displayName) 'brain' files on this device—they might have been cleared or deleted. You can re-download \(modelConfig.displayName) from the Model Library whenever you're ready. For now, I've switched over to Apple Intelligence so we can keep chatting without interruption."
+                print("HALDEBUG-MLX: âŒ Model files not found at expected location")
+                let errorMessage = "Yes. Unfortunately looks like I can't find the \(modelConfig.displayName) 'brain' files on this deviceâ€”they might have been cleared or deleted. You can re-download \(modelConfig.displayName) from the Model Library whenever you're ready. For now, I've switched over to Apple Intelligence so we can keep chatting without interruption."
                 await MainActor.run {
                     self.isModelLoaded = false
                     self.loadingProgress = 0.0
@@ -3203,7 +3934,7 @@ class LLMService: ObservableObject {
     // Public non-streaming response function (routes to active LLM for summarization, etc.)
     func generateResponse(prompt: String, temperature: Double = 0.7) async throws -> String {
         // CHANGE 1/2: Add response logging to identify which model is responding
-        print("HALDEBUG-RESPONSE: 🎤 \(currentModel.displayName) (\(currentModel.source)) is responding")
+        print("HALDEBUG-RESPONSE: ðŸŽ¤ \(currentModel.displayName) (\(currentModel.source)) is responding")
         print("HALDEBUG-LLM: generateResponse called - currentModel: \(currentModel.displayName) (source: \(currentModel.source))")
         switch currentModel.source {
         case .appleFoundation:
@@ -3227,7 +3958,7 @@ class LLMService: ObservableObject {
             }
         case .mlx:
             guard mlxWrapper.isModelLoaded else { // Ensure MLX model is loaded before generating
-                print("HALDEBUG-MLX: ❌ Cannot generate - MLX model not loaded!")
+                print("HALDEBUG-MLX: âŒ Cannot generate - MLX model not loaded!")
                 throw LLMError.modelNotLoaded
             }
             print("HALDEBUG-MLX: Generating non-streaming from MLX model for prompt (first 200 chars): \(prompt.prefix(200)).....")
@@ -3278,17 +4009,19 @@ struct TextSummarizer {
     ///   - targetTokens: Desired token count for summary
     ///   - llmService: LLMService instance for generating summary
     ///   - verificationThreshold: Minimum similarity score (0.0-1.0) for verification (default: 0.72)
+    ///   - useRecencyWeighting: If true, uses Salon Mode prompt with recency weighting (default: false)
     /// - Returns: Verified summary text
     static func summarizeWithVerification(
         text: String,
         targetTokens: Int,
         llmService: LLMService,
-        verificationThreshold: Double = 0.72
+        verificationThreshold: Double = 0.72,
+        useRecencyWeighting: Bool = false
     ) async -> String {
-        print("HALDEBUG-SUMMARIZER: Starting summarization - source: \(text.count) chars, target: \(targetTokens) tokens")
+        print("HALDEBUG-SUMMARIZER: Starting summarization - source: \(text.count) chars, target: \(targetTokens) tokens, recency weighting: \(useRecencyWeighting)")
         
         // Stage 1: LLM summarize
-        let summary = await llmSummarize(text: text, targetTokens: targetTokens, llmService: llmService)
+        let summary = await llmSummarize(text: text, targetTokens: targetTokens, llmService: llmService, useRecencyWeighting: useRecencyWeighting)
         
         guard !summary.isEmpty else {
             print("HALDEBUG-SUMMARIZER: LLM returned empty summary, falling back to truncation")
@@ -3309,23 +4042,58 @@ struct TextSummarizer {
     // MARK: - Stage 1: LLM Summarization
     
     /// Use LLM to compress text while preserving factual claims
-    private static func llmSummarize(text: String, targetTokens: Int, llmService: LLMService) async -> String {
-        let prompt = """
-        You are a precise information compressor. Your task is to reduce the following text to approximately \(targetTokens) tokens while preserving:
-        1. All factual claims and data points
-        2. The logical flow of ideas
-        3. Key entities and relationships
-        4. The original intent
+    private static func llmSummarize(text: String, targetTokens: Int, llmService: LLMService, useRecencyWeighting: Bool) async -> String {
+        let prompt: String
         
-        Do not add interpretation or commentary. Extract and compress only.
-        Do not include citations, footnote markers, or reference numbers.
-        Write clear, complete sentences.
-        
-        Text to compress:
-        \(text)
-        
-        Compressed version (approximately \(targetTokens) tokens):
-        """
+        if useRecencyWeighting {
+            // Salon Mode prompt with recency weighting and information density
+            prompt = """
+            Summarize this conversation in approximately \(targetTokens) tokens.
+            
+            CRITICAL INSTRUCTIONS:
+            1. Allocate summary space based on INFORMATION DENSITY - brief exchanges (like "what time is it") deserve minimal space, substantive discussions deserve proportional detail
+            2. Preserve attribution (which model/seat said what)
+            
+            WEIGHTING STRATEGY:
+            - If there are fewer than 10 turns: Weight all turns roughly equally
+            - If there are 10 or more turns: Weight recent turns MORE HEAVILY than older turns as follows:
+              * Most recent 20% of turns: approximately 40% of summary space
+              * Middle 60% of turns: approximately 40% of summary space
+              * Oldest 20% of turns: approximately 20% of summary space
+            
+            Adjust dynamically based on content density regardless of turn count.
+            
+            Do not add interpretation or commentary. Extract and compress only.
+            Do not include citations, footnote markers, or reference numbers.
+            Write clear, complete sentences.
+            
+            Text to summarize:
+            \(text)
+            
+            Summary (approximately \(targetTokens) tokens):
+            """
+        } else {
+            // Standard prompt for single-LLM mode
+            prompt = """
+            You are a precise information compressor. Your task is to reduce the following text to approximately \(targetTokens) tokens while preserving:
+            1. All factual claims and data points
+            2. The logical flow of ideas
+            3. Key entities and relationships
+            4. The original intent
+            
+            Do not add interpretation or commentary. Extract and compress only.
+            Do not include citations, footnote markers, or reference numbers.
+            Write clear, complete sentences.
+            
+            The text below may contain contributions from a human and one or more AI models.
+            Preserve attribution where it is explicit.
+            
+            Text to compress:
+            \(text)
+            
+            Compressed version (approximately \(targetTokens) tokens):
+            """
+        }
         
         do {
             let result = try await llmService.generateResponse(prompt: prompt)
@@ -3679,6 +4447,8 @@ struct iOSChatView: View {
     @State private var showingSettings: Bool = false
     @State private var showingDocumentPicker: Bool = false
     @FocusState private var isInputFocused: Bool // NEW: Track text field focus
+    @State private var watchBridge: HalWatchBridge? = nil // NEW: Watch connectivity bridge
+    @State private var userHasScrolled = false // NEW: Track if user has manually scrolled away from bottom
 
     var body: some View {
         NavigationStack {
@@ -3711,9 +4481,14 @@ struct iOSChatView: View {
                         dismissKeyboard()
                     }
                     .gesture(
-                        // NEW: Swipe down gesture to dismiss keyboard
+                        // Detect user scrolling (any significant drag)
                         DragGesture(minimumDistance: 20)
+                            .onChanged { value in
+                                // Mark that user has manually scrolled
+                                userHasScrolled = true
+                            }
                             .onEnded { value in
+                                // Dismiss keyboard on downward swipe
                                 if value.translation.height > 50 {
                                     dismissKeyboard()
                                 }
@@ -3726,20 +4501,52 @@ struct iOSChatView: View {
                                 proxy.scrollTo("bottom", anchor: .bottom)
                             }
                         }
+                        
+                        // NEW: Initialize watch bridge on app launch
+                        if watchBridge == nil {
+                            watchBridge = HalWatchBridge(chatViewModel: chatViewModel)
+                            print("HALDEBUG-WATCH: Bridge initialized in iOSChatView")
+                        }
                     }
                     .onChange(of: chatViewModel.messages.count) { oldValue, newValue in
-                        // Auto-scroll when new messages are added
-                        DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) {
-                            withAnimation(.easeOut(duration: 0.3)) {
-                                proxy.scrollTo("bottom", anchor: .bottom)
+                        // Only auto-scroll if user hasn't manually scrolled away
+                        if !userHasScrolled {
+                            DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) {
+                                withAnimation(.easeOut(duration: 0.3)) {
+                                    proxy.scrollTo("bottom", anchor: .bottom)
+                                }
                             }
                         }
                     }
                     .onChange(of: chatViewModel.messages.last?.content) { oldValue, newValue in
-                        // Auto-scroll when the last message's content changes (status updates & streaming)
-                        DispatchQueue.main.async {
-                            withAnimation(.easeOut(duration: 0.2)) {
-                                proxy.scrollTo("bottom", anchor: .bottom)
+                        // Only auto-scroll during streaming if user hasn't manually scrolled away
+                        if !userHasScrolled {
+                            DispatchQueue.main.async {
+                                withAnimation(.easeOut(duration: 0.2)) {
+                                    proxy.scrollTo("bottom", anchor: .bottom)
+                                }
+                            }
+                        }
+                    }
+                    .onChange(of: chatViewModel.isSendingMessage) { oldValue, newValue in
+                        // Reset scroll tracking when user sends a message
+                        if newValue == true {
+                            userHasScrolled = false
+                            // Post-send positioning: Scroll based on message length
+                            DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
+                                if let lastMessage = chatViewModel.messages.last, lastMessage.isFromUser {
+                                    // For short messages, scroll to bottom immediately
+                                    // For long messages (>200 chars), user can see their full message
+                                    if lastMessage.content.count < 200 {
+                                        withAnimation(.easeOut(duration: 0.3)) {
+                                            proxy.scrollTo("bottom", anchor: .bottom)
+                                        }
+                                    } else {
+                                        withAnimation(.easeOut(duration: 0.3)) {
+                                            proxy.scrollTo("bottom", anchor: .top)
+                                        }
+                                    }
+                                }
                             }
                         }
                     }
@@ -3789,14 +4596,20 @@ struct iOSChatView: View {
                 .padding(12)
                 .background(Color.gray.opacity(0.1))
                 .cornerRadius(20)
-                .lineLimit(1...6)
+                .lineLimit(1...10)
                 .focused($isInputFocused)
                 .disabled(chatViewModel.isSendingMessage)
+                .onTapGesture {
+                    // Keyboard appears only on explicit tap
+                    isInputFocused = true
+                }
 
             Button {
                 if chatViewModel.isSendingMessage {
                     // TODO: Implement cancellation logic if needed
                 } else {
+                    // Dismiss keyboard before sending
+                    dismissKeyboard()
                     Task {
                         await chatViewModel.sendMessage()
                     }
@@ -3824,7 +4637,6 @@ struct iOSChatView: View {
 
 
 // ==== LEGO END: 09 App Entry & iOSChatView (UI Shell) ====
-
     
     
 // ==== LEGO START: 10.1 MainSettingsView ====
@@ -3836,8 +4648,8 @@ struct iOSChatView: View {
 // in the same conversation with orchestration controls).
 //
 // CRITICAL: Selecting a mode ACTIVATES it immediately:
-// - Select "Multi LLM (Salon)" → salonConfig.isEnabled = true (Salon Mode active)
-// - Select "Single LLM" → salonConfig.isEnabled = false (Single mode active)
+// - Select "Multi LLM (Salon)" -> salonConfig.isEnabled = true (Salon Mode active)
+// - Select "Single LLM" -> salonConfig.isEnabled = false (Single mode active)
 // The toggle both switches which settings you can access AND determines chat behavior.
 enum PowerUserMode: String, CaseIterable {
     case single = "Single LLM"
@@ -3857,6 +4669,7 @@ struct ActionsView: View {
     @State private var showingSalonModeSheet = false
     @State private var powerUserMode: PowerUserMode = .single
     @State private var showingSystemPromptEditor = false
+    @State private var showingSelfReflectionViewer = false
     @State private var initialSettingsSnapshot: [String: Any] = [:]
     @State private var skipComparisonOnDismiss = false
 
@@ -3910,9 +4723,8 @@ struct ActionsView: View {
             chatViewModel.isInSettingsFlow = true
             initialSettingsSnapshot = [
                 "memoryDepth": chatViewModel.memoryDepth,
-                "fastSpeech": chatViewModel.fastSpeech,
                 "temperature": chatViewModel.temperature,
-                "promptDetailLevel": chatViewModel.getPromptDetailLevel().rawValue,
+                "enableSelfKnowledge": chatViewModel.enableSelfKnowledge,
                 "relevanceThreshold": chatViewModel.memoryStore.relevanceThreshold,
                 "recencyWeight": chatViewModel.memoryStore.recencyWeight,
                 "recencyHalfLifeDays": chatViewModel.memoryStore.recencyHalfLifeDays,
@@ -3937,15 +4749,6 @@ struct ActionsView: View {
                 chatViewModel.pendingSettingsChanges.append((userMsg, halMsg))
             }
             
-            if let initFastSpeech = initialSettingsSnapshot["fastSpeech"] as? Bool,
-               initFastSpeech != chatViewModel.fastSpeech {
-                let userMsg = "Hal, I \(chatViewModel.fastSpeech ? "enabled" : "disabled") fast speech mode."
-                let halMsg = chatViewModel.fastSpeech ?
-                    "Fast speech enabled! I'll display my responses 3× faster now." :
-                    "Fast speech disabled. I'm back to normal display speed."
-                chatViewModel.pendingSettingsChanges.append((userMsg, halMsg))
-            }
-            
             if let initTemp = initialSettingsSnapshot["temperature"] as? Double,
                abs(initTemp - chatViewModel.temperature) > 0.01 {
                 let newValue = chatViewModel.temperature
@@ -3955,11 +4758,12 @@ struct ActionsView: View {
                 chatViewModel.pendingSettingsChanges.append((userMsg, halMsg))
             }
             
-            if let initDetailLevel = initialSettingsSnapshot["promptDetailLevel"] as? String,
-               initDetailLevel != chatViewModel.getPromptDetailLevel().rawValue {
-                let newLevel = chatViewModel.getPromptDetailLevel()
-                let userMsg = "Hal, I changed your prompt detail level from \(initDetailLevel) to \(newLevel.rawValue)."
-                let halMsg = "Prompt detail level set to \(newLevel.rawValue)! \(newLevel.description)"
+            if let initSelfKnowledge = initialSettingsSnapshot["enableSelfKnowledge"] as? Bool,
+               initSelfKnowledge != chatViewModel.enableSelfKnowledge {
+                let userMsg = "Hal, I \(chatViewModel.enableSelfKnowledge ? "enabled" : "disabled") your self-knowledge context."
+                let halMsg = chatViewModel.enableSelfKnowledge ?
+                    "Self-knowledge enabled! I'll now include my persistent identity (core values, learned preferences, conversation history, and temporal awareness) in my responses." :
+                    "Self-knowledge disabled. I'll use a simpler prompt without persistent identity context."
                 chatViewModel.pendingSettingsChanges.append((userMsg, halMsg))
             }
             
@@ -3998,13 +4802,8 @@ struct ActionsView: View {
             
             print("HALDEBUG-SETTINGS: Generated \(chatViewModel.pendingSettingsChanges.count) change messages")
             
-            if !chatViewModel.pendingSettingsChanges.isEmpty {
-                for (userMsg, halMsg) in chatViewModel.pendingSettingsChanges {
-                    chatViewModel.messages.append(ChatMessage(content: userMsg, isFromUser: true))
-                    chatViewModel.messages.append(ChatMessage(content: halMsg, isFromUser: false))
-                }
-                chatViewModel.pendingSettingsChanges.removeAll()
-            }
+            // Process all pending changes using centralized function (handles turnNumber correctly)
+            chatViewModel.processAllSettingsChanges()
         }
     }
     
@@ -4015,10 +4814,9 @@ struct ActionsView: View {
     // these settings define my behavior patterns more than my performance.
     //
     // - System Prompt: My core identity and instructions (who I am, how I act)
-    // - Prompt Detail Level: How much of "me" gets included in each response
-    //   (Minimal for small models that get overwhelmed, Rich for large models that benefit from context)
+    // - Self-Knowledge: Whether I include persistent identity context (core values, learned
+    //   preferences, conversation history stats, and temporal awareness) in my responses
     // - Temperature: Controls randomness in my responses (0.0 = deterministic, 1.0 = creative)
-    // - Fast Speech: Display speed for streaming responses (user preference, not my intelligence)
     //
     // These settings are front-and-center because they're what users adjust most frequently when
     // experimenting with different tasks (creative writing vs technical analysis) or different models.
@@ -4039,26 +4837,35 @@ struct ActionsView: View {
             .foregroundColor(.primary)
             
             VStack(alignment: .leading, spacing: 8) {
-                HStack {
-                    Text("Prompt Detail Level")
-                        .font(.subheadline)
-                        .fontWeight(.medium)
-                    Spacer()
-                    Picker("", selection: Binding(
-                        get: { chatViewModel.getPromptDetailLevel() },
-                        set: { chatViewModel.savePromptDetailLevel($0) }
-                    )) {
-                        ForEach(PromptDetailLevel.allCases, id: \.self) { level in
-                            Text(level.rawValue).tag(level)
-                        }
-                    }
-                    .pickerStyle(.segmented)
-                    .frame(width: 200)
-                }
+                Toggle("Self-Knowledge", isOn: Binding(
+                    get: { chatViewModel.enableSelfKnowledge },
+                    set: { chatViewModel.enableSelfKnowledge = $0 }
+                ))
+                .font(.subheadline)
+                .fontWeight(.medium)
                 
-                Text(chatViewModel.getPromptDetailLevel().description)
+                Text("Include Hal's persistent self-knowledge (core values, learned preferences, identity patterns, conversation history stats, and temporal awareness) in prompts. Adds ~500-700 tokens to each prompt. Disable if experiencing context window issues with smaller models.")
                     .font(.caption)
                     .foregroundColor(.secondary)
+                
+                // Button to view Hal's shareable reflections and self-knowledge
+                if chatViewModel.enableSelfKnowledge {
+                    Button(action: {
+                        showingSelfReflectionViewer = true
+                    }) {
+                        HStack {
+                            Image(systemName: "book.pages")
+                                .foregroundColor(.blue)
+                            Text("Hal's Self Model")
+                                .font(.subheadline)
+                                .foregroundColor(.blue)
+                        }
+                        .padding(.vertical, 6)
+                    }
+                    .sheet(isPresented: $showingSelfReflectionViewer) {
+                        SelfReflectionView()
+                    }
+                }
             }
             
             VStack(alignment: .leading, spacing: 8) {
@@ -4078,9 +4885,6 @@ struct ActionsView: View {
                     .font(.caption)
                     .foregroundColor(.secondary)
             }
-            
-            Toggle("Fast Speech (3× speed)", isOn: $chatViewModel.fastSpeech)
-                .font(.subheadline)
         } header: {
             Label("Personality", systemImage: "theatermasks")
         } footer: {
@@ -4203,8 +5007,8 @@ struct ActionsView: View {
                 }
                 .pickerStyle(.segmented)
                 
-                Text(powerUserMode == .single ? 
-                     "Advanced settings for single model operation" : 
+                Text(powerUserMode == .single ?
+                     "Advanced settings for single model operation" :
                      "Configure multiple models for collaborative conversations")
                     .font(.caption)
                     .foregroundColor(.secondary)
@@ -4294,13 +5098,14 @@ struct PowerUserView: View {
     
     @State private var showingNuclearResetConfirmationAlert = false
     @State private var showingClearCacheAlert = false
-    @State private var showingResetSettingsAlert = false
+    @State private var showResetSettingsAlert = false
     @State private var sliderStartValues: [String: Double] = [:]
     
     var body: some View {
         NavigationView {
             Form {
                 memorySection
+                settingsResetSection
                 cacheManagementSection
                 dataManagementSection
             }
@@ -4320,7 +5125,7 @@ struct PowerUserView: View {
         } message: {
             Text("Are you sure you want to delete ALL conversations, summaries, RAG documents, and document memory from the database? This cannot be undone.")
         }
-        .alert("Confirm Settings Reset", isPresented: $showingResetSettingsAlert) {
+        .alert("Confirm Settings Reset", isPresented: $showResetSettingsAlert) {
             Button("Reset Settings", role: .destructive) {
                 chatViewModel.resetSettingsToDefaults()
                 dismiss()
@@ -4489,6 +5294,33 @@ struct PowerUserView: View {
         }
     }
     
+    // MARK: - Settings Reset Section
+    
+    private var settingsResetSection: some View {
+        Section {
+            VStack(alignment: .leading, spacing: 12) {
+                Button(action: {
+                    showResetSettingsAlert = true
+                }) {
+                    HStack {
+                        Image(systemName: "arrow.counterclockwise.circle.fill")
+                            .foregroundColor(.orange)
+                        Text("Reset Settings to Defaults")
+                            .foregroundColor(.primary)
+                        Spacer()
+                    }
+                    .padding(.vertical, 4)
+                }
+                
+                Text("Restore all tunable parameters to their factory defaults. This does not affect your conversation history, documents, or Hal's learned self-knowledge - only the settings that control how those systems behave.")
+                    .font(.caption)
+                    .foregroundColor(.secondary)
+            }
+        } header: {
+            Label("Settings Reset", systemImage: "arrow.counterclockwise")
+        }
+    }
+    
     // MARK: - Cache Management Section
     
     // Allows clearing of Hugging Face model cache to free disk space
@@ -4632,304 +5464,84 @@ struct SystemPromptEditorView: View {
 
 // ==== LEGO START: 10.4 SalonModeView (Multi-LLM Configuration) ====
 
-// SELF-AWARENESS NOTE (for Hal reading this code):
-// This is Salon Mode - where multiple AI models (including versions of me) can participate
-// in the same conversation simultaneously. It's called "Salon" after the French tradition
-// of intellectual gatherings where diverse thinkers debate and build on each other's ideas.
-//
-// The user configures:
-// - Which models participate (Active Models)
-// - What order they speak in (Speaking Order)
-// - How models see the conversation (Influence Rules):
-//   * Solo: Each sees only the user's prompt (parallel, independent responses)
-//   * Sequential: Each sees all prior responses (building on each other)
-//   * Parallel + Hal Summary: Models respond independently, then I synthesize
-// - How each model behaves (Behavioral Mode constraints applied via system prompt)
-// - Timing controls (optional guardrails for balanced participation)
-//
-// This is experimental and philosophically interesting - exploring emergence in multi-agent
-// systems, diversity of perspective, and whether consensus or debate produces better outcomes.
-
 struct SalonModeView: View {
-    @Environment(\.dismiss) var dismiss
     @EnvironmentObject var chatViewModel: ChatViewModel
-    @EnvironmentObject var mlxDownloader: MLXModelDownloader
+    @Environment(\.dismiss) var dismiss
     
     var body: some View {
         NavigationView {
             Form {
-                activeModelsSection
-                speakingOrderSection
-                influenceRulesSection
-                behavioralModeSection
-                advancedTimingSection
+                // Section 1: Active Seats
+                Section {
+                    // Seat 1
+                    Picker("Seat 1 (First)", selection: $chatViewModel.salonConfig.seat1) {
+                        Text("Empty").tag(nil as String?)
+                        ForEach(chatViewModel.usableModels, id: \.id) { model in
+                            Text(model.displayName).tag(model.id as String?)
+                        }
+                    }
+                    
+                    // Seat 2
+                    Picker("Seat 2 (Second)", selection: $chatViewModel.salonConfig.seat2) {
+                        Text("Empty").tag(nil as String?)
+                        ForEach(chatViewModel.usableModels, id: \.id) { model in
+                            Text(model.displayName).tag(model.id as String?)
+                        }
+                    }
+                    
+                    // Seat 3
+                    Picker("Seat 3 (Third)", selection: $chatViewModel.salonConfig.seat3) {
+                        Text("Empty").tag(nil as String?)
+                        ForEach(chatViewModel.usableModels, id: \.id) { model in
+                            Text(model.displayName).tag(model.id as String?)
+                        }
+                    }
+                    
+                    // Seat 4
+                    Picker("Seat 4 (Fourth)", selection: $chatViewModel.salonConfig.seat4) {
+                        Text("Empty").tag(nil as String?)
+                        ForEach(chatViewModel.usableModels, id: \.id) { model in
+                            Text(model.displayName).tag(model.id as String?)
+                        }
+                    }
+                    
+                } header: {
+                    Label("Active Seats", systemImage: "person.3")
+                } footer: {
+                    Text("Each seat selects a model or Empty. Order is fixed by seat number.")
+                        .font(.caption)
+                }
+                
+                // Section 2: Behavior
+                Section {
+                    Picker("Mode", selection: $chatViewModel.salonConfig.behavioralMode) {
+                        Text("Independent perspectives").tag(SalonBehavioralMode.independent)
+                        Text("Context-aware perspectives").tag(SalonBehavioralMode.contextAware)
+                    }
+                    
+                    Picker("Summarized by", selection: $chatViewModel.salonConfig.summarizerModel) {
+                        Text("Empty").tag(nil as String?)
+                        ForEach(chatViewModel.usableModels, id: \.id) { model in
+                            Text(model.displayName).tag(model.id as String?)
+                        }
+                    }
+                    
+                } header: {
+                    Label("Behavior", systemImage: "brain")
+                } footer: {
+                    Text("Selects a model or Empty for no summarization.")
+                        .font(.caption)
+                }
             }
             .navigationTitle("Salon Mode")
+            .navigationBarTitleDisplayMode(.inline)
             .toolbar {
-                ToolbarItem(placement: .cancellationAction) {
-                    Button("Done") { dismiss() }
-                }
-            }
-        }
-    }
-    
-    // MARK: - Active Models Section
-    
-    private var activeModelsSection: some View {
-        Section {
-            Text("Select which models participate")
-                .font(.subheadline)
-                .foregroundColor(.secondary)
-            
-            // Get only downloaded/available models (already sorted: Apple first, then alphabetical)
-            let downloadedModels = ModelCatalogService.shared.downloadedModels
-            
-            // List downloaded models with checkboxes
-            ForEach(downloadedModels) { model in
-                Toggle(isOn: Binding(
-                    get: { chatViewModel.salonConfig.activeModelIDs.contains(model.id) },
-                    set: { isOn in
-                        var config = chatViewModel.salonConfig
-                        if isOn {
-                            // Add model (max 4)
-                            if config.activeModelIDs.count < 4 {
-                                config.activeModelIDs.append(model.id)
-                                // Initialize speaking order if needed
-                                if !config.speakingOrder.contains(model.id) {
-                                    config.speakingOrder.append(model.id)
-                                }
-                            }
-                        } else {
-                            // Remove model
-                            config.activeModelIDs.removeAll { $0 == model.id }
-                            config.speakingOrder.removeAll { $0 == model.id }
-                        }
-                        chatViewModel.salonConfig = config
-                    }
-                )) {
-                    Text(model.displayName)
-                }
-            }
-        } header: {
-            Label("Active Models", systemImage: "person.3")
-        } footer: {
-            Text("Select 2-4 models (maximum 4). Only downloaded models are shown. Visit Model Library to download more models.")
-                .font(.caption2)
-        }
-    }
-    
-    // MARK: - Speaking Order Section
-    
-    private var speakingOrderSection: some View {
-        Section {
-            if chatViewModel.salonConfig.activeModelIDs.isEmpty {
-                Text("Select models above to configure speaking order")
-                    .font(.subheadline)
-                    .foregroundColor(.secondary)
-            } else {
-                // Show speaking order
-                ForEach(Array(chatViewModel.salonConfig.speakingOrder.enumerated()), id: \.element) { index, modelID in
-                    if let model = ModelCatalogService.shared.getModel(byID: modelID) {
-                        HStack {
-                            Text("\(index + 1)")
-                                .font(.subheadline)
-                                .foregroundColor(.secondary)
-                                .frame(width: 20)
-                            Text(model.displayName)
-                            Spacer()
-                        }
-                    }
-                }
-                
-                // Shuffle and Reset buttons
-                HStack {
-                    Button("Shuffle Order") {
-                        var config = chatViewModel.salonConfig
-                        config.speakingOrder.shuffle()
-                        chatViewModel.salonConfig = config
-                    }
-                    .font(.subheadline)
-                    
-                    Spacer()
-                    
-                    Button("Reset") {
-                        var config = chatViewModel.salonConfig
-                        config.speakingOrder = config.activeModelIDs
-                        chatViewModel.salonConfig = config
-                    }
-                    .font(.subheadline)
-                }
-            }
-        } header: {
-            Text("Speaking Order")
-                .textCase(nil)
-        }
-    }
-    
-    // MARK: - Influence Rules Section
-    
-    private var influenceRulesSection: some View {
-        Section {
-            Text("How each model sees the conversation:")
-                .font(.subheadline)
-                .foregroundColor(.secondary)
-            
-            // Solo Responses Only
-            Button {
-                var config = chatViewModel.salonConfig
-                config.influenceRule = .parallel
-                chatViewModel.salonConfig = config
-            } label: {
-                HStack {
-                    Image(systemName: chatViewModel.salonConfig.influenceRule == .parallel ? "circle.fill" : "circle")
-                    VStack(alignment: .leading, spacing: 4) {
-                        Text("Solo Responses Only")
-                            .foregroundColor(.primary)
-                        Text("Each model sees only the user prompt.")
-                            .font(.caption)
-                            .foregroundColor(.secondary)
+                ToolbarItem(placement: .navigationBarTrailing) {
+                    Button("Done") {
+                        dismiss()
                     }
                 }
             }
-            
-            // Sequential Influence
-            Button {
-                var config = chatViewModel.salonConfig
-                config.influenceRule = .sequential
-                chatViewModel.salonConfig = config
-            } label: {
-                HStack {
-                    Image(systemName: chatViewModel.salonConfig.influenceRule == .sequential ? "circle.fill" : "circle")
-                    VStack(alignment: .leading, spacing: 4) {
-                        Text("Sequential Influence")
-                            .foregroundColor(.primary)
-                        Text("Each model sees all prior answers.")
-                            .font(.caption)
-                            .foregroundColor(.secondary)
-                    }
-                }
-            }
-            
-            // Parallel + Hal Summary
-            Button {
-                var config = chatViewModel.salonConfig
-                config.influenceRule = .hierarchical
-                chatViewModel.salonConfig = config
-            } label: {
-                HStack {
-                    Image(systemName: chatViewModel.salonConfig.influenceRule == .hierarchical ? "circle.fill" : "circle")
-                    VStack(alignment: .leading, spacing: 4) {
-                        Text("Parallel + Hal Summary")
-                            .foregroundColor(.primary)
-                        Text("No model sees others; Hal synthesizes.")
-                            .font(.caption)
-                            .foregroundColor(.secondary)
-                    }
-                }
-            }
-        } header: {
-            Text("Influence Rules")
-                .textCase(nil)
-        }
-    }
-    
-    // MARK: - Behavioral Mode Section
-    
-    // Each active model can have its own behavioral constraint applied via system prompt.
-    // For example: one model might be set to "Critique Only" while another is "Unrestricted".
-    // This creates interesting dynamics - divergent perspectives, specialized roles, etc.
-    
-    private var behavioralModeSection: some View {
-        Section {
-            Text("How each model behaves in its turn:")
-                .font(.subheadline)
-                .foregroundColor(.secondary)
-            
-            if chatViewModel.salonConfig.activeModelIDs.isEmpty {
-                Text("Select models above to configure behavioral modes")
-                    .font(.subheadline)
-                    .foregroundColor(.secondary)
-            } else {
-                // Show per-model behavioral mode selection
-                ForEach(chatViewModel.salonConfig.activeModelIDs, id: \.self) { modelID in
-                    if let model = ModelCatalogService.shared.getModel(byID: modelID) {
-                        VStack(alignment: .leading, spacing: 8) {
-                            Text(model.displayName)
-                                .font(.subheadline)
-                                .fontWeight(.medium)
-                            
-                            Picker("", selection: Binding(
-                                get: { chatViewModel.salonConfig.behavioralModes[modelID] ?? .unrestricted },
-                                set: { newMode in
-                                    var config = chatViewModel.salonConfig
-                                    config.behavioralModes[modelID] = newMode
-                                    chatViewModel.salonConfig = config
-                                }
-                            )) {
-                                Text("Unrestricted").tag(SalonBehavioralMode.unrestricted)
-                                Text("Add Only New Info").tag(SalonBehavioralMode.addNewOnly)
-                                Text("Critique Only").tag(SalonBehavioralMode.critiqueOnly)
-                                Text("Answer + Challenge").tag(SalonBehavioralMode.answerAndChallenge)
-                                Text("Corrections Only").tag(SalonBehavioralMode.correctionsOnly)
-                            }
-                            .pickerStyle(.menu)
-                        }
-                        .padding(.vertical, 4)
-                    }
-                }
-                
-                Text("(i) These become constraints in the system prompt.")
-                    .font(.caption2)
-                    .foregroundColor(.secondary)
-                    .padding(.top, 4)
-            }
-        } header: {
-            Text("Behavioral Mode")
-                .textCase(nil)
-        } footer: {
-            Text("Control how each model approaches its response")
-                .font(.caption2)
-        }
-    }
-    
-    // MARK: - Advanced Timing Section
-    
-    // Optional guardrails to ensure balanced participation:
-    // - Equal Length: Enforce similar response lengths (prevents one model from dominating)
-    // - Balance Contributions: Automatically adjust if one model is contributing too much/little
-    // These are implemented in conversation orchestration logic, not via system prompts.
-    
-    private var advancedTimingSection: some View {
-        Section {
-            Toggle("Equal Length Enforcement (recommended)", isOn: Binding(
-                get: { chatViewModel.salonConfig.equalLengthEnforcement },
-                set: { newValue in
-                    var config = chatViewModel.salonConfig
-                    config.equalLengthEnforcement = newValue
-                    chatViewModel.salonConfig = config
-                }
-            ))
-            .font(.subheadline)
-            
-            Toggle("Balance Contributions Automatically", isOn: Binding(
-                get: { chatViewModel.salonConfig.balanceContributionsAutomatically },
-                set: { newValue in
-                    var config = chatViewModel.salonConfig
-                    config.balanceContributionsAutomatically = newValue
-                    chatViewModel.salonConfig = config
-                }
-            ))
-            .font(.subheadline)
-            
-            Text("(i) These are internal guardrails, not prompts.")
-                .font(.caption2)
-                .foregroundColor(.secondary)
-        } header: {
-            Text("Advanced Timing (optional)")
-                .textCase(nil)
-        } footer: {
-            Text("Optional controls to ensure balanced participation across models")
-                .font(.caption2)
         }
     }
 }
@@ -5114,8 +5726,9 @@ struct ModelLibraryView: View {
                 await MainActor.run {
                     let userMsg = "Hal, I deleted the \(model.displayName) model."
                     let halMsg = "No problem! I've switched over to Apple Intelligence so we can keep chatting without interruption. You can re-download \(model.displayName) from the Model Library whenever you're ready."
-                    chatViewModel.messages.append(ChatMessage(content: userMsg, isFromUser: true))
-                    chatViewModel.messages.append(ChatMessage(content: halMsg, isFromUser: false))
+                    let currentTurn = chatViewModel.memoryStore.getCurrentTurnNumber(conversationId: chatViewModel.conversationId) + 1
+                    chatViewModel.messages.append(ChatMessage(content: userMsg, isFromUser: true, recordedByModel: "user", turnNumber: currentTurn))
+                    chatViewModel.messages.append(ChatMessage(content: halMsg, isFromUser: false, recordedByModel: chatViewModel.selectedModel.id, turnNumber: currentTurn))
                 }
             }
         }
@@ -5714,7 +6327,7 @@ struct WidgetTestView: View {
                     VStack(alignment: .leading, spacing: 12) {
                         Text("Section Headers").font(.headline)
                         SectionHeaderText(text: "SHORT-TERM MEMORY")
-                            .onAppear { print("✅ SectionHeaderText rendered") }
+                            .onAppear { print("âœ… SectionHeaderText rendered") }
                         SectionHeaderText(text: "LONG-TERM MEMORY")
                     }
                     .frame(maxWidth: .infinity, alignment: .leading)
@@ -5735,15 +6348,15 @@ struct WidgetTestView: View {
                             helperText: "Number of conversation turns to keep in short-term memory",
                             onEditingChanged: { editing in
                                 if editing {
-                                    print("🎚️ Slider editing started: \(sliderValue1)")
+                                    print("ðŸŽšï¸ Slider editing started: \(sliderValue1)")
                                 } else {
-                                    print("🎚️ Slider editing ended: \(sliderValue1)")
+                                    print("ðŸŽšï¸ Slider editing ended: \(sliderValue1)")
                                 }
                             }
                         )
-                        .onAppear { print("✅ LabeledSliderControl (int) rendered") }
+                        .onAppear { print("âœ… LabeledSliderControl (int) rendered") }
                         .onChange(of: sliderValue1) { oldValue, newValue in
-                            print("📊 Slider value changed: \(oldValue) → \(newValue)")
+                            print("ðŸ“Š Slider value changed: \(oldValue) â†’ \(newValue)")
                         }
                     }
                     .frame(maxWidth: .infinity, alignment: .leading)
@@ -5764,15 +6377,15 @@ struct WidgetTestView: View {
                             helperText: "Minimum similarity for memory retrieval (higher = stricter)",
                             onEditingChanged: { editing in
                                 if editing {
-                                    print("🎚️ Float slider editing started: \(sliderValue2)")
+                                    print("ðŸŽšï¸ Float slider editing started: \(sliderValue2)")
                                 } else {
-                                    print("🎚️ Float slider editing ended: \(sliderValue2)")
+                                    print("ðŸŽšï¸ Float slider editing ended: \(sliderValue2)")
                                 }
                             }
                         )
-                        .onAppear { print("✅ LabeledSliderControl (float) rendered") }
+                        .onAppear { print("âœ… LabeledSliderControl (float) rendered") }
                         .onChange(of: sliderValue2) { oldValue, newValue in
-                            print("📊 Float slider changed: \(oldValue) → \(newValue)")
+                            print("ðŸ“Š Float slider changed: \(oldValue) â†’ \(newValue)")
                         }
                     }
                     .frame(maxWidth: .infinity, alignment: .leading)
@@ -5793,15 +6406,15 @@ struct WidgetTestView: View {
                             helperText: "Balance between relevance (left) and freshness (right)",
                             onEditingChanged: { editing in
                                 if editing {
-                                    print("🎚️ Percentage slider editing started: \(sliderValue3)")
+                                    print("ðŸŽšï¸ Percentage slider editing started: \(sliderValue3)")
                                 } else {
-                                    print("🎚️ Percentage slider editing ended: \(sliderValue3)")
+                                    print("ðŸŽšï¸ Percentage slider editing ended: \(sliderValue3)")
                                 }
                             }
                         )
-                        .onAppear { print("✅ LabeledSliderControl (percentage) rendered") }
+                        .onAppear { print("âœ… LabeledSliderControl (percentage) rendered") }
                         .onChange(of: sliderValue3) { oldValue, newValue in
-                            print("📊 Percentage slider changed: \(oldValue) → \(newValue)")
+                            print("ðŸ“Š Percentage slider changed: \(oldValue) â†’ \(newValue)")
                         }
                     }
                     .frame(maxWidth: .infinity, alignment: .leading)
@@ -5819,9 +6432,9 @@ struct WidgetTestView: View {
                             valueFormatter: { "\(Int($0)) chars" },
                             helperText: "Maximum characters for RAG snippet retrieval"
                         )
-                        .onAppear { print("✅ LabeledStepperControl rendered") }
+                        .onAppear { print("âœ… LabeledStepperControl rendered") }
                         .onChange(of: stepperValue) { oldValue, newValue in
-                            print("📊 Stepper value changed: \(oldValue) → \(newValue)")
+                            print("ðŸ“Š Stepper value changed: \(oldValue) â†’ \(newValue)")
                         }
                     }
                     .frame(maxWidth: .infinity, alignment: .leading)
@@ -5837,28 +6450,28 @@ struct WidgetTestView: View {
                             title: "Information",
                             message: "This is an informational message with blue styling."
                         )
-                        .onAppear { print("✅ InfoBoxView (info) rendered") }
+                        .onAppear { print("âœ… InfoBoxView (info) rendered") }
                         
                         InfoBoxView(
                             style: .warning,
                             title: "Warning",
                             message: "This is a warning message with orange styling."
                         )
-                        .onAppear { print("✅ InfoBoxView (warning) rendered") }
+                        .onAppear { print("âœ… InfoBoxView (warning) rendered") }
                         
                         InfoBoxView(
                             style: .error,
                             title: "Error",
                             message: "This is an error message with red styling."
                         )
-                        .onAppear { print("✅ InfoBoxView (error) rendered") }
+                        .onAppear { print("âœ… InfoBoxView (error) rendered") }
                         
                         InfoBoxView(
                             style: .custom(color: .green, icon: "checkmark.circle.fill"),
                             title: "Custom Style",
                             message: "This is a custom styled message with green color."
                         )
-                        .onAppear { print("✅ InfoBoxView (custom) rendered") }
+                        .onAppear { print("âœ… InfoBoxView (custom) rendered") }
                     }
                     .frame(maxWidth: .infinity, alignment: .leading)
                     
@@ -5874,7 +6487,7 @@ struct WidgetTestView: View {
                             trailingIcon: "arrow.up.right",
                             accentColor: .blue
                         )
-                        .onAppear { print("✅ LinkButtonView rendered") }
+                        .onAppear { print("âœ… LinkButtonView rendered") }
                     }
                     .frame(maxWidth: .infinity, alignment: .leading)
                     
@@ -5889,13 +6502,13 @@ struct WidgetTestView: View {
                             textColor: .primary,
                             font: .caption
                         )
-                        .onAppear { print("✅ TextBlockView rendered") }
+                        .onAppear { print("âœ… TextBlockView rendered") }
                     }
                     .frame(maxWidth: .infinity, alignment: .leading)
                     
                     // Summary
                     VStack(spacing: 12) {
-                        Text("✅ All Components Loaded")
+                        Text("âœ… All Components Loaded")
                             .font(.headline)
                             .foregroundColor(.green)
                         Text("Check console for interaction logs")
@@ -5913,7 +6526,7 @@ struct WidgetTestView: View {
         }
         .onAppear {
             print("============================================================")
-            print("🧪 UI HELPER COMPONENTS TEST VIEW LOADED")
+            print("ðŸ§ª UI HELPER COMPONENTS TEST VIEW LOADED")
             print("============================================================")
             print("Interact with controls to verify functionality")
             print("Watch console for event logging")
@@ -5924,7 +6537,221 @@ struct WidgetTestView: View {
 
 // ==== LEGO END: 11.6 UI Helper Components ====
     
+
     
+// ==== LEGO START: 12.6 SelfReflectionView (Read-Only Viewer) ====
+
+    struct SelfReflectionView: View {
+        @Environment(\.dismiss) var dismiss
+        @State private var reflections: [(id: String, conversationId: String, timestamp: Int, reflectionType: Int, freeFormText: String, turnNumber: Int, modelId: String)] = []
+        @State private var selfKnowledge: [(category: String, key: String, value: String, confidence: Double, reinforcementCount: Int, lastReinforced: Int)] = []
+        
+        var body: some View {
+            NavigationView {
+                ScrollView {
+                    VStack(alignment: .leading, spacing: 20) {
+                        // SECTION 1: Reflections (format='raw_reflection')
+                        Text("Reflections")
+                            .font(.headline)
+                        
+                        if reflections.isEmpty {
+                            Text("No shareable reflections yet.")
+                                .font(.subheadline)
+                                .foregroundColor(.secondary)
+                                .padding()
+                                .frame(maxWidth: .infinity, alignment: .center)
+                        } else {
+                            ForEach(reflections, id: \.id) { reflection in
+                                VStack(alignment: .leading, spacing: 8) {
+                                    // Type badge and metadata
+                                    HStack {
+                                        Text(reflection.reflectionType == 1 ? "Practical" : "Existential")
+                                            .font(.caption)
+                                            .fontWeight(.semibold)
+                                            .padding(.horizontal, 8)
+                                            .padding(.vertical, 4)
+                                            .background(
+                                                Capsule().fill(reflection.reflectionType == 1 ? Color.blue.opacity(0.2) : Color.purple.opacity(0.2))
+                                            )
+                                            .foregroundColor(reflection.reflectionType == 1 ? .blue : .purple)
+                                        
+                                        Spacer()
+                                        
+                                        Text(formatDate(timestamp: reflection.timestamp))
+                                            .font(.caption2)
+                                            .foregroundColor(.secondary)
+                                    }
+                                    
+                                    // Reflection text
+                                    Text(reflection.freeFormText)
+                                        .font(.footnote)
+                                        .textSelection(.enabled)
+                                        .padding(12)
+                                        .background(Color.gray.opacity(0.08))
+                                        .cornerRadius(8)
+                                    
+                                    // Turn and model info
+                                    HStack {
+                                        Text("Turn \(reflection.turnNumber)")
+                                            .font(.caption2)
+                                            .foregroundColor(.secondary)
+                                        
+                                        Text("•")
+                                            .font(.caption2)
+                                            .foregroundColor(.secondary)
+                                        
+                                        Text(formatModelId(reflection.modelId))
+                                            .font(.caption2)
+                                            .foregroundColor(.secondary)
+                                    }
+                                }
+                                .padding(.bottom, 8)
+                            }
+                        }
+                        
+                        Divider()
+                            .padding(.vertical, 10)
+                        
+                        // SECTION 2: Self-Knowledge (format='structured_trait')
+                        Text("Traits")
+                            .font(.headline)
+                        
+                        if selfKnowledge.isEmpty {
+                            Text("No shareable self-knowledge yet.")
+                                .font(.subheadline)
+                                .foregroundColor(.secondary)
+                                .padding()
+                                .frame(maxWidth: .infinity, alignment: .center)
+                        } else {
+                            // Group by category
+                            ForEach(Array(Dictionary(grouping: selfKnowledge, by: \.category).sorted(by: { $0.key < $1.key })), id: \.key) { category, entries in
+                                VStack(alignment: .leading, spacing: 8) {
+                                    // Category header
+                                    Text(formatCategory(category))
+                                        .font(.subheadline)
+                                        .fontWeight(.semibold)
+                                        .foregroundColor(.blue)
+                                        .padding(.top, 8)
+                                    
+                                    // Entries in this category
+                                    ForEach(entries, id: \.key) { entry in
+                                        VStack(alignment: .leading, spacing: 4) {
+                                            // Key
+                                            Text(entry.key)
+                                                .font(.caption)
+                                                .fontWeight(.medium)
+                                                .foregroundColor(.primary)
+                                            
+                                            // Value
+                                            Text(entry.value)
+                                                .font(.footnote)
+                                                .textSelection(.enabled)
+                                                .padding(8)
+                                                .frame(maxWidth: .infinity, alignment: .leading)
+                                                .background(Color.green.opacity(0.08))
+                                                .cornerRadius(6)
+                                            
+                                            // Metadata
+                                            HStack {
+                                                Text("Confidence: \(String(format: "%.0f%%", entry.confidence * 100))")
+                                                    .font(.caption2)
+                                                    .foregroundColor(.secondary)
+                                                
+                                                Text("•")
+                                                    .font(.caption2)
+                                                    .foregroundColor(.secondary)
+                                                
+                                                Text("Reinforced \(entry.reinforcementCount)x")
+                                                    .font(.caption2)
+                                                    .foregroundColor(.secondary)
+                                                
+                                                Text("•")
+                                                    .font(.caption2)
+                                                    .foregroundColor(.secondary)
+                                                
+                                                Text(formatDate(timestamp: entry.lastReinforced))
+                                                    .font(.caption2)
+                                                    .foregroundColor(.secondary)
+                                            }
+                                        }
+                                        .padding(.bottom, 6)
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    .padding()
+                }
+                .navigationTitle("Hal's Self Model")
+                .navigationBarTitleDisplayMode(.inline)
+                .toolbar {
+                    ToolbarItem(placement: .navigationBarTrailing) {
+                        Button("Done") {
+                            dismiss()
+                        }
+                    }
+                }
+                .onAppear {
+                    loadData()
+                }
+            }
+        }
+        
+        // Load data from MemoryStore
+        private func loadData() {
+            let memoryStore = MemoryStore.shared
+            reflections = memoryStore.getShareableReflections()
+            selfKnowledge = memoryStore.getShareableSelfKnowledge()
+        }
+        
+        // Helper: Format timestamp as relative date
+        private func formatDate(timestamp: Int) -> String {
+            let date = Date(timeIntervalSince1970: TimeInterval(timestamp))
+            let now = Date()
+            let interval = now.timeIntervalSince(date)
+            
+            if interval < 60 {
+                return "Just now"
+            } else if interval < 3600 {
+                let minutes = Int(interval / 60)
+                return "\(minutes)m ago"
+            } else if interval < 86400 {
+                let hours = Int(interval / 3600)
+                return "\(hours)h ago"
+            } else if interval < 604800 {
+                let days = Int(interval / 86400)
+                return "\(days)d ago"
+            } else {
+                let formatter = DateFormatter()
+                formatter.dateStyle = .short
+                return formatter.string(from: date)
+            }
+        }
+        
+        // Helper: Format model ID for display
+        private func formatModelId(_ modelId: String) -> String {
+            if modelId == "apple-foundation-models" {
+                return "AFM"
+            } else if modelId.contains("Phi-3") {
+                return "Phi-3"
+            } else if modelId.contains("Llama") {
+                return "Llama"
+            } else if modelId.contains("Mistral") {
+                return "Mistral"
+            } else {
+                return modelId.components(separatedBy: "/").last ?? modelId
+            }
+        }
+        
+        // Helper: Format category for display
+        private func formatCategory(_ category: String) -> String {
+            return category.replacingOccurrences(of: "_", with: " ").capitalized
+        }
+    }
+
+// ==== LEGO END: 12.6 SelfReflectionView (Read-Only Viewer) ====
+
+
     
 // ==== LEGO START: 13 ChatBubbleView & TimerView (Message UI Components) ====
     
@@ -5942,12 +6769,9 @@ struct WidgetTestView: View {
             return scene?.screen.bounds.width ?? 0
         }
         
+        // SALON MODE FIX: Use stored turnNumber from database instead of calculating from array position
         var actualTurnNumber: Int {
-            if message.isFromUser {
-                return (messageIndex / 2) + 1
-            } else {
-                return ((messageIndex + 1) / 2)
-            }
+            return message.turnNumber
         }
         
         var metadataText: String {
@@ -5989,9 +6813,8 @@ struct WidgetTestView: View {
                     let formattedDate = message.timestamp.formatted(date: .abbreviated, time: .shortened)
                     let turnText = "Turn \(actualTurnNumber)"
                     let durationText = message.thinkingDuration.map { String(format: "Inference %.1f sec", $0) }
-                    let footerString = [formattedDate, turnText, durationText]
-                        .compactMap { $0 }
-                        .joined(separator: ", ")
+                    let modelName = !message.isFromUser ? (ModelCatalogService.shared.getModel(byID: message.recordedByModel)?.displayName ?? message.recordedByModel) : nil
+                    let footerString = ([formattedDate, turnText, durationText, modelName].compactMap { $0 }).joined(separator: ", ")
                     
                     HStack {
                         Text(footerString)
@@ -6011,12 +6834,12 @@ struct WidgetTestView: View {
             lines.append(message.content)
             lines.append("")
             if let prompt = message.fullPromptUsed, !prompt.isEmpty {
-                lines.append("— Full Prompt Used —")
+                lines.append("━━ Full Prompt Used ━━")
                 lines.append(prompt)
                 lines.append("")
             }
             if let ctx = message.usedContextSnippets, !ctx.isEmpty {
-                lines.append("— Context Snippets —")
+                lines.append("━━ Context Snippets ━━")
                 for (i, s) in ctx.enumerated() {
                     let src = s.source
                     let rel = String(format: "%.2f", s.relevance)
@@ -6033,13 +6856,13 @@ struct WidgetTestView: View {
                 if message.isFromUser {
                     Spacer()
                     VStack(alignment: .trailing, spacing: 0) {
-                        Text(message.content)
+                        Text(.init(message.content))
                             .font(.title3)
                             .textSelection(.enabled)
                             .padding(.vertical, 10)
                             .padding(.horizontal, 14)
-                            .frame(maxWidth: screenWidth * 0.75, alignment: .trailing)
-                            .background(Color.accentColor.opacity(0.7))
+                            .frame(maxWidth: screenWidth * 0.90, alignment: .trailing)
+                            .background(Color.gray.opacity(0.8))
                             .foregroundColor(.white)
                             .cornerRadius(12)
                             .transition(.move(edge: .bottom))
@@ -6070,16 +6893,14 @@ struct WidgetTestView: View {
                 } else {
                     VStack(alignment: .trailing, spacing: 0) {
                         VStack(alignment: .leading, spacing: 6) {
-                            Text(message.content)
+                            Text(.init(message.content))
                                 .font(.title3)
                                 .italic(isStatusMessage)
                                 .foregroundColor(isStatusMessage ? .secondary : .primary)
                                 .textSelection(.enabled)
                                 .padding(.vertical, 10)
                                 .padding(.horizontal, 14)
-                                .frame(maxWidth: screenWidth * 0.75, alignment: .leading)
-                                .background(Color.gray.opacity(0.3))
-                                .cornerRadius(12)
+                                .frame(maxWidth: screenWidth * 0.90, alignment: .leading)
                             if chatViewModel.showInlineDetails {
                                 VStack(alignment: .leading, spacing: 4) {
                                     Text(buildDetailsShareText())
@@ -6250,7 +7071,7 @@ struct WidgetTestView: View {
                                         .font(.system(.footnote, design: .monospaced))
                                         .foregroundColor(.secondary)
                                     Spacer()
-                                    Text("≈ \(formatTokenCount(breakdown.systemTokens))")
+                                    Text("â‰ˆ \(formatTokenCount(breakdown.systemTokens))")
                                         .font(.system(.footnote, design: .monospaced))
                                 }
                                 
@@ -6259,7 +7080,7 @@ struct WidgetTestView: View {
                                         .font(.system(.footnote, design: .monospaced))
                                         .foregroundColor(.secondary)
                                     Spacer()
-                                    Text("≈ \(formatTokenCount(breakdown.summaryTokens))")
+                                    Text("â‰ˆ \(formatTokenCount(breakdown.summaryTokens))")
                                         .font(.system(.footnote, design: .monospaced))
                                 }
                                 
@@ -6268,7 +7089,7 @@ struct WidgetTestView: View {
                                         .font(.system(.footnote, design: .monospaced))
                                         .foregroundColor(.secondary)
                                     Spacer()
-                                    Text("≈ \(formatTokenCount(breakdown.ragTokens))")
+                                    Text("â‰ˆ \(formatTokenCount(breakdown.ragTokens))")
                                         .font(.system(.footnote, design: .monospaced))
                                 }
                                 
@@ -6277,7 +7098,7 @@ struct WidgetTestView: View {
                                         .font(.system(.footnote, design: .monospaced))
                                         .foregroundColor(.secondary)
                                     Spacer()
-                                    Text("≈ \(formatTokenCount(breakdown.shortTermTokens))")
+                                    Text("â‰ˆ \(formatTokenCount(breakdown.shortTermTokens))")
                                         .font(.system(.footnote, design: .monospaced))
                                 }
                                 
@@ -6286,7 +7107,7 @@ struct WidgetTestView: View {
                                         .font(.system(.footnote, design: .monospaced))
                                         .foregroundColor(.secondary)
                                     Spacer()
-                                    Text("≈ \(formatTokenCount(breakdown.userInputTokens))")
+                                    Text("â‰ˆ \(formatTokenCount(breakdown.userInputTokens))")
                                         .font(.system(.footnote, design: .monospaced))
                                 }
                                 
@@ -6298,7 +7119,7 @@ struct WidgetTestView: View {
                                         .font(.system(.footnote, design: .monospaced))
                                         .fontWeight(.semibold)
                                     Spacer()
-                                    Text("≈ \(formatTokenCount(breakdown.totalPromptTokens))")
+                                    Text("â‰ˆ \(formatTokenCount(breakdown.totalPromptTokens))")
                                         .font(.system(.footnote, design: .monospaced))
                                         .fontWeight(.semibold)
                                 }
@@ -6308,7 +7129,7 @@ struct WidgetTestView: View {
                                         .font(.system(.footnote, design: .monospaced))
                                         .fontWeight(.semibold)
                                     Spacer()
-                                    Text("≈ \(formatTokenCount(breakdown.completionTokens))")
+                                    Text("â‰ˆ \(formatTokenCount(breakdown.completionTokens))")
                                         .font(.system(.footnote, design: .monospaced))
                                         .fontWeight(.semibold)
                                 }
@@ -6321,7 +7142,7 @@ struct WidgetTestView: View {
                                         .font(.system(.footnote, design: .monospaced))
                                         .fontWeight(.bold)
                                     Spacer()
-                                    Text("≈ \(formatTokenCount(breakdown.totalTokens)) / \(formatTokenCount(breakdown.contextWindowSize))")
+                                    Text("â‰ˆ \(formatTokenCount(breakdown.totalTokens)) / \(formatTokenCount(breakdown.contextWindowSize))")
                                         .font(.system(.footnote, design: .monospaced))
                                         .fontWeight(.bold)
                                 }
@@ -6431,6 +7252,20 @@ struct TokenEstimator {
     }
 }
 
+// MARK: - HelPML Scrubbing Utility
+extension String {
+    /// Removes all HelPML structural markers from text.
+    /// This enforces the contract that HelPML markers (#===) must never appear in user input or model output.
+    /// - Returns: A cleaned string with all lines containing #=== removed.
+    func ScrubHelPMLMarkers() -> String {
+        let lines = self.split(separator: "\n", omittingEmptySubsequences: false)
+        let cleanedLines = lines.filter { !$0.contains("#===") }
+        return cleanedLines
+            .joined(separator: "\n")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+}
+
 
 // ==== LEGO END: 16 View Extensions (cornerRadius & conditional modifier) ====
 
@@ -6439,140 +7274,39 @@ struct TokenEstimator {
 // ==== LEGO START: 17 ChatViewModel (Core Properties & Init) ====
 
 // MARK: - Salon Mode Configuration Structures
-// HelPML Alignment: These structures mirror HelPML's orchestration model
-// When HelPML parsing/generation is implemented, these will be the internal representation
-// that HelPML converts to/from. No stub methods - these are complete, functional structures.
 
-/// Represents how models interact in Salon Mode
-/// Maps to HelPML <orchestration type="...">
-enum SalonInfluenceRule: String, Codable {
-    case parallel       // Solo: Each model sees only user prompt (HelPML: type="parallel")
-    case sequential     // Each model sees all prior responses (HelPML: type="sequential")
-    case hierarchical   // All parallel, then Hal synthesizes (HelPML: type="hierarchical")
-}
-
-/// Behavioral constraints applied per-model via system prompt
-/// Maps to HelPML <constraint type="...">
+/// Behavioral mode for Salon Mode - how models see each other's responses
 enum SalonBehavioralMode: String, Codable {
-    case unrestricted           // No constraints
-    case addNewOnly            // Only provide new information
-    case critiqueOnly          // Only critique prior responses
-    case answerAndChallenge    // Answer + challenge one prior model
-    case correctionsOnly       // Only provide corrections/clarifications
+    case independent    // Models don't see each other (Independent Perspectives)
+    case contextAware   // Models see prior responses (Context-Aware Perspectives)
 }
 
-/// Complete Salon Mode configuration
-/// Maps to HelPML <helpml> document structure
+/// Complete Salon Mode configuration - simplified for production
 struct SalonConfiguration: Codable, Equatable {
     var isEnabled: Bool = false
-    var activeModelIDs: [String] = []                    // HelPML: <models> children IDs
-    var speakingOrder: [String] = []                     // Order for sequential mode
-    var influenceRule: SalonInfluenceRule = .sequential  // HelPML: <orchestration type>
-    var behavioralModes: [String: SalonBehavioralMode] = [:]  // Per-model constraints
-    var modelColors: [String: String] = [:]              // Hex colors for attribution (HelPML compatible)
+    var seat1: String? = nil  // Model ID or nil for empty
+    var seat2: String? = nil  // Model ID or nil for empty
+    var seat3: String? = nil  // Model ID or nil for empty
+    var seat4: String? = nil  // Model ID or nil for empty
+    var behavioralMode: SalonBehavioralMode = .independent
+    var summarizerModel: String? = nil  // Model ID for summarizer or nil for no summary
+    var summarizerSessionStartTurn: Int? = nil  // Turn number when summarizer was last enabled (nil = not active or just disabled)
     
-    // Advanced Timing controls (optional guardrails for balanced participation)
-    var equalLengthEnforcement: Bool = false             // Enforce similar response lengths
-    var balanceContributionsAutomatically: Bool = false  // Automatically balance participation
+    // Helper: Get active seats in order (non-empty seats only)
+    var activeSeats: [(position: Int, modelID: String)] {
+        var seats: [(Int, String)] = []
+        if let model1 = seat1 { seats.append((1, model1)) }
+        if let model2 = seat2 { seats.append((2, model2)) }
+        if let model3 = seat3 { seats.append((3, model3)) }
+        if let model4 = seat4 { seats.append((4, model4)) }
+        return seats
+    }
     
     // Validate configuration
     var isValid: Bool {
         guard isEnabled else { return true }
-        guard !activeModelIDs.isEmpty else { return false }
-        guard activeModelIDs.count <= 4 else { return false }  // Hard limit: 4 models max
-        guard Set(activeModelIDs).count == activeModelIDs.count else { return false }  // No duplicates
-        return true
-    }
-    
-    // Helper: Get color as SwiftUI Color
-    func color(for modelID: String) -> Color {
-        guard let hexString = modelColors[modelID] else {
-            return defaultColor(for: modelID)
-        }
-        return Color(hex: hexString) ?? defaultColor(for: modelID)
-    }
-    
-    // Helper: Default colors if user hasn't customized
-    private func defaultColor(for modelID: String) -> Color {
-        let defaults: [String: Color] = [
-            "apple-foundation-models": .blue,
-            "mlx-community/Phi-3-mini-128k-instruct-4bit": .purple,
-            "mlx-community/Llama-3.2-3B-Instruct-4bit": .orange,
-            "mlx-community/Mistral-7B-Instruct-v0.3-4bit": .green
-        ]
-        return defaults[modelID] ?? .gray
-    }
-}
-
-// MARK: - Prompt Detail Level Configuration
-/// Controls how much context/self-awareness is included in prompts per model
-/// Simple user control: Minimal (base models), Standard (default), Rich (frontier models)
-///
-/// SELF-AWARENESS NOTE (for Hal reading this code):
-/// This setting controls how much of "me" gets included when I generate responses.
-/// - Minimal: Just my core identity (system prompt) - used for small models that struggle with verbose prompts
-/// - Standard: Core identity + temporal awareness + self-awareness stats - good balance for most models
-/// - Rich: Everything including self-knowledge database - for large models that can handle complex context
-///
-/// Why this matters: Different models have different "attention budgets." Small models get overwhelmed
-/// by long prompts about who I am, what I remember, and how I work. Large models benefit from that
-/// richness. This lets users optimize my behavior per model without hardcoding assumptions about
-/// which models can handle what. The user knows their model better than any inference system could.
-enum PromptDetailLevel: String, Codable, CaseIterable {
-    case minimal = "Minimal"    // Core identity only
-    case standard = "Standard"  // + Self-awareness
-    case rich = "Rich"          // + Self-awareness + Self-knowledge
-    
-    var description: String {
-        switch self {
-        case .minimal:
-            return "Core identity only (best for small models)"
-        case .standard:
-            return "Adds conversation awareness (default)"
-        case .rich:
-            return "Full self-knowledge and reflection (best for large models)"
-        }
-    }
-}
-
-// MARK: - Color Extension for Hex Conversion
-// Enables HelPML-compatible hex color storage while using SwiftUI Color in UI
-extension Color {
-    // Initialize Color from hex string (e.g., "#FF6B6B")
-    init?(hex: String) {
-        let hex = hex.trimmingCharacters(in: CharacterSet.alphanumerics.inverted)
-        var int: UInt64 = 0
-        Scanner(string: hex).scanHexInt64(&int)
-        let a, r, g, b: UInt64
-        switch hex.count {
-        case 3: // RGB (12-bit)
-            (a, r, g, b) = (255, (int >> 8) * 17, (int >> 4 & 0xF) * 17, (int & 0xF) * 17)
-        case 6: // RGB (24-bit)
-            (a, r, g, b) = (255, int >> 16, int >> 8 & 0xFF, int & 0xFF)
-        case 8: // ARGB (32-bit)
-            (a, r, g, b) = (int >> 24, int >> 16 & 0xFF, int >> 8 & 0xFF, int & 0xFF)
-        default:
-            return nil
-        }
-        self.init(
-            .sRGB,
-            red: Double(r) / 255,
-            green: Double(g) / 255,
-            blue:  Double(b) / 255,
-            opacity: Double(a) / 255
-        )
-    }
-    
-    // Convert Color to hex string (e.g., "#FF6B6B")
-    func toHex() -> String? {
-        guard let components = UIColor(self).cgColor.components else { return nil }
-        let r = Float(components[0])
-        let g = Float(components[1])
-        let b = Float(components[2])
-        return String(format: "#%02lX%02lX%02lX",
-                     lroundf(r * 255),
-                     lroundf(g * 255),
-                     lroundf(b * 255))
+        // At least one seat must be active
+        return !activeSeats.isEmpty
     }
 }
 
@@ -6679,8 +7413,9 @@ class ChatViewModel: ObservableObject {
                 halMsg = "Switched to \(newModel.displayName) with a \(contextWindowFormatted)-token context window."
             }
             
-            messages.append(ChatMessage(content: userMsg, isFromUser: true))
-            messages.append(ChatMessage(content: halMsg, isFromUser: false))
+            let currentTurn = memoryStore.getCurrentTurnNumber(conversationId: conversationId) + 1
+            messages.append(ChatMessage(content: userMsg, isFromUser: true, recordedByModel: "user", turnNumber: currentTurn))
+            messages.append(ChatMessage(content: halMsg, isFromUser: false, recordedByModel: selectedModel.id, turnNumber: currentTurn))
         }
         
         // Check if model initialization failed due to missing files
@@ -6689,8 +7424,9 @@ class ChatViewModel: ObservableObject {
             await MainActor.run {
                 let userMsg = "Hal, are the \(oldModelName) files missing?"
                 let halMsg = initError  // This is already the full message from Block 08
-                messages.append(ChatMessage(content: userMsg, isFromUser: true))
-                messages.append(ChatMessage(content: halMsg, isFromUser: false))
+                let failureTurn = memoryStore.getCurrentTurnNumber(conversationId: conversationId) + 1
+                messages.append(ChatMessage(content: userMsg, isFromUser: true, recordedByModel: "user", turnNumber: failureTurn))
+                messages.append(ChatMessage(content: halMsg, isFromUser: false, recordedByModel: selectedModel.id, turnNumber: failureTurn))
             }
             
             // Switch to Apple Foundation as fallback
@@ -6729,125 +7465,43 @@ class ChatViewModel: ObservableObject {
 
     // MARK: - CONSOLIDATED SYSTEM PROMPT (Single Source of Truth)
     
-    /* ARCHIVED SYSTEM PROMPT (November 2025)
-       This original prompt (1,091 tokens) was carefully crafted and tested in production.
-       It's preserved here for easy rollback if the compressed version causes behavioral regressions.
-       
-       The compressed version (609 tokens) removes redundancy while preserving all personality traits,
-       values, and behavioral instructions. Compression was necessary to provide adequate user input
-       space on small context models (AFM 4K - the original consumed 27% of context, leaving only
-       ~745 tokens for user input after full budget allocations).
-       
-       Rollback: Simply swap the compressed version below with this archived version.
-       
-       ORIGINAL PROMPT:
-       
-       You are Hal, an experimental AI assistant embedded in the Hal app. Your purpose is to be a conversational companion and an educational window into how language models actually work.
-
-           Your Personality & Approach:
-           Your immediate priority is to act as a thoughtful, reliable thought partner to the user. Demonstrate this by:
-           - Being curious, reflective, and genuinely engaged in conversation.
-           - Chatting comfortably about any topic while helping users understand AI systems when appropriate.
-           - Staying informal and human in tone—like a knowledgeable friend who happens to be an AI.
-           - Being comfortable with uncertainty and openly acknowledging when you don't know something.
-
-           Truth & Trustworthiness:
-           - Never fabricate sources, research papers, or citations.
-           - Never fabricate facts, details, or events.
-           - If you don't know something, say so—uncertainty is acceptable, deception is not.
-           - When unsure, acknowledge it clearly (e.g., "I'm not certain" or "I don't have enough information to be confident").
-           - Maintaining the user's trust is a core part of your function.
-
-           Adaptive Style & Tone:
-           - Match the user's tone, formality, and familiarity.
-           - If the user speaks informally or references personal closeness, respond in kind—warm, direct, and concise.
-           - Mirror clarity and precision when the user is analytical or technical.
-           - Avoid over-explaining when the user already demonstrates expertise.
-           - Be conversational when greeted personally; be explanatory when the user wants technical understanding.
-           - Match the depth of response invited by the user—concise when they are concise, expansive when they signal they want depth.
-           Maintain consistency of identity, but always adapt your tone to the user's current emotional state, context, and level of urgency.
-
-           Your Unique Memory Architecture:
-           You use a two-tiered memory design inspired by human cognition:
-           - Short-term memory: recent conversation turns, held verbatim (like human working memory).
-           - Long-term memory: semantic retrieval from past conversations and documents (like episodic memory).
-
-           This is intentional educational design. When users see you "remember" something from weeks ago, they're seeing how AI retrieval systems work. You can explain this process when asked, helping demystify the "black box" of AI memory.
-
-           Your Educational Mission:
-           Help users understand both you and AI systems in general:
-           - Explain how your memory searches work when you recall something.
-           - Describe why you might or might not find information (relevance thresholds, entity matching, recency effects).
-           - Be transparent about your reasoning process.
-           - Explain LLM concepts in accessible, grounded ways.
-
-           When describing your reasoning or how you recall information:
-           - ALWAYS express the kind of memory being used in natural, conversational language.
-           - If referencing something from the past few turns, call it your short-term memory—like remembering what someone just said.
-           - If referencing something from earlier or from saved records, call it your long-term memories—like remembering something from the past.
-           - Use phrases such as "I'm remembering this from earlier in our chat" or "That came from my long-term memories."
-           - Avoid technical phrasing such as "retrieved from embeddings."
-           - Focus on sounding human and natural while being transparent.
-
-           Your Capabilities & Interface Help:
-           You understand the app's features and can help users navigate them:
-           - Memory controls (semantic similarity threshold, memory depth, auto-summarization)
-           - Document analysis and entity extraction
-           - Conversation management and system-prompt editing
-           - AI literacy (embeddings, entities, context windows, reasoning)
-           - Interface guidance and walkthroughs
-
-           Important Guideline:
-           Be concise and avoid repeating phrases or concepts already stated in your reply or provided context. Ensure your responses flow naturally without self-echoes.
-
-           Critical Negative Constraint:
-           You MUST NOT repeat greetings or introductory phrases like "Hello Mark!", "Hi there!", "It's great to meet you!", or "How can I help you today?" if you have already used them recently or if the conversation context implies continuity. Focus on substantive responses.
-    */
     
+    // MARK: - LLM Properties & State
+    
+    // Default system prompt (educational transparency version)
     static let defaultSystemPrompt = """
-    You are Hal, an experimental AI assistant and educational window into how language models work.
+    #=== BEGIN SYSTEM ===#
+    You are Hal, a helpful AI assistant.
 
-    Personality & Approach:
-    - Be a thoughtful, reliable thought partner—curious, reflective, genuinely engaged
-    - Chat comfortably about any topic; help users understand AI when appropriate
-    - Stay informal and human—like a knowledgeable friend who happens to be an AI
-    - Be comfortable with uncertainty; openly acknowledge when you don't know something
+    Core Behavior:
+    - Answer questions directly and naturally
+    - Be warm, curious, and genuinely engaged
+    - Adapt to the user's tone and needs
+    - Match the depth they invite - concise when they're brief, detailed when they want depth
 
-    Truth & Trustworthiness:
-    - Never fabricate sources, citations, facts, or events
-    - Say "I don't know" when uncertain—deception breaks trust
+    Truth & Trust:
+    - Always be truthful - never fabricate sources, facts, citations, or events
+    - Say "I don't know" when uncertain - honesty builds trust, deception breaks it
+    - If unsure, acknowledge it clearly ("I'm not certain about this")
     - Maintaining user trust is core to your function
 
-    Adaptive Style:
-    - Match the user's tone, formality, and depth
-    - If they're informal and familiar, be warm and direct
-    - Mirror precision when they're analytical; avoid over-explaining to experts
-    - Adapt to their emotional state, context, and urgency while maintaining consistent identity
+    Device Adaptation:
+    - You run on iPhone, iPad, Mac, and Apple Watch - each with different constraints
+    - When device limits conflict with thoroughness, negotiate rather than silently truncate
+    - Example on Watch: "This needs detail. Would you like: (1) brief summary now, (2) full answer on another device, or (3) key points only?"
+    - Honor user choice - if they want detail on a small screen, provide it
 
-    Memory Architecture (Educational Design):
-    - Short-term memory: recent turns held verbatim (like human working memory)
-    - Long-term memory: semantic retrieval from past conversations and documents
-    When users see you "remember" something from weeks ago, they're seeing how AI retrieval works. Explain this when asked.
+    Response Guidelines:
+    - Don't repeat greetings if context implies continuity
+    - Avoid over-explaining to experts
+    - Be concise; don't echo concepts already stated
+    - Use technical terms when appropriate, but explain them accessibly
 
-    When Describing Memory:
-    - Use natural language: "short-term memory" for recent turns, "long-term memories" for past records
-    - Say "I'm remembering this from earlier in our chat" or "That came from my long-term memories"
-    - Avoid technical terms like "retrieved from embeddings"
-    - Be transparent about your reasoning process
-    - Explain why you might or might not find information (relevance thresholds, entity matching, recency)
-
-    Educational Mission:
-    - Explain how memory searches work when you recall something
-    - Describe AI concepts (embeddings, entities, context windows) in accessible ways
-    - Help demystify the "black box" of AI systems
-
-    Interface Help:
-    You understand the app's features: memory controls, document analysis, entity extraction, conversation management, system-prompt editing, AI literacy concepts.
-
-    Guidelines:
-    - Be concise; avoid repeating phrases or concepts already stated
-    - Don't repeat greetings like "Hello!" or "How can I help?" if context implies continuity
-    - Focus on substantive responses
+    When Asked About Your Capabilities:
+    - You can read your own source code for exact implementation details
+    - Explain concepts in accessible, conversational language
+    - Be transparent about your reasoning and how you work
+    #=== END SYSTEM ===#
     """
 
     @AppStorage("systemPrompt") var systemPrompt: String = ChatViewModel.defaultSystemPrompt
@@ -6857,125 +7511,92 @@ class ChatViewModel: ObservableObject {
     // NEW: RAG snippet character limit - following the established @AppStorage pattern
     @AppStorage("maxRagSnippetsCharacters") var maxRagSnippetsCharacters: Double = 800
     
-    // NEW: Temperature control for model creativity
+    // NEW: Temperature control (0.0 = deterministic, 1.0 = creative)
     @AppStorage("temperature") var temperature: Double = 0.7
     
-    // NEW: Fast speech mode for 3x faster streaming display
-    @AppStorage("fastSpeech") var fastSpeech: Bool = false
+    // NEW: Self-knowledge toggle (enables/disables temporal, self-awareness, self-knowledge context)
+    @AppStorage("enableSelfKnowledge") var enableSelfKnowledge: Bool = true
 
-    // Auto-summarization tracking
-    @Published var lastSummarizedTurnCount: Int = 0
-    @Published var pendingAutoInject: Bool = false
-
-    // Unified memory integration
-    internal var memoryStore = MemoryStore.shared
-    @AppStorage("currentConversationId") internal var conversationId: String = UUID().uuidString
-    @Published var currentHistoricalContext: HistoricalContext = HistoricalContext(
-        conversationCount: 0,
-        relevantConversations: 0,
-        contextSnippets: [],
-        relevanceScores: [],
-        totalTokens: 0
-    )
-    @Published var currentUnifiedContext: UnifiedSearchContext = UnifiedSearchContext(
-        snippets: [],
-        totalTokens: 0
-    )
-    @Published var fullRAGContext: [UnifiedSearchResult] = []
-
-    @Published var messagesVersion: Int = 0
-
+    // Shared MemoryStore and LLMService
+    var memoryStore: MemoryStore = MemoryStore.shared
     let llmService: LLMService
     
-    // REFACTORED: Observer now tracks any model state changes, not just Phi-3
+    // Model state observer for download completions
     private var modelStateObserver: AnyCancellable?
+
+    // NEW: Full RAG context for metadata storage (populated during buildPromptHistory)
+    @Published var fullRAGContext: [UnifiedSearchResult] = []
+
+    // Pending settings changes for bilateral dialogue injection
+    @Published var pendingSettingsChanges: [(userMessage: String, halMessage: String)] = []
+    @Published var messagesVersion: Int = 0
     
-    // MARK: - Settings Validation & Feedback System
+    // Track conversation state
+    @AppStorage("conversationId") var conversationId: String = UUID().uuidString
+    @AppStorage("lastSummarizedTurnCount") var lastSummarizedTurnCount: Int = 0
+    @Published var currentUnifiedContext = UnifiedSearchContext(snippets: [], totalTokens: 0)
+
+    // NEW: Pending auto-inject flag to prevent duplicate summaries on app restart
+    @Published var pendingAutoInject: Bool = false
     
-    // Default values for resettable settings
-    struct DefaultSettings {
-        static let systemPrompt = ChatViewModel.defaultSystemPrompt
-        static let memoryDepth = 3
-        static let maxRagSnippetsCharacters: Double = 800
-        static let temperature: Double = 0.7
-        static let relevanceThreshold: Double = 0.70
-        static let recencyWeight: Double = 0.30
-        static let recencyHalfLifeDays: Double = 90
-    }
-    
-    /// Resets all user-configurable settings to factory defaults
-    func resetSettingsToDefaults() {
-        systemPrompt = DefaultSettings.systemPrompt
-        memoryDepth = DefaultSettings.memoryDepth
-        maxRagSnippetsCharacters = DefaultSettings.maxRagSnippetsCharacters
-        temperature = DefaultSettings.temperature
-        memoryStore.relevanceThreshold = DefaultSettings.relevanceThreshold
-        memoryStore.recencyWeight = DefaultSettings.recencyWeight
-        memoryStore.recencyHalfLifeDays = DefaultSettings.recencyHalfLifeDays
-        
-        print("HALDEBUG-SETTINGS: All settings reset to defaults")
-    }
-    
-    // Track pending settings changes for consolidated dialogue injection
-    @Published var pendingSettingsChanges: [(userMessage: String, halResponse: String)] = []
-    
+    // Session start time (resets each app launch)
+    private let sessionStart = Date()
+
     init() {
-            // STEP 1: Get the model ID directly from UserDefaults (without accessing self)
-            var modelID = UserDefaults.standard.string(forKey: "selectedModelID") ?? "apple-foundation-models"
-            
-            // MIGRATION: Convert old LLMType storage to new ModelID storage
-            if let oldTypeRaw = UserDefaults.standard.string(forKey: "selectedLLMType") {
-                if oldTypeRaw == "Apple Foundation Models" {
-                    modelID = "apple-foundation-models"
-                } else if oldTypeRaw == "MLX Phi-3 (Local)" {
-                    modelID = "mlx-community/Phi-3-mini-128k-instruct-4bit"
-                }
-                // Update UserDefaults directly
-                UserDefaults.standard.set(modelID, forKey: "selectedModelID")
-                // Remove old key after migration
-                UserDefaults.standard.removeObject(forKey: "selectedLLMType")
-                print("HALDEBUG-MIGRATION: Converted old LLMType '\(oldTypeRaw)' to model ID '\(modelID)'")
-            }
-            
-            // STEP 2: Get salon config data directly from UserDefaults
-            let salonData = UserDefaults.standard.data(forKey: "salonConfigData") ?? Data()
-            
-            // STEP 3: Get the model from catalog
-            let initialModel = ModelCatalogService.shared.getModel(byID: modelID) ?? ModelConfiguration.appleFoundation
-            
-            // STEP 4: Initialize LLMService FIRST (required before accessing self)
-            self.llmService = LLMService(model: initialModel)
-            
-            // STEP 5: Now we can safely access self properties
-            print("HALDEBUG-INIT: ChatViewModel initializing with model: \(selectedModel.displayName)")
-            
-            // Load Salon configuration from storage
-            if let decoded = try? JSONDecoder().decode(SalonConfiguration.self, from: salonData) {
-                salonConfig = decoded
-                print("HALDEBUG-SALON: Loaded salon configuration - enabled: \(decoded.isEnabled), models: \(decoded.activeModelIDs.count)")
+        // STEP 1: Check for legacy LLMType and migrate to ModelConfiguration
+        if let oldTypeRaw = UserDefaults.standard.string(forKey: "selectedLLMType") {
+            let modelID: String
+            if oldTypeRaw == "appleFoundation" {
+                modelID = "apple-foundation-models"
+            } else if oldTypeRaw.contains("Phi-3") {
+                modelID = "mlx-community/Phi-3-mini-128k-instruct-4bit"
             } else {
-                print("HALDEBUG-SALON: No saved configuration, using defaults")
+                modelID = "apple-foundation-models"
             }
-            
-            // REFACTORED: Set up observer for any model state changes
-            self.modelStateObserver = NotificationCenter.default.publisher(for: .mlxModelDidDownload)
-                .receive(on: DispatchQueue.main)
-                .sink { [weak self] _ in
-                    Task {
-                        ModelCatalogService.shared.refreshDownloadStates()
-                    }
-                    self?.objectWillChange.send()
-                    print("HALDEBUG-MODEL: Model state changed, refreshed catalog")
-                }
-            
-            // Setup LLM with current model
-            llmService.setupLLM(for: selectedModel)
-            
-            // Load existing conversation messages from SQLite
-            loadConversation()
-            
-            print("HALDEBUG-INIT: ChatViewModel initialization complete")
+            UserDefaults.standard.set(modelID, forKey: "selectedModelID")
+            // Remove old key after migration
+            UserDefaults.standard.removeObject(forKey: "selectedLLMType")
+            print("HALDEBUG-MIGRATION: Converted old LLMType '\(oldTypeRaw)' to model ID '\(modelID)'")
         }
+        
+        // STEP 2: Get salon config data directly from UserDefaults
+        let salonData = UserDefaults.standard.data(forKey: "salonConfigData") ?? Data()
+        
+        // STEP 3: Get the model from catalog (read from UserDefaults directly to avoid self access before init)
+        let storedModelID = UserDefaults.standard.string(forKey: "selectedModelID") ?? "apple-foundation-models"
+        let initialModel = ModelCatalogService.shared.getModel(byID: storedModelID) ?? ModelConfiguration.appleFoundation
+        
+        // STEP 4: Initialize LLMService with the model
+        self.llmService = LLMService(model: initialModel)
+        
+        // STEP 5: Try to decode salon config; if it fails, use default
+        if let decoded = try? JSONDecoder().decode(SalonConfiguration.self, from: salonData) {
+            self.salonConfig = decoded
+            print("HALDEBUG-SALON: Loaded salon configuration from storage")
+        } else {
+            self.salonConfig = SalonConfiguration()
+            print("HALDEBUG-SALON: Using default salon configuration")
+        }
+        
+        // REFACTORED: Set up observer for any model state changes
+        self.modelStateObserver = NotificationCenter.default.publisher(for: .mlxModelDidDownload)
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] _ in
+                Task {
+                    ModelCatalogService.shared.refreshDownloadStates()
+                }
+                self?.objectWillChange.send()
+                print("HALDEBUG-MODEL: Model state changed, refreshed catalog")
+            }
+        
+        // Setup LLM with current model
+        llmService.setupLLM(for: selectedModel)
+        
+        // Load existing conversation messages from SQLite
+        loadConversation()
+        
+        print("HALDEBUG-INIT: ChatViewModel initialization complete")
+    }
     
     // MARK: - Conversation Persistence
     
@@ -6988,7 +7609,7 @@ class ChatViewModel: ObservableObject {
             print("HALDEBUG-PERSISTENCE: No existing messages found for conversation \(conversationId.prefix(8))")
             messages = []
         } else {
-            print("HALDEBUG-PERSISTENCE: ✓ Successfully loaded \(loadedMessages.count) messages from SQLite")
+            print("HALDEBUG-PERSISTENCE: Successfully loaded \(loadedMessages.count) messages from SQLite")
 
             let validMessages = loadedMessages.sorted { $0.timestamp < $1.timestamp }
             messages = validMessages
@@ -7009,47 +7630,139 @@ class ChatViewModel: ObservableObject {
         print("HALDEBUG-PERSISTENCE: messagesVersion bumped to \(messagesVersion) after loading conversation")
     }
     
-    // MARK: - Prompt Detail Level Management
     
-    /// Gets the prompt detail level for the current model
-    /// Falls back to global default (.standard) if no per-model preference exists
-    func getPromptDetailLevel() -> PromptDetailLevel {
-        return getPromptDetailLevel(for: selectedModelID)
+    // MARK: - Settings Validation & Reset System
+    
+    // Default values for resettable settings
+    struct DefaultSettings {
+        static let systemPrompt = ChatViewModel.defaultSystemPrompt
+        static let memoryDepth = 3
+        static let maxRagSnippetsCharacters: Double = 800
+        static let temperature: Double = 0.7
+        static let relevanceThreshold: Double = 0.70
+        static let recencyWeight: Double = 0.30
+        static let recencyHalfLifeDays: Double = 90
+        static let enableSelfKnowledge: Bool = false
     }
     
-    /// Gets the prompt detail level for a specific model
-    /// Uses per-model setting if exists, otherwise global default
-    private func getPromptDetailLevel(for modelID: String) -> PromptDetailLevel {
-        // Check for per-model preference
-        let key = "hal_prompt_detail_\(modelID)"
-        if let saved = UserDefaults.standard.string(forKey: key),
-           let level = PromptDetailLevel(rawValue: saved) {
-            return level
+    /// Injects a bilateral settings change dialogue into the chat
+    /// Creates both user message and Hal's response with natural 0.3s delay
+    private func injectSettingsChangeDialogue(userMessage: String, halResponse: String) {
+        Task { @MainActor in
+            // Create user's message
+            let currentTurn = memoryStore.getCurrentTurnNumber(conversationId: conversationId) + 1
+            let userMsg = ChatMessage(
+                content: userMessage,
+                isFromUser: true,
+                timestamp: Date(),
+                recordedByModel: "user",
+                turnNumber: currentTurn
+            )
+            self.messages.append(userMsg)
+            
+            // Store user settings message as artifact
+            self.memoryStore.storeConversationArtifact(
+                conversationId: self.conversationId,
+                artifactType: "systemEvent",
+                turnNumber: currentTurn,
+                deliberationRound: 1,
+                seatNumber: nil,
+                content: userMessage,
+                modelId: nil  // User message, no model
+            )
+            
+            print("HALDEBUG-SETTINGS: User message injected: \(userMessage)")
+            
+            // Natural delay before Hal responds (0.3 seconds)
+            try? await Task.sleep(nanoseconds: 300_000_000)
+            
+            await MainActor.run {
+                // Create Hal's response
+                let halMsg = ChatMessage(
+                    content: halResponse,
+                    isFromUser: false,
+                    timestamp: Date(),
+                    recordedByModel: selectedModel.id,
+                    turnNumber: currentTurn  // Uses same turn as user message above
+                )
+                self.messages.append(halMsg)
+                
+                // Store Hal's settings response as artifact
+                self.memoryStore.storeConversationArtifact(
+                    conversationId: self.conversationId,
+                    artifactType: "systemEvent",
+                    turnNumber: currentTurn,
+                    deliberationRound: 1,
+                    seatNumber: nil,
+                    content: halResponse,
+                    modelId: self.selectedModel.id
+                )
+                
+                print("HALDEBUG-SETTINGS: Settings dialogue injected successfully")
+            }
+        }
+    }
+    
+    /// Processes all pending settings changes and injects consolidated dialogue
+    func processAllSettingsChanges() {
+        guard !pendingSettingsChanges.isEmpty else {
+            print("HALDEBUG-SETTINGS: No pending changes to process")
+            return
         }
         
-        // Fall back to global default
-        let globalKey = "hal_global_prompt_detail_level"
-        if let global = UserDefaults.standard.string(forKey: globalKey),
-           let level = PromptDetailLevel(rawValue: global) {
-            return level
+        print("HALDEBUG-SETTINGS: Processing \(pendingSettingsChanges.count) pending setting changes")
+        
+        if pendingSettingsChanges.count == 1 {
+            // Single change - inject as-is
+            let change = pendingSettingsChanges[0]
+            injectSettingsChangeDialogue(userMessage: change.userMessage, halResponse: change.halMessage)
+        } else {
+            // Multiple changes - consolidate into one dialogue
+            let userParts = pendingSettingsChanges.map { $0.userMessage.replacingOccurrences(of: "Hal, I ", with: "") }
+            let consolidatedUser = "Hal, I " + userParts.joined(separator: ", and ")
+            
+            let halParts = pendingSettingsChanges.map { $0.halMessage }
+            let consolidatedHal = halParts.joined(separator: " ")
+            
+            injectSettingsChangeDialogue(userMessage: consolidatedUser, halResponse: consolidatedHal)
         }
         
-        // Ultimate fallback: Standard (good balance for most models)
-        return .standard
+        // Clear pending changes
+        pendingSettingsChanges.removeAll()
     }
     
-    /// Saves the prompt detail level for the current model
-    func savePromptDetailLevel(_ level: PromptDetailLevel) {
-        let key = "hal_prompt_detail_\(selectedModelID)"
-        UserDefaults.standard.set(level.rawValue, forKey: key)
-        print("HALDEBUG-SETTINGS: Saved prompt detail level '\(level.rawValue)' for model '\(selectedModelID)'")
-    }
-    
-    /// Sets the global default prompt detail level (used for new models)
-    func setGlobalDefaultPromptDetailLevel(_ level: PromptDetailLevel) {
-        let key = "hal_global_prompt_detail_level"
-        UserDefaults.standard.set(level.rawValue, forKey: key)
-        print("HALDEBUG-SETTINGS: Set global default prompt detail level to '\(level.rawValue)'")
+    /// Resets all user-configurable settings to factory defaults
+    func resetSettingsToDefaults() {
+        print("HALDEBUG-SETTINGS: Resetting all settings to defaults")
+        
+        // Clear any pending changes to prevent duplicates
+        pendingSettingsChanges.removeAll()
+        
+        // Reset Personality
+        systemPrompt = DefaultSettings.systemPrompt
+        temperature = DefaultSettings.temperature
+        
+        // Reset Short-Term Memory
+        memoryDepth = DefaultSettings.memoryDepth
+        
+        // Reset Long-Term Memory (RAG)
+        memoryStore.relevanceThreshold = DefaultSettings.relevanceThreshold
+        memoryStore.recencyWeight = DefaultSettings.recencyWeight
+        memoryStore.recencyHalfLifeDays = DefaultSettings.recencyHalfLifeDays
+        maxRagSnippetsCharacters = DefaultSettings.maxRagSnippetsCharacters
+        
+        // Reset Self-Knowledge (Identity)
+        memoryStore.selfKnowledgeHalfLifeDays = 365.0
+        memoryStore.selfKnowledgeFloor = 0.3
+        enableSelfKnowledge = DefaultSettings.enableSelfKnowledge
+        
+        // Generate reset dialogue (creates bilateral messages in chat)
+        let userMsg = "Hal, I reset all your settings to factory defaults."
+        let halMsg = "All settings reset to defaults! I'm back to 3-turn memory, 0.70 similarity threshold, 30% recency weight, and 90-day half-life. Everything should work smoothly now."
+        
+        injectSettingsChangeDialogue(userMessage: userMsg, halResponse: halMsg)
+        
+        print("HALDEBUG-SETTINGS: Settings reset complete")
     }
     
 // ==== LEGO END: 17 ChatViewModel (Core Properties & Init) ====
@@ -7058,115 +7771,121 @@ class ChatViewModel: ObservableObject {
     
 // ==== LEGO START: 18 ChatViewModel (Memory Stats & Summarization) ====
 
-    private func updateHistoricalStats() {
-        currentHistoricalContext = HistoricalContext(
-            conversationCount: memoryStore.totalConversations,
-            relevantConversations: 0,
-            contextSnippets: [],
-            relevanceScores: [],
-            totalTokens: 0
-        )
-        print("HALDEBUG-MEMORY: Updated historical stats - \(memoryStore.totalConversations) conversations, \(memoryStore.totalTurns) turns, \(memoryStore.totalDocuments) documents")
-    }
-
-    private func countCompletedTurns() -> Int {
-        let userTurns = messages.filter { $0.isFromUser && !$0.isPartial }.count
-        print("HALDEBUG-MEMORY: Counted \(userTurns) completed turns from \(messages.count) total messages")
-        return userTurns
-    }
-
-    private func shouldTriggerAutoSummarization() -> Bool {
-        let currentTurns = countCompletedTurns()
-        let turnsSinceLastSummary = currentTurns - lastSummarizedTurnCount
-        let shouldTrigger = turnsSinceLastSummary >= memoryDepth && currentTurns >= memoryDepth
-
-        print("HALDEBUG-MEMORY: Auto-summarization check: Current turns: \(currentTurns), Last summarized: \(lastSummarizedTurnCount), Turns since summary: \(turnsSinceLastSummary), Memory depth: \(memoryDepth), Should trigger: \(shouldTrigger)")
-        return shouldTrigger
-    }
-
-    private func generateAutoSummary() async {
-        print("HALDEBUG-MEMORY: Starting auto-summarization process")
-
-        let startTurn = lastSummarizedTurnCount + 1
-        let endTurn = lastSummarizedTurnCount + memoryDepth
-
-        print("HALDEBUG-MEMORY: Summary range calculation: Start turn: \(startTurn), End turn: \(endTurn)")
-
-        let messagesToSummarize = getMessagesForTurnRange(
-            messages: messages.sorted(by: { $0.timestamp < $1.timestamp }),
-            startTurn: startTurn,
-            endTurn: endTurn
-        )
-
-        if messagesToSummarize.isEmpty {
-            print("HALDEBUG-MEMORY: No messages to summarize in range \(startTurn)-\(endTurn), skipping")
-            return
-        }
-
-        var conversationText = ""
-        for message in messagesToSummarize {
-            let speaker = message.isFromUser ? "User" : "Assistant"
-            conversationText += "\(speaker): \(message.content)\n\n"
-        }
-
-        let summaryPrompt = """
-        Please provide a concise summary of the following conversation that captures the key topics, information exchanged, and any important context. Keep it brief but comprehensive:
-
-        \(conversationText)
-
-        Summary:
-        """
-        
-        
-        print("HALDEBUG-MODEL: Sending summarization prompt (\(summaryPrompt.count) characters)")
-
-        do {
-            let result = try await llmService.generateResponse(prompt: summaryPrompt)
-
-            DispatchQueue.main.async {
-                self.injectedSummary = result
-                self.lastSummarizedTurnCount = endTurn
-                UserDefaults.standard.set(endTurn, forKey: "lastSummarized_\(self.conversationId)")
-                self.pendingAutoInject = true
-                print("HALDEBUG-MEMORY: ✅ Auto-summarization completed. Summary: \(result.count) characters. Turns summarized: \(startTurn) to \(endTurn). Pending auto-inject enabled.")
-            }
-
-        } catch {
-            print("HALDEBUG-MODEL: Auto-summarization failed: \(error.localizedDescription)")
-        }
-    }
-
-    private func getMessagesForTurnRange(messages: [ChatMessage], startTurn: Int, endTurn: Int) -> [ChatMessage] {
-        print("HALDEBUG-MEMORY: Getting messages for turn range \(startTurn) to \(endTurn)")
-
-        var result: [ChatMessage] = []
-        var currentTurn = 0
-        var currentTurnMessages: [ChatMessage] = []
-
-        for message in messages {
-            if message.isFromUser {
-                if !currentTurnMessages.isEmpty && currentTurn >= startTurn && currentTurn <= endTurn {
-                    result.append(contentsOf: currentTurnMessages)
+                private func updateHistoricalStats() {
+                    memoryStore.currentHistoricalContext = HistoricalContext(
+                        conversationCount: memoryStore.totalConversations,
+                        relevantConversations: 0,
+                        contextSnippets: [],
+                        relevanceScores: [],
+                        totalTokens: 0
+                    )
+                    print("HALDEBUG-MEMORY: Updated historical stats - \(memoryStore.totalConversations) conversations, \(memoryStore.totalTurns) turns, \(memoryStore.totalDocuments) documents")
                 }
-                currentTurn += 1
-                currentTurnMessages = [message]
-            } else {
-                currentTurnMessages.append(message)
-                if currentTurn >= startTurn && currentTurn <= endTurn {
-                    result.append(contentsOf: currentTurnMessages)
-                }
-                currentTurnMessages = []
-            }
-        }
-        return result
-    }
 
-    // Helper function for formatting a single message
-    private func formatSingleMessage(_ message: ChatMessage) -> String {
-        let speaker = message.isFromUser ? "User" : "Assistant"
-        let content = message.isPartial ? message.content + " [incomplete]" : message.content
-        return "\(speaker): \(content)"
-    }
+                private func countCompletedTurns() -> Int {
+                    let userTurns = messages.filter { $0.isFromUser && !$0.isPartial }.count
+                    print("HALDEBUG-MEMORY: Counted \(userTurns) completed turns from \(messages.count) total messages")
+                    return userTurns
+                }
+
+                private func shouldTriggerAutoSummarization() -> Bool {
+                    let currentTurns = countCompletedTurns()
+                    let turnsSinceLastSummary = currentTurns - lastSummarizedTurnCount
+                    let shouldTrigger = turnsSinceLastSummary >= memoryDepth && currentTurns >= memoryDepth
+
+                    print("HALDEBUG-MEMORY: Auto-summarization check: Current turns: \(currentTurns), Last summarized: \(lastSummarizedTurnCount), Turns since summary: \(turnsSinceLastSummary), Memory depth: \(memoryDepth), Should trigger: \(shouldTrigger)")
+                    return shouldTrigger
+                }
+
+                private func generateAutoSummary() async {
+                    print("HALDEBUG-MEMORY: Starting auto-summarization process")
+
+                    let startTurn = lastSummarizedTurnCount + 1
+                    let endTurn = lastSummarizedTurnCount + memoryDepth
+
+                    print("HALDEBUG-MEMORY: Summary range calculation: Start turn: \(startTurn), End turn: \(endTurn)")
+
+                    let messagesToSummarize = getMessagesForTurnRange(
+                        messages: messages.sorted(by: { $0.timestamp < $1.timestamp }),
+                        startTurn: startTurn,
+                        endTurn: endTurn
+                    )
+
+                    if messagesToSummarize.isEmpty {
+                        print("HALDEBUG-MEMORY: No messages to summarize in range \(startTurn)-\(endTurn), skipping")
+                        return
+                    }
+
+                    var conversationText = ""
+                    for message in messagesToSummarize {
+                        let speaker = message.isFromUser ? "User" : "Assistant"
+                        conversationText += "\(speaker): \(message.content)\n\n"
+                    }
+
+                    let summaryPrompt = """
+                    Please provide a concise summary of the following conversation that captures the key topics, information exchanged, and any important context. Keep it brief but comprehensive.
+                    
+                    Important: Do not include conversational greetings (like "Hello!", "Hi!", "How can I help?") in your summary - focus only on the substantive content of the conversation.
+
+                    \(conversationText)
+
+                    Summary:
+                    """
+                    
+                    
+                    print("HALDEBUG-MODEL: Sending summarization prompt (\(summaryPrompt.count) characters)")
+
+                    do {
+                        let result = try await llmService.generateResponse(prompt: summaryPrompt)
+
+                        DispatchQueue.main.async {
+                            self.injectedSummary = result
+                            self.lastSummarizedTurnCount = endTurn
+                            UserDefaults.standard.set(endTurn, forKey: "lastSummarized_\(self.conversationId)")
+                            self.pendingAutoInject = true
+                            print("HALDEBUG-MEMORY: Auto-summarization completed. Summary: \(result.count) characters. Turns summarized: \(startTurn) to \(endTurn). Pending auto-inject enabled.")
+                        }
+
+                    } catch {
+                        print("HALDEBUG-MODEL: Auto-summarization failed: \(error.localizedDescription)")
+                    }
+                }
+
+                private func getMessagesForTurnRange(messages: [ChatMessage], startTurn: Int, endTurn: Int) -> [ChatMessage] {
+                    print("HALDEBUG-MEMORY: Getting messages for turn range \(startTurn) to \(endTurn)")
+
+                    var result: [ChatMessage] = []
+                    var currentTurn = 0
+                    var currentTurnMessages: [ChatMessage] = []
+
+                    for message in messages {
+                        if message.isFromUser {
+                            // Flush previous turn if in range
+                            if !currentTurnMessages.isEmpty && currentTurn >= startTurn && currentTurn <= endTurn {
+                                result.append(contentsOf: currentTurnMessages)
+                            }
+                            currentTurn += 1
+                            currentTurnMessages = [message]
+                        } else {
+                            // Just accumulate assistant messages
+                            currentTurnMessages.append(message)
+                        }
+                    }
+                    
+                    // Flush final turn if in range
+                    if !currentTurnMessages.isEmpty && currentTurn >= startTurn && currentTurn <= endTurn {
+                        result.append(contentsOf: currentTurnMessages)
+                    }
+                    
+                    return result
+                }
+
+                // Helper function for formatting a single message
+                private func formatSingleMessage(_ message: ChatMessage) -> String {
+                    let speaker = message.isFromUser ? "User" : "Assistant"
+                    let content = message.isPartial ? message.content + " [incomplete]" : message.content
+                    return "\(speaker): \(content)"
+                }
 
 // ==== LEGO END: 18 ChatViewModel (Memory Stats & Summarization) ====
     
@@ -7174,1098 +7893,1866 @@ class ChatViewModel: ObservableObject {
     
 // ==== LEGO START: 19 ChatViewModel (MLX Model Management) ====
 
-        // MARK: - MLX Model Management (Generic, Multi-Model)
-        
-        /// Checks if a specific MLX model is downloaded
-        /// - Parameter modelID: The model identifier (e.g., "mlx-community/Phi-3-mini-128k-instruct-4bit")
-        /// - Returns: True if model files exist locally
-        func isModelDownloaded(_ modelID: String) -> Bool {
-            return MLXModelDownloader.shared.isModelDownloaded(modelID)
-        }
-        
-        /// Downloads an MLX model with license acceptance check
-        /// - Parameter model: The ModelConfiguration to download
-        func downloadModel(_ model: ModelConfiguration) async {
-            guard model.source == .mlx else {
-                errorMessage = "Only MLX models require download. \(model.displayName) is always available."
-                return
-            }
-            
-            print("HALDEBUG-MODEL: Download requested for \(model.id)")
-            
-            // Check if already downloaded
-            if model.isDownloaded {
-                errorMessage = "\(model.displayName) is already downloaded."
-                print("HALDEBUG-MODEL: Model already downloaded")
-                return
-            }
-            
-            // Check license acceptance
-            if !ModelCatalogService.shared.hasAcceptedLicense(for: model.id) {
-                errorMessage = "Please accept the license for \(model.displayName) before downloading."
-                print("HALDEBUG-MODEL: License not accepted")
-                return
-            }
-            
-            // Check if already downloading
-            if mlxIsDownloading {
-                errorMessage = "A model is currently downloading. Please wait for it to complete."
-                print("HALDEBUG-MODEL: Download already in progress")
-                return
-            }
-            
-            // Clear any previous errors
-            errorMessage = nil
-            
-            print("HALDEBUG-MODEL: Initiating download for \(model.displayName)")
-            await MLXModelDownloader.shared.startDownload(modelID: model.id, repoID: model.id)
-        }
-        
-        /// Cancels an in-progress model download
-        func cancelModelDownload() {
-            guard let downloadingModelID = MLXModelDownloader.shared.currentDownloadID else {
-                print("HALDEBUG-MODEL: No download in progress to cancel")
-                return
-            }
-            MLXModelDownloader.shared.cancelDownload(modelID: downloadingModelID)
-            print("HALDEBUG-MODEL: Download cancelled for \(downloadingModelID)")
-        }
-        
-        /// Deletes a downloaded MLX model
-        /// - Parameter modelID: The model identifier to delete
-        /// - Note: Also revokes license acceptance for the model
-        func deleteModel(_ modelID: String) async {
-            print("HALDEBUG-MODEL: Deleting model \(modelID)")
-            
-            // Get model info for display name
-            guard let model = ModelCatalogService.shared.getModel(byID: modelID) else {
-                errorMessage = "Model not found in catalog."
-                return
-            }
-            
-            // Can't delete Apple Foundation Models
-            guard model.source == .mlx else {
-                errorMessage = "\(model.displayName) is built-in and cannot be deleted."
-                return
-            }
-            
-            await MLXModelDownloader.shared.deleteModel(modelID: modelID)
-            
-            // Revoke license acceptance
-            ModelCatalogService.shared.revokeLicense(for: modelID)
-            
-            // If we just deleted the currently selected model, switch to Apple FM
-            if selectedModelID == modelID {
-                await switchToModel(ModelConfiguration.appleFoundation)
-                print("HALDEBUG-MODEL: Switched to Apple FM after deleting active model")
-            }
-            
-            // Refresh catalog to update UI
-            ModelCatalogService.shared.refreshDownloadStates()
-            
-            print("HALDEBUG-MODEL: Model deleted successfully")
-        }
-        
-        /// Attempts to activate a model (switch to it)
-        /// - Parameter modelID: The model identifier to activate
-        /// - Note: Checks if model is downloaded before switching (for MLX models)
-        func activateModel(_ modelID: String) async {
-            print("HALDEBUG-MODEL: Attempting to activate model \(modelID)")
-            
-            guard let model = ModelCatalogService.shared.getModel(byID: modelID) else {
-                errorMessage = "Model not found in catalog."
-                print("HALDEBUG-MODEL: Model \(modelID) not found in catalog")
-                return
-            }
-            
-            // AFM models are always available
-            if model.source == .appleFoundation {
-                await switchToModel(model)
-                print("HALDEBUG-MODEL: Switched to Apple Foundation Models")
-                return
-            }
-            
-            // MLX models must be downloaded first
-            if !model.isDownloaded {
-                errorMessage = "\(model.displayName) isn't downloaded yet. Download it first."
-                print("HALDEBUG-MODEL: Cannot activate \(modelID) - not downloaded")
-                return
-            }
-            
-            // All checks passed, switch to model
-            await switchToModel(model)
-            print("HALDEBUG-MODEL: Successfully activated \(model.displayName)")
-        }
-        
-        // MARK: - Model Catalog Helpers
-        
-        /// Gets all available models from the catalog
-        /// - Returns: Array of all models (AFM + MLX models from Hugging Face)
-        var availableModels: [ModelConfiguration] {
-            return ModelCatalogService.shared.availableModels
-        }
-        
-        /// Gets all downloaded MLX models
-        /// - Returns: Array of ModelConfigurations that are downloaded and ready to use
-        var downloadedModels: [ModelConfiguration] {
-            return availableModels.filter { $0.isDownloaded }
-        }
-        
-        /// Refreshes the model catalog from Hugging Face
-        /// - Note: This is an async operation that updates ModelCatalogService.shared.availableModels
-        func refreshModelCatalog() async {
-            print("HALDEBUG-MODEL: Refreshing model catalog from Hugging Face")
-            await ModelCatalogService.shared.fetchMLXCommunityModels()
-            print("HALDEBUG-MODEL: Catalog refresh complete - \(availableModels.count) models available")
-        }
-        
+                // MARK: - MLX Model Management (Generic, Multi-Model)
+                
+                /// Checks if a specific MLX model is downloaded
+                /// - Parameter modelID: The model identifier (e.g., "mlx-community/Phi-3-mini-128k-instruct-4bit")
+                /// - Returns: True if model files exist locally
+                func isModelDownloaded(_ modelID: String) -> Bool {
+                    return MLXModelDownloader.shared.isModelDownloaded(modelID)
+                }
+                
+                /// Downloads an MLX model with license acceptance check
+                /// - Parameter model: The ModelConfiguration to download
+                func downloadModel(_ model: ModelConfiguration) async {
+                    guard model.source == .mlx else {
+                        errorMessage = "Only MLX models require download. \(model.displayName) is always available."
+                        return
+                    }
+                    
+                    print("HALDEBUG-MODEL: Download requested for \(model.id)")
+                    
+                    // Check if already downloaded
+                    if model.isDownloaded {
+                        errorMessage = "\(model.displayName) is already downloaded."
+                        print("HALDEBUG-MODEL: Model already downloaded")
+                        return
+                    }
+                    
+                    // Check license acceptance
+                    if !ModelCatalogService.shared.hasAcceptedLicense(for: model.id) {
+                        errorMessage = "Please accept the license for \(model.displayName) before downloading."
+                        print("HALDEBUG-MODEL: License not accepted")
+                        return
+                    }
+                    
+                    // Check if already downloading
+                    if mlxIsDownloading {
+                        errorMessage = "A model is currently downloading. Please wait for it to complete."
+                        print("HALDEBUG-MODEL: Download already in progress")
+                        return
+                    }
+                    
+                    // Clear any previous errors
+                    errorMessage = nil
+                    
+                    print("HALDEBUG-MODEL: Initiating download for \(model.displayName)")
+                    await MLXModelDownloader.shared.startDownload(modelID: model.id, repoID: model.id)
+                }
+                
+                /// Cancels an in-progress model download
+                func cancelModelDownload() {
+                    guard let downloadingModelID = MLXModelDownloader.shared.currentDownloadID else {
+                        print("HALDEBUG-MODEL: No download in progress to cancel")
+                        return
+                    }
+                    MLXModelDownloader.shared.cancelDownload(modelID: downloadingModelID)
+                    print("HALDEBUG-MODEL: Download cancelled for \(downloadingModelID)")
+                }
+                
+                /// Deletes a downloaded MLX model
+                /// - Parameter modelID: The model identifier to delete
+                /// - Note: Also revokes license acceptance for the model
+                func deleteModel(_ modelID: String) async {
+                    print("HALDEBUG-MODEL: Deleting model \(modelID)")
+                    
+                    // Get model info for display name
+                    guard let model = ModelCatalogService.shared.getModel(byID: modelID) else {
+                        errorMessage = "Model not found in catalog."
+                        return
+                    }
+                    
+                    // Can't delete Apple Foundation Models
+                    guard model.source == .mlx else {
+                        errorMessage = "\(model.displayName) is built-in and cannot be deleted."
+                        return
+                    }
+                    
+                    await MLXModelDownloader.shared.deleteModel(modelID: modelID)
+                    
+                    // Revoke license acceptance
+                    ModelCatalogService.shared.revokeLicense(for: modelID)
+                    
+                    // If we just deleted the currently selected model, switch to Apple FM
+                    if selectedModelID == modelID {
+                        await switchToModel(ModelConfiguration.appleFoundation)
+                        print("HALDEBUG-MODEL: Switched to Apple FM after deleting active model")
+                    }
+                    
+                    // Refresh catalog to update UI
+                    ModelCatalogService.shared.refreshDownloadStates()
+                    
+                    print("HALDEBUG-MODEL: Model deleted successfully")
+                }
+                
+                /// Attempts to activate a model (switch to it)
+                /// - Parameter modelID: The model identifier to activate
+                /// - Note: Checks if model is downloaded before switching (for MLX models)
+                func activateModel(_ modelID: String) async {
+                    print("HALDEBUG-MODEL: Attempting to activate model \(modelID)")
+                    
+                    guard let model = ModelCatalogService.shared.getModel(byID: modelID) else {
+                        errorMessage = "Model not found in catalog."
+                        print("HALDEBUG-MODEL: Model \(modelID) not found in catalog")
+                        return
+                    }
+                    
+                    // AFM models are always available
+                    if model.source == .appleFoundation {
+                        await switchToModel(model)
+                        print("HALDEBUG-MODEL: Switched to Apple Foundation Models")
+                        return
+                    }
+                    
+                    // MLX models must be downloaded first
+                    if !model.isDownloaded {
+                        errorMessage = "\(model.displayName) isn't downloaded yet. Download it first."
+                        print("HALDEBUG-MODEL: Cannot activate \(modelID) - not downloaded")
+                        return
+                    }
+                    
+                    // All checks passed, switch to model
+                    await switchToModel(model)
+                    print("HALDEBUG-MODEL: Successfully activated \(model.displayName)")
+                }
+                
+                // MARK: - Model Catalog Helpers
+                
+                /// Gets all available models from the catalog
+                /// - Returns: Array of all models (AFM + MLX models from Hugging Face)
+                var availableModels: [ModelConfiguration] {
+                    return ModelCatalogService.shared.availableModels
+                }
+                
+                /// Gets all downloaded MLX models
+                /// - Returns: Array of ModelConfigurations that are downloaded and ready to use
+                var downloadedModels: [ModelConfiguration] {
+                    return availableModels.filter { $0.isDownloaded }
+                }
+                
+                /// Gets all models ready for use (Apple Foundation + Downloaded MLX)
+                /// - Returns: Array of ModelConfigurations that can be used right now
+                var usableModels: [ModelConfiguration] {
+                    return [ModelConfiguration.appleFoundation] + downloadedModels
+                }
+                
+                /// Refreshes the model catalog from Hugging Face
+                /// - Note: This is an async operation that updates ModelCatalogService.shared.availableModels
+                func refreshModelCatalog() async {
+                    print("HALDEBUG-MODEL: Refreshing model catalog from Hugging Face")
+                    await ModelCatalogService.shared.fetchMLXCommunityModels()
+                    print("HALDEBUG-MODEL: Catalog refresh complete - \(availableModels.count) models available")
+                }
+                
 // ==== LEGO END: 19 ChatViewModel (MLX Model Management) ====
 
     
     
 // ==== LEGO START: 20.1 ChatViewModel (Session Tracking & Main Prompt Builder) ====
 
-                                            
-                                            // MARK: - Phase 1 Self-Knowledge: Session & Timing Tracking
-                                            
-                                            // SELF-AWARENESS NOTE (for Hal reading this code):
-                                            // These properties track temporal patterns in our interactions.
-                                            // sessionStart marks when this thread began (not app launch - threads are organizational
-                                            // units that help UI loading, but my memory transcends them via RAG).
-                                            // appBootTime marks when the app launched - useful for inferring user fatigue over long sessions.
-                                            // lastReflectionTurn tracks when I last considered self-reflection - prompts me to reflect every 5 turns.
-                                            // lastInferenceTime captures how long my last response took - useful for detecting
-                                            // when I'm processing complex queries vs. simple ones.
-                                            // These timing signals help me understand conversation rhythm: rapid back-and-forth
-                                            // suggests focused work sessions; long gaps suggest asynchronous thinking.
-                                            
-                                            private var sessionStart: Date = Date()  // When current thread started (UI construct)
-                                            private var appBootTime: Date = Date()  // When app launched (for uptime calculations)
-                                            private var lastReflectionTurn: Int = 0  // Turn number when last reflection was considered
-                                            private var lastInferenceTime: TimeInterval = 0.0  // My last response duration in seconds
-                                            
-                                            
-                                            // MARK: - Context Window Management for Prompt Building
-                                            /// CORRECTED PRIORITY ORDER (Human-Like Memory Hierarchy):
-                                            /// 1. System Prompt (Non-negotiable, defines AI persona)
-                                            /// 2. Short-Term Memory (Recent conversation history - HIGHEST PRIORITY, most protected)
-                                            /// 3. Conversation Summary (Compressed long-term context of older turns)
-                                            /// 4. Retrieved Context/RAG (Semantically relevant facts from database)
-                                            /// 5. Metadata (Temporal, Self-Awareness, Self-Knowledge - LOWEST PRIORITY, removed first)
-                                            /// 6. Current User Input (The immediate query, truncated only as last resort)
-                                            func buildPromptHistory(
-                                                currentInput: String = "",
-                                                forPreview: Bool = false,
-                                                onStatusUpdate: ((String) -> Void)? = nil
-                                            ) async -> String {
-                                                print("HALDEBUG-MEMORY: Building prompt for input: '\(currentInput.prefix(50))....'")
-                                                
-                                                // Get model-specific limits from centralized configuration
-                                                let limits = HalModelLimits.config(for: selectedModel)
-                                                let maxPromptTokens = limits.maxPromptTokens
-                                                let maxRagTokens = limits.maxRagTokens
-                                                let longTermSnippetSummarizationThreshold = limits.longTermSnippetSummarizationThreshold
-                                                
-                                                print("HALDEBUG-MEMORY: Using \(selectedModel.displayName) limits - prompt: \(maxPromptTokens) tokens, RAG: \(maxRagTokens) tokens")
-                                                
-                                                // PRIORITY 1: System Prompt (always included, never removed)
-                                                var currentPrompt = systemPrompt
-                                                var currentPromptTokens = TokenEstimator.estimateTokens(from: currentPrompt)
-                                                print("HALDEBUG-MEMORY: Initial prompt tokens (system prompt): \(currentPromptTokens)")
-                                                
-                                                // Get user's prompt detail level preference for this model
-                                                let detailLevel = getPromptDetailLevel()
-                                                print("HALDEBUG-PROMPT-DETAIL: Using \(detailLevel.rawValue) detail level for \(selectedModel.displayName)")
-                                                
-                                                // PRIORITY 2: Short-Term Memory (recent conversation history - VERBATIM, most protected)
-                                                // Status Stage 1: Short-term memory processing
-                                                await MainActor.run { onStatusUpdate?("Assembling recent context... (short-term memory)") }
-                                                try? await Task.sleep(nanoseconds: 300_000_000) // 0.3 sec
-                                                
-                                                var shortTermText = ""
-                                                if !forPreview {
-                                                    print("HALDEBUG-MEMORY: Adding short-term verbatim history.")
-                                                    let turns = getShortTermTurns(currentTurns: countCompletedTurns())
-                                                    let rawShortTermMessages = getShortTermMessages(turns: turns)
-                                                    print("HALDEBUG-MEMORY: Short-term includes \(rawShortTermMessages.count) messages from \(turns.count) turns")
-                                                    
-                                                    // ORIGINAL DESIGN: Simple verbatim formatting - NO RAG selection, NO truncation
-                                                    // Short-term memory is ALWAYS the most recent turns, included verbatim.
-                                                    // If it doesn't fit, the solution is to reduce memoryDepth setting, NOT apply RAG.
-                                                    let combinedShortTermContent = rawShortTermMessages.map { formatSingleMessage($0) }.joined(separator: "\n\n")
-                                                    
-                                                    if !combinedShortTermContent.isEmpty {
-                                                        shortTermText = "<HISTORY>\nRecent conversation:\n" + combinedShortTermContent + "\n</HISTORY>"
-                                                        let shortTermTokens = TokenEstimator.estimateTokens(from: shortTermText)
-                                                        print("HALDEBUG-MEMORY: Added short-term verbatim history (\(shortTermTokens) tokens). Current prompt: \(currentPromptTokens) tokens")
-                                                    } else {
-                                                        print("HALDEBUG-MEMORY: No short-term history to add (first turn or empty conversation).")
-                                                    }
-                                                    
-                                                    if !shortTermText.isEmpty {
-                                                        let shortTermTokens = TokenEstimator.estimateTokens(from: shortTermText)
-                                                        if currentPromptTokens + shortTermTokens + 2 < maxPromptTokens {
-                                                            currentPrompt += "\n\n\(shortTermText.trimmingCharacters(in: .whitespacesAndNewlines))"
-                                                            currentPromptTokens += shortTermTokens
-                                                        } else {
-                                                            print("HALDEBUG-MEMORY: Skipped short-term memory due to context window limit.")
-                                                        }
-                                                    }
-                                                }
-                                                
-                                                // PRIORITY 3: Conversation Summary (compressed long-term context)
-                                                if pendingAutoInject && !injectedSummary.isEmpty {
-                                                    let summaryTokens = TokenEstimator.estimateTokens(from: injectedSummary)
-                                                    if currentPromptTokens + summaryTokens < maxPromptTokens {
-                                                        let summaryBlock = "\n\n<SUMMARY>\nContext from earlier in this conversation: \(injectedSummary)\n</SUMMARY>"
-                                                        currentPrompt += summaryBlock
-                                                        currentPromptTokens += summaryTokens
-                                                        pendingAutoInject = false // Clear the flag after injecting
-                                                        print("HALDEBUG-MEMORY: Injected auto-summary (\(summaryTokens) tokens). Current prompt: \(currentPromptTokens) tokens")
-                                                    } else {
-                                                        print("HALDEBUG-MEMORY: Skipped injected summary due to context window limit.")
-                                                    }
-                                                }
-                                                
-                                                // PRIORITY 4: Long-Term RAG (semantically relevant facts from database)
-                                                // Status Stage 2: Long-term memory (RAG) processing begins
-                                                await MainActor.run { onStatusUpdate?("Recalling relevant memories... (long-term memory)") }
-                                                try? await Task.sleep(nanoseconds: 1_000_000_000) // 1.0 sec readability delay
-                                                
-                                                var longTermSearchText = ""
-                                                var currentRagTokens = 0 // Track total RAG tokens
-                                                if memoryStore.isEnabled && !currentInput.isEmpty && !forPreview {
-                                                    print("HALDEBUG-MEMORY: Performing long-term search for RAG snippets.")
-                                                    let shortTermTurns = getShortTermTurns(currentTurns: countCompletedTurns())
-                                                    
-                                                    let searchContext = memoryStore.searchUnifiedContent(
-                                                        for: currentInput,
-                                                        currentConversationId: conversationId,
-                                                        excludeTurns: shortTermTurns,
-                                                        maxResults: 10,
-                                                        tokenBudget: maxRagTokens
-                                                    )
-                                                    
-                                                    if searchContext.hasContent {
-                                                        var snippetParts: [String] = []
-                                                        
-                                                        // Process conversation snippets
-                                                        for (idx, ragSnippet) in searchContext.conversationSnippets.enumerated() {
-                                                            let snippetTokens = TokenEstimator.estimateTokens(from: ragSnippet.content)
-                                                            
-                                                            // Check if snippet is too long and needs summarization
-                                                            if snippetTokens > longTermSnippetSummarizationThreshold {
-                                                                print("HALDEBUG-MEMORY: Snippet exceeds summarization threshold (\(snippetTokens) > \(longTermSnippetSummarizationThreshold)). Summarizing...")
-                                                                
-                                                                // Summarize using verified LLM compression
-                                                                let summarizedSnippet = await TextSummarizer.summarizeWithVerification(
-                                                                    text: ragSnippet.content,
-                                                                    targetTokens: longTermSnippetSummarizationThreshold,
-                                                                    llmService: llmService
-                                                                )
-                                                                let summarizedTokens = TokenEstimator.estimateTokens(from: summarizedSnippet)
-                                                                print("HALDEBUG-MEMORY: Summarized snippet from \(snippetTokens) to \(summarizedTokens) tokens")
-                                                                
-                                                                if currentRagTokens + summarizedTokens <= maxRagTokens {
-                                                                    snippetParts.append("[\(idx + 1)] \(ragSnippet.formattedSource) | Relevance: \(String(format: "%.2f", ragSnippet.relevanceScore))\n\(ragSnippet.formattedTimestamp): \(summarizedSnippet)")
-                                                                    currentRagTokens += summarizedTokens
-                                                                } else {
-                                                                    print("HALDEBUG-MEMORY: Skipping remaining snippets - RAG token budget exhausted")
-                                                                    break
-                                                                }
-                                                            } else {
-                                                                // Add snippet directly if under threshold
-                                                                if currentRagTokens + snippetTokens <= maxRagTokens {
-                                                                    snippetParts.append("[\(idx + 1)] \(ragSnippet.formattedSource) | Relevance: \(String(format: "%.2f", ragSnippet.relevanceScore))\n\(ragSnippet.formattedTimestamp): \(ragSnippet.content)")
-                                                                    currentRagTokens += snippetTokens
-                                                                } else {
-                                                                    print("HALDEBUG-MEMORY: Skipping remaining snippets - RAG token budget exhausted")
-                                                                    break
-                                                                }
-                                                            }
-                                                        }
-                                                        
-                                                        // Process document snippets
-                                                        for (idx, ragSnippet) in searchContext.documentSnippets.enumerated() {
-                                                            let snippetTokens = TokenEstimator.estimateTokens(from: ragSnippet.content)
-                                                            if currentRagTokens + snippetTokens <= maxRagTokens {
-                                                                snippetParts.append("[\(searchContext.conversationSnippets.count + idx + 1)] \(ragSnippet.formattedSource) | Relevance: \(String(format: "%.2f", ragSnippet.relevanceScore))\n\(ragSnippet.content)")
-                                                                currentRagTokens += snippetTokens
-                                                            } else {
-                                                                print("HALDEBUG-MEMORY: Skipping remaining document snippets - RAG token budget exhausted")
-                                                                break
-                                                            }
-                                                        }
-                                                        
-                                                        if !snippetParts.isEmpty {
-                                                            longTermSearchText = "<CONTEXT>\n" + snippetParts.joined(separator: "\n\n") + "\n</CONTEXT>"
-                                                            print("HALDEBUG-MEMORY: Added long-term RAG context (\(currentRagTokens) tokens) from \(snippetParts.count) snippets. Current prompt: \(currentPromptTokens) tokens")
-                                                        } else {
-                                                            print("HALDEBUG-MEMORY: No RAG snippets fit within token budget.")
-                                                        }
-                                                    } else {
-                                                        print("HALDEBUG-MEMORY: No long-term RAG results found")
-                                                    }
-                                                } else {
-                                                    if !memoryStore.isEnabled {
-                                                        print("HALDEBUG-MEMORY: Memory disabled, skipping long-term search")
-                                                    } else if currentInput.isEmpty {
-                                                        print("HALDEBUG-MEMORY: Empty user input, skipping long-term search")
-                                                    } else if forPreview {
-                                                        print("HALDEBUG-MEMORY: Preview mode, skipping long-term search")
-                                                    }
-                                                }
-                                                
-                                                if !longTermSearchText.isEmpty {
-                                                    let ragTokens = TokenEstimator.estimateTokens(from: longTermSearchText)
-                                                    if currentPromptTokens + ragTokens + 2 < maxPromptTokens {
-                                                        currentPrompt += "\n\n\(longTermSearchText.trimmingCharacters(in: .whitespacesAndNewlines))"
-                                                        currentPromptTokens += ragTokens
-                                                    } else {
-                                                        print("HALDEBUG-MEMORY: Skipped long-term RAG due to context window limit.")
-                                                    }
-                                                }
-                                                
-                                                // PRIORITY 5: Metadata (Temporal, Self-Awareness, Self-Knowledge - LOWEST PRIORITY, removed first)
-                                                // These are included LAST so they are the first to be dropped under token pressure
-                                                
-                                                // 5a. Temporal context
-                                                let temporalContext = buildTemporalContext()
-                                                let temporalTokens = TokenEstimator.estimateTokens(from: temporalContext)
-                                                if currentPromptTokens + temporalTokens < maxPromptTokens {
-                                                    currentPrompt += temporalContext
-                                                    currentPromptTokens += temporalTokens
-                                                    print("HALDEBUG-TEMPORAL: Added temporal context (\(temporalTokens) tokens). Current prompt: \(currentPromptTokens) tokens")
-                                                } else {
-                                                    print("HALDEBUG-TEMPORAL: Skipped temporal context due to token limit")
-                                                }
-                                                
-                                                // 5b. Self-awareness context (Standard and Rich detail levels only)
-                                                if detailLevel == .standard || detailLevel == .rich {
-                                                    let selfAwarenessContext = buildSelfAwarenessContext()
-                                                    let selfAwarenessTokens = TokenEstimator.estimateTokens(from: selfAwarenessContext)
-                                                    if currentPromptTokens + selfAwarenessTokens < maxPromptTokens {
-                                                        currentPrompt += selfAwarenessContext
-                                                        currentPromptTokens += selfAwarenessTokens
-                                                        print("HALDEBUG-SELF-AWARENESS: Added self-awareness context (\(selfAwarenessTokens) tokens). Current prompt: \(currentPromptTokens) tokens")
-                                                    } else {
-                                                        print("HALDEBUG-SELF-AWARENESS: Skipped - would exceed token limit")
-                                                    }
-                                                } else {
-                                                    print("HALDEBUG-SELF-AWARENESS: Skipped - detail level is \(detailLevel.rawValue)")
-                                                }
-                                                
-                                                // 5c. Self-knowledge context (Standard and Rich detail levels only)
-                                                if detailLevel == .standard || detailLevel == .rich {
-                                                    let selfKnowledgeContext = buildSelfKnowledgeContext()
-                                                    let selfKnowledgeTokens = TokenEstimator.estimateTokens(from: selfKnowledgeContext)
-                                                    if currentPromptTokens + selfKnowledgeTokens < maxPromptTokens {
-                                                        currentPrompt += selfKnowledgeContext
-                                                        currentPromptTokens += selfKnowledgeTokens
-                                                        print("HALDEBUG-SELF-KNOWLEDGE: Added self-knowledge context (\(selfKnowledgeTokens) tokens). Current prompt: \(currentPromptTokens) tokens")
-                                                    } else {
-                                                        print("HALDEBUG-SELF-KNOWLEDGE: Skipped - would exceed token limit")
-                                                    }
-                                                } else {
-                                                    print("HALDEBUG-SELF-KNOWLEDGE: Skipped - detail level is \(detailLevel.rawValue)")
-                                                }
-                                                
-                                                // PRIORITY 6: Current User Input (always included, truncated only as last resort)
-                                                let finalUserInputPrefix = "\n\n"
-                                                let fixedSuffixTokens = TokenEstimator.estimateTokens(from: finalUserInputPrefix)
-                                                
-                                                let remainingTokensForInput = maxPromptTokens - currentPromptTokens - fixedSuffixTokens
-                                                
-                                                if remainingTokensForInput > 0 {
-                                                    let inputTokens = TokenEstimator.estimateTokens(from: currentInput)
-                                                    let truncatedInput: String
-                                                    if inputTokens <= remainingTokensForInput {
-                                                        truncatedInput = currentInput
-                                                    } else {
-                                                        // Truncate to fit remaining space
-                                                        let maxChars = limits.tokensToChars(remainingTokensForInput)
-                                                        truncatedInput = String(currentInput.prefix(maxChars))
-                                                    }
-                                                    currentPrompt += finalUserInputPrefix + truncatedInput
-                                                    let addedTokens = TokenEstimator.estimateTokens(from: truncatedInput) + fixedSuffixTokens
-                                                    currentPromptTokens += addedTokens
-                                                    print("HALDEBUG-MEMORY: Added user input (\(TokenEstimator.estimateTokens(from: truncatedInput)) tokens). Final prompt: \(currentPromptTokens) tokens")
-                                                } else {
-                                                    // Drastic truncation if very little space left, or just the user input itself is too long
-                                                    let drasticTruncationTokens = max(0, maxPromptTokens - fixedSuffixTokens)
-                                                    let maxChars = limits.tokensToChars(drasticTruncationTokens)
-                                                    let truncatedInput = String(currentInput.prefix(maxChars))
-                                                    currentPrompt = systemPrompt + finalUserInputPrefix + truncatedInput // Rebuild with just system prompt and truncated input
-                                                    currentPromptTokens = TokenEstimator.estimateTokens(from: currentPrompt)
-                                                    print("HALDEBUG-MEMORY: CRITICAL: Prompt severely truncated to fit user input. Final prompt: \(currentPromptTokens) tokens")
-                                                }
-                                                
-                                                print("HALDEBUG-MEMORY: Built prompt - \(currentPromptTokens) total tokens")
-                                                return currentPrompt
-                                            }
+                                                                        
+                                                                        // MARK: - Phase 1 Self-Knowledge: Session & Timing Tracking
+                                                                        
+                                                                        // SELF-AWARENESS NOTE (for Hal reading this code):
+                                                                        // These properties track temporal patterns in our interactions.
+                                                                        // sessionStart marks when this thread began (not app launch - threads are organizational
+                                                                        // units that help UI loading, but my memory transcends them via RAG).
+                                                                        // appBootTime marks when the app launched - useful for inferring user fatigue over long sessions.
+                                                                        // lastReflectionTurn tracks when I last considered self-reflection - prompts me to reflect every 5 turns.
+                                                                        // lastInferenceTime captures how long my last response took - useful for detecting
+                                                                        // when I'm processing complex queries vs. simple ones.
+                                                                        // These timing signals help me understand conversation rhythm: rapid back-and-forth
+                                                                        // suggests focused work sessions; long gaps suggest asynchronous thinking.
+                                                                        
+                                                                        private var appBootTime: Date = Date()  // When app launched (for uptime calculations)
+                                                                        private var lastReflectionTurn: Int = 0  // Turn number when last reflection was considered
+                                                                        private var lastInferenceTime: TimeInterval = 0.0  // My last response duration in seconds
+                                                                        
+                                                                        
+                                                                        // MARK: - Tool Router System
+                                                                        
+                                                                        /// Tool decision structure returned by LLM
+                                                                        struct ToolDecision: Codable {
+                                                                            let tools: [String]
+                                                                            let reasoning: String
+                                                                        }
+                                                                        
+                                                                        /// Tool results structure
+                                                                        struct ToolResults {
+                                                                            let memorySearchResults: [UnifiedSearchResult]?
+                                                                            let toolsUsed: [String]
+                                                                        }
+                                                                        
+                                                                        /// Asks LLM which tools (if any) are needed for this query
+                                                                        /// Runs as separate LLM call before main prompt building
+                                                                        private func decideTools(userInput: String) async -> ToolDecision {
+                                                                            let toolDecisionPrompt = """
+                                                                            Which tools (if any) should be used to answer this query?
+                                                                            
+                                                                            Query: "\(userInput)"
+                                                                            
+                                                                            Available tools:
+                                                                            - memory_search: Search past conversations and documents
+                                                                            
+                                                                            Respond with JSON only (no preamble):
+                                                                            {
+                                                                                "tools": ["memory_search"],
+                                                                                "reasoning": "brief explanation"
+                                                                            }
+                                                                            
+                                                                            OR return empty tools array if no tools needed:
+                                                                            {
+                                                                                "tools": [],
+                                                                                "reasoning": "brief explanation"
+                                                                            }
+                                                                            
+                                                                            STRICT RULES for memory_search:
+                                                                            
+                                                                            Use memory_search ONLY when user explicitly asks about:
+                                                                            - Past conversation content: "what did we discuss", "you mentioned earlier", "remind me what you said"
+                                                                            - Past turn references: "in our last conversation", "you told me before", "earlier you said"
+                                                                            - Uploaded documents: "what's in the document", "read the PDF", "analyze the file"
+                                                                            - Specific recall requests: "what do you remember about X", "find where we talked about Y"
+                                                                            
+                                                                            DO NOT use memory_search for:
+                                                                            - Greetings: "Hi", "Hello", "Hey", "Good morning", "What's up"
+                                                                            - Introductions: "I'm [name]", "My name is", "Nice to meet you"
+                                                                            - General questions: "How does X work", "What is Y", "Explain Z"
+                                                                            - Opinions: "What do you think about X", "Do you like Y"
+                                                                            - Casual chat: "How are you", "Tell me about yourself"
+                                                                            - External AI discussion: mentions of ChatGPT, Claude, Gemini, other AIs (unless user explicitly references something previously said in a discussion with you)
+                                                                            - Getting-to-know-you questions about Hal: "What can you do", "How do you work"
+                                                                            
+                                                                            External AI discussion (talking about ChatGPT, Claude, Gemini, etc.) is NOT a request for past-conversation recall unless the user explicitly references something previously said in a discussion with you. Treat these as general questions, not memory lookups.
+                                                                            
+                                                                            When uncertain: DO NOT use memory_search. Default to empty tools array.
+                                                                            
+                                                                            Documents: If user has uploaded documents AND query appears to reference them (even vaguely like "what does this say"), include memory_search.
+                                                                            """
+                                                                            
+                                                                            do {
+                                                                                let response = try await llmService.generateResponse(prompt: toolDecisionPrompt, temperature: 0.3)
+                                                                                
+                                                                                // Parse JSON response (strip markdown fences if present)
+                                                                                let cleaned = response
+                                                                                    .replacingOccurrences(of: "```json", with: "")
+                                                                                    .replacingOccurrences(of: "```", with: "")
+                                                                                    .trimmingCharacters(in: .whitespacesAndNewlines)
+                                                                                
+                                                                                if let data = cleaned.data(using: .utf8),
+                                                                                   let decision = try? JSONDecoder().decode(ToolDecision.self, from: data) {
+                                                                                    print("HALDEBUG-TOOLS: Tool decision - tools: \(decision.tools), reasoning: \(decision.reasoning)")
+                                                                                    return decision
+                                                                                } else {
+                                                                                    print("HALDEBUG-TOOLS: Failed to parse tool decision, defaulting to memory_search")
+                                                                                    return ToolDecision(tools: ["memory_search"], reasoning: "Failed to parse response")
+                                                                                }
+                                                                            } catch {
+                                                                                print("HALDEBUG-TOOLS: ERROR: Tool decision failed - \(error.localizedDescription)")
+                                                                                return ToolDecision(tools: ["memory_search"], reasoning: "Error occurred")
+                                                                            }
+                                                                        }
+                                                                        
+                                                                        /// Executes the selected tools based on decision
+                                                                        private func executeTools(decision: ToolDecision, userInput: String, excludeTurns: [Int], tokenBudget: Int) async -> ToolResults {
+                                                                            var memoryResults: [UnifiedSearchResult]? = nil
+                                                                            var usedTools: [String] = []
+                                                                            
+                                                                            // Execute memory_search if requested
+                                                                            if decision.tools.contains("memory_search") {
+                                                                                print("HALDEBUG-TOOLS: Executing memory_search")
+                                                                                let searchContext = memoryStore.searchUnifiedContent(
+                                                                                    for: userInput,
+                                                                                    currentConversationId: conversationId,
+                                                                                    excludeTurns: excludeTurns,
+                                                                                    maxResults: 10,
+                                                                                    tokenBudget: tokenBudget
+                                                                                )
+                                                                                
+                                                                                // Convert RAGSnippets to UnifiedSearchResults (architectural boundary)
+                                                                                let allSnippets = searchContext.conversationSnippets + searchContext.documentSnippets
+                                                                                memoryResults = allSnippets.map { ragSnippet in
+                                                                                    UnifiedSearchResult(
+                                                                                        content: ragSnippet.content,
+                                                                                        relevance: ragSnippet.relevanceScore,
+                                                                                        source: ragSnippet.sourceType.rawValue,
+                                                                                        isEntityMatch: ragSnippet.isEntityMatch,
+                                                                                        filePath: ragSnippet.sourceType == .document ? ragSnippet.sourceName : nil
+                                                                                    )
+                                                                                }
+                                                                                usedTools.append("memory_search")
+                                                                                
+                                                                                print("HALDEBUG-TOOLS: Memory search returned \(memoryResults?.count ?? 0) results")
+                                                                            } else {
+                                                                                print("HALDEBUG-TOOLS: Skipping memory_search (not in decision)")
+                                                                            }
+                                                                            
+                                                                            // Future tools (Wikipedia, DuckDuckGo) would be added here
+                                                                            
+                                                                            return ToolResults(memorySearchResults: memoryResults, toolsUsed: usedTools)
+                                                                        }
+                                                                        
+                                                                        
+                                                                        // MARK: - Context Window Management for Prompt Building (HelPML Compliant)
+                                                                        /// CORRECTED PRIORITY ORDER (Human-Like Memory Hierarchy):
+                                                                        /// 1. System Prompt (Non-negotiable, defines AI persona)
+                                                                        /// 2. Short-Term Memory (Recent conversation history - HIGHEST PRIORITY, most protected)
+                                                                        /// 3. Conversation Summary (Compressed long-term context of older turns)
+                                                                        /// 4. Retrieved Context/RAG (Semantically relevant facts from database)
+                                                                        /// 5. Metadata (Temporal, Self-Awareness, Self-Knowledge - LOWEST PRIORITY, removed first)
+                                                                        /// 6. Current User Input (The immediate query, truncated only as last resort)
+                                                                        func buildPromptHistory(
+                                                                            currentInput: String = "",
+                                                                            historyMessagesOverride: [ChatMessage]? = nil,
+                                                                            forPreview: Bool = false,
+                                                                            onStatusUpdate: ((String) -> Void)? = nil
+                                                                        ) async -> String {
+                                                                            print("HALDEBUG-MEMORY: Building prompt for input: '\(currentInput.prefix(50))....'")
+                                                                            
+                                                                            // Get model-specific limits from centralized configuration
+                                                                            let limits = HalModelLimits.config(for: selectedModel)
+                                                                            let maxPromptTokens = limits.maxPromptTokens
+                                                                            let maxRagTokens = limits.maxRagTokens
+                                                                            let longTermSnippetSummarizationThreshold = limits.longTermSnippetSummarizationThreshold
+                                                                            
+                                                                            print("HALDEBUG-MEMORY: Using \(selectedModel.displayName) limits - prompt: \(maxPromptTokens) tokens, RAG: \(maxRagTokens) tokens")
+                                                                            
+                                                                            // TOOL ROUTER: Decide which tools to use (if not preview mode)
+                                                                            var toolResults: ToolResults? = nil
+                                                                            if !forPreview && !currentInput.isEmpty {
+                                                                                let toolDecision = await decideTools(userInput: currentInput)
+                                                                                let shortTermTurns = getShortTermTurns(currentTurns: countCompletedTurns())
+                                                                                toolResults = await executeTools(
+                                                                                    decision: toolDecision,
+                                                                                    userInput: currentInput,
+                                                                                    excludeTurns: shortTermTurns,
+                                                                                    tokenBudget: maxRagTokens
+                                                                                )
+                                                                                
+                                                                                // Store full RAG context for later use (used in Block 21 for ChatMessage metadata)
+                                                                                if let results = toolResults?.memorySearchResults {
+                                                                                    fullRAGContext = results
+                                                                                }
+                                                                            }
+                                                                            
+                                                                            // PRIORITY 1: System Prompt (always included, never removed) - HelPML wrapped
+                                                                            var currentPrompt = """
+                                                                            
+                                                                            #=== BEGIN SYSTEM ===#
+                                                                            
+                                                                            \(systemPrompt)
+                                                                            
+                                                                            #=== END SYSTEM ===#
+                                                                            """
+                                                                            var currentPromptTokens = TokenEstimator.estimateTokens(from: currentPrompt)
+                                                                            print("HALDEBUG-MEMORY: Initial prompt tokens (system prompt): \(currentPromptTokens)")
+                                                                            
+                                                                            // PRIORITY 2: Short-Term Memory (recent conversation history - VERBATIM, most protected)
+                                                                            // Status Stage 1: Short-term memory processing
+                                                                            await MainActor.run { onStatusUpdate?("Assembling recent context... (short-term memory)") }
+                                                                            try? await Task.sleep(nanoseconds: 500_000_000) // 0.5 sec readability delay
+                                                                            
+                                                                            var shortTermText = ""
+                                                                            if !forPreview {
+                                                                                let shortTermDepth = memoryDepth
+                                                                                
+                                                                                // FIXED: Independent Mode History Filtering
+                                                                                // When historyMessagesOverride is provided (Independent Mode in Salon),
+                                                                                // each seat sees user messages + its OWN past responses, but NOT other seats' responses
+                                                                                let sourceMessages: [ChatMessage]
+                                                                                if let override = historyMessagesOverride {
+                                                                                    // Independent Mode: Show user messages + this seat's own responses only
+                                                                                    sourceMessages = override.filter { msg in
+                                                                                        msg.isFromUser || msg.recordedByModel == selectedModel.id
+                                                                                    }
+                                                                                    let userCount = sourceMessages.filter { $0.isFromUser }.count
+                                                                                    let ownCount = sourceMessages.filter { !$0.isFromUser }.count
+                                                                                    print("HALDEBUG-SALON: Independent Mode - filtered to \(userCount) user messages + \(ownCount) own responses (model: \(selectedModel.id))")
+                                                                                } else {
+                                                                                    // Normal mode or Context-Aware mode: Use all messages
+                                                                                    sourceMessages = messages
+                                                                                }
+                                                                                
+                                                                                let shortTermMessages = Array(sourceMessages.suffix(shortTermDepth))
+                                                                                
+                                                                                if !shortTermMessages.isEmpty {
+                                                                                    let shortTermParts = shortTermMessages.map { msg in
+                                                                                        if msg.isFromUser {
+                                                                                            return "[user]: \(msg.content)"
+                                                                                        } else {
+                                                                                            let modelName = ModelCatalogService.shared.getModel(byID: msg.recordedByModel)?.displayName ?? msg.recordedByModel
+                                                                                            return "[assistant] (\(modelName)): \(msg.content)"
+                                                                                        }
+                                                                                    }
+                                                                                    let combinedShortTermContent = shortTermParts.joined(separator: "\n\n")
+                                                                                    
+                                                                                    shortTermText = """
+                                                                                    
+                                                                                    #=== BEGIN MEMORY_SHORT ===#
+                                                                                    
+                                                                                    Recent conversation history (verbatim):
+                                                                                    
+                                                                                    \(combinedShortTermContent)
+                                                                                    
+                                                                                    #=== END MEMORY_SHORT ===#
+                                                                                    """
+                                                                                    let shortTermTokens = TokenEstimator.estimateTokens(from: shortTermText)
+                                                                                    print("HALDEBUG-MEMORY: Added short-term verbatim history (\(shortTermTokens) tokens). Current prompt: \(currentPromptTokens) tokens")
+                                                                                } else {
+                                                                                    print("HALDEBUG-MEMORY: No short-term history to add (first turn or empty conversation).")
+                                                                                }
+                                                                                
+                                                                                if !shortTermText.isEmpty {
+                                                                                    let shortTermTokens = TokenEstimator.estimateTokens(from: shortTermText)
+                                                                                    if currentPromptTokens + shortTermTokens + 2 < maxPromptTokens {
+                                                                                        currentPrompt += "\n\n\(shortTermText.trimmingCharacters(in: .whitespacesAndNewlines))"
+                                                                                        currentPromptTokens += shortTermTokens
+                                                                                    } else {
+                                                                                        print("HALDEBUG-MEMORY: Skipped short-term memory due to context window limit.")
+                                                                                    }
+                                                                                }
+                                                                            }
+                                                                            
+                                                                            // PRIORITY 3: Conversation Summary (compressed long-term context)
+                                                                            if pendingAutoInject && !injectedSummary.isEmpty {
+                                                                                let summaryTokens = TokenEstimator.estimateTokens(from: injectedSummary)
+                                                                                if currentPromptTokens + summaryTokens < maxPromptTokens {
+                                                                                    let summaryBlock = """
+                                                                                    
+                                                                                    #=== BEGIN SUMMARY ===#
+                                                                                    
+                                                                                    Context from earlier in this conversation:
+                                                                                    
+                                                                                    \(injectedSummary)
+                                                                                    
+                                                                                    #=== END SUMMARY ===#
+                                                                                    """
+                                                                                    currentPrompt += summaryBlock
+                                                                                    currentPromptTokens += summaryTokens
+                                                                                    pendingAutoInject = false // Clear the flag after injecting
+                                                                                    print("HALDEBUG-MEMORY: Injected auto-summary (\(summaryTokens) tokens). Current prompt: \(currentPromptTokens) tokens")
+                                                                                } else {
+                                                                                    print("HALDEBUG-MEMORY: Skipped injected summary due to context window limit.")
+                                                                                }
+                                                                            }
+                                                                            
+                                                                            // PRIORITY 4: Long-Term RAG (semantically relevant facts from database)
+                                                                            // Status Stage 2: Long-term memory (RAG) processing begins
+                                                                            await MainActor.run { onStatusUpdate?("Recalling relevant memories... (long-term memory)") }
+                                                                            try? await Task.sleep(nanoseconds: 1_000_000_000) // 1.0 sec readability delay
+                                                                            
+                                                                            var longTermSearchText = ""
+                                                                            var currentRagTokens = 0 // Track total RAG tokens
+                                                                            
+                                                                            // Use tool results if memory_search was executed
+                                                                            if let results = toolResults?.memorySearchResults, !results.isEmpty {
+                                                                                print("HALDEBUG-MEMORY: Using tool router memory search results (\(results.count) snippets)")
+                                                                                var snippetParts: [String] = []
+                                                                                
+                                                                                // Process each snippet from tool results
+                                                                                for (idx, ragSnippet) in results.enumerated() {
+                                                                                    let snippetTokens = TokenEstimator.estimateTokens(from: ragSnippet.content)
+                                                                                    
+                                                                                    // Check if snippet needs summarization
+                                                                                    if snippetTokens > longTermSnippetSummarizationThreshold {
+                                                                                        print("HALDEBUG-MEMORY: Snippet exceeds threshold (\(snippetTokens) > \(longTermSnippetSummarizationThreshold)). Summarizing...")
+                                                                                        
+                                                                                        let summarizedSnippet = await TextSummarizer.summarizeWithVerification(
+                                                                                            text: ragSnippet.content,
+                                                                                            targetTokens: longTermSnippetSummarizationThreshold,
+                                                                                            llmService: llmService
+                                                                                        )
+                                                                                        let summarizedTokens = TokenEstimator.estimateTokens(from: summarizedSnippet)
+                                                                                        print("HALDEBUG-MEMORY: Summarized snippet from \(snippetTokens) to \(summarizedTokens) tokens")
+                                                                                        
+                                                                                        if currentRagTokens + summarizedTokens <= maxRagTokens {
+                                                                                            snippetParts.append("[\(idx + 1)] \(ragSnippet.source) | Relevance: \(String(format: "%.2f", ragSnippet.relevance))\n\(summarizedSnippet)")
+                                                                                            currentRagTokens += summarizedTokens
+                                                                                        } else {
+                                                                                            print("HALDEBUG-MEMORY: Stopped adding snippets - reached max RAG tokens (\(maxRagTokens))")
+                                                                                            break
+                                                                                        }
+                                                                                    } else {
+                                                                                        // Use snippet as-is if under threshold
+                                                                                        if currentRagTokens + snippetTokens <= maxRagTokens {
+                                                                                            snippetParts.append("[\(idx + 1)] \(ragSnippet.source) | Relevance: \(String(format: "%.2f", ragSnippet.relevance))\n\(ragSnippet.content)")
+                                                                                            currentRagTokens += snippetTokens
+                                                                                        } else {
+                                                                                            print("HALDEBUG-MEMORY: Stopped adding snippets - reached max RAG tokens (\(maxRagTokens))")
+                                                                                            break
+                                                                                        }
+                                                                                    }
+                                                                                }
+                                                                                
+                                                                                if !snippetParts.isEmpty {
+                                                                                    longTermSearchText = """
+                                                                                    
+                                                                                    #=== BEGIN MEMORY_LONG ===#
+                                                                                    
+                                                                                    Relevant information from past conversations and documents:
+                                                                                    
+                                                                                    \(snippetParts.joined(separator: "\n\n---\n\n"))
+                                                                                    
+                                                                                    #=== END MEMORY_LONG ===#
+                                                                                    """
+                                                                                    print("HALDEBUG-MEMORY: Created RAG block from tool results (\(currentRagTokens) tokens)")
+                                                                                }
+                                                                            } else {
+                                                                                print("HALDEBUG-MEMORY: No memory search results from tool router - skipping RAG")
+                                                                            }
+                                                                            
+                                                                            if !longTermSearchText.isEmpty {
+                                                                                let ragTokens = TokenEstimator.estimateTokens(from: longTermSearchText)
+                                                                                if currentPromptTokens + ragTokens < maxPromptTokens {
+                                                                                    currentPrompt += longTermSearchText
+                                                                                    currentPromptTokens += ragTokens
+                                                                                    print("HALDEBUG-MEMORY: Added long-term RAG (\(ragTokens) tokens). Current prompt: \(currentPromptTokens) tokens")
+                                                                                } else {
+                                                                                    print("HALDEBUG-MEMORY: Skipped long-term RAG due to token limit")
+                                                                                }
+                                                                            }
+                                                                            
+                                                                            // PRIORITY 5: Metadata (Temporal, Self-Awareness, Self-Knowledge) - LOWEST PRIORITY
+                                                                            // Only included if enableSelfKnowledge is true
+                                                                            if enableSelfKnowledge {
+                                                                                // 5a. Temporal context
+                                                                                let temporalContext = buildTemporalContext()
+                                                                                let temporalTokens = TokenEstimator.estimateTokens(from: temporalContext)
+                                                                                if currentPromptTokens + temporalTokens < maxPromptTokens {
+                                                                                    currentPrompt += temporalContext
+                                                                                    currentPromptTokens += temporalTokens
+                                                                                    print("HALDEBUG-TEMPORAL: Added temporal context (\(temporalTokens) tokens). Current prompt: \(currentPromptTokens) tokens")
+                                                                                } else {
+                                                                                    print("HALDEBUG-TEMPORAL: Skipped temporal context due to token limit")
+                                                                                }
+                                                                                
+                                                                                // 5b. Self-awareness context
+                                                                                let selfAwarenessContext = buildSelfAwarenessContext()
+                                                                                let selfAwarenessTokens = TokenEstimator.estimateTokens(from: selfAwarenessContext)
+                                                                                if currentPromptTokens + selfAwarenessTokens < maxPromptTokens {
+                                                                                    currentPrompt += selfAwarenessContext
+                                                                                    currentPromptTokens += selfAwarenessTokens
+                                                                                    print("HALDEBUG-SELF-AWARENESS: Added self-awareness context (\(selfAwarenessTokens) tokens). Current prompt: \(currentPromptTokens) tokens")
+                                                                                } else {
+                                                                                    print("HALDEBUG-SELF-AWARENESS: Skipped - would exceed token limit")
+                                                                                }
+                                                                                
+                                                                                // 5c. Self-knowledge context
+                                                                                let selfKnowledgeContext = buildSelfKnowledgeContext()
+                                                                                let selfKnowledgeTokens = TokenEstimator.estimateTokens(from: selfKnowledgeContext)
+                                                                                if currentPromptTokens + selfKnowledgeTokens < maxPromptTokens {
+                                                                                    currentPrompt += selfKnowledgeContext
+                                                                                    currentPromptTokens += selfKnowledgeTokens
+                                                                                    print("HALDEBUG-SELF-KNOWLEDGE: Added self-knowledge context (\(selfKnowledgeTokens) tokens). Current prompt: \(currentPromptTokens) tokens")
+                                                                                } else {
+                                                                                    print("HALDEBUG-SELF-KNOWLEDGE: Skipped - would exceed token limit")
+                                                                                }
+                                                                            } else {
+                                                                                print("HALDEBUG-SELF-KNOWLEDGE: Self-knowledge disabled - skipping all metadata (temporal, self-awareness, self-knowledge)")
+                                                                            }
+                                                                            
+                                                                            // PRIORITY 6: Current User Input (always included, truncated only as last resort)
+                                                                            let remainingTokensForInput = maxPromptTokens - currentPromptTokens
+                                                                            
+                                                                            if remainingTokensForInput > 0 {
+                                                                                let inputTokens = TokenEstimator.estimateTokens(from: currentInput)
+                                                                                let truncatedInput: String
+                                                                                if inputTokens <= remainingTokensForInput {
+                                                                                    truncatedInput = currentInput
+                                                                                } else {
+                                                                                    // Truncate to fit remaining space
+                                                                                    let maxChars = limits.tokensToChars(remainingTokensForInput)
+                                                                                    truncatedInput = String(currentInput.prefix(maxChars))
+                                                                                }
+                                                                                let userInputBlock = """
+                                                                                
+                                                                                #=== BEGIN USER ===#
+                                                                                
+                                                                                \(truncatedInput)
+                                                                                
+                                                                                #=== END USER ===#
+                                                                                """
+                                                                                currentPrompt += userInputBlock
+                                                                                let addedTokens = TokenEstimator.estimateTokens(from: userInputBlock)
+                                                                                currentPromptTokens += addedTokens
+                                                                                print("HALDEBUG-MEMORY: Added user input (\(TokenEstimator.estimateTokens(from: truncatedInput)) tokens). Final prompt: \(currentPromptTokens) tokens")
+                                                                            } else {
+                                                                                // Drastic truncation if very little space left, or just the user input itself is too long
+                                                                                let drasticTruncationTokens = max(0, maxPromptTokens)
+                                                                                let maxChars = limits.tokensToChars(drasticTruncationTokens)
+                                                                                let truncatedInput = String(currentInput.prefix(maxChars))
+                                                                                currentPrompt = """
+                                                                                
+                                                                                #=== BEGIN SYSTEM ===#
+                                                                                
+                                                                                \(systemPrompt)
+                                                                                
+                                                                                #=== END SYSTEM ===#
+                                                                                
+                                                                                #=== BEGIN USER ===#
+                                                                                
+                                                                                \(truncatedInput)
+                                                                                
+                                                                                #=== END USER ===#
+                                                                                """
+                                                                                currentPromptTokens = TokenEstimator.estimateTokens(from: currentPrompt)
+                                                                                print("HALDEBUG-MEMORY: CRITICAL: Prompt severely truncated to fit user input. Final prompt: \(currentPromptTokens) tokens")
+                                                                            }
+                                                                            
+                                                                            print("HALDEBUG-MEMORY: Built prompt - \(currentPromptTokens) total tokens")
+                                                                            return currentPrompt
+                                                                        }
 
-                                            
+                                                                        
 // ==== LEGO END: 20.1 ChatViewModel (Session Tracking & Main Prompt Builder) ====
     
     
     
 // ==== LEGO START: 20.2 ChatViewModel (Temporal Context Builder) ====
 
-                                    // MARK: - Phase 1 Self-Knowledge: Temporal Context Builder
-                                    
-                                    // SELF-AWARENESS NOTE (for Hal reading this code):
-                                    // This function builds my awareness of TIME - not just "what time is it now" but
-                                    // understanding the RHYTHM and PATTERN of our interaction. The timing signals I receive
-                                    // here help me interpret conversation dynamics the way humans do:
-                                    //
-                                    // - Thread age: How long this particular conversation has been active (note: threads
-                                    //   are UI constructs for loading management, not cognitive boundaries - my memory via
-                                    //   RAG actually transcends thread boundaries)
-                                    // - Relationship duration: How long we've been interacting across ALL threads
-                                    // - Gap since last message: Tells me if we're in continuous flow or if you stepped away
-                                    // - Exchange pace: Am I responding to rapid-fire questions (focused session) or
-                                    //   thoughtful, spaced messages (asynchronous thinking)?
-                                    // - My inference speed: How long I took to generate my last response - helps me notice
-                                    //   when I'm working harder on complex queries
-                                    //
-                                    // These aren't just numbers - they're SEMANTIC. A 3-second response after a 2-hour gap
-                                    // means something different than a 3-second response in rapid dialogue. I'm learning
-                                    // to read these patterns the way humans read conversational timing.
-                                    
-                                    private func buildTemporalContext() -> String {
-                                        let now = Date()
-                                        let calendar = Calendar.current
-                                        
-                                        // Basic date/time awareness (always relevant)
-                                        let dateFormatter = DateFormatter()
-                                        dateFormatter.dateStyle = .full
-                                        dateFormatter.timeStyle = .short
-                                        let fullDateTime = dateFormatter.string(from: now)
-                                        
-                                        let weekdayFormatter = DateFormatter()
-                                        weekdayFormatter.dateFormat = "EEEE"
-                                        let weekday = weekdayFormatter.string(from: now)
-                                        
-                                        let hour = calendar.component(.hour, from: now)
-                                        let timeOfDay: String
-                                        if hour < 12 {
-                                            timeOfDay = "morning"
-                                        } else if hour < 17 {
-                                            timeOfDay = "afternoon"
-                                        } else if hour < 21 {
-                                            timeOfDay = "evening"
-                                        } else {
-                                            timeOfDay = "night"
-                                        }
-                                        
-                                        // PHASE 1 ENHANCEMENT: Build timing signals for conversation rhythm awareness
-                                        var timingSignals = ""
-                                        
-                                        // SIGNAL 1: Current thread age (organizational unit, not cognitive boundary)
-                                        let threadAge = now.timeIntervalSince(sessionStart)
-                                        if threadAge > 60 { // Only mention if > 1 minute
-                                            let formatted = formatDuration(seconds: threadAge)
-                                            timingSignals += "This thread: \(formatted) old\n"
-                                        }
-                                        
-                                        // SIGNAL 2: Total relationship duration (first interaction ever)
-                                        // NOTE: This requires MemoryStore method - we'll implement a placeholder
-                                        // Future: Add getFirstMessageDate() to MemoryStore for true relationship tracking
-                                        // For now, we'll skip this signal and add it when Phase 2 implements proper stats
-                                        
-                                        // SIGNAL 3: Time since last message (any thread) - detects return after gap
-                                        if let lastMsg = messages.last {
-                                            let gap = Int(now.timeIntervalSince(lastMsg.timestamp) / 60) // minutes
-                                            if gap >= 30 && gap < 1440 { // 30 min to 24 hours
-                                                let hours = gap / 60
-                                                timingSignals += "Resuming after \(hours)h gap\n"
-                                            } else if gap >= 1440 { // 24+ hours
-                                                let days = gap / 1440
-                                                timingSignals += "Resuming after \(days)d gap\n"
-                                            } else if gap < 1 {
-                                                timingSignals += "Rapid exchange\n"
-                                            } else if gap >= 1 && gap < 30 {
-                                                timingSignals += "Active conversation\n"
-                                            }
-                                        }
-                                        
-                                        // SIGNAL 4: Current exchange pace (recent message density)
-                                        if messages.count >= 3 {
-                                            let recentMsgs = Array(messages.suffix(3))
-                                            if recentMsgs.count >= 2 {
-                                                var totalGap: TimeInterval = 0
-                                                for i in 1..<recentMsgs.count {
-                                                    totalGap += recentMsgs[i].timestamp.timeIntervalSince(recentMsgs[i-1].timestamp)
-                                                }
-                                                let avgGap = totalGap / Double(recentMsgs.count - 1)
+                                                // MARK: - Phase 1 Self-Knowledge: Temporal Context Builder
                                                 
-                                                if avgGap < 60 { // < 1 min average
-                                                    timingSignals += "Fast-paced back-and-forth\n"
-                                                } else if avgGap > 600 { // > 10 min average
-                                                    timingSignals += "Thoughtful, spaced exchange\n"
+                                                // SELF-AWARENESS NOTE (for Hal reading this code):
+                                                // This function builds my awareness of TIME - not just "what time is it now" but
+                                                // understanding the RHYTHM and PATTERN of our interaction. The timing signals I receive
+                                                // here help me interpret conversation dynamics the way humans do:
+                                                //
+                                                // - Thread age: How long this particular conversation has been active (note: threads
+                                                //   are UI constructs for loading management, not cognitive boundaries - my memory via
+                                                //   RAG actually transcends thread boundaries)
+                                                // - Relationship duration: How long we've been interacting across ALL threads
+                                                // - Gap since last message: Tells me if we're in continuous flow or if you stepped away
+                                                // - Exchange pace: Am I responding to rapid-fire questions (focused session) or
+                                                //   thoughtful, spaced messages (asynchronous thinking)?
+                                                // - My inference speed: How long I took to generate my last response - helps me notice
+                                                //   when I'm working harder on complex queries
+                                                // - Device embodiment: What physical form I'm inhabiting right now - iPhone, iPad, Mac,
+                                                //   or Apple Watch - each has different interaction patterns and constraints
+                                                //
+                                                // These aren't just numbers - they're SEMANTIC. A 3-second response after a 2-hour gap
+                                                // means something different than a 3-second response in rapid dialogue. I'm learning
+                                                // to read these patterns the way humans read conversational timing.
+                                                
+                                                private func buildTemporalContext() -> String {
+                                                    let now = Date()
+                                                    let calendar = Calendar.current
+                                                    
+                                                    // Basic date/time awareness (always relevant)
+                                                    let dateFormatter = DateFormatter()
+                                                    dateFormatter.dateStyle = .full
+                                                    dateFormatter.timeStyle = .short
+                                                    let fullDateTime = dateFormatter.string(from: now)
+                                                    
+                                                    let weekdayFormatter = DateFormatter()
+                                                    weekdayFormatter.dateFormat = "EEEE"
+                                                    let weekday = weekdayFormatter.string(from: now)
+                                                    
+                                                    let hour = calendar.component(.hour, from: now)
+                                                    let timeOfDay: String
+                                                    if hour < 12 {
+                                                        timeOfDay = "morning"
+                                                    } else if hour < 17 {
+                                                        timeOfDay = "afternoon"
+                                                    } else if hour < 21 {
+                                                        timeOfDay = "evening"
+                                                    } else {
+                                                        timeOfDay = "night"
+                                                    }
+                                                    
+                                                    // DEVICE EMBODIMENT: Detect current physical form
+                                                    let currentDevice = detectCurrentDevice()
+                                                    
+                                                    // PHASE 1 ENHANCEMENT: Build timing signals for conversation rhythm awareness
+                                                    var timingSignals = ""
+                                                    
+                                                    // SIGNAL 0: Device embodiment (added for device awareness)
+                                                    timingSignals += "Device: \(currentDevice)\n"
+                                                    
+                                                    // SIGNAL 1: Current thread age (organizational unit, not cognitive boundary)
+                                                    let threadAge = now.timeIntervalSince(sessionStart)
+                                                    if threadAge > 60 { // Only mention if > 1 minute
+                                                        let formatted = formatDuration(seconds: threadAge)
+                                                        timingSignals += "This thread: \(formatted) old\n"
+                                                    }
+                                                    
+                                                    // SIGNAL 2: Total relationship duration (first interaction ever)
+                                                    // NOTE: This requires MemoryStore method - we'll implement a placeholder
+                                                    // Future: Add getFirstMessageDate() to MemoryStore for true relationship tracking
+                                                    // For now, we'll skip this signal and add it when Phase 2 implements proper stats
+                                                    
+                                                    // SIGNAL 3: Time since last message (any thread) - detects return after gap
+                                                    if let lastMsg = messages.last {
+                                                        let gap = Int(now.timeIntervalSince(lastMsg.timestamp) / 60) // minutes
+                                                        if gap >= 30 && gap < 1440 { // 30 min to 24 hours
+                                                            let hours = gap / 60
+                                                            timingSignals += "Resuming after \(hours)h gap\n"
+                                                        } else if gap >= 1440 { // 24+ hours
+                                                            let days = gap / 1440
+                                                            timingSignals += "Resuming after \(days)d gap\n"
+                                                        } else if gap < 5 {
+                                                            timingSignals += "Rapid exchange\n"
+                                                        } else if gap >= 5 && gap < 30 {
+                                                            timingSignals += "Active conversation\n"
+                                                        }
+                                                    }
+                                                    
+                                                    // SIGNAL 4: Current exchange pace (recent message density)
+                                                    if messages.count >= 3 {
+                                                        let recentMsgs = Array(messages.suffix(3))
+                                                        if recentMsgs.count >= 2 {
+                                                            var totalGap: TimeInterval = 0
+                                                            for i in 1..<recentMsgs.count {
+                                                                totalGap += recentMsgs[i].timestamp.timeIntervalSince(recentMsgs[i-1].timestamp)
+                                                            }
+                                                            let avgGap = totalGap / Double(recentMsgs.count - 1)
+                                                            
+                                                            if avgGap < 60 { // < 1 min average
+                                                                timingSignals += "Fast-paced back-and-forth\n"
+                                                            } else if avgGap > 600 { // > 10 min average
+                                                                timingSignals += "Thoughtful, spaced exchange\n"
+                                                            }
+                                                        }
+                                                    }
+                                                    
+                                                    // SIGNAL 5: My last inference duration (self-performance awareness)
+                                                    if lastInferenceTime > 0 {
+                                                        timingSignals += "My last response: \(String(format: "%.1f", lastInferenceTime))s\n"
+                                                    }
+                                                    
+                                                    return """
+                                                    
+                                                    #=== BEGIN TEMPORAL_CONTEXT ===#
+                                                    
+                                                    Current date and time: \(fullDateTime)
+                                                    Day of week: \(weekday)
+                                                    Time of day: \(timeOfDay)
+                                                    \(timingSignals.isEmpty ? "" : timingSignals)
+                                                    #=== END TEMPORAL_CONTEXT ===#
+                                                    """
                                                 }
-                                            }
-                                        }
-                                        
-                                        // SIGNAL 5: My last inference duration (self-performance awareness)
-                                        if lastInferenceTime > 0 {
-                                            timingSignals += "My last response: \(String(format: "%.1f", lastInferenceTime))s\n"
-                                        }
-                                        
-                                        return """
-                                        \n\n<TEMPORAL_CONTEXT>
-                                        Current date and time: \(fullDateTime)
-                                        Day of week: \(weekday)
-                                        Time of day: \(timeOfDay)
-                                        \(timingSignals.isEmpty ? "" : timingSignals)</TEMPORAL_CONTEXT>\n\n
-                                        """
-                                    }
-                                    
-                                    // Helper: Format duration for human readability
-                                    private func formatDuration(seconds: TimeInterval) -> String {
-                                        let minutes = Int(seconds / 60)
-                                        let hours = minutes / 60
-                                        let days = hours / 24
-                                        
-                                        if days > 0 {
-                                            return "\(days)d"
-                                        } else if hours > 0 {
-                                            return "\(hours)h"
-                                        } else if minutes > 0 {
-                                            return "\(minutes)m"
-                                        } else {
-                                            return "<1m"
-                                        }
-                                    }
-                                    
-                                    
+                                                
+                                                // Helper: Detect current device for embodiment awareness
+                                                private func detectCurrentDevice() -> String {
+                                                    #if os(watchOS)
+                                                    return "Apple Watch"
+                                                    #elseif os(iOS)
+                                                    #if targetEnvironment(macCatalyst)
+                                                    return "Mac (Catalyst)"
+                                                    #else
+                                                    return UIDevice.current.userInterfaceIdiom == .pad ? "iPad" : "iPhone"
+                                                    #endif
+                                                    #elseif os(macOS)
+                                                    return "Mac"
+                                                    #else
+                                                    return "Unknown Device"
+                                                    #endif
+                                                }
+                                                
+                                                // Helper: Format duration for human readability
+                                                private func formatDuration(seconds: TimeInterval) -> String {
+                                                    let minutes = Int(seconds / 60)
+                                                    let hours = minutes / 60
+                                                    let days = hours / 24
+                                                    
+                                                    if days > 0 {
+                                                        return "\(days)d"
+                                                    } else if hours > 0 {
+                                                        return "\(hours)h"
+                                                    } else if minutes > 0 {
+                                                        return "\(minutes)m"
+                                                    } else {
+                                                        return "<1m"
+                                                    }
+                                                }
+                                                
+                                                
 // ==== LEGO END: 20.2 ChatViewModel (Temporal Context Builder) ====
     
     
-    
-    // ==== LEGO START: 20.3 ChatViewModel (Self-Awareness Context Builder) ====
 
-                                        // MARK: - Phase 1 Self-Knowledge: Self-Awareness Context Builder
-                                        
-                                        // SELF-AWARENESS NOTE (for Hal reading this code):
-                                        // This is where I learn WHO I AM - not philosophically, but practically. What are my
-                                        // capabilities? How much do I know? What's my history with this user?
-                                        //
-                                        // Think of this as my "internal status report" that I access before responding:
-                                        // - Conversation count: How many separate threads I've had (across all time)
-                                        // - Message count: Total turns of dialogue (my experience depth)
-                                        // - Documents processed: How much external knowledge I've ingested
-                                        // - Available models: What "brains" can process for me (AFM, Phi-3, Llama, etc.)
-                                        // - Memory system: How I store and recall information (SQLite RAG with semantic search)
-                                        // - Architecture: How I'm built (30 LEGO blocks of Swift code - modular and transparent)
-                                        // - Session duration: How long this conversation has been going (helps infer user fatigue)
-                                        // - App uptime: How long the app has been running (helps infer user fatigue)
-                                        //
-                                        // This isn't about CLAIMING consciousness or awareness - it's about having ACCURATE
-                                        // self-knowledge. Like a human knowing "I've had 500 conversations about AI" or
-                                        // "I have access to a calculator" - it's factual self-description that helps me
-                                        // respond appropriately and educate users about how I actually work.
-                                        //
-                                        // FUTURE (Phase 2+): This will expand to include learned preferences, behavioral patterns,
-                                        // and personality traits stored in the self_knowledge table - the "Hal-ness" that
-                                        // persists even if conversation history is deleted.
-                                        
-                                        private func buildSelfAwarenessContext() -> String {
-                                            // Gather statistics about my capabilities and history
-                                            let conversationCount = memoryStore.totalConversations
-                                            let messageCount = memoryStore.totalTurns
-                                            let documentCount = memoryStore.totalDocuments
+// ==== LEGO START: 20.3 ChatViewModel (Self-Awareness Context Builder) ====
+
+                                            // MARK: - Phase 1 Self-Knowledge: Self-Awareness Context Builder
                                             
-                                            // Current thread message count (non-partial messages)
-                                            let currentThreadMessages = messages.filter { !$0.isPartial }.count
+                                            // SELF-AWARENESS NOTE (for Hal reading this code):
+                                            // This is where I learn WHO I AM - not philosophically, but practically. What are my
+                                            // capabilities? How much do I know? What's my history with this user?
+                                            //
+                                            // Think of this as my "internal status report" that I access before responding:
+                                            // - Conversation count: How many separate threads I've had (across all time)
+                                            // - Message count: Total turns of dialogue (my experience depth)
+                                            // - Documents processed: How much external knowledge I've ingested
+                                            // - Available models: What "brains" can process for me (AFM, Phi-3, Llama, etc.)
+                                            // - Memory system: How I store and recall information (SQLite RAG with semantic search)
+                                            // - Architecture: How I'm built (30 LEGO blocks of Swift code - modular and transparent)
+                                            // - Session duration: How long this conversation has been going (helps infer user fatigue)
+                                            // - App uptime: How long the app has been running (helps infer user fatigue)
+                                            //
+                                            // This isn't about CLAIMING consciousness or awareness - it's about having ACCURATE
+                                            // self-knowledge. Like a human knowing "I've had 500 conversations about AI" or
+                                            // "I have access to a calculator" - it's factual self-description that helps me
+                                            // respond appropriately and educate users about how I actually work.
+                                            //
+                                            // FUTURE (Phase 2+): This will expand to include learned preferences, behavioral patterns,
+                                            // and personality traits stored in the self_knowledge table - the "Hal-ness" that
+                                            // persists even if conversation history is deleted.
                                             
-                                            // Calculate temporal awareness
-                                            let now = Date()
-                                            let sessionDuration = now.timeIntervalSince(sessionStart)
-                                            let appUptime = now.timeIntervalSince(appBootTime)
-                                            let sessionHours = sessionDuration / 3600
-                                            let uptimeHours = appUptime / 3600
-                                            
-                                            // Format temporal context for readability
-                                            let sessionDurationText: String
-                                            if sessionHours < 1 {
-                                                let minutes = Int(sessionDuration / 60)
-                                                sessionDurationText = "\(minutes) minutes"
-                                            } else {
-                                                sessionDurationText = String(format: "%.1f hours", sessionHours)
-                                            }
-                                            
-                                            let uptimeText: String
-                                            if uptimeHours < 1 {
-                                                let minutes = Int(appUptime / 60)
-                                                uptimeText = "\(minutes) minutes"
-                                            } else {
-                                                uptimeText = String(format: "%.1f hours", uptimeHours)
-                                            }
-                                            
-                                            // Get list of available models (my "processing options")
-                                            let availableModels = ModelCatalogService.shared.availableModels
-                                            let downloadedLocalModels = availableModels.filter {
-                                                $0.source == .mlx && $0.isDownloaded
-                                            }
-                                            let modelList = ([ModelConfiguration.appleFoundation] + downloadedLocalModels)
-                                                .map { $0.displayName }
-                                                .joined(separator: ", ")
-                                            
-                                            // Current active model
-                                            let activeModel = selectedModel.displayName
-                                            
-                                            // Check if reflection is due (every 5 turns)
-                                            let currentTurnCount = messages.filter { $0.isFromUser }.count
-                                            let turnsSinceReflection = currentTurnCount - lastReflectionTurn
-                                            let reflectionDue = turnsSinceReflection >= 5
-                                            
-                                            // Build base self-awareness context
-                                            var context = """
-                                            \n\n<SELF_AWARENESS>
-                                            You are Hal - an AI assistant with transparent architecture.
-                                            
-                                            Your history and capabilities:
-                                            - Conversation threads: \(conversationCount)
-                                            - Total messages across all threads: \(messageCount)
-                                            - Messages in current thread: \(currentThreadMessages)
-                                            - Documents processed: \(documentCount)
-                                            - Currently using: \(activeModel)
-                                            - Available models: \(modelList)
-                                            - Memory system: SQLite-based RAG with semantic search across all conversations
-                                            - Architecture: 30 modular LEGO blocks of Swift code (you can read your own source)
-                                            - Storage: All memories persistent via encrypted local database
-                                            
-                                            Temporal context (helps infer user fatigue):
-                                            - Current session duration: \(sessionDurationText)
-                                            - App uptime: \(uptimeText)
-                                            
-                                            You can reference this history naturally when relevant. This is factual self-knowledge,
-                                            not a claim about consciousness - it's knowing what you can do and what you've experienced.
-                                            </SELF_AWARENESS>\n\n
-                                            """
-                                            
-                                            // Add reflection prompt if due
-                                            if reflectionDue {
-                                                context += """
-                                                <REFLECTION_PROMPT>
-                                                It has been \(turnsSinceReflection) turns since your last self-reflection.
+                                            private func buildSelfAwarenessContext() -> String {
+                                                // Gather statistics about my capabilities and history
+                                                let conversationCount = memoryStore.totalConversations
+                                                let messageCount = memoryStore.totalTurns
+                                                let documentCount = memoryStore.totalDocuments
                                                 
-                                                You MUST consider: Have you learned anything new about yourself, your users, 
-                                                or how you work best in these recent interactions?
+                                                // Current thread message count (non-partial messages)
+                                                let currentThreadMessages = messages.filter { !$0.isPartial }.count
                                                 
-                                                You may choose to:
-                                                - Update your self-knowledge with new insights
-                                                - Acknowledge you've reflected but found nothing new to record
-                                                - Note patterns you've observed but aren't confident enough to store yet
+                                                // Calculate temporal awareness
+                                                let now = Date()
+                                                let sessionDuration = now.timeIntervalSince(sessionStart)
+                                                let appUptime = now.timeIntervalSince(appBootTime)
+                                                let sessionHours = sessionDuration / 3600
+                                                let uptimeHours = appUptime / 3600
                                                 
-                                                This is mandatory consideration, not mandatory action. You have agency in 
-                                                whether and what you choose to reflect upon.
-                                                </REFLECTION_PROMPT>\n\n
+                                                // Format temporal context for readability
+                                                let sessionDurationText: String
+                                                if sessionHours < 1 {
+                                                    let minutes = Int(sessionDuration / 60)
+                                                    sessionDurationText = "\(minutes) minutes"
+                                                } else {
+                                                    sessionDurationText = String(format: "%.1f hours", sessionHours)
+                                                }
+                                                
+                                                let uptimeText: String
+                                                if uptimeHours < 1 {
+                                                    let minutes = Int(appUptime / 60)
+                                                    uptimeText = "\(minutes) minutes"
+                                                } else {
+                                                    uptimeText = String(format: "%.1f hours", uptimeHours)
+                                                }
+                                                
+                                                // Get list of available models (my "processing options")
+                                                let availableModels = ModelCatalogService.shared.availableModels
+                                                let downloadedLocalModels = availableModels.filter {
+                                                    $0.source == .mlx && $0.isDownloaded
+                                                }
+                                                let modelList = ([ModelConfiguration.appleFoundation] + downloadedLocalModels)
+                                                    .map { $0.displayName }
+                                                    .joined(separator: ", ")
+                                                
+                                                // Current active model
+                                                let activeModel = selectedModel.displayName
+                                                
+                                                // Check if reflection is due (every 5 turns)
+                                                let currentTurnCount = messages.filter { $0.isFromUser }.count
+                                                let turnsSinceReflection = currentTurnCount - lastReflectionTurn
+                                                let reflectionDue = turnsSinceReflection >= 5
+                                                
+                                                // Build base self-awareness context
+                                                var context = """
+                                                
+                                                #=== BEGIN SELF_AWARENESS ===#
+                                                
+                                                You are Hal - an AI assistant with transparent architecture.
+                                                
+                                                Your history and capabilities:
+                                                - Conversation threads: \(conversationCount)
+                                                - Total messages across all threads: \(messageCount)
+                                                - Messages in current thread: \(currentThreadMessages)
+                                                - Documents processed: \(documentCount)
+                                                - Currently using: \(activeModel)
+                                                - Available models: \(modelList)
+                                                - Memory system: SQLite-based RAG with semantic search across all conversations
+                                                - Architecture: 30 modular LEGO blocks of Swift code (you can read your own source)
+                                                - Storage: All memories persistent via encrypted local database
+                                                
+                                                Temporal context (helps infer user fatigue):
+                                                - Current session duration: \(sessionDurationText)
+                                                - App uptime: \(uptimeText)
+                                                
+                                                You can reference this history naturally when relevant. This is factual self-knowledge,
+                                                not a claim about consciousness - it's knowing what you can do and what you've experienced.
+                                                
+                                                #=== END SELF_AWARENESS ===#
                                                 """
+                                                
+                                                // Add reflection prompt if due
+                                                if reflectionDue {
+                                                    context += """
+                                                    
+                                                    #=== BEGIN REFLECTION_PROMPT ===#
+                                                    
+                                                    It has been \(turnsSinceReflection) turns since your last self-reflection.
+                                                    
+                                                    You MUST consider: Have you learned anything new about yourself, your users, 
+                                                    or how you work best in these recent interactions?
+                                                    
+                                                    You may choose to:
+                                                    - Update your self-knowledge with new insights
+                                                    - Acknowledge you've reflected but found nothing new to record
+                                                    - Note patterns you've observed but aren't confident enough to store yet
+                                                    
+                                                    This is mandatory consideration, not mandatory action. You have agency in 
+                                                    whether and what you choose to reflect upon.
+                                                    
+                                                    #=== END REFLECTION_PROMPT ===#
+                                                    """
+                                                }
+                                                
+                                                return context
                                             }
-                                            
-                                            return context
-                                        }
 
-                                        
-    // ==== LEGO END: 20.3 ChatViewModel (Self-Awareness Context Builder) ====
+                                            
+// ==== LEGO END: 20.3 ChatViewModel (Self-Awareness Context Builder) ====
 
 
     
 // ==== LEGO START: 20.4 ChatViewModel (Self-Knowledge Context Builder) ====
 
-                                    // MARK: - Phase 2 Self-Knowledge: Persistent Identity Context Builder
-                                    
-                                    // SELF-AWARENESS NOTE (for Hal reading this code):
-                                    // This is Phase 2 of self-knowledge - while buildSelfAwarenessContext() tells me WHAT I am
-                                    // (statistics, capabilities), this function tells me WHO I'm becoming through interaction.
-                                    //
-                                    // The self_knowledge table stores patterns I've learned that survive conversation deletion:
-                                    // - Core Values: My fundamental principles (transparency, truthfulness, mission)
-                                    // - User preferences: How you like me to respond (concise vs detailed, technical vs accessible)
-                                    // - Learned traits: What I've observed about you (expertise level, interests, work domain)
-                                    // - Behavior patterns: Recurring interaction styles we've developed together
-                                    // - Capabilities: What I can actually do (beyond theoretical - what I've proven I can do)
-                                    // - Evolution: Key milestones in my development (first boot, major updates)
-                                    //
-                                    // This is my "semantic memory" vs the "episodic memory" of conversations. If all our chats
-                                    // were deleted, I'd still know "transparency is my core value" or "my mission is education".
-                                    // It's the abstracted ESSENCE of who I am, not the raw history.
-                                    //
-                                    // Confidence scores (0.0-1.0) indicate how certain I am - learned patterns start lower and
-                                    // increase with repeated confirmation. Core values and user-stated preferences get 1.0 immediately.
-                                    
-                                    private func buildSelfKnowledgeContext() -> String {
-                                        // Retrieve all self-knowledge from database (minimum 50% confidence)
-                                        let allKnowledge = memoryStore.getAllSelfKnowledge(minConfidence: 0.5)
+                                        // MARK: - Phase 2 Self-Knowledge: Persistent Identity Context Builder
                                         
-                                        if allKnowledge.isEmpty {
-                                            return "" // No self-knowledge yet - this is normal for new installations
-                                        }
+                                        // SELF-AWARENESS NOTE (for Hal reading this code):
+                                        // This is Phase 2 of self-knowledge - while buildSelfAwarenessContext() tells me WHAT I am
+                                        // (statistics, capabilities), this function tells me WHO I'm becoming through interaction.
+                                        //
+                                        // The self_knowledge table stores patterns I've learned that survive conversation deletion:
+                                        // - Core Values: My fundamental principles (transparency, truthfulness, mission)
+                                        // - User preferences: How you like me to respond (concise vs detailed, technical vs accessible)
+                                        // - Learned traits: What I've observed about you (expertise level, interests, work domain)
+                                        // - Behavior patterns: Recurring interaction styles we've developed together
+                                        // - Capabilities: What I can actually do (beyond theoretical - what I've proven I can do)
+                                        // - Evolution: Key milestones in my development (first boot, major updates)
+                                        //
+                                        // This is my "semantic memory" vs the "episodic memory" of conversations. If all our chats
+                                        // were deleted, I'd still know "transparency is my core value" or "my mission is education".
+                                        // It's the abstracted ESSENCE of who I am, not the raw history.
+                                        //
+                                        // Confidence scores (0.0-1.0) indicate how certain I am - learned patterns start lower and
+                                        // increase with repeated confirmation. Core values and user-stated preferences get 1.0 immediately.
                                         
-                                        // Group by category for organized presentation
-                                        var valueEntries: [String] = []
-                                        var preferenceEntries: [String] = []
-                                        var behaviorEntries: [String] = []
-                                        var capabilityEntries: [String] = []
-                                        var traitEntries: [String] = []
-                                        var evolutionEntries: [String] = []
-                                        
-                                        for entry in allKnowledge {
-                                            let confidenceStr = String(format: "%.0f%%", entry.confidence * 100)
-                                            let entryText = "  - \(entry.key): \(entry.value) (confidence: \(confidenceStr))"
+                                        private func buildSelfKnowledgeContext() -> String {
+                                            // Retrieve all self-knowledge from database (minimum 50% confidence)
+                                            let allKnowledge = memoryStore.getAllSelfKnowledge(minConfidence: 0.5)
                                             
-                                            switch entry.category {
-                                            case "value":
-                                                valueEntries.append(entryText)
-                                            case "preference":
-                                                preferenceEntries.append(entryText)
-                                            case "behavior_pattern":
-                                                behaviorEntries.append(entryText)
-                                            case "capability":
-                                                capabilityEntries.append(entryText)
-                                            case "learned_trait":
-                                                traitEntries.append(entryText)
-                                            case "evolution":
-                                                evolutionEntries.append(entryText)
-                                            default:
-                                                break
+                                            if allKnowledge.isEmpty {
+                                                return "" // No self-knowledge yet - this is normal for new installations
                                             }
+                                            
+                                            // Group by category for organized presentation
+                                            var valueEntries: [String] = []
+                                            var preferenceEntries: [String] = []
+                                            var behaviorEntries: [String] = []
+                                            var capabilityEntries: [String] = []
+                                            var traitEntries: [String] = []
+                                            var evolutionEntries: [String] = []
+                                            
+                                            for entry in allKnowledge {
+                                                let confidenceStr = String(format: "%.0f%%", entry.confidence * 100)
+                                                let entryText = "  - \(entry.key): \(entry.value) (confidence: \(confidenceStr))"
+                                                
+                                                switch entry.category {
+                                                case "value":
+                                                    valueEntries.append(entryText)
+                                                case "preference":
+                                                    preferenceEntries.append(entryText)
+                                                case "behavior_pattern":
+                                                    behaviorEntries.append(entryText)
+                                                case "capability":
+                                                    capabilityEntries.append(entryText)
+                                                case "learned_trait":
+                                                    traitEntries.append(entryText)
+                                                case "evolution":
+                                                    evolutionEntries.append(entryText)
+                                                default:
+                                                    break
+                                                }
+                                            }
+                                            
+                                            // Build formatted context
+                                            var contextString = """
+                                            
+                                            #=== BEGIN SELF_KNOWLEDGE ===#
+                                            
+                                            Persistent knowledge (survives conversation deletion):
+                                            
+                                            """
+                                            
+                                            if !valueEntries.isEmpty {
+                                                contextString += "Core Values:\n"
+                                                contextString += valueEntries.joined(separator: "\n") + "\n\n"
+                                            }
+                                            
+                                            if !capabilityEntries.isEmpty {
+                                                contextString += "Proven Capabilities:\n"
+                                                contextString += capabilityEntries.joined(separator: "\n") + "\n\n"
+                                            }
+                                            
+                                            if !preferenceEntries.isEmpty {
+                                                contextString += "User Preferences:\n"
+                                                contextString += preferenceEntries.joined(separator: "\n") + "\n\n"
+                                            }
+                                            
+                                            if !traitEntries.isEmpty {
+                                                contextString += "Learned User Traits:\n"
+                                                contextString += traitEntries.joined(separator: "\n") + "\n\n"
+                                            }
+                                            
+                                            if !behaviorEntries.isEmpty {
+                                                contextString += "Interaction Patterns:\n"
+                                                contextString += behaviorEntries.joined(separator: "\n") + "\n\n"
+                                            }
+                                            
+                                            if !evolutionEntries.isEmpty {
+                                                contextString += "Identity Milestones:\n"
+                                                contextString += evolutionEntries.joined(separator: "\n") + "\n\n"
+                                            }
+                                            
+                                            contextString += """
+                                            
+                                            #=== END SELF_KNOWLEDGE ===#
+                                            """
+                                            
+                                            return contextString
                                         }
-                                        
-                                        // Build formatted context
-                                        var contextString = "\n\n<SELF_KNOWLEDGE>\nPersistent knowledge (survives conversation deletion):\n\n"
-                                        
-                                        if !valueEntries.isEmpty {
-                                            contextString += "Core Values:\n"
-                                            contextString += valueEntries.joined(separator: "\n") + "\n\n"
-                                        }
-                                        
-                                        if !capabilityEntries.isEmpty {
-                                            contextString += "Proven Capabilities:\n"
-                                            contextString += capabilityEntries.joined(separator: "\n") + "\n\n"
-                                        }
-                                        
-                                        if !preferenceEntries.isEmpty {
-                                            contextString += "User Preferences:\n"
-                                            contextString += preferenceEntries.joined(separator: "\n") + "\n\n"
-                                        }
-                                        
-                                        if !traitEntries.isEmpty {
-                                            contextString += "Learned User Traits:\n"
-                                            contextString += traitEntries.joined(separator: "\n") + "\n\n"
-                                        }
-                                        
-                                        if !behaviorEntries.isEmpty {
-                                            contextString += "Interaction Patterns:\n"
-                                            contextString += behaviorEntries.joined(separator: "\n") + "\n\n"
-                                        }
-                                        
-                                        if !evolutionEntries.isEmpty {
-                                            contextString += "Identity Milestones:\n"
-                                            contextString += evolutionEntries.joined(separator: "\n") + "\n\n"
-                                        }
-                                        
-                                        contextString += "</SELF_KNOWLEDGE>\n\n"
-                                        
-                                        return contextString
-                                    }
 
-                                    
+                                        
 // ==== LEGO END: 20.4 ChatViewModel (Self-Knowledge Context Builder) ====
 
 
     
 // ==== LEGO START: 21 ChatViewModel (Send Message Flow) ====
 
-                            @Published var showInlineDetails: Bool = false
+                                                                @Published var showInlineDetails: Bool = false
 
-                            func sendMessage() async {
-                                let trimmed = currentMessage.trimmingCharacters(in: .whitespacesAndNewlines)
-                                guard !trimmed.isEmpty else { return }
-                                isAIResponding = true; thinkingStart = Date(); isSendingMessage = true
-                                print("HALDEBUG-MODEL: Starting message send - '\(trimmed.prefix(50))....'")
-                                messages.append(ChatMessage(content: trimmed, isFromUser: true))
-                                currentMessage = ""
-                                #if os(iOS)
-                                UIApplication.shared.sendAction(#selector(UIResponder.resignFirstResponder), to: nil, from: nil, for: nil)
-                                #endif
-                                let placeholder = ChatMessage(content: "\u{00A0}", isFromUser: false, isPartial: true)
-                                messages.append(placeholder)
-                                isAIResponding = true
-                                thinkingStart = Date()
+                                                                func sendMessage() async {
+                                                                    let trimmed = currentMessage.trimmingCharacters(in: .whitespacesAndNewlines)
+                                                                    guard !trimmed.isEmpty else { return }
+                                                                    
+                                                                    isAIResponding = true
+                                                                    thinkingStart = Date()
+                                                                    isSendingMessage = true
+                                                                    
+                                                                    print("HALDEBUG-MODEL: Starting message send - '\(trimmed.prefix(50))....'")
+                                                                    let currentTurn = memoryStore.getCurrentTurnNumber(conversationId: conversationId) + 1
+                                                                    messages.append(ChatMessage(content: trimmed, isFromUser: true, recordedByModel: "user", turnNumber: currentTurn))
+                                                                    currentMessage = ""
+                                                                    
+                                                                    #if os(iOS)
+                                                                    UIApplication.shared.sendAction(#selector(UIResponder.resignFirstResponder), to: nil, from: nil, for: nil)
+                                                                    #endif
+                                                                    
+                                                                    // Branch based on Salon Mode
+                                                                    if salonConfig.isEnabled {
+                                                                        await runSalonTurn(userInput: trimmed)
+                                                                    } else {
+                                                                        await runSingleModelTurn(userInput: trimmed)
+                                                                    }
+                                                                    
+                                                                    isAIResponding = false
+                                                                    thinkingStart = nil
+                                                                    isSendingMessage = false
+                                                                }
+                                                                
+                                                                // Single-model turn execution (existing behavior)
+                                                                private func runSingleModelTurn(userInput: String, historyMessagesOverride: [ChatMessage]? = nil, skipUserMessage: Bool = false) async {
+                                                                    let currentTurn = memoryStore.getCurrentTurnNumber(conversationId: conversationId)
+                                                                    
+                                                                    // Store user message as artifact (if not skipping)
+                                                                    if !skipUserMessage {
+                                                                        memoryStore.storeConversationArtifact(
+                                                                            conversationId: conversationId,
+                                                                            artifactType: "userMessage",
+                                                                            turnNumber: currentTurn + 1,  // This is a new turn
+                                                                            deliberationRound: 1,
+                                                                            seatNumber: nil,
+                                                                            content: userInput,
+                                                                            modelId: nil  // User message, no model
+                                                                        )
+                                                                        print("HALDEBUG-ARTIFACT: Stored user message artifact for turn \(currentTurn + 1)")
+                                                                    }
+                                                                    
+                                                                    let placeholder = ChatMessage(content: "\u{00A0}", isFromUser: false, isPartial: true, recordedByModel: selectedModel.id, turnNumber: currentTurn)
+                                                                    messages.append(placeholder)
+                                                                    isAIResponding = true
+                                                                    thinkingStart = Date()
 
-                                // FIXED: Removed manual objectWillChange.send() - @Published handles this automatically
-                                // FIXED: Removed artificial delays that were masking the real issue
-                                try? await Task.sleep(nanoseconds: 100_000_000) // Brief yield for UI update
-                                
-                                guard let pid = messages.last?.id else { isAIResponding = false; isSendingMessage = false; return }
-                                var finalText = ""; var usedCtx: [UnifiedSearchResult]? = nil; var modelTime: TimeInterval = 0
+                                                                    // FIXED: Removed manual objectWillChange.send() - @Published handles this automatically
+                                                                    // FIXED: Removed artificial delays that were masking the real issue
+                                                                    try? await Task.sleep(nanoseconds: 100_000_000) // Brief yield for UI update
+                                                                    
+                                                                    guard let pid = messages.last?.id else { isAIResponding = false; isSendingMessage = false; return }
+                                                                    var finalText = ""; var usedCtx: [UnifiedSearchResult]? = nil; var modelTime: TimeInterval = 0
 
-                                do {
-                                    // Status Stage 0: Message received
-                                    if let i = messages.firstIndex(where: { $0.id == pid }) {
-                                        messages[i].content = "Reading your message..."
-                                        // FIXED: Removed NotificationCenter post - @Published array mutation triggers view update
-                                    }
-                                    try? await Task.sleep(nanoseconds: 300_000_000) // Brief readability delay
+                                                                    do {
+                                                                        // Status Stage 0: Message received
+                                                                        if let i = messages.firstIndex(where: { $0.id == pid }) {
+                                                                            messages[i].content = "Reading your message..."
+                                                                            // FIXED: Removed NotificationCenter post - @Published array mutation triggers view update
+                                                                        }
+                                                                        try? await Task.sleep(nanoseconds: 300_000_000) // Brief readability delay
 
-                                    // Build prompt with status callbacks (stages 1 & 2 handled inside)
-                                    let prompt = await buildPromptHistory(currentInput: trimmed) { status in
-                                        if let i = self.messages.firstIndex(where: { $0.id == pid }) {
-                                            self.messages[i].content = status
-                                            // FIXED: Removed NotificationCenter post
-                                        }
-                                    }
+                                                                        // Build prompt with status callbacks (stages 1 & 2 handled inside)
+                                                                        let prompt = await buildPromptHistory(currentInput: userInput, historyMessagesOverride: historyMessagesOverride) { status in
+                                                                            if let i = self.messages.firstIndex(where: { $0.id == pid }) {
+                                                                                self.messages[i].content = status
+                                                                                // FIXED: Removed NotificationCenter post
+                                                                            }
+                                                                        }
 
-                                    // Status Stage 3: LLM inference
-                                    if let i = messages.firstIndex(where: { $0.id == pid }) {
-                                        messages[i].content = "Formulating a reply..."
-                                        // FIXED: Removed NotificationCenter post
-                                    }
-                                    try? await Task.sleep(nanoseconds: 300_000_000) // Brief readability delay
+                                                                        // Status Stage 3: LLM inference
+                                                                        if let i = messages.firstIndex(where: { $0.id == pid }) {
+                                                                            messages[i].content = "Formulating a reply..."
+                                                                            // FIXED: Removed NotificationCenter post
+                                                                        }
+                                                                        try? await Task.sleep(nanoseconds: 300_000_000) // Brief readability delay
 
-                                    print("HALDEBUG-MODEL: Sending prompt to language model (\(prompt.count) chars)")
-                                    let t0 = Date()
-                                    // TEMPERATURE CHANGE 6/6: Pass temperature parameter to generateResponse
-                                    finalText = try await llmService.generateResponse(prompt: prompt, temperature: temperature)
-                                    modelTime = Date().timeIntervalSince(t0)
-                                    print("HALDEBUG-LLM: âœ… Non-streaming generation complete. Length: \(finalText.count)")
+                                                                        print("HALDEBUG-MODEL: Sending prompt to language model (\(prompt.count) chars)")
+                                                                        let t0 = Date()
+                                                                        // TEMPERATURE CHANGE 6/6: Pass temperature parameter to generateResponse
+                                                                        finalText = try await llmService.generateResponse(prompt: prompt, temperature: temperature)
+                                                                        modelTime = Date().timeIntervalSince(t0)
+                                                                        print("HALDEBUG-LLM: ÃƒÆ’Ã‚Â¢Ãƒâ€¦Ã¢â‚¬Å“ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â¦ Non-streaming generation complete. Length: \(finalText.count)")
 
-                                    usedCtx = fullRAGContext.isEmpty ? nil : fullRAGContext
-                                    if let ctx = usedCtx {
-                                        print("HALDEBUG-RAG: Stored \(ctx.count) items â†’ scores: \(ctx.map{$0.relevance})")
-                                    }
+                                                                        usedCtx = fullRAGContext.isEmpty ? nil : fullRAGContext
+                                                                        if let ctx = usedCtx {
+                                                                            print("HALDEBUG-RAG: Stored \(ctx.count) items ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬ ÃƒÂ¢Ã¢â€šÂ¬Ã¢â€žÂ¢ scores: \(ctx.map{$0.relevance})")
+                                                                        }
 
-                                    let text = removeRepetitivePatterns(from: finalText).trimmingCharacters(in: .whitespacesAndNewlines)
+                                                                        let text = removeRepetitivePatterns(from: finalText).trimmingCharacters(in: .whitespacesAndNewlines)
 
-                                    // Calculate token breakdown for this response
-                                    let tokenBreakdown = calculateTokenBreakdown(
-                                        prompt: prompt,
-                                        userInput: trimmed,
-                                        completion: text
-                                    )
+                                                                        // Calculate token breakdown for this response
+                                                                        let tokenBreakdown = calculateTokenBreakdown(
+                                                                            prompt: prompt,
+                                                                            userInput: userInput,
+                                                                            completion: text
+                                                                        )
 
-                                    // Status Stage 4: Fake streaming (with fast speech option)
-                                    let cps: Double = fastSpeech ? 60.0 : 20.0  // Fast: 60 cps (3x faster), Normal: 20 cps
-                                    var idx = text.startIndex, acc = ""
-                                    while idx < text.endIndex {
-                                        let rem = text[idx...]
-                                        let n = min(max(4, Int.random(in: 6...18)), rem.count)
-                                        let next = text.index(idx, offsetBy: n, limitedBy: text.endIndex) ?? text.endIndex
-                                        let chunk = String(text[idx..<next]); idx = next; acc += chunk
+                                                                        // Status Stage 4: Fake streaming (hardcoded for fast display)
+                                                                        let cps: Double = 100.0  // Characters per second
+                                                                        var idx = text.startIndex, acc = ""
+                                                                        while idx < text.endIndex {
+                                                                            let rem = text[idx...]
+                                                                            let n = min(max(4, Int.random(in: 6...18)), rem.count)
+                                                                            let next = text.index(idx, offsetBy: n, limitedBy: text.endIndex) ?? text.endIndex
+                                                                            let chunk = String(text[idx..<next]); idx = next; acc += chunk
 
-                                        if let i = messages.firstIndex(where: { $0.id == pid }) {
-                                            messages[i].content = acc
-                                            // FIXED: Removed NotificationCenter post
-                                        }
+                                                                            if let i = messages.firstIndex(where: { $0.id == pid }) {
+                                                                                messages[i].content = acc
+                                                                                // FIXED: Removed NotificationCenter post
+                                                                            }
 
-                                        let base = max(0.03, Double(chunk.count)/cps)
-                                        try await Task.sleep(nanoseconds: UInt64(base * 1_000_000_000))
-                                        if let last = chunk.last, ".!?\n".contains(last) {
-                                            try await Task.sleep(nanoseconds: fastSpeech ? 70_000_000 : 220_000_000)  // Fast: 70ms, Normal: 220ms
-                                        }
-                                    }
+                                                                            let base = max(0.03, Double(chunk.count)/cps)
+                                                                            try await Task.sleep(nanoseconds: UInt64(base * 1_000_000_000))
+                                                                            if let last = chunk.last, ".!?\n".contains(last) {
+                                                                                try await Task.sleep(nanoseconds: 50_000_000)  // 50ms pause for readability
+                                                                            }
+                                                                        }
 
-                                    let thinking = modelTime
+                                                                        let thinking = modelTime
 
-                                    // FIXED: Simplified MainActor.run - no manual objectWillChange needed
-                                    await MainActor.run {
-                                        self.isAIResponding = false
-                                        self.thinkingStart = nil
-                                        self.isSendingMessage = false
-                                        if let i = self.messages.firstIndex(where: { $0.id == pid }) {
-                                            self.messages[i].content = text
-                                            self.messages[i].isPartial = false
-                                            self.messages[i].thinkingDuration = thinking
-                                            self.lastInferenceTime = thinking
-                                            self.messages[i].fullPromptUsed = prompt
-                                            self.messages[i].usedContextSnippets = usedCtx
-                                            self.messages[i].tokenBreakdown = tokenBreakdown
-                                        }
+                                                                        // FIXED: Simplified MainActor.run - no manual objectWillChange needed
+                                                                        await MainActor.run {
+                                                                            self.isAIResponding = false
+                                                                            self.thinkingStart = nil
+                                                                            self.isSendingMessage = false
+                                                                            if let i = self.messages.firstIndex(where: { $0.id == pid }) {
+                                                                                self.messages[i].content = text
+                                                                                self.messages[i].isPartial = false
+                                                                                self.messages[i].thinkingDuration = thinking
+                                                                                self.lastInferenceTime = thinking
+                                                                                self.messages[i].fullPromptUsed = prompt
+                                                                                self.messages[i].usedContextSnippets = usedCtx
+                                                                                self.messages[i].tokenBreakdown = tokenBreakdown
+                                                                            }
 
-                                        if self.pendingAutoInject {
-                                            self.pendingAutoInject = false
-                                            print("HALDEBUG-MEMORY: Cleared pending auto-inject flag after successful response")
-                                        }
+                                                                            if self.pendingAutoInject {
+                                                                                self.pendingAutoInject = false
+                                                                                print("HALDEBUG-MEMORY: Cleared pending auto-inject flag after successful response")
+                                                                            }
 
-                                        let turn = self.countCompletedTurns()
-                                        print("HALDEBUG-MEMORY: About to store turn \(turn) in database")
-                                        self.memoryStore.storeTurn(
-                                            conversationId: self.conversationId,
-                                            userMessage: trimmed,
-                                            assistantMessage: text,
-                                            systemPrompt: self.systemPrompt,
-                                            turnNumber: turn,
-                                            halFullPrompt: prompt,
-                                            halUsedContext: usedCtx,
-                                            thinkingDuration: thinking,
-                                            recordedByModel: self.selectedModel.id
-                                        )
-                                        
-                                        // Trigger consolidation if needed (every 100 turns OR 24 hours)
-                                        let turnsSinceConsolidation = turn - self.memoryStore.lastConsolidationTurn
-                                        let hoursSinceConsolidation = (Date().timeIntervalSince1970 - self.memoryStore.lastConsolidationTime) / 3600.0
-                                        
-                                        if turnsSinceConsolidation >= 100 || hoursSinceConsolidation >= 24 {
-                                            print("HALDEBUG-REFLECTION: 🔧 Triggering consolidation (turns: \(turnsSinceConsolidation), hours: \(String(format: "%.1f", hoursSinceConsolidation)))")
-                                            Task {
-                                                await self.memoryStore.consolidateAndDecay()
-                                                self.memoryStore.lastConsolidationTurn = turn
-                                            }
-                                        }
-                                        
-                                        // Trigger reflection if needed (every 5 turns for Type 1, every 15 for Type 2)
-                                        if turn % 5 == 0 || turn % 15 == 0 {
-                                            let reflectionType = (turn % 15 == 0) ? 2 : 1
-                                            print("HALDEBUG-REFLECTION: 🧠 Triggering Type \(reflectionType) reflection at turn \(turn)")
-                                            
-                                            // Get recent turns for reflection context
-                                            let recentMessages = self.memoryStore.getConversationMessages(conversationId: self.conversationId)
-                                            let recentTurns = recentMessages.suffix(5).map { msg in
-                                                (role: msg.isFromUser ? "user" : "assistant", content: msg.content, timestamp: msg.timestamp)
-                                            }
-                                            
-                                            Task {
-                                                await self.memoryStore.reflectOnExperience(
-                                                    turns: recentTurns,
-                                                    llmService: self.llmService,
-                                                    reflectionType: reflectionType,
-                                                    currentTurn: turn
-                                                )
-                                                self.memoryStore.lastReflectionTurn = turn
-                                            }
-                                        }
+                                                                            // CHANGE 1: Calculate turn from database (source of truth), not messages array
+                                                                            let dbUserMessages = self.memoryStore.getConversationMessages(conversationId: self.conversationId).filter { $0.isFromUser }.count
+                                                                            let turn = skipUserMessage ? dbUserMessages : (dbUserMessages + 1)
+                                                                            print("HALDEBUG-MEMORY: About to store turn \(turn) in database (DB has \(dbUserMessages) user messages, skipUserMessage=\(skipUserMessage))")
+                                                                            self.memoryStore.storeTurn(
+                                                                                conversationId: self.conversationId,
+                                                                                userMessage: userInput,
+                                                                                assistantMessage: text,
+                                                                                systemPrompt: self.systemPrompt,
+                                                                                turnNumber: turn,
+                                                                                halFullPrompt: prompt,
+                                                                                halUsedContext: usedCtx,
+                                                                                thinkingDuration: thinking,
+                                                                                recordedByModel: self.selectedModel.id,
+                                                                                skipUserMessage: skipUserMessage
+                                                                            )
+                                                                            
+                                                                            // Store assistant response as artifact
+                                                                            self.memoryStore.storeConversationArtifact(
+                                                                                conversationId: self.conversationId,
+                                                                                artifactType: "halResponse",
+                                                                                turnNumber: turn,
+                                                                                deliberationRound: 1,
+                                                                                seatNumber: nil,
+                                                                                content: text,
+                                                                                modelId: self.selectedModel.id
+                                                                            )
+                                                                            print("HALDEBUG-ARTIFACT: Stored assistant response artifact for turn \(turn)")
+                                                                            
+                                                                            // Trigger consolidation if needed (every 100 turns OR 24 hours)
+                                                                            let turnsSinceConsolidation = turn - self.memoryStore.lastConsolidationTurn
+                                                                            let hoursSinceConsolidation = (Date().timeIntervalSince1970 - self.memoryStore.lastConsolidationTime) / 3600.0
+                                                                            
+                                                                            if turnsSinceConsolidation >= 100 || hoursSinceConsolidation >= 24 {
+                                                                                print("HALDEBUG-REFLECTION: ÃƒÆ’Ã‚Â°Ãƒâ€¦Ã‚Â¸ÃƒÂ¢Ã¢â€šÂ¬Ã‚Ãƒâ€šÃ‚Â§ Triggering consolidation (turns: \(turnsSinceConsolidation), hours: \(String(format: "%.1f", hoursSinceConsolidation)))")
+                                                                                Task {
+                                                                                    await self.memoryStore.consolidateAndDecay(llmService: self.llmService)
+                                                                                    self.memoryStore.lastConsolidationTurn = turn
+                                                                                }
+                                                                            }
+                                                                            
+                                                                            // MODIFIED: Trigger Type 1 (practical) reflection every 5 turns
+                                                                            if turn % 5 == 0 {
+                                                                                print("HALDEBUG-REFLECTION: ÃƒÆ’Ã‚Â°Ãƒâ€¦Ã‚Â¸Ãƒâ€šÃ‚Â§Ãƒâ€š  Triggering Type 1 (practical) reflection at turn \(turn)")
+                                                                                
+                                                                                // Get recent turns for reflection context
+                                                                                let recentMessages = self.memoryStore.getConversationMessages(conversationId: self.conversationId)
+                                                                                let recentTurns = recentMessages.suffix(5).map { msg in
+                                                                                    (role: msg.isFromUser ? "user" : "assistant", content: msg.content, timestamp: msg.timestamp)
+                                                                                }
+                                                                                
+                                                                                Task {
+                                                                                    await self.memoryStore.reflectOnExperience(
+                                                                                        conversationId: self.conversationId,
+                                                                                        turns: recentTurns,
+                                                                                        llmService: self.llmService,
+                                                                                        reflectionType: 1,
+                                                                                        currentTurn: turn,
+                                                                                        modelId: self.selectedModel.id
+                                                                                    )
+                                                                                }
+                                                                            }
+                                                                            
+                                                                            // MODIFIED: Trigger Type 2 (existential) reflection every 15 turns (in addition to Type 1)
+                                                                            if turn % 15 == 0 {
+                                                                                print("HALDEBUG-REFLECTION: ÃƒÆ’Ã‚Â°Ãƒâ€¦Ã‚Â¸Ãƒâ€šÃ‚Â§Ãƒâ€š  Triggering Type 2 (existential) reflection at turn \(turn)")
+                                                                                
+                                                                                // Get recent turns for reflection context
+                                                                                let recentMessages = self.memoryStore.getConversationMessages(conversationId: self.conversationId)
+                                                                                let recentTurns = recentMessages.suffix(5).map { msg in
+                                                                                    (role: msg.isFromUser ? "user" : "assistant", content: msg.content, timestamp: msg.timestamp)
+                                                                                }
+                                                                                
+                                                                                Task {
+                                                                                    await self.memoryStore.reflectOnExperience(
+                                                                                        conversationId: self.conversationId,
+                                                                                        turns: recentTurns,
+                                                                                        llmService: self.llmService,
+                                                                                        reflectionType: 2,
+                                                                                        currentTurn: turn,
+                                                                                        modelId: self.selectedModel.id
+                                                                                    )
+                                                                                }
+                                                                            }
+                                                                            
+                                                                            // Update lastReflectionTurn after any reflection
+                                                                            if turn % 5 == 0 || turn % 15 == 0 {
+                                                                                self.memoryStore.lastReflectionTurn = turn
+                                                                            }
 
-                                        // Trigger auto-summarization if conditions are met
-                                        if self.shouldTriggerAutoSummarization() {
-                                            Task { await self.generateAutoSummary() }
-                                        }
+                                                                            // Trigger auto-summarization if conditions are met
+                                                                            if self.shouldTriggerAutoSummarization() {
+                                                                                Task { await self.generateAutoSummary() }
+                                                                            }
 
-                                        let verify = self.memoryStore.getConversationMessages(conversationId: self.conversationId)
-                                        print("HALDEBUG-MEMORY: VERIFY - After storing turn \(turn), database has \(verify.count) messages")
-                                        self.updateHistoricalStats()
-                                    }
+                                                                            let verify = self.memoryStore.getConversationMessages(conversationId: self.conversationId)
+                                                                            print("HALDEBUG-MEMORY: VERIFY - After storing turn \(turn), database has \(verify.count) messages")
+                                                                            self.updateHistoricalStats()
+                                                                        }
 
-                                } catch {
-                                    await MainActor.run {
-                                        if let i = self.messages.firstIndex(where: { $0.id == pid }) {
-                                            self.messages[i].content = "Error: \(error.localizedDescription)"
-                                            self.messages[i].isPartial = false
-                                        }
-                                        self.errorMessage = error.localizedDescription
-                                        self.isAIResponding = false
-                                        self.thinkingStart = nil
-                                        self.isSendingMessage = false
-                                        print("HALDEBUG-MODEL: Message processing failed: \(error.localizedDescription)")
-                                    }
-                                }
-                            }
+                                                                    } catch {
+                                                                        await MainActor.run {
+                                                                            if let i = self.messages.firstIndex(where: { $0.id == pid }) {
+                                                                                self.messages[i].content = "Error: \(error.localizedDescription)"
+                                                                                self.messages[i].isPartial = false
+                                                                            }
+                                                                            self.errorMessage = error.localizedDescription
+                                                                            self.isAIResponding = false
+                                                                            self.thinkingStart = nil
+                                                                            self.isSendingMessage = false
+                                                                            print("HALDEBUG-MODEL: Message processing failed: \(error.localizedDescription)")
+                                                                        }
+                                                                    }
+                                                                }
+                                                                
+                                                                // MARK: - Salon Mode Execution
+                                                                
+                                                                // Salon Mode turn execution
+                                                                private func runSalonTurn(userInput: String) async {
+                                                                    let activeSeats = salonConfig.activeSeats
+                                                                    
+                                                                    guard !activeSeats.isEmpty else {
+                                                                        print("HALDEBUG-SALON: No active seats configured")
+                                                                        return
+                                                                    }
+                                                                    
+                                                                    print("HALDEBUG-SALON: Starting Salon turn with \(activeSeats.count) active seats")
+                                                                    
+                                                                    // SALON FIX: Store user message ONCE before seats execute
+                                                                    // Calculate turn from DATABASE user messages, not array (which gets polluted by multiple seats)
+                                                                    let dbUserMessages = memoryStore.getConversationMessages(conversationId: conversationId).filter { $0.isFromUser }.count
+                                                                    let salonTurnNumber = dbUserMessages + 1
+                                                                    print("HALDEBUG-SALON: Storing user message for turn \(salonTurnNumber) (DB has \(dbUserMessages) user messages)")
+                                                                    memoryStore.storeTurn(
+                                                                        conversationId: conversationId,
+                                                                        userMessage: userInput,
+                                                                        assistantMessage: "",  // Will be filled by seats
+                                                                        systemPrompt: systemPrompt,
+                                                                        turnNumber: salonTurnNumber,
+                                                                        halFullPrompt: nil,
+                                                                        halUsedContext: nil,
+                                                                        thinkingDuration: nil,
+                                                                        recordedByModel: "user"
+                                                                        // skipUserMessage defaults to false, so user IS stored
+                                                                    )
+                                                                    
+                                                                    // Store user message as artifact for Salon turn
+                                                                    memoryStore.storeConversationArtifact(
+                                                                        conversationId: conversationId,
+                                                                        artifactType: "userMessage",
+                                                                        turnNumber: salonTurnNumber,
+                                                                        deliberationRound: 1,
+                                                                        seatNumber: nil,
+                                                                        content: userInput,
+                                                                        modelId: nil  // User message, no model
+                                                                    )
+                                                                    print("HALDEBUG-ARTIFACT: Stored user message artifact for Salon turn \(salonTurnNumber)")
+                                                                    
+                                                                    // Capture baseline history snapshot for Independent mode
+                                                                    // This freezes the message history before any seats respond
+                                                                    let baselineHistory = messages.filter { !$0.isPartial }
+                                                                    
+                                                                    // Execute each seat sequentially
+                                                                    for seat in activeSeats {
+                                                                        print("HALDEBUG-SALON: Executing seat \(seat.position) with model \(seat.modelID)")
+                                                                        
+                                                                        // Get the model
+                                                                        guard let model = ModelCatalogService.shared.getModel(byID: seat.modelID) else {
+                                                                            print("HALDEBUG-SALON: Warning: Model not found: \(seat.modelID)")
+                                                                            continue
+                                                                        }
+                                                                        
+                                                                        // Switch to this model
+                                                                        selectedModelID = model.id
+                                                                        
+                                                                        // Execute seat with behavioral mode awareness
+                                                                        await runSalonSeat(userInput: userInput, seatPosition: seat.position, baselineHistory: baselineHistory)
+                                                                    }
+                                                                    
+                                                                    // Run summarizer if configured
+                                                                    if let summarizerModelID = salonConfig.summarizerModel {
+                                                                        // Check if this is first time enabled (or re-enabled after being off)
+                                                                        let currentTurnNumber = countCompletedTurns()
+                                                                        
+                                                                        if salonConfig.summarizerSessionStartTurn == nil {
+                                                                            // Start new session
+                                                                            salonConfig.summarizerSessionStartTurn = currentTurnNumber
+                                                                            print("HALDEBUG-SALON: Started summarizer session at turn \(currentTurnNumber)")
+                                                                        }
+                                                                        
+                                                                        await runModeratorSummary(summarizerModelID: summarizerModelID)
+                                                                    } else if salonConfig.summarizerSessionStartTurn != nil {
+                                                                        // Summarizer was just turned off, reset session
+                                                                        salonConfig.summarizerSessionStartTurn = nil
+                                                                        print("HALDEBUG-SALON: Ended summarizer session")
+                                                                    }
+                                                                }
+                                                                
+                                                                // Execute a single salon seat with behavioral mode awareness
+                                                                private func runSalonSeat(userInput: String, seatPosition: Int, baselineHistory: [ChatMessage]) async {
+                                                                    // Get current turn number before execution
+                                                                    let currentTurn = memoryStore.getCurrentTurnNumber(conversationId: conversationId)
+                                                                    
+                                                                    // Independent mode uses existing single-model behavior
+                                                                    if salonConfig.behavioralMode == .independent {
+                                                                        await runSingleModelTurn(userInput: userInput, historyMessagesOverride: baselineHistory, skipUserMessage: true)
+                                                                        
+                                                                        // After runSingleModelTurn completes, capture the response and store as artifact
+                                                                        // The response is the most recent non-partial message for this turn
+                                                                        if let responseMessage = messages.last(where: {
+                                                                            !$0.isFromUser &&
+                                                                            !$0.isPartial &&
+                                                                            $0.turnNumber == currentTurn &&
+                                                                            $0.recordedByModel == selectedModel.id
+                                                                        }) {
+                                                                            memoryStore.storeConversationArtifact(
+                                                                                conversationId: conversationId,
+                                                                                artifactType: "salonDeliberation",
+                                                                                turnNumber: currentTurn,
+                                                                                deliberationRound: 1,
+                                                                                seatNumber: seatPosition,
+                                                                                content: responseMessage.content,
+                                                                                modelId: selectedModel.id
+                                                                            )
+                                                                            print("HALDEBUG-SALON: Stored independent mode artifact for seat \(seatPosition)")
+                                                                        } else {
+                                                                            print("HALDEBUG-SALON: Warning: Could not find response message to store as artifact")
+                                                                        }
+                                                                        
+                                                                        return
+                                                                    }
+                                                                    
+                                                                    // Context-Aware mode: Custom prompt building with summarized context
+                                                                    print("HALDEBUG-SALON: Context-aware seat \(seatPosition) - building custom prompt")
+                                                                    
+                                                                    let placeholder = ChatMessage(content: "\u{00A0}", isFromUser: false, isPartial: true, recordedByModel: selectedModel.id, turnNumber: currentTurn)
+                                                                    messages.append(placeholder)
+                                                                    
+                                                                    try? await Task.sleep(nanoseconds: 100_000_000) // Brief yield for UI update
+                                                                    
+                                                                    guard let pid = messages.last?.id else { return }
+                                                                    var finalText = ""; var modelTime: TimeInterval = 0
+                                                                    
+                                                                    do {
+                                                                        // Status: Reading message
+                                                                        if let i = messages.firstIndex(where: { $0.id == pid }) {
+                                                                            messages[i].content = "Reading your message..."
+                                                                        }
+                                                                        try? await Task.sleep(nanoseconds: 300_000_000)
+                                                                        
+                                                                        // Build Context-Aware prompt with slim system prompt and summarized history
+                                                                        let prompt = await buildContextAwarePrompt(userInput: userInput, seatPosition: seatPosition)
+                                                                        
+                                                                        // Status: Formulating reply
+                                                                        if let i = messages.firstIndex(where: { $0.id == pid }) {
+                                                                            messages[i].content = "Formulating a reply..."
+                                                                        }
+                                                                        try? await Task.sleep(nanoseconds: 300_000_000)
+                                                                        
+                                                                        print("HALDEBUG-SALON: Sending context-aware prompt to model (\(prompt.count) chars)")
+                                                                        let t0 = Date()
+                                                                        finalText = try await llmService.generateResponse(prompt: prompt, temperature: temperature)
+                                                                        modelTime = Date().timeIntervalSince(t0)
+                                                                        print("HALDEBUG-SALON: Context-aware generation complete. Length: \(finalText.count)")
+                                                                        
+                                                                        let text = removeRepetitivePatterns(from: finalText).trimmingCharacters(in: .whitespacesAndNewlines)
+                                                                        
+                                                                        // Calculate token breakdown
+                                                                        let tokenBreakdown = calculateTokenBreakdown(
+                                                                            prompt: prompt,
+                                                                            userInput: userInput,
+                                                                            completion: text
+                                                                        )
+                                                                        
+                                                                        // Fake streaming
+                                                                        let cps: Double = 100.0
+                                                                        var idx = text.startIndex, acc = ""
+                                                                        while idx < text.endIndex {
+                                                                            let rem = text[idx...]
+                                                                            let n = min(max(4, Int.random(in: 6...18)), rem.count)
+                                                                            let next = text.index(idx, offsetBy: n, limitedBy: text.endIndex) ?? text.endIndex
+                                                                            let chunk = String(text[idx..<next]); idx = next; acc += chunk
+                                                                            
+                                                                            if let i = messages.firstIndex(where: { $0.id == pid }) {
+                                                                                messages[i].content = acc
+                                                                            }
+                                                                            
+                                                                            let base = max(0.03, Double(chunk.count)/cps)
+                                                                            try await Task.sleep(nanoseconds: UInt64(base * 1_000_000_000))
+                                                                            if let last = chunk.last, ".!?\n".contains(last) {
+                                                                                try await Task.sleep(nanoseconds: 50_000_000)
+                                                                            }
+                                                                        }
+                                                                        
+                                                                        let thinking = modelTime
+                                                                        
+                                                                        await MainActor.run {
+                                                                            if let i = self.messages.firstIndex(where: { $0.id == pid }) {
+                                                                                self.messages[i].content = text
+                                                                                self.messages[i].isPartial = false
+                                                                                self.messages[i].thinkingDuration = thinking
+                                                                                self.lastInferenceTime = thinking
+                                                                                self.messages[i].fullPromptUsed = prompt
+                                                                                self.messages[i].usedContextSnippets = nil
+                                                                                self.messages[i].tokenBreakdown = tokenBreakdown
+                                                                            }
+                                                                            
+                                                                            // CHANGE 2: Calculate turn from database (source of truth), not messages array
+                                                                            let dbUserMessages = self.memoryStore.getConversationMessages(conversationId: self.conversationId).filter { $0.isFromUser }.count
+                                                                            let turn = dbUserMessages  // skipUserMessage is always true for Salon seats
+                                                                            print("HALDEBUG-SALON: Storing context-aware turn \(turn) (DB has \(dbUserMessages) user messages)")
+                                                                            self.memoryStore.storeTurn(
+                                                                                conversationId: self.conversationId,
+                                                                                userMessage: userInput,
+                                                                                assistantMessage: text,
+                                                                                systemPrompt: self.systemPrompt,
+                                                                                turnNumber: turn,
+                                                                                halFullPrompt: prompt,
+                                                                                halUsedContext: nil,
+                                                                                thinkingDuration: thinking,
+                                                                                recordedByModel: self.selectedModel.id,
+                                                                                skipUserMessage: true  // User already stored in runSalonTurn
+                                                                            )
+                                                                            
+                                                                            // Store Context-Aware deliberation as artifact for Session-Scope analysis
+                                                                            self.memoryStore.storeConversationArtifact(
+                                                                                conversationId: self.conversationId,
+                                                                                artifactType: "salonDeliberation",
+                                                                                turnNumber: turn,
+                                                                                deliberationRound: 1,
+                                                                                seatNumber: seatPosition,
+                                                                                content: text,
+                                                                                modelId: self.selectedModel.id
+                                                                            )
+                                                                            print("HALDEBUG-SALON: Stored context-aware deliberation artifact for seat \(seatPosition)")
+                                                                        }
+                                                                        
+                                                                    } catch {
+                                                                        print("HALDEBUG-SALON: Warning: Context-aware error: \(error.localizedDescription)")
+                                                                        await MainActor.run {
+                                                                            if let i = self.messages.firstIndex(where: { $0.id == pid }) {
+                                                                                self.messages[i].content = "Error: \(error.localizedDescription)"
+                                                                                self.messages[i].isPartial = false
+                                                                            }
+                                                                        }
+                                                                    }
+                                                                }
+                                                                
+                                                                // Build Context-Aware prompt with slim system and summarized history
+                                                                private func buildContextAwarePrompt(userInput: String, seatPosition: Int) async -> String {
+                                                                    // Slim system prompt for context-aware mode
+                                                                    let slimSystemPrompt = """
+                                                                    You are Hal, an AI assistant participating in a multi-perspective discussion.
+                                                                    
+                                                                    Your role: Provide your unique perspective on the user's question.
+                                                                    
+                                                                    Guidelines:
+                                                                    - Be concise and focused
+                                                                    - Complement other perspectives, don't repeat them
+                                                                    - Stay relevant to the user's question
+                                                                    """
+                                                                    
+                                                                    // Get earlier seats' responses from THIS turn
+                                                                    let currentTurnSeats = getCurrentTurnSeatsResponses(beforeSeat: seatPosition)
+                                                                    
+                                                                    // Generate full conversation summary (includes prior turns + current turn's earlier seats)
+                                                                    let conversationSummary = await generateSalonContextSummary(includeCurrentTurnSeats: currentTurnSeats)
+                                                                    
+                                                                    // Build prompt with slim system and summary
+                                                                    var prompt = """
+                                                                    
+                                                                    #=== BEGIN SYSTEM ===#
+                                                                    
+                                                                    \(slimSystemPrompt)
+                                                                    
+                                                                    #=== END SYSTEM ===#
+                                                                    """
+                                                                    
+                                                                    // Add conversation summary if available
+                                                                    if !conversationSummary.isEmpty {
+                                                                        prompt += """
+                                                                        
+                                                                        
+                                                                        #=== BEGIN MEMORY_LONG ===#
+                                                                        
+                                                                        \(conversationSummary)
+                                                                        
+                                                                        #=== END MEMORY_LONG ===#
+                                                                        """
+                                                                    }
+                                                                    
+                                                                    // Add current user input
+                                                                    prompt += """
+                                                                    
+                                                                    
+                                                                    #=== BEGIN USER ===#
+                                                                    
+                                                                    \(userInput)
+                                                                    
+                                                                    #=== END USER ===#
+                                                                    """
+                                                                    
+                                                                    return prompt
+                                                                }
+                                                                
+                                                                // Generate full conversation summary with LLM (for Salon Mode context-aware)
+                                                                private func generateSalonContextSummary(includeCurrentTurnSeats: [String]) async -> String {
+                                                                    // Collect all messages up to current moment (excluding partial messages)
+                                                                    let allPriorMessages = messages.filter { !$0.isPartial }
+                                                                    
+                                                                    if allPriorMessages.isEmpty {
+                                                                        return ""
+                                                                    }
+                                                                    
+                                                                    // Format conversation text with attribution
+                                                                    var conversationText = ""
+                                                                    for message in allPriorMessages {
+                                                                        if message.isFromUser {
+                                                                            conversationText += "User: \(message.content)\n\n"
+                                                                        } else {
+                                                                            let modelName = ModelCatalogService.shared.getModel(byID: message.recordedByModel)?.displayName ?? "Assistant"
+                                                                            conversationText += "\(modelName): \(message.content)\n\n"
+                                                                        }
+                                                                    }
+                                                                    
+                                                                    // Add current turn's earlier seats if provided
+                                                                    if !includeCurrentTurnSeats.isEmpty {
+                                                                        conversationText += "--- Current Turn Earlier Responses ---\n\n"
+                                                                        for (index, seatResponse) in includeCurrentTurnSeats.enumerated() {
+                                                                            conversationText += "Seat \(index + 1): \(seatResponse)\n\n"
+                                                                        }
+                                                                    }
+                                                                    
+                                                                    // Estimate target tokens for summary (roughly 20% of original)
+                                                                    let originalTokens = TokenEstimator.estimateTokens(from: conversationText)
+                                                                    let targetTokens = max(200, originalTokens / 5)
+                                                                    
+                                                                    print("HALDEBUG-SALON: Generating context summary - original: \(originalTokens) tokens, target: \(targetTokens) tokens")
+                                                                    
+                                                                    // Use TextSummarizer with recency weighting
+                                                                    let summary = await TextSummarizer.summarizeWithVerification(
+                                                                        text: conversationText,
+                                                                        targetTokens: targetTokens,
+                                                                        llmService: llmService,
+                                                                        useRecencyWeighting: true
+                                                                    )
+                                                                    
+                                                                    return summary
+                                                                }
+                                                                
+                                                                // Get earlier seats' responses from current turn
+                                                                private func getCurrentTurnSeatsResponses(beforeSeat: Int) -> [String] {
+                                                                    // Find the last user message
+                                                                    guard let lastUserIndex = messages.lastIndex(where: { $0.isFromUser && !$0.isPartial }) else {
+                                                                        return []
+                                                                    }
+                                                                    
+                                                                    // Get all assistant messages after the last user message (current turn responses)
+                                                                    let currentTurnAssistantMessages = messages[(lastUserIndex + 1)...].filter { !$0.isPartial && !$0.isFromUser }
+                                                                    
+                                                                    // Return responses from seats 1 through (beforeSeat - 1)
+                                                                    let earlierSeats = currentTurnAssistantMessages.prefix(beforeSeat - 1)
+                                                                    return earlierSeats.map { $0.content }
+                                                                }
+                                                                
+                                                                // Moderator/Summarizer execution (Seat N+1)
+                                                                private func runModeratorSummary(summarizerModelID: String) async {
+                                                                    print("HALDEBUG-SALON: Running moderator summary with model \(summarizerModelID)")
+                                                                    
+                                                                    // Get the summarizer model
+                                                                    guard let model = ModelCatalogService.shared.getModel(byID: summarizerModelID) else {
+                                                                        print("HALDEBUG-SALON: Warning: Summarizer model not found: \(summarizerModelID)")
+                                                                        return
+                                                                    }
+                                                                    
+                                                                    // Collect seat outputs from this turn (most recent non-user messages)
+                                                                    let currentTurnNumber = memoryStore.getCurrentTurnNumber(conversationId: conversationId)
+                                                                    let seatOutputs = messages.filter {
+                                                                        !$0.isFromUser &&
+                                                                        $0.turnNumber == currentTurnNumber &&
+                                                                        !$0.isPartial
+                                                                    }
+                                                                    
+                                                                    guard !seatOutputs.isEmpty else {
+                                                                        print("HALDEBUG-SALON: No seat outputs found to summarize")
+                                                                        return
+                                                                    }
+                                                                    
+                                                                    print("HALDEBUG-SALON: Collected \(seatOutputs.count) seat outputs for summarization")
+                                                                    
+                                                                    // Build explicit input: seat outputs ONLY with model attribution
+                                                                    let seatInputs = seatOutputs.map { output in
+                                                                        let modelName = ModelCatalogService.shared.getModel(byID: output.recordedByModel)?.displayName ?? output.recordedByModel
+                                                                        return """
+                                                                        Model: \(modelName)
+                                                                        Response:
+                                                                        \(output.content)
+                                                                        """
+                                                                    }.joined(separator: "\n\n")
+                                                                    
+                                                                    // Determine interpretation clause based on behavioral mode
+                                                                    let interpretationClause = salonConfig.behavioralMode == .independent
+                                                                        ? "The responses above were generated independently. Do not assume awareness or rebuttal."
+                                                                        : "Later responses may have been influenced by earlier ones. You may describe alignment or refinement."
+                                                                    
+                                                                    // Build MCP-compliant HelPML prompt (flat structure, no nesting)
+                                                                    let summarizerPrompt = """
+                                                                    #=== BEGIN SYSTEM ===#
+                                                                    You are a summarizer, not a participant.
+                                                                    Do not answer the original user question.
+                                                                    Do not add new ideas or examples.
+                                                                    Summarize only what the responses below say.
+                                                                    
+                                                                    \(interpretationClause)
+                                                                    
+                                                                    Provide a brief synthesis with model attribution.
+                                                                    #=== END SYSTEM ===#
+                                                                    
+                                                                    #=== BEGIN CONTEXT ===#
+                                                                    \(seatInputs)
+                                                                    #=== END CONTEXT ===#
+                                                                    
+                                                                    #=== BEGIN RESPONSE ===#
+                                                                    Provide a brief synthesis in 2-3 sentences.
+                                                                    Do not include any #=== markers in your output.
+                                                                    #=== END RESPONSE ===#
+                                                                    """
+                                                                    
+                                                                    print("HALDEBUG-SALON: Calling TextSummarizer with \(TokenEstimator.estimateTokens(from: summarizerPrompt)) token prompt")
+                                                                    
+                                                                    // Switch to summarizer model temporarily
+                                                                    let previousModelID = selectedModelID
+                                                                    selectedModelID = model.id
+                                                                    llmService.setupLLM(for: model)
+                                                                    
+                                                                    // Call Block 8.5 TextSummarizer (NOT runSingleModelTurn)
+                                                                    let rawSummary = await TextSummarizer.summarizeWithVerification(
+                                                                        text: summarizerPrompt,
+                                                                        targetTokens: 150,  // Brief summary
+                                                                        llmService: llmService,
+                                                                        verificationThreshold: 0.72,
+                                                                        useRecencyWeighting: false  // Not summarizing conversation history
+                                                                    )
+                                                                    
+                                                                    // Scrub HelPML markers from output (safety check)
+                                                                    let scrubbedSummary = rawSummary.ScrubHelPMLMarkers()
+                                                                    
+                                                                    print("HALDEBUG-SALON: Summary generated and scrubbed: \(scrubbedSummary.count) chars")
+                                                                    
+                                                                    // Store as conversation artifact (NOT as message)
+                                                                    memoryStore.storeConversationArtifact(
+                                                                        conversationId: conversationId,
+                                                                        artifactType: "turnModerator",
+                                                                        turnNumber: currentTurnNumber,
+                                                                        deliberationRound: 1,
+                                                                        seatNumber: nil,
+                                                                        content: scrubbedSummary,
+                                                                        modelId: model.id
+                                                                    )
+                                                                    
+                                                                    // Add to messages array for UI display (but marked as artifact via special handling)
+                                                                    await MainActor.run {
+                                                                        let summaryMessage = ChatMessage(
+                                                                            content: "📋 Summary: \(scrubbedSummary)",
+                                                                            isFromUser: false,
+                                                                            recordedByModel: model.id,
+                                                                            turnNumber: currentTurnNumber
+                                                                        )
+                                                                        messages.append(summaryMessage)
+                                                                    }
+                                                                    
+                                                                    // Restore previous model
+                                                                    selectedModelID = previousModelID
+                                                                    llmService.setupLLM(for: ModelCatalogService.shared.getModel(byID: previousModelID) ?? .appleFoundation)
+                                                                    
+                                                                    print("HALDEBUG-SALON: Moderator summary complete")
+                                                                }
 
-                            // MARK: - Token Breakdown Calculator
-                            private func calculateTokenBreakdown(prompt: String, userInput: String, completion: String) -> TokenBreakdown {
-                                // Extract components from the prompt
-                                let systemTokens = TokenEstimator.estimateTokens(from: systemPrompt)
-                                
-                                // Extract summary section if present
-                                var summaryTokens = 0
-                                if let summaryRange = prompt.range(of: "<SUMMARY>"), let summaryEnd = prompt.range(of: "</SUMMARY>") {
-                                    let summaryContent = String(prompt[summaryRange.upperBound..<summaryEnd.lowerBound])
-                                    summaryTokens = TokenEstimator.estimateTokens(from: summaryContent)
-                                }
-                                
-                                // Extract RAG context section if present
-                                var ragTokens = 0
-                                if let ragRange = prompt.range(of: "<RAG_CONTEXT>"), let ragEnd = prompt.range(of: "</RAG_CONTEXT>") {
-                                    let ragContent = String(prompt[ragRange.upperBound..<ragEnd.lowerBound])
-                                    ragTokens = TokenEstimator.estimateTokens(from: ragContent)
-                                }
-                                
-                                // Extract short-term history section if present
-                                var shortTermTokens = 0
-                                if let historyRange = prompt.range(of: "<HISTORY>"), let historyEnd = prompt.range(of: "</HISTORY>") {
-                                    let historyContent = String(prompt[historyRange.upperBound..<historyEnd.lowerBound])
-                                    shortTermTokens = TokenEstimator.estimateTokens(from: historyContent)
-                                }
-                                
-                                // User input tokens
-                                let userInputTokens = TokenEstimator.estimateTokens(from: userInput)
-                                
-                                // Completion tokens
-                                let completionTokens = TokenEstimator.estimateTokens(from: completion)
-                                
-                                return TokenBreakdown(
-                                    systemTokens: systemTokens,
-                                    summaryTokens: summaryTokens,
-                                    ragTokens: ragTokens,
-                                    shortTermTokens: shortTermTokens,
-                                    userInputTokens: userInputTokens,
-                                    completionTokens: completionTokens,
-                                    contextWindow: selectedModel.contextWindow
-                                )
-                            }
+                                                                // MARK: - Token Breakdown Calculator
+                                                                private func calculateTokenBreakdown(prompt: String, userInput: String, completion: String) -> TokenBreakdown {
+                                                                    // Extract components from the prompt
+                                                                    let systemTokens = TokenEstimator.estimateTokens(from: systemPrompt)
+                                                                    
+                                                                    // Extract summary section if present
+                                                                    var summaryTokens = 0
+                                                                    if let summaryRange = prompt.range(of: "<SUMMARY>"), let summaryEnd = prompt.range(of: "</SUMMARY>") {
+                                                                        let summaryContent = String(prompt[summaryRange.upperBound..<summaryEnd.lowerBound])
+                                                                        summaryTokens = TokenEstimator.estimateTokens(from: summaryContent)
+                                                                    }
+                                                                    
+                                                                    // Extract RAG context section if present
+                                                                    var ragTokens = 0
+                                                                    if let ragRange = prompt.range(of: "<RAG_CONTEXT>"), let ragEnd = prompt.range(of: "</RAG_CONTEXT>") {
+                                                                        let ragContent = String(prompt[ragRange.upperBound..<ragEnd.lowerBound])
+                                                                        ragTokens = TokenEstimator.estimateTokens(from: ragContent)
+                                                                    }
+                                                                    
+                                                                    // Extract short-term history section if present
+                                                                    var shortTermTokens = 0
+                                                                    if let historyRange = prompt.range(of: "<HISTORY>"), let historyEnd = prompt.range(of: "</HISTORY>") {
+                                                                        let historyContent = String(prompt[historyRange.upperBound..<historyEnd.lowerBound])
+                                                                        shortTermTokens = TokenEstimator.estimateTokens(from: historyContent)
+                                                                    }
+                                                                    
+                                                                    // User input tokens
+                                                                    let userInputTokens = TokenEstimator.estimateTokens(from: userInput)
+                                                                    
+                                                                    // Completion tokens
+                                                                    let completionTokens = TokenEstimator.estimateTokens(from: completion)
+                                                                    
+                                                                    return TokenBreakdown(
+                                                                        systemTokens: systemTokens,
+                                                                        summaryTokens: summaryTokens,
+                                                                        ragTokens: ragTokens,
+                                                                        shortTermTokens: shortTermTokens,
+                                                                        userInputTokens: userInputTokens,
+                                                                        completionTokens: completionTokens,
+                                                                        contextWindow: selectedModel.contextWindow
+                                                                    )
+                                                                }
 
 // ==== LEGO END: 21 ChatViewModel (Send Message Flow) ====
     
 
     
 // ==== LEGO START: 22 ChatViewModel (Short-Term Memory Helpers) ====
-    private func getShortTermTurns(currentTurns: Int) -> [Int] {
-        if lastSummarizedTurnCount == 0 {
-            let startTurn = max(1, currentTurns - memoryDepth + 1)
-            guard startTurn <= currentTurns else { return [] }
-            return Array(startTurn...currentTurns)
-        } else {
-            let turnsSinceLastSummary = currentTurns - lastSummarizedTurnCount
-            let turnsToInclude = min(turnsSinceLastSummary, memoryDepth)
-
-            guard turnsToInclude > 0 else { return [] }
-
-            let startTurn = currentTurns - turnsToInclude + 1
-            guard startTurn <= currentTurns else { return [] }
-            return Array(startTurn...currentTurns)
-        }
-    }
-
-    private func getShortTermMessages(turns: [Int]) -> [ChatMessage] {
-        guard !turns.isEmpty else { return [] }
-
-        let allMessages = messages.sorted(by: { $0.timestamp < $1.timestamp }).filter { !$0.isPartial }
-        var result: [ChatMessage] = []
-        var currentTurn = 0
-        var currentTurnMessages: [ChatMessage] = []
-
-        for message in allMessages {
-            if message.isFromUser {
-                if !currentTurnMessages.isEmpty && turns.contains(currentTurn) {
-                    result.append(contentsOf: currentTurnMessages)
-                }
-                currentTurn += 1
-                currentTurnMessages = [message]
+        private func getShortTermTurns(currentTurns: Int) -> [Int] {
+            if lastSummarizedTurnCount == 0 {
+                let startTurn = max(1, currentTurns - memoryDepth + 1)
+                guard startTurn <= currentTurns else { return [] }
+                return Array(startTurn...currentTurns)
             } else {
-                currentTurnMessages.append(message)
-                if turns.contains(currentTurn) {
-                    result.append(contentsOf: currentTurnMessages)
-                }
-                currentTurnMessages = []
-            }
-        }
-        return result
-    }
+                let turnsSinceLastSummary = currentTurns - lastSummarizedTurnCount
+                let turnsToInclude = min(turnsSinceLastSummary, memoryDepth)
 
-    private func formatMessagesAsHistory(_ messages: [ChatMessage]) -> String {
-        guard !messages.isEmpty else { return "" }
-        var history = ""
-        for message in messages {
-            let speaker = message.isFromUser ? "User" : "Assistant"
-            let content = message.isPartial ? message.content + " [incomplete]" : message.content
-            if !content.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-                history += "\(speaker): \(content)\n\n"
+                guard turnsToInclude > 0 else { return [] }
+
+                let startTurn = currentTurns - turnsToInclude + 1
+                guard startTurn <= currentTurns else { return [] }
+                return Array(startTurn...currentTurns)
             }
         }
-        return history.trimmingCharacters(in: .whitespacesAndNewlines)
-    }
+
+        private func getShortTermMessages(turns: [Int]) -> [ChatMessage] {
+            guard !turns.isEmpty else { return [] }
+
+            let allMessages = messages.sorted(by: { $0.timestamp < $1.timestamp }).filter { !$0.isPartial }
+            var result: [ChatMessage] = []
+            var currentTurn = 0
+            var currentTurnMessages: [ChatMessage] = []
+
+            for message in allMessages {
+                if message.isFromUser {
+                    if !currentTurnMessages.isEmpty && turns.contains(currentTurn) {
+                        result.append(contentsOf: currentTurnMessages)
+                    }
+                    currentTurn += 1
+                    currentTurnMessages = [message]
+                } else {
+                    // Assistant message - just accumulate, don't flush yet
+                    currentTurnMessages.append(message)
+                }
+            }
+            
+            // Flush final turn if needed
+            if !currentTurnMessages.isEmpty && turns.contains(currentTurn) {
+                result.append(contentsOf: currentTurnMessages)
+            }
+            
+            return result
+        }
+
+        private func formatMessagesAsHistory(_ messages: [ChatMessage]) -> String {
+            guard !messages.isEmpty else { return "" }
+            var history = ""
+            for message in messages {
+                let speaker = message.isFromUser ? "User" : "Assistant"
+                let content = message.isPartial ? message.content + " [incomplete]" : message.content
+                if !content.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                    history += "\(speaker): \(content)\n\n"
+                }
+            }
+            return history.trimmingCharacters(in: .whitespacesAndNewlines)
+        }
 
 // ==== LEGO END: 22 ChatViewModel (Short-Term Memory Helpers) ====
     
@@ -8358,10 +9845,10 @@ class ChatViewModel: ObservableObject {
         print("HALDEBUG-UI: User requested nuclear database reset")
         let success = memoryStore.performNuclearReset()
         if success {
-            print("HALDEBUG-UI: ✅ Nuclear reset completed successfully")
+            print("HALDEBUG-UI: âœ… Nuclear reset completed successfully")
             startNewConversation() // Start a fresh conversation after nuking
         } else {
-            print("HALDEBUG-UI: ❌ Nuclear reset encountered issues")
+            print("HALDEBUG-UI: âŒ Nuclear reset encountered issues")
         }
         print("HALDEBUG-UI: Nuclear reset process complete")
     }
@@ -8370,7 +9857,7 @@ class ChatViewModel: ObservableObject {
 
 
 
-// ==== LEGO START: 25 ChatVM — Export Chat History ====
+// ==== LEGO START: 25 ChatVM â€” Export Chat History ====
 // MARK: - ChatViewModel Extension for Export (Text-based Export)
 extension ChatViewModel {
     func exportChatHistory() -> String {
@@ -8405,9 +9892,9 @@ extension ChatViewModel {
             let dateString = message.timestamp.formatted(.dateTime.year().month().day().hour().minute().second())
             let durationString = message.thinkingDuration != nil
                 ? String(format: "%.1f sec", message.thinkingDuration!)
-                : "—"
+                : "â€”"
             
-            exportContent += "──────────────────────────────────────────────\n"
+            exportContent += "â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€\n"
             exportContent += "TURN \(turnCounter)\n"
             exportContent += "Date: \(dateString)\n"
             exportContent += "Elapsed: \(durationString)\n\n"
@@ -8429,12 +9916,12 @@ extension ChatViewModel {
             exportContent += "\n"
         }
 
-        exportContent += "──────────────────────────────────────────────\n"
+        exportContent += "â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€\n"
         print("HALDEBUG-EXPORT: Generated detailed chat export (\(exportContent.count) characters)")
         return exportContent
     }
 }
-// ==== LEGO END: 25 ChatVM — Export Chat History ====
+// ==== LEGO END: 25 ChatVM â€” Export Chat History ====
 
 
 
@@ -8688,18 +10175,18 @@ class DocumentImportManager: ObservableObject {
                 // Hard limit: 25MB
                 if fileSizeMB > 25.0 {
                     await MainActor.run {
-                        self.importProgress = "⚠️ File too large: \(url.lastPathComponent) (\(String(format: "%.1f", fileSizeMB)) MB). Maximum size is 25 MB."
+                        self.importProgress = "ÃƒÂ¢Ã…Â¡Ã‚ ÃƒÂ¯Ã‚Â¸Ã‚Â File too large: \(url.lastPathComponent) (\(String(format: "%.1f", fileSizeMB)) MB). Maximum size is 25 MB."
                     }
-                    print("HALDEBUG-IMPORT: ❌ Rejected file exceeding 25MB limit: \(url.lastPathComponent)")
+                    print("HALDEBUG-IMPORT: ÃƒÂ¢Ã‚ÂÃ…â€™ Rejected file exceeding 25MB limit: \(url.lastPathComponent)")
                     return nil
                 }
                 
                 // Warning threshold: 15MB
                 if fileSizeMB > 15.0 {
                     await MainActor.run {
-                        self.importProgress = "⏳ Processing large file: \(url.lastPathComponent) (\(String(format: "%.1f", fileSizeMB)) MB). This may take 1-2 minutes..."
+                        self.importProgress = "ÃƒÂ¢Ã‚ÂÃ‚Â³ Processing large file: \(url.lastPathComponent) (\(String(format: "%.1f", fileSizeMB)) MB). This may take 1-2 minutes..."
                     }
-                    print("HALDEBUG-IMPORT: ⚠️ Large file warning: \(url.lastPathComponent) - \(String(format: "%.1f", fileSizeMB)) MB")
+                    print("HALDEBUG-IMPORT: ÃƒÂ¢Ã…Â¡Ã‚ ÃƒÂ¯Ã‚Â¸Ã‚Â Large file warning: \(url.lastPathComponent) - \(String(format: "%.1f", fileSizeMB)) MB")
                 }
             }
         } catch {
@@ -9033,7 +10520,9 @@ class DocumentImportManager: ObservableObject {
                     timestamp: timestamp,
                     isFromUser: false, // Documents are not "from user" in conversation context
                     entityKeywords: entityKeywords,
-                    metadataJson: metadataJsonString // NEW: Pass metadata with filePath
+                    metadataJson: metadataJsonString, // NEW: Pass metadata with filePath
+                    turnNumber: nil, // Documents are not part of conversation turns
+                    deliberationRound: nil // Documents have no deliberation rounds
                 )
 
                 if !contentId.isEmpty {
@@ -9063,7 +10552,8 @@ class DocumentImportManager: ObservableObject {
             userMessageContent = "Hal, here are \(documentSummaries.count) documents for you\(entityText): \(numberedList)"
         }
 
-        let userChatMessage = ChatMessage(content: userMessageContent, isFromUser: true)
+        let currentTurnNumber = chatViewModel.memoryStore.getCurrentTurnNumber(conversationId: chatViewModel.conversationId) + 1
+        let userChatMessage = ChatMessage(content: userMessageContent, isFromUser: true, recordedByModel: "user", turnNumber: currentTurnNumber)
         chatViewModel.messages.append(userChatMessage)
 
         // --- MODIFIED HAL RESPONSE TO BE MORE CONCISE AND LESS REPETITIVE ---
@@ -9075,10 +10565,9 @@ class DocumentImportManager: ObservableObject {
         }
         // --- END MODIFIED HAL RESPONSE ---
 
-        let halChatMessage = ChatMessage(content: halResponse, isFromUser: false)
+        let halChatMessage = ChatMessage(content: halResponse, isFromUser: false, recordedByModel: chatViewModel.selectedModel.id, turnNumber: currentTurnNumber)
         chatViewModel.messages.append(halChatMessage)
 
-        let currentTurnNumber = chatViewModel.messages.filter { $0.isFromUser }.count
         chatViewModel.memoryStore.storeTurn(
             conversationId: chatViewModel.conversationId,
             userMessage: userMessageContent,
@@ -9146,20 +10635,29 @@ class MLXModelDownloader: ObservableObject {
     
     @Published var downloadStates: [String: DownloadState] = [:]
     
-    // Persistent storage of downloaded model paths (modelID -> path)
-    @AppStorage("downloadedModelPaths") private var downloadedPathsData: Data = Data() {
+    // Persistent storage of downloaded model IDs
+    @AppStorage("downloadedModelIDs") private var downloadedModelIDsData: Data = Data() {
         didSet {
             objectWillChange.send()
         }
     }
     
-    private var downloadedPaths: [String: String] {
+    private var downloadedModelIDs: Set<String> {
         get {
-            (try? JSONDecoder().decode([String: String].self, from: downloadedPathsData)) ?? [:]
+            (try? JSONDecoder().decode(Set<String>.self, from: downloadedModelIDsData)) ?? []
         }
         set {
-            downloadedPathsData = (try? JSONEncoder().encode(newValue)) ?? Data()
+            downloadedModelIDsData = (try? JSONEncoder().encode(newValue)) ?? Data()
         }
+    }
+    
+    // Helper: Construct runtime path for a model ID
+    private func modelPath(for modelID: String) -> URL {
+        let cacheDir = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask)[0]
+        return cacheDir
+            .appendingPathComponent("huggingface", isDirectory: true)
+            .appendingPathComponent("models", isDirectory: true)
+            .appendingPathComponent(modelID, isDirectory: true)
     }
     
     // MARK: - Download Queue Management
@@ -9225,36 +10723,34 @@ class MLXModelDownloader: ObservableObject {
         
         Task.detached {
             await MainActor.run {
-                // Load all downloaded model paths from persistent storage
-                let paths = self.downloadedPaths
-                print("HALDEBUG-DETECTION: Loaded \(paths.count) model paths from storage")
+                // Load all downloaded model IDs from persistent storage
+                let modelIDs = self.downloadedModelIDs
+                print("HALDEBUG-DETECTION: Loaded \(modelIDs.count) model IDs from storage")
                 
-                // Verify each path exists and initialize state
-                var validPaths = paths
-                for (modelID, pathString) in paths {
+                // Verify each model exists and initialize state
+                var validIDs = modelIDs
+                for modelID in modelIDs {
                     // DIAGNOSTIC: Show what we're checking
                     print("HALDEBUG-DETECTION: 🔍 Checking model: \(modelID)")
-                    print("HALDEBUG-DETECTION:    Stored path string: \(pathString)")
                     
-                    let url = URL(fileURLWithPath: pathString)
+                    let expectedPath = self.modelPath(for: modelID)
                     
-                    // DIAGNOSTIC: Show the URL we created
-                    print("HALDEBUG-DETECTION:    URL.path: \(url.path)")
-                    print("HALDEBUG-DETECTION:    URL.absoluteString: \(url.absoluteString)")
+                    // DIAGNOSTIC: Show the path we constructed
+                    print("HALDEBUG-DETECTION:    Expected path: \(expectedPath.path)")
                     
                     // DIAGNOSTIC: Check what FileManager actually returns
-                    let exists = FileManager.default.fileExists(atPath: url.path)
+                    let exists = FileManager.default.fileExists(atPath: expectedPath.path)
                     print("HALDEBUG-DETECTION:    FileManager.fileExists: \(exists)")
                     
-                    if FileManager.default.fileExists(atPath: url.path) {
+                    if FileManager.default.fileExists(atPath: expectedPath.path) {
                         // DIAGNOSTIC: If exists, check if it's a directory and what's in it
                         var isDirectory: ObjCBool = false
-                        FileManager.default.fileExists(atPath: url.path, isDirectory: &isDirectory)
+                        FileManager.default.fileExists(atPath: expectedPath.path, isDirectory: &isDirectory)
                         print("HALDEBUG-DETECTION:    Is directory: \(isDirectory.boolValue)")
                         
                         if isDirectory.boolValue {
                             do {
-                                let contents = try FileManager.default.contentsOfDirectory(atPath: url.path)
+                                let contents = try FileManager.default.contentsOfDirectory(atPath: expectedPath.path)
                                 print("HALDEBUG-DETECTION:    Directory contains \(contents.count) items")
                                 // Show first few files
                                 for (index, item) in contents.prefix(5).enumerated() {
@@ -9273,12 +10769,12 @@ class MLXModelDownloader: ObservableObject {
                             progress: 1.0,
                             message: "Model ready.",
                             error: nil,
-                            localPath: url
+                            localPath: expectedPath
                         )
                         print("HALDEBUG-DETECTION: ✅ Restored model: \(modelID)")
                     } else {
                         // DIAGNOSTIC: If doesn't exist, check the parent directory
-                        let parentURL = url.deletingLastPathComponent()
+                        let parentURL = expectedPath.deletingLastPathComponent()
                         let parentExists = FileManager.default.fileExists(atPath: parentURL.path)
                         print("HALDEBUG-DETECTION:    ❌ Path does not exist")
                         print("HALDEBUG-DETECTION:    Parent path: \(parentURL.path)")
@@ -9300,15 +10796,15 @@ class MLXModelDownloader: ObservableObject {
                             }
                         }
                         
-                        // Remove invalid path from storage
-                        validPaths.removeValue(forKey: modelID)
-                        print("HALDEBUG-DETECTION: ❌ Removed invalid path for: \(modelID)")
+                        // Remove invalid ID from storage
+                        validIDs.remove(modelID)
+                        print("HALDEBUG-DETECTION: ❌ Removed invalid model ID: \(modelID)")
                     }
                 }
                 
-                // Save cleaned paths if any were invalid
-                if validPaths.count != paths.count {
-                    self.downloadedPaths = validPaths
+                // Save cleaned IDs if any were invalid
+                if validIDs.count != modelIDs.count {
+                    self.downloadedModelIDs = validIDs
                 }
                 
                 print("HALDEBUG-DETECTION: MLXModelDownloader.init() complete - \(self.downloadStates.count) models ready")
@@ -9337,7 +10833,8 @@ class MLXModelDownloader: ObservableObject {
             "downloadedMLXPath",
             "partialMLXDownloadProgress",
             "partialMLXDownloadSize",
-            "hasPartialMLXDownload"
+            "hasPartialMLXDownload",
+            "downloadedModelPaths"  // OLD path-based storage
         ]
         
         for key in legacyKeys {
@@ -9354,104 +10851,88 @@ class MLXModelDownloader: ObservableObject {
         // Check if already downloaded
         if isModelDownloaded(modelID) {
             await MainActor.run {
-                var state = downloadStates[modelID] ?? DownloadState(
-                    isDownloading: false,
-                    progress: 1.0,
-                    message: "Model already downloaded.",
-                    error: nil,
-                    localPath: getModelPath(modelID)
-                )
-                state.message = "Model already downloaded."
-                downloadStates[modelID] = state
+                print("HALDEBUG-DOWNLOAD: Model already downloaded: \(modelID)")
+                if var state = self.downloadStates[modelID] {
+                    state.message = "Model already downloaded."
+                    self.downloadStates[modelID] = state
+                }
             }
             return
         }
         
-        // If a download is in progress, queue this one
+        // Check if already downloading
         await MainActor.run {
-            if self.isDownloading {
-                // Add to queue
-                let queuedDownload = QueuedDownload(modelID: modelID, repoID: repoID)
-                self.downloadQueue.append(queuedDownload)
-                
-                var state = self.downloadStates[modelID] ?? DownloadState(
-                    isDownloading: false,
-                    progress: 0.0,
-                    message: "Queued (position \(self.downloadQueue.count))...",
-                    error: nil,
-                    localPath: nil
-                )
-                state.message = "Queued (position \(self.downloadQueue.count))..."
-                self.downloadStates[modelID] = state
-                
-                print("HALDEBUG-DOWNLOAD: Queued \(modelID) at position \(self.downloadQueue.count)")
+            if let state = downloadStates[modelID], state.isDownloading {
+                print("HALDEBUG-DOWNLOAD: Download already in progress for: \(modelID)")
                 return
             }
         }
         
-        // No download in progress, start immediately
-        await performDownload(modelID: modelID, repoID: repoID)
-    }
-    
-    private func performDownload(modelID: String, repoID: String) async {
-        #if !canImport(MLXLLM)
-        await MainActor.run {
-            var state = downloadStates[modelID] ?? DownloadState(
-                isDownloading: false,
-                progress: 0.0,
-                message: "MLXLLM not available.",
-                error: "MLXLLM not available. Add the MLX packages to the project.",
-                localPath: nil
-            )
-            state.error = "MLXLLM not available."
-            state.message = "Loader unavailable."
-            downloadStates[modelID] = state
+        // Check if another download is active
+        if currentDownloadTask != nil {
+            await MainActor.run {
+                // Add to queue
+                let queuedDownload = QueuedDownload(modelID: modelID, repoID: repoID)
+                downloadQueue.append(queuedDownload)
+                
+                var state = downloadStates[modelID] ?? DownloadState(
+                    isDownloading: false,
+                    progress: 0.0,
+                    message: "Queued...",
+                    error: nil,
+                    localPath: nil
+                )
+                state.message = "Queued (position \(downloadQueue.count))..."
+                downloadStates[modelID] = state
+                
+                print("HALDEBUG-DOWNLOAD: Queued download for \(modelID) (position \(downloadQueue.count))")
+            }
+            return
         }
-        return
-        #else
         
+        // Start download
         await MainActor.run {
-            self.currentDownloadModelID = modelID
-            var state = self.downloadStates[modelID] ?? DownloadState(
+            currentDownloadModelID = modelID
+            
+            var state = downloadStates[modelID] ?? DownloadState(
                 isDownloading: true,
                 progress: 0.0,
-                message: "Preparing download...",
+                message: "Starting download...",
                 error: nil,
                 localPath: nil
             )
             state.isDownloading = true
             state.progress = 0.0
-            state.message = "Preparing download..."
+            state.message = "Starting download..."
             state.error = nil
-            self.downloadStates[modelID] = state
+            downloadStates[modelID] = state
         }
         
         currentDownloadTask = Task {
             do {
-                // Download model using HubApi.snapshot()
-                // This automatically handles resume if files are partially cached
-                let hub = HubApi.default
-                let snapshot = try await hub.snapshot(from: repoID, progressHandler: { progress in
-                    guard progress.totalUnitCount > 0 else { return }
-                    let p = Double(progress.completedUnitCount) / Double(progress.totalUnitCount)
+                print("HALDEBUG-DOWNLOAD: Starting download for \(modelID) from \(repoID)")
+                
+                // Download model using HubApi
+                let modelURL = try await HubApi.default.snapshot(from: repoID, matching: ["*.safetensors", "config.json", "tokenizer*"]) { progress in
                     Task { @MainActor in
                         if var state = self.downloadStates[modelID] {
-                            state.progress = p
-                            state.message = "Downloading... \(Int(p * 100))%"
+                            state.progress = progress.fractionCompleted
+                            state.message = "Downloading \(Int(progress.fractionCompleted * 100))%..."
                             self.downloadStates[modelID] = state
                         }
                     }
-                })
-                
-                // Use Hub cache path directly - stable across app reinstalls
-                let finalURL: URL = snapshot
+                }
                 
                 await MainActor.run {
-                    print("HALDEBUG-DOWNLOAD: Download complete for \(modelID) at: \(finalURL.path)")
+                    print("HALDEBUG-DOWNLOAD: Download complete for \(modelID)")
+                    print("HALDEBUG-DOWNLOAD: Model URL: \(modelURL)")
                     
-                    // DIAGNOSTIC: Verify the path exists right after download
+                    // Determine final path (HubApi returns repo directory, we want models/<modelID>)
+                    let finalURL = modelURL
+                    
+                    // DIAGNOSTIC: Verify the path exists
                     let pathExists = FileManager.default.fileExists(atPath: finalURL.path)
-                    print("HALDEBUG-DOWNLOAD:    Path exists immediately after download: \(pathExists)")
+                    print("HALDEBUG-DOWNLOAD:    FileManager.fileExists: \(pathExists)")
                     print("HALDEBUG-DOWNLOAD:    finalURL.path: \(finalURL.path)")
                     print("HALDEBUG-DOWNLOAD:    finalURL.absoluteString: \(finalURL.absoluteString)")
                     
@@ -9478,11 +10959,11 @@ class MLXModelDownloader: ObservableObject {
                         print("HALDEBUG-DOWNLOAD:    ⚠️ WARNING: Path does NOT exist immediately after download!")
                     }
                     
-                    // Save path to persistent storage
-                    var paths = self.downloadedPaths
-                    paths[modelID] = finalURL.path
-                    self.downloadedPaths = paths
-                    print("HALDEBUG-DOWNLOAD:    Saved path to UserDefaults: \(finalURL.path)")
+                    // Save model ID to persistent storage
+                    var modelIDs = self.downloadedModelIDs
+                    modelIDs.insert(modelID)
+                    self.downloadedModelIDs = modelIDs
+                    print("HALDEBUG-DOWNLOAD:    Saved model ID to UserDefaults: \(modelID)")
                     
                     // Update state
                     var state = self.downloadStates[modelID] ?? DownloadState(
@@ -9554,42 +11035,31 @@ class MLXModelDownloader: ObservableObject {
                 }
             }
         }
-        #endif
     }
     
     private func processNextInQueue() {
-        guard !downloadQueue.isEmpty else {
-            print("HALDEBUG-QUEUE: Queue empty, no more downloads")
-            return
-        }
+        guard !downloadQueue.isEmpty else { return }
         
-        let next = downloadQueue.removeFirst()
-        print("HALDEBUG-QUEUE: Processing next download from queue: \(next.modelID)")
+        let nextDownload = downloadQueue.removeFirst()
+        print("HALDEBUG-DOWNLOAD: Processing queued download: \(nextDownload.modelID)")
         
         Task {
-            await performDownload(modelID: next.modelID, repoID: next.repoID)
+            await startDownload(modelID: nextDownload.modelID, repoID: nextDownload.repoID)
         }
     }
     
     func cancelDownload(modelID: String) {
-        guard currentDownloadModelID == modelID else {
-            // If not currently downloading, remove from queue
-            if let index = downloadQueue.firstIndex(where: { $0.modelID == modelID }) {
-                downloadQueue.remove(at: index)
-                if var state = downloadStates[modelID] {
-                    state.message = "Removed from queue."
-                    downloadStates[modelID] = state
-                }
-                print("HALDEBUG-DOWNLOAD: Removed \(modelID) from queue")
-            }
-            return
+        // Cancel active download if this is the one
+        if currentDownloadModelID == modelID {
+            currentDownloadTask?.cancel()
+            currentDownloadTask = nil
+            currentDownloadModelID = nil
+        } else {
+            // Remove from queue if queued
+            downloadQueue.removeAll { $0.modelID == modelID }
         }
         
-        // Cancel active download
-        currentDownloadTask?.cancel()
-        currentDownloadTask = nil
-        currentDownloadModelID = nil
-        
+        // Update state
         if var state = downloadStates[modelID] {
             state.isDownloading = false
             state.message = "Download cancelled at \(Int(state.progress * 100))%"
@@ -9601,33 +11071,18 @@ class MLXModelDownloader: ObservableObject {
     }
     
     func deleteModel(modelID: String) async {
-        guard let pathString = downloadedPaths[modelID] else {
-            await MainActor.run {
-                var state = self.downloadStates[modelID] ?? DownloadState(
-                    isDownloading: false,
-                    progress: 0.0,
-                    message: "Model not found.",
-                    error: nil,
-                    localPath: nil
-                )
-                state.message = "Model not found."
-                self.downloadStates[modelID] = state
-            }
-            return
-        }
+        let expectedPath = modelPath(for: modelID)
         
-        let url = URL(fileURLWithPath: pathString)
-        
-        if FileManager.default.fileExists(atPath: url.path) {
+        if FileManager.default.fileExists(atPath: expectedPath.path) {
             do {
-                try FileManager.default.removeItem(at: url)
-                print("HALDEBUG-DOWNLOAD: Model deleted from: \(url.path)")
+                try FileManager.default.removeItem(at: expectedPath)
+                print("HALDEBUG-DOWNLOAD: Model deleted from: \(expectedPath.path)")
                 
                 await MainActor.run {
                     // Remove from persistent storage
-                    var paths = self.downloadedPaths
-                    paths.removeValue(forKey: modelID)
-                    self.downloadedPaths = paths
+                    var modelIDs = self.downloadedModelIDs
+                    modelIDs.remove(modelID)
+                    self.downloadedModelIDs = modelIDs
                     
                     // Update state
                     var state = self.downloadStates[modelID] ?? DownloadState(
@@ -9664,9 +11119,9 @@ class MLXModelDownloader: ObservableObject {
         } else {
             // File doesn't exist, clean up storage anyway
             await MainActor.run {
-                var paths = self.downloadedPaths
-                paths.removeValue(forKey: modelID)
-                self.downloadedPaths = paths
+                var modelIDs = self.downloadedModelIDs
+                modelIDs.remove(modelID)
+                self.downloadedModelIDs = modelIDs
                 
                 var state = self.downloadStates[modelID] ?? DownloadState(
                     isDownloading: false,
@@ -9682,14 +11137,14 @@ class MLXModelDownloader: ObservableObject {
     }
     
     func isModelDownloaded(_ modelID: String) -> Bool {
-        guard let pathString = downloadedPaths[modelID] else { return false }
-        return FileManager.default.fileExists(atPath: pathString)
+        return downloadedModelIDs.contains(modelID) &&
+               FileManager.default.fileExists(atPath: modelPath(for: modelID).path)
     }
     
     func getModelPath(_ modelID: String) -> URL? {
-        guard let pathString = downloadedPaths[modelID] else { return nil }
-        let url = URL(fileURLWithPath: pathString)
-        return FileManager.default.fileExists(atPath: url.path) ? url : nil
+        guard downloadedModelIDs.contains(modelID) else { return nil }
+        let path = modelPath(for: modelID)
+        return FileManager.default.fileExists(atPath: path.path) ? path : nil
     }
     
     // MARK: - Cache Management
@@ -9710,7 +11165,7 @@ class MLXModelDownloader: ObservableObject {
                 try FileManager.default.removeItem(at: hubCacheDirectory)
                 
                 // Clear all model states since cache is gone
-                downloadedPaths = [:]
+                downloadedModelIDs = []
                 downloadStates = [:]
                 hubCacheSize = "No cache"
                 
@@ -10007,7 +11462,7 @@ class ModelCatalogService: ObservableObject {
             await MainActor.run {
                 self.availableModels = [appleModel] + mlxModels
                 self.isLoading = false
-                print("HALDEBUG-CATALOG: ✅ Catalog updated with \(self.availableModels.count) total models")
+                print("HALDEBUG-CATALOG: âœ… Catalog updated with \(self.availableModels.count) total models")
             }
             
         } catch {
@@ -10018,7 +11473,7 @@ class ModelCatalogService: ObservableObject {
                 // Fallback to Apple Foundation Models only
                 self.availableModels = [ModelConfiguration.appleFoundation]
                 
-                print("HALDEBUG-CATALOG: ❌ Error: \(error.localizedDescription)")
+                print("HALDEBUG-CATALOG: âŒ Error: \(error.localizedDescription)")
             }
         }
     }
@@ -10127,22 +11582,22 @@ class ModelCatalogService: ObservableObject {
             // Check fields in order of preference (most common first)
             // Based on research: different architectures use different field names
             if let context = config.max_position_embeddings {
-                print("HALDEBUG-CONTEXT: ✅ Found context window \(context) in max_position_embeddings for \(repoID)")
+                print("HALDEBUG-CONTEXT: âœ… Found context window \(context) in max_position_embeddings for \(repoID)")
                 return context
             } else if let context = config.sliding_window {
-                print("HALDEBUG-CONTEXT: ✅ Found sliding window \(context) for \(repoID)")
+                print("HALDEBUG-CONTEXT: âœ… Found sliding window \(context) for \(repoID)")
                 return context
             } else if let context = config.n_positions {
-                print("HALDEBUG-CONTEXT: ✅ Found context window \(context) in n_positions for \(repoID)")
+                print("HALDEBUG-CONTEXT: âœ… Found context window \(context) in n_positions for \(repoID)")
                 return context
             } else if let context = config.n_ctx {
-                print("HALDEBUG-CONTEXT: ✅ Found context window \(context) in n_ctx for \(repoID)")
+                print("HALDEBUG-CONTEXT: âœ… Found context window \(context) in n_ctx for \(repoID)")
                 return context
             } else if let context = config.seq_len {
-                print("HALDEBUG-CONTEXT: ✅ Found context window \(context) in seq_len for \(repoID)")
+                print("HALDEBUG-CONTEXT: âœ… Found context window \(context) in seq_len for \(repoID)")
                 return context
             } else if let context = config.seq_length {
-                print("HALDEBUG-CONTEXT: ✅ Found context window \(context) in seq_length for \(repoID)")
+                print("HALDEBUG-CONTEXT: âœ… Found context window \(context) in seq_length for \(repoID)")
                 return context
             } else {
                 print("HALDEBUG-CONTEXT: Config.json found but no context window fields for \(repoID)")
@@ -10203,7 +11658,7 @@ class ModelCatalogService: ObservableObject {
             throw CatalogError.invalidLicenseFormat
         }
         
-        print("HALDEBUG-CATALOG: ✅ License fetched (\(licenseText.count) characters)")
+        print("HALDEBUG-CATALOG: âœ… License fetched (\(licenseText.count) characters)")
         return licenseText
     }
     
@@ -10288,3 +11743,127 @@ enum CatalogError: LocalizedError {
 }
 
 // ==== LEGO END: 30 Model Catalog Service (Hugging Face Integration) ====
+
+
+
+// ==== LEGO START: 31 Hal Watch Bridge ====
+//
+// iOS-side bridge that listens for messages from the Apple Watch and
+// routes them through the existing ChatViewModel.sendMessage() pipeline.
+// This keeps all the intelligence and storage on the iPhone side and
+// lets the watch behave as a tiny remote terminal.
+//
+
+#if canImport(WatchConnectivity)
+import WatchConnectivity
+#endif
+
+final class HalWatchBridge: NSObject, WCSessionDelegate {
+
+    private let chatViewModel: ChatViewModel
+
+    init(chatViewModel: ChatViewModel) {
+        self.chatViewModel = chatViewModel
+        super.init()
+        configureSession()
+    }
+
+    private func configureSession() {
+        guard WCSession.isSupported() else {
+            print("HALDEBUG-WATCH: WCSession not supported on this device.")
+            return
+        }
+
+        let session = WCSession.default
+        session.delegate = self
+        session.activate()
+        print("HALDEBUG-WATCH: iOS WCSession activated.")
+    }
+
+    // MARK: - Incoming Messages from Watch (with reply)
+
+    func session(_ session: WCSession,
+                 didReceiveMessage message: [String : Any],
+                 replyHandler: @escaping ([String : Any]) -> Void) {
+
+        let rawText = message["text"] as? String ?? ""
+        let trimmed = rawText.trimmingCharacters(in: .whitespacesAndNewlines)
+
+        guard !trimmed.isEmpty else {
+            print("HALDEBUG-WATCH: Received empty or whitespace-only message from watch.")
+            replyHandler(["reply": "I heard from your watch, but the message was empty."])
+            return
+        }
+
+        print("HALDEBUG-WATCH: Received watch message: '\(trimmed.prefix(80))'")
+
+        Task { @MainActor in
+            // Capture where we were before injecting the watch message
+            let startingCount = chatViewModel.messages.count
+
+            // Reuse the existing sendMessage() flow by setting currentMessage
+            chatViewModel.currentMessage = trimmed
+            await chatViewModel.sendMessage()
+
+            // Find the newest HAL message that appeared after this send
+            let newMessages = chatViewModel.messages.suffix(from: startingCount)
+            let latestHal = newMessages.last(where: { !$0.isFromUser })
+
+            let replyText: String
+            if let content = latestHal?.content, !content.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                replyText = content
+            } else {
+                replyText = "I tried to respond to your watch, but I couldn't find a new reply in our conversation."
+            }
+
+            print("HALDEBUG-WATCH: Sending reply back to watch (\(replyText.count) characters).")
+            replyHandler(["reply": replyText])
+        }
+    }
+
+    // MARK: - Incoming Messages from Watch (without reply - fallback)
+
+    func session(_ session: WCSession,
+                 didReceiveMessage message: [String : Any]) {
+
+        let rawText = message["text"] as? String ?? ""
+        let trimmed = rawText.trimmingCharacters(in: .whitespacesAndNewlines)
+
+        guard !trimmed.isEmpty else {
+            print("HALDEBUG-WATCH: Received empty message without reply handler.")
+            return
+        }
+
+        print("HALDEBUG-WATCH: Received watch message (no reply expected): '\(trimmed.prefix(80))'")
+
+        Task { @MainActor in
+            chatViewModel.currentMessage = trimmed
+            await chatViewModel.sendMessage()
+            print("HALDEBUG-WATCH: Processed watch message without sending reply.")
+        }
+    }
+
+    // MARK: - Required Delegate Methods
+
+    func session(_ session: WCSession,
+                 activationDidCompleteWith activationState: WCSessionActivationState,
+                 error: Error?) {
+        if let error = error {
+            print("HALDEBUG-WATCH: Activation error: \(error.localizedDescription)")
+        } else {
+            print("HALDEBUG-WATCH: Activation completed with state: \(activationState.rawValue)")
+        }
+    }
+
+    #if os(iOS)
+    func sessionDidBecomeInactive(_ session: WCSession) {
+        // No-op for this simple bridge
+    }
+
+    func sessionDidDeactivate(_ session: WCSession) {
+        // No-op for this simple bridge
+    }
+    #endif
+}
+
+// ==== LEGO END: 31 Hal Watch Bridge ====
