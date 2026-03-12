@@ -32,7 +32,7 @@ struct HalWatchApp: App {
 
 
 
-// ==== LEGO START: 03 - Connectivity – WatchConnectivityManager ====
+// ==== LEGO START: 03 - Connectivity â€“ WatchConnectivityManager ====
 
 import WatchConnectivity
 import Combine
@@ -78,21 +78,12 @@ class WatchConnectivityManager: NSObject, ObservableObject, WCSessionDelegate {
             "source": "watch"
         ]
 
-        session.sendMessage(payload, replyHandler: { [weak self] reply in
-            // Handle Hal's response from iPhone
-            DispatchQueue.main.async {
-                if let replyText = reply["reply"] as? String {
-                    self?.lastReceivedMessage = replyText
-                    print("[WatchConnectivity] RECEIVED REPLY ← \(replyText)")
-                } else {
-                    print("[WatchConnectivity] Reply missing 'reply' field")
-                }
-            }
-        }) { error in
+        // Fire and forget - response will be pushed back by iPhone separately
+        session.sendMessage(payload, replyHandler: nil) { error in
             print("[WatchConnectivity] ERROR sending: \(error.localizedDescription)")
         }
 
-        print("[WatchConnectivity] SENT → \(text)")
+        print("[WatchConnectivity] SENT -> \(text)")
     }
 
     // -------------------------------------------------------------
@@ -104,7 +95,7 @@ class WatchConnectivityManager: NSObject, ObservableObject, WCSessionDelegate {
         DispatchQueue.main.async {
             if let reply = message["reply"] as? String {
                 self.lastReceivedMessage = reply
-                print("[WatchConnectivity] RECEIVED ← \(reply)")
+                print("[WatchConnectivity] RECEIVED â† \(reply)")
             } else {
                 print("[WatchConnectivity] Received message without 'reply' field")
             }
@@ -130,15 +121,16 @@ class WatchConnectivityManager: NSObject, ObservableObject, WCSessionDelegate {
     }
 }
 
-// ==== LEGO END: 03 - Connectivity – WatchConnectivityManager ====
+// ==== LEGO END: 03 - Connectivity â€“ WatchConnectivityManager ====
 
 
 
-// ==== LEGO START: 04 - UI – Root Container ====
+// ==== LEGO START: 04 - UI â€“ Root Container ====
 
 enum WatchStage {
     case eyeIdle          // Crisp HAL eye, awaiting tap
     case inputActive      // Blurred eye with input UI on top
+    case sending          // Blurred eye with spinner while Hal thinks
     case responseVisible  // Blurred eye with Hal's reply visible
 }
 
@@ -168,9 +160,15 @@ struct WatchRootView: View {
             // Input UI overlay
             if stage == .inputActive {
                 WatchInputView(connectivity: connectivity, onSend: {
-                    stage = .eyeIdle      // fade back to crisp eye
+                    stage = .sending
                 })
                 .transition(.opacity.animation(.easeInOut(duration: 0.25)))
+            }
+
+            // Sending/thinking overlay
+            if stage == .sending {
+                WatchSendingOverlay()
+                    .transition(.opacity.animation(.easeInOut(duration: 0.25)))
             }
 
             // Response overlay
@@ -191,11 +189,11 @@ struct WatchRootView: View {
 }
 
 
-// ==== LEGO END: 04 - UI – Root Container ====
+// ==== LEGO END: 04 - UI â€“ Root Container ====
 
 
 
-// ==== LEGO START: 05 - UI – Input View ====
+// ==== LEGO START: 05 - UI â€“ Input View ====
 
 struct WatchInputView: View {
     @ObservedObject var connectivity: WatchConnectivityManager
@@ -227,18 +225,18 @@ struct WatchInputView: View {
                 return
             }
             
-            // Send to Hal
+            // Send to Hal and transition to thinking state
             connectivity.send(text: trimmed)
             onSend()
         }
     }
 }
 
-// ==== LEGO END: 05 - UI – Input View ====
+// ==== LEGO END: 05 - UI â€“ Input View ====
 
 
 
-// ==== LEGO START: 06 - UI – Response Overlay ====
+// ==== LEGO START: 06 - UI â€“ Response Overlay ====
 
 struct WatchResponseOverlay: View {
     let text: String
@@ -268,7 +266,38 @@ struct WatchResponseOverlay: View {
     }
 }
 
-// ==== LEGO END: 06 - UI – Response Overlay ====
+// ==== LEGO END: 06 - UI â€“ Response Overlay ====
+
+
+
+// ==== LEGO START: 06.5 - UI - Sending Overlay ====
+
+struct WatchSendingOverlay: View {
+    var body: some View {
+        VStack {
+            Spacer()
+
+            VStack(spacing: 12) {
+                ProgressView()
+                    .progressViewStyle(CircularProgressViewStyle(tint: .white))
+                    .scaleEffect(1.2)
+
+                Text("Hal is thinking...")
+                    .font(.footnote)
+                    .foregroundColor(.white.opacity(0.8))
+            }
+            .padding()
+            .background(Color.black.opacity(0.6))
+            .clipShape(RoundedRectangle(cornerRadius: 12))
+
+            Spacer()
+        }
+        .ignoresSafeArea()
+    }
+}
+
+// ==== LEGO END: 06.5 - UI - Sending Overlay ====
+
 
 
 
@@ -283,7 +312,7 @@ extension WatchConnectivityManager {
 
 
 
-// ==== LEGO START: 08 - Optional – Hal Eye Animation (Empty Placeholder) ====
+// ==== LEGO START: 08 - Optional â€“ Hal Eye Animation (Empty Placeholder) ====
 
 struct HalEyeView: View {
     var body: some View {
@@ -294,5 +323,4 @@ struct HalEyeView: View {
     }
 }
 
-// ==== LEGO END: 08 - Optional – Hal Eye Animation ====
-
+// ==== LEGO END: 08 - Optional â€“ Hal Eye Animation ====
