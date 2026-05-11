@@ -9602,8 +9602,24 @@ class ChatViewModel: ObservableObject {
 
                                                                             var msgs: [HalChatMessage] = []
 
-                                                                            // STEP 0: System message — Hal's identity (effectiveSystemPrompt).
-                                                                            msgs.append(.system(effectiveSystemPrompt))
+                                                                            // STEP 0 + STEP 2: System message = Hal's identity + CURRENT CONTEXT block.
+                                                                            // The CONTEXT block carries temporal awareness (date, time of day, weekday,
+                                                                            // device, thread age, conversation pace, last inference duration). Original
+                                                                            // intent: let Hal situate himself in time and rhythm. Mapping: buildPromptHistory
+                                                                            // put TEMPORAL_CONTEXT in its own marker section; chat form folds it into
+                                                                            // the system message so the model treats it as orienting background.
+                                                                            let temporalRaw = buildTemporalContext()
+                                                                            let temporalBody = temporalRaw
+                                                                                .replacingOccurrences(of: "#=== BEGIN TEMPORAL_CONTEXT ===#", with: "")
+                                                                                .replacingOccurrences(of: "#=== END TEMPORAL_CONTEXT ===#", with: "")
+                                                                                .trimmingCharacters(in: .whitespacesAndNewlines)
+                                                                            let systemMessage: String
+                                                                            if temporalBody.isEmpty {
+                                                                                systemMessage = effectiveSystemPrompt
+                                                                            } else {
+                                                                                systemMessage = "\(effectiveSystemPrompt)\n\nCURRENT CONTEXT:\n\(temporalBody)"
+                                                                            }
+                                                                            msgs.append(.system(systemMessage))
 
                                                                             // STEP 1: Conversation history as alternating .user/.assistant turns.
                                                                             //
