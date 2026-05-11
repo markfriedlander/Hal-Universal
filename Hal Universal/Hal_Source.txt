@@ -59,6 +59,7 @@ import PDFKit // For PDF document processing
 import MLX // Import MLX framework (conceptual, requires actual framework link)
 import MLXLLM
 import Hub
+import HuggingFace // For #hubDownloader macro (HubClient type)
 import MLXLMCommon // FIXED: Added missing import for proper MLX API access
 import MLXHuggingFace // mlx-swift-lm 3.x: provides #huggingFaceTokenizerLoader macro
 import Tokenizers // FIXED: Added missing import for tokenizer decode method
@@ -75,6 +76,63 @@ extension HubApi {
 
 // Add @preconcurrency import for Foundation to help with Swift 6 concurrency warnings
 @preconcurrency import Foundation
+
+// MARK: - RuntimeLog (in-process log buffer queryable via API)
+//
+// Hal runs on a remote iPhone with no easy console-log access. To debug MLX
+// behaviour (TTFT, token rates, generation stopping early, etc.) we need to
+// see HALDEBUG-* lines without standing over the device. RuntimeLog captures
+// log entries into a thread-safe ring buffer that the LocalAPIServer exposes
+// via GET_LOGS, so any remote caller (CC, hal_test.py) can read recent
+// debug output the same way they'd read state.
+//
+// halLog(...) is a top-level convenience that captures AND prints — drop-in
+// replacement for `print(...)` for any line you want queryable later.
+final class RuntimeLog: @unchecked Sendable {
+    static let shared = RuntimeLog()
+    private let lock = NSLock()
+    private var lines: [String] = []
+    private let capacity: Int = 1000
+    private let formatter: DateFormatter
+
+    init() {
+        let f = DateFormatter()
+        f.dateFormat = "HH:mm:ss.SSS"
+        self.formatter = f
+    }
+
+    func log(_ message: String) {
+        let ts = formatter.string(from: Date())
+        let entry = "[\(ts)] \(message)"
+        lock.lock()
+        lines.append(entry)
+        if lines.count > capacity {
+            lines.removeFirst(lines.count - capacity)
+        }
+        lock.unlock()
+        print(entry)
+    }
+
+    func snapshot(limit: Int) -> [String] {
+        lock.lock()
+        defer { lock.unlock() }
+        let n = max(0, min(limit, lines.count))
+        return Array(lines.suffix(n))
+    }
+
+    func clear() {
+        lock.lock()
+        lines.removeAll(keepingCapacity: true)
+        lock.unlock()
+    }
+}
+
+/// Captures `message` into the runtime log buffer AND prints to stdout.
+/// Use anywhere a `print` would go but you want the line queryable via the
+/// API later. Thread-safe.
+func halLog(_ message: String) {
+    RuntimeLog.shared.log(message)
+}
 
 // MARK: - Named Entity Support
 struct NamedEntity: Codable, Hashable {
@@ -3932,21 +3990,47 @@ class MLXWrapper: ObservableObject {
                 return
             }
 
-            print("HALDEBUG-MLX: Loading from local path: \(localPath.path)")
+            halLog("HALDEBUG-MLX: Loading from local path: \(localPath.path)")
 
-            // Buffer recycling cache — per MLX docs, this controls reuse of intermediate computation
-            // buffers, NOT the KV cache. 20 MB is the documented iOS example; 64 MB is fine.
-            MLX.GPU.set(cacheLimit: 64 * 1024 * 1024)    // 64 MB (per MLX iOS docs)
+            // Match LLMEval's cache config exactly. 20 MB is documented iOS example.
+            Memory.cacheLimit = 20 * 1024 * 1024
 
             await MainActor.run {
                 self.loadingProgress = 0.2
                 self.loadingMessage = "Configuring model..."
             }
 
-            // Load model container from local directory (mlx-swift-lm 3.x API)
+            // Determine model-specific extraEOSTokens for chat-template stop signals.
+            // Without these, models with custom turn markers (Gemma <end_of_turn>,
+            // Phi <|end|>, Qwen <turn|>) may keep generating past the natural
+            // end of a turn, producing repetition loops. This mirrors LLMRegistry's
+            // built-in configs.
+            let idLower = modelConfig.id.lowercased()
+            let extraEOSTokens: Set<String>
+            if idLower.contains("gemma") {
+                extraEOSTokens = ["<end_of_turn>"]
+            } else if idLower.contains("phi") {
+                extraEOSTokens = ["<|end|>"]
+            } else if idLower.contains("qwen") {
+                extraEOSTokens = ["<turn|>"]
+            } else {
+                extraEOSTokens = []
+            }
+            halLog("HALDEBUG-MLX: extraEOSTokens for \(modelConfig.id): \(extraEOSTokens)")
+
+            // Use the configuration-based loadContainer so extraEOSTokens flow into
+            // the ResolvedModelConfiguration. The downloader is provided but unused
+            // because the configuration carries a .directory URL (already local).
+            // This matches what LLMRegistry-based loads in LLMEval get for free via
+            // their built-in configs (gemma3_1B_qat_4bit etc.).
+            let mlxModelConfig = MLXLMCommon.ModelConfiguration(
+                directory: localPath,
+                extraEOSTokens: extraEOSTokens
+            )
             let container = try await LLMModelFactory.shared.loadContainer(
-                from: localPath,
-                using: #huggingFaceTokenizerLoader()
+                from: #hubDownloader(),
+                using: #huggingFaceTokenizerLoader(),
+                configuration: mlxModelConfig
             )
             await MainActor.run {
                 self.loadingProgress = 0.9
@@ -4089,7 +4173,7 @@ class MLXWrapper: ObservableObject {
             throw LLMService.LLMError.modelNotLoaded
         }
 
-        print("HALDEBUG-MLX-CHAT: Generating from \(messages.count) chat messages (roles: \(messages.map { $0.role.rawValue }.joined(separator: ",")))")
+        halLog("HALDEBUG-MLX-CHAT: Generating from \(messages.count) chat messages (roles: \(messages.map { $0.role.rawValue }.joined(separator: ",")))")
         let generateStart = Date.timeIntervalSinceReferenceDate
 
         do {
@@ -4118,7 +4202,7 @@ class MLXWrapper: ObservableObject {
             )
             let lmInput = try await container.prepare(input: userInput)
             let promptTokenCount = lmInput.text.tokens.size
-            print("HALDEBUG-MLX-CHAT: Input prepared in \(String(format: "%.2f", Date.timeIntervalSinceReferenceDate - generateStart))s; prompt tokens: \(promptTokenCount)")
+            halLog("HALDEBUG-MLX-CHAT: Input prepared in \(String(format: "%.2f", Date.timeIntervalSinceReferenceDate - generateStart))s; prompt tokens: \(promptTokenCount)")
 
             // Near-exact LLMEval parameter shape: temp 0.6, maxTokens 50 to match the
             // working benchmark. Once Gemma generates real prose, we'll raise these.
@@ -4132,11 +4216,11 @@ class MLXWrapper: ObservableObject {
 
             if let first = await iterator.next() {
                 let ttft = (Date.timeIntervalSinceReferenceDate - streamStart) * 1000
-                print("HALDEBUG-MLX-CHAT: First token at \(String(format: "%.0f", ttft))ms")
+                halLog("HALDEBUG-MLX-CHAT: First token at \(String(format: "%.0f", ttft))ms")
                 switch first {
                 case .chunk(let text): fullText += text
                 case .info(let info):
-                    print("HALDEBUG-MLX-CHAT: Generation complete (first): \(info.generationTokenCount) tokens at \(String(format: "%.1f", info.tokensPerSecond)) tok/s")
+                    halLog("HALDEBUG-MLX-CHAT: Generation complete (first): \(info.generationTokenCount) tokens at \(String(format: "%.1f", info.tokensPerSecond)) tok/s")
                 case .toolCall(_): break
                 }
 
@@ -4144,19 +4228,19 @@ class MLXWrapper: ObservableObject {
                     switch next {
                     case .chunk(let text): fullText += text
                     case .info(let info):
-                        print("HALDEBUG-MLX-CHAT: Generation complete: \(info.generationTokenCount) tokens at \(String(format: "%.1f", info.tokensPerSecond)) tok/s")
+                        halLog("HALDEBUG-MLX-CHAT: Generation complete: \(info.generationTokenCount) tokens at \(String(format: "%.1f", info.tokensPerSecond)) tok/s")
                     case .toolCall(_): break
                     }
                 }
             } else {
-                print("HALDEBUG-MLX-CHAT: Stream produced no items at all (Gemma generated 0 tokens)")
+                halLog("HALDEBUG-MLX-CHAT: Stream produced no items at all (Gemma generated 0 tokens)")
             }
 
             MLX.GPU.clearCache()
-            print("HALDEBUG-MLX-CHAT: Returning fullText (\(fullText.count) chars): \(fullText.prefix(150))")
+            halLog("HALDEBUG-MLX-CHAT: Returning fullText (\(fullText.count) chars): \(fullText.prefix(150))")
             return fullText.trimmingCharacters(in: CharacterSet.whitespacesAndNewlines)
         } catch {
-            print("HALDEBUG-MLX-CHAT: Error during MLX chat generation: \(error.localizedDescription)")
+            halLog("HALDEBUG-MLX-CHAT: Error during MLX chat generation: \(error.localizedDescription)")
             throw LLMService.LLMError.predictionFailed(error)
         }
     }
@@ -4271,8 +4355,8 @@ class LLMService: ObservableObject {
     // sendMessage/runSingleModelTurn picks the new path. Subsystems like
     // summarization can keep using generateResponse temporarily.
     func generateChatResponse(messages: [HalChatMessage], temperature: Double = 0.7) async throws -> String {
-        print("HALDEBUG-RESPONSE: \(currentModel.displayName) (\(currentModel.source)) is responding [chat-path]")
-        print("HALDEBUG-LLM: generateChatResponse called - \(messages.count) messages, currentModel: \(currentModel.displayName)")
+        halLog("HALDEBUG-RESPONSE: \(currentModel.displayName) (\(currentModel.source)) is responding [chat-path]")
+        halLog("HALDEBUG-LLM: generateChatResponse called - \(messages.count) messages, currentModel: \(currentModel.displayName)")
 
         switch currentModel.source {
         case .appleFoundation:
@@ -4285,10 +4369,10 @@ class LLMService: ObservableObject {
             let session: LanguageModelSession
             if let sys = systemMessage, !sys.isEmpty {
                 session = LanguageModelSession(instructions: Instructions(sys))
-                print("HALDEBUG-LLM-CHAT: AFM session with Instructions (\(sys.count) chars)")
+                halLog("HALDEBUG-LLM-CHAT: AFM session with Instructions (\(sys.count) chars)")
             } else {
                 session = LanguageModelSession()
-                print("HALDEBUG-LLM-CHAT: AFM session without Instructions")
+                halLog("HALDEBUG-LLM-CHAT: AFM session without Instructions")
             }
 
             do {
@@ -4297,16 +4381,16 @@ class LLMService: ObservableObject {
                 for try await snapshot in stream {
                     accumulatedText = snapshot.content
                 }
-                print("HALDEBUG-LLM-CHAT: AFM response length: \(accumulatedText.count)")
+                halLog("HALDEBUG-LLM-CHAT: AFM response length: \(accumulatedText.count)")
                 return accumulatedText
             } catch {
-                print("HALDEBUG-LLM-CHAT: AFM chat generation error: \(error.localizedDescription)")
+                halLog("HALDEBUG-LLM-CHAT: AFM chat generation error: \(error.localizedDescription)")
                 throw LLMError.predictionFailed(error)
             }
 
         case .mlx:
             guard mlxWrapper.isModelLoaded else {
-                print("HALDEBUG-MLX-CHAT: Cannot generate - MLX model not loaded")
+                halLog("HALDEBUG-MLX-CHAT: Cannot generate - MLX model not loaded")
                 throw LLMError.modelNotLoaded
             }
             return try await mlxWrapper.generateChat(messages: messages, temperature: temperature)
@@ -9514,7 +9598,7 @@ class ChatViewModel: ObservableObject {
                                                                         // temporal context, summary, RAG snippets, self-knowledge. See
                                                                         // HANDOFF_BRIEF "prompt format" section for rationale.
                                                                         func buildChatMessages(currentInput: String) async -> [HalChatMessage] {
-                                                                            print("HALDEBUG-CHAT: Building chat messages for input: '\(currentInput.prefix(60))…'")
+                                                                            halLog("HALDEBUG-CHAT: Building chat messages for input: '\(currentInput.prefix(60))…'")
 
                                                                             var msgs: [HalChatMessage] = []
 
@@ -9533,7 +9617,7 @@ class ChatViewModel: ObservableObject {
                                                                             msgs.append(.system(effectiveSystemPrompt))
                                                                             msgs.append(.user(currentInput))
 
-                                                                            print("HALDEBUG-CHAT: Built \(msgs.count) chat messages (step 0 — system + user)")
+                                                                            halLog("HALDEBUG-CHAT: Built \(msgs.count) chat messages (step 0 — system + user)")
                                                                             return msgs
                                                                         }
 
@@ -11996,7 +12080,14 @@ class MLXModelDownloader: ObservableObject {
 
                 // Download model using HubApi. Progress callback used only as fallback
                 // when sizeGB is unknown — otherwise the polling task drives progress.
-                let modelURL = try await HubApi.default.snapshot(from: repoID, matching: ["*.safetensors", "config.json", "tokenizer*"]) { progress in
+                // Match mlx-swift-lm's modelDownloadPatterns (Libraries/MLXLMCommon/ModelFactory.swift):
+                //   ["*.safetensors"] + ["*.json", "*.jinja"]
+                // The "*.jinja" pattern is CRITICAL — modern HF models (Gemma 4, etc.) ship
+                // chat templates in a separate chat_template.jinja file, not in tokenizer_config.json.
+                // Without it, the tokenizer throws TokenizerError.missingChatTemplate and the LLM
+                // input processor falls back to joining message content with "\n\n", producing
+                // degenerate output (echo, repetition) because role markers are lost.
+                let modelURL = try await HubApi.default.snapshot(from: repoID, matching: ["*.safetensors", "*.json", "*.jinja"]) { progress in
                     guard expectedBytes == 0 else { return }
                     Task { @MainActor in
                         if var state = self.downloadStates[modelID] {
@@ -13432,6 +13523,17 @@ class HalTestConsole: ObservableObject {
         } else if trimmed == "GET_RENDERED_MESSAGES" {
             return buildRenderedMessagesJSON(vm: vm)
 
+        } else if trimmed == "GET_LOGS" {
+            return buildLogsJSON(limit: 200)
+
+        } else if trimmed.hasPrefix("GET_LOGS:") {
+            let n = Int(trimmed.dropFirst("GET_LOGS:".count).trimmingCharacters(in: .whitespaces)) ?? 200
+            return buildLogsJSON(limit: max(1, min(1000, n)))
+
+        } else if trimmed == "CLEAR_LOGS" {
+            RuntimeLog.shared.clear()
+            return "{\"status\":\"ok\",\"command\":\"CLEAR_LOGS\"}"
+
         } else if trimmed.hasPrefix("CANCEL_DOWNLOAD:") {
             let modelID = String(trimmed.dropFirst("CANCEL_DOWNLOAD:".count)).trimmingCharacters(in: .whitespaces)
             MLXModelDownloader.shared.cancelDownload(modelID: modelID)
@@ -13689,6 +13791,14 @@ class HalTestConsole: ObservableObject {
           "mlxLoadingMessage": "\(mlxLoadingMessage)"
         }
         """
+    }
+
+    // Returns the most recent log entries captured by RuntimeLog. Useful for
+    // diagnosing MLX/AFM generation behaviour without device-console access.
+    func buildLogsJSON(limit: Int) -> String {
+        let entries = RuntimeLog.shared.snapshot(limit: limit)
+        let json = entries.map { "\"\(jsonStringEscape($0))\"" }.joined(separator: ",")
+        return "{\"status\":\"ok\",\"count\":\(entries.count),\"logs\":[\(json)]}"
     }
 
     func buildRenderedMessagesJSON(vm: ChatViewModel) -> String {

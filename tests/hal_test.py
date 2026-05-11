@@ -38,6 +38,8 @@ Thread management:
 UI observation (what's on screen vs what's in the DB):
   python3 tests/hal_test.py ui_state                   # current view, sheets, typing state, error banners, input draft
   python3 tests/hal_test.py rendered_messages          # messages bound to chat view (vm.messages, includes partials)
+  python3 tests/hal_test.py logs [N]                   # last N debug log entries (default 200) - HALDEBUG-* etc.
+  python3 tests/hal_test.py clear_logs                 # wipe the in-process log buffer
 
 Document management:
   python3 tests/hal_test.py list_documents             # list imported documents
@@ -400,6 +402,25 @@ def cmd_ui_state(config):
     print(json.dumps(result, indent=2))
 
 
+def cmd_logs(config, limit=200):
+    """Recent in-process log entries captured by RuntimeLog. Includes HALDEBUG-*
+    lines from the chat path (TTFT, token rate, generation stop reason, etc.).
+    Use to diagnose MLX/AFM behaviour without device-console access."""
+    cmd = "GET_LOGS" if limit == 200 else f"GET_LOGS:{limit}"
+    result = send_command(cmd, config)
+    entries = result.get("logs", [])
+    count = result.get("count", 0)
+    print(f"\n{count} log entries:\n")
+    for line in entries:
+        print(line)
+
+
+def cmd_clear_logs(config):
+    """Wipe the runtime log buffer (e.g. before running a focused test)."""
+    result = send_command("CLEAR_LOGS", config)
+    print(json.dumps(result, indent=2))
+
+
 def cmd_rendered_messages(config):
     """Messages currently bound to the chat view's ForEach (vm.messages), distinct
     from GET_MESSAGES which reads from the SQLite memoryStore. Use this to see
@@ -666,6 +687,19 @@ def main():
             print("ERROR: HTTP config required. Run setup first.")
             sys.exit(1)
         cmd_ui_state(config)
+
+    elif subcommand == "logs":
+        if not config:
+            print("ERROR: HTTP config required. Run setup first.")
+            sys.exit(1)
+        limit = int(args[1]) if len(args) > 1 else 200
+        cmd_logs(config, limit=limit)
+
+    elif subcommand == "clear_logs":
+        if not config:
+            print("ERROR: HTTP config required. Run setup first.")
+            sys.exit(1)
+        cmd_clear_logs(config)
 
     elif subcommand == "rendered_messages":
         if not config:
