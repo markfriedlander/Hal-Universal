@@ -24,7 +24,15 @@ Model management (requires LocalAPIServer running):
   python3 tests/hal_test.py model_status <model_id>    # poll download status
   python3 tests/hal_test.py switch_model <model_id>    # switch active model
   python3 tests/hal_test.py delete_model <model_id>    # delete downloaded model
+  python3 tests/hal_test.py cancel_download <model_id> # cancel in-progress download
   python3 tests/hal_test.py current_model              # show active model
+
+Thread management:
+  python3 tests/hal_test.py threads                    # list all threads
+  python3 tests/hal_test.py switch_thread <id>         # switch to existing thread
+  python3 tests/hal_test.py messages                   # print messages in current thread
+  python3 tests/hal_test.py memory_stats               # DB row counts
+  python3 tests/hal_test.py reflections                # recent self-reflection entries
 
 Scripted file format:
   # comment lines are ignored
@@ -329,6 +337,62 @@ def cmd_current_model(config):
     print(f"Active model: {result.get('modelID', '?')} ({result.get('displayName', '?')})")
 
 
+def cmd_cancel_download(model_id, config):
+    result = send_command(f"CANCEL_DOWNLOAD:{model_id}", config)
+    print(f"Cancel result: {result}")
+
+
+# ─── Thread Management ───────────────────────────────────────────────────────
+
+def cmd_threads(config):
+    result = send_command("GET_THREADS", config)
+    threads = result.get("threads", [])
+    if not threads:
+        print("No threads found.")
+        return
+    print(f"\n{'ID':<38} {'Active':>6}  Title")
+    print("-" * 70)
+    for t in threads:
+        act = "◀" if t.get("active") else " "
+        print(f"{t['id']:<38} {act:>6}  {t.get('title', '?')}")
+
+
+def cmd_switch_thread(thread_id, config):
+    result = send_command(f"SWITCH_THREAD:{thread_id}", config)
+    if "error" in result:
+        print(f"Error: {result['error']}")
+    else:
+        print(f"Switched to thread {thread_id[:8]}... ({result.get('messageCount', '?')} messages)")
+
+
+def cmd_messages(config):
+    result = send_command("GET_MESSAGES", config)
+    msgs = result.get("messages", [])
+    conv = result.get("conversationId", "?")
+    print(f"\nThread: {conv[:8]}...  ({result.get('messageCount', 0)} messages)\n")
+    for m in msgs:
+        role = m.get("role", "?").upper()
+        ts   = m.get("timestamp", 0)
+        text = m.get("content", "")
+        trunc = " [truncated]" if m.get("truncated") else ""
+        print(f"[{role}] {text}{trunc}\n")
+
+
+def cmd_memory_stats(config):
+    result = send_command("GET_MEMORY_STATS", config)
+    print(json.dumps(result, indent=2))
+
+
+def cmd_reflections(config):
+    result = send_command("GET_REFLECTIONS", config)
+    entries = result.get("reflections", [])
+    total   = result.get("count", 0)
+    print(f"\n{total} total reflections (showing up to 20):\n")
+    for r in entries:
+        rtype = "Practical" if r.get("type") == 1 else "Existential"
+        print(f"[{rtype} @ turn {r.get('turn', '?')}]  {r.get('text', '')}\n")
+
+
 # ─── Main ────────────────────────────────────────────────────────────────────
 
 def main():
@@ -465,6 +529,49 @@ def main():
             print("ERROR: HTTP config required. Run setup first.")
             sys.exit(1)
         cmd_current_model(config)
+
+    elif subcommand == "cancel_download":
+        if not config:
+            print("ERROR: HTTP config required. Run setup first.")
+            sys.exit(1)
+        if len(args) < 2:
+            print("Usage: hal_test.py cancel_download <model_id>")
+            sys.exit(1)
+        cmd_cancel_download(args[1], config)
+
+    # Thread management commands
+    elif subcommand == "threads":
+        if not config:
+            print("ERROR: HTTP config required. Run setup first.")
+            sys.exit(1)
+        cmd_threads(config)
+
+    elif subcommand == "switch_thread":
+        if not config:
+            print("ERROR: HTTP config required. Run setup first.")
+            sys.exit(1)
+        if len(args) < 2:
+            print("Usage: hal_test.py switch_thread <thread_id>")
+            sys.exit(1)
+        cmd_switch_thread(args[1], config)
+
+    elif subcommand == "messages":
+        if not config:
+            print("ERROR: HTTP config required. Run setup first.")
+            sys.exit(1)
+        cmd_messages(config)
+
+    elif subcommand == "memory_stats":
+        if not config:
+            print("ERROR: HTTP config required. Run setup first.")
+            sys.exit(1)
+        cmd_memory_stats(config)
+
+    elif subcommand == "reflections":
+        if not config:
+            print("ERROR: HTTP config required. Run setup first.")
+            sys.exit(1)
+        cmd_reflections(config)
 
     else:
         print(f"Unknown subcommand: {subcommand}")

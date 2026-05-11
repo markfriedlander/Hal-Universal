@@ -13035,6 +13035,79 @@ class HalTestConsole: ObservableObject {
             }
             return "{\"status\":\"error\",\"message\":\"SET_RAG_DEDUP: must be 0.0–1.0\"}"
 
+        } else if trimmed.hasPrefix("SET_RECENCY_WEIGHT:") {
+            let valStr = String(trimmed.dropFirst("SET_RECENCY_WEIGHT:".count)).trimmingCharacters(in: .whitespaces)
+            if let val = Double(valStr), val >= 0.0, val <= 1.0 {
+                vm.memoryStore.recencyWeight = val
+                writeStateJSON(vm: vm)
+                return "{\"status\":\"ok\",\"recencyWeight\":\(val)}"
+            }
+            return "{\"status\":\"error\",\"message\":\"SET_RECENCY_WEIGHT: must be 0.0–1.0\"}"
+
+        } else if trimmed.hasPrefix("SET_RECENCY_HALFLIFE:") {
+            let valStr = String(trimmed.dropFirst("SET_RECENCY_HALFLIFE:".count)).trimmingCharacters(in: .whitespaces)
+            if let val = Double(valStr), val >= 1.0 {
+                vm.memoryStore.recencyHalfLifeDays = val
+                writeStateJSON(vm: vm)
+                return "{\"status\":\"ok\",\"recencyHalfLifeDays\":\(val)}"
+            }
+            return "{\"status\":\"error\",\"message\":\"SET_RECENCY_HALFLIFE: must be >= 1.0 (days)\"}"
+
+        } else if trimmed == "GET_THREADS" {
+            let threads = vm.threads
+            let activeID = vm.conversationId
+            let entries = threads.map { t -> String in
+                let active = t.id == activeID
+                let title = jsonStringEscape(t.title)
+                return "{\"id\":\"\(t.id)\",\"title\":\"\(title)\",\"active\":\(active),\"createdAt\":\(t.createdAt),\"lastActiveAt\":\(t.lastActiveAt)}"
+            }.joined(separator: ",")
+            return "{\"status\":\"ok\",\"threads\":[\(entries)]}"
+
+        } else if trimmed.hasPrefix("SWITCH_THREAD:") {
+            let threadID = String(trimmed.dropFirst("SWITCH_THREAD:".count)).trimmingCharacters(in: .whitespaces)
+            let known = vm.threads.first { $0.id == threadID }
+            guard known != nil else {
+                return "{\"status\":\"error\",\"message\":\"Thread not found: \(jsonStringEscape(threadID))\"}"
+            }
+            vm.messages.removeAll()
+            vm.injectedSummary = ""
+            vm.pendingAutoInject = false
+            vm.lastSummarizedTurnCount = 0
+            vm.conversationId = threadID
+            vm.loadConversation()
+            vm.loadThreads()
+            print("HALDEBUG-TESTCONSOLE: Switched to thread \(threadID.prefix(8))")
+            writeStateJSON(vm: vm)
+            return "{\"status\":\"ok\",\"command\":\"SWITCH_THREAD\",\"conversationId\":\"\(threadID)\",\"messageCount\":\(vm.messages.count)}"
+
+        } else if trimmed == "GET_MESSAGES" {
+            let msgs = vm.messages.filter { !$0.isPartial }
+            let entries = msgs.map { m -> String in
+                let role = m.isFromUser ? "user" : "assistant"
+                let content = jsonStringEscape(String(m.content.prefix(500)))
+                let ts = Int(m.timestamp.timeIntervalSince1970)
+                return "{\"role\":\"\(role)\",\"timestamp\":\(ts),\"content\":\"\(content)\",\"truncated\":\(m.content.count > 500)}"
+            }.joined(separator: ",")
+            return "{\"status\":\"ok\",\"conversationId\":\"\(vm.conversationId)\",\"messageCount\":\(msgs.count),\"messages\":[\(entries)]}"
+
+        } else if trimmed == "GET_MEMORY_STATS" {
+            let ms = vm.memoryStore
+            return "{\"status\":\"ok\",\"totalConversations\":\(ms.totalConversations),\"totalTurns\":\(ms.totalTurns),\"totalDocuments\":\(ms.totalDocuments),\"totalDocumentChunks\":\(ms.totalDocumentChunks),\"activeThreadMessages\":\(vm.messages.filter{!$0.isPartial}.count)}"
+
+        } else if trimmed.hasPrefix("CANCEL_DOWNLOAD:") {
+            let modelID = String(trimmed.dropFirst("CANCEL_DOWNLOAD:".count)).trimmingCharacters(in: .whitespaces)
+            MLXModelDownloader.shared.cancelDownload(modelID: modelID)
+            print("HALDEBUG-TESTCONSOLE: Cancelled download for \(modelID)")
+            return "{\"status\":\"ok\",\"command\":\"CANCEL_DOWNLOAD\",\"modelID\":\"\(jsonStringEscape(modelID))\"}"
+
+        } else if trimmed == "GET_REFLECTIONS" {
+            let reflections = vm.memoryStore.getShareableReflections()
+            let entries = reflections.prefix(20).map { r -> String in
+                let text = jsonStringEscape(String(r.freeFormText.prefix(300)))
+                return "{\"id\":\"\(r.id)\",\"type\":\(r.reflectionType),\"turn\":\(r.turnNumber),\"timestamp\":\(r.timestamp),\"text\":\"\(text)\"}"
+            }.joined(separator: ",")
+            return "{\"status\":\"ok\",\"count\":\(reflections.count),\"reflections\":[\(entries)]}"
+
         } else if trimmed == "RESET_SETTINGS" {
             vm.resetSettingsToDefaults()
             writeStateJSON(vm: vm)
@@ -13158,21 +13231,28 @@ class HalTestConsole: ObservableObject {
         let hasOverride = systemPromptOverride != nil
         let liveID = vm.llmService.activeModelID
         let hasSummary = !vm.injectedSummary.isEmpty
+        let ms = vm.memoryStore
         let state = """
         {
           "modelID": "\(liveID)",
           "conversationId": "\(vm.conversationId)",
+          "activeThreadMessages": \(vm.messages.filter { !$0.isPartial }.count),
           "turnCount": \(turnCount),
           "memoryDepth": \(vm.memoryDepth),
           "maxMemoryDepth": \(vm.maxMemoryDepth),
           "temperature": \(String(format: "%.2f", vm.temperature)),
           "selfKnowledgeEnabled": \(vm.enableSelfKnowledge),
-          "similarityThreshold": \(String(format: "%.2f", vm.memoryStore.relevanceThreshold)),
+          "similarityThreshold": \(String(format: "%.2f", ms.relevanceThreshold)),
+          "recencyWeight": \(String(format: "%.2f", ms.recencyWeight)),
+          "recencyHalfLifeDays": \(String(format: "%.1f", ms.recencyHalfLifeDays)),
           "maxRagSnippetsCharacters": \(Int(vm.maxRagSnippetsCharacters)),
           "ragDedupThreshold": \(String(format: "%.2f", vm.ragDedupSimilarityThreshold)),
           "lastSummarizedTurnCount": \(vm.lastSummarizedTurnCount),
           "injectedSummaryActive": \(hasSummary),
           "injectedSummaryLength": \(vm.injectedSummary.count),
+          "totalConversations": \(ms.totalConversations),
+          "totalTurns": \(ms.totalTurns),
+          "totalDocuments": \(ms.totalDocuments),
           "systemPromptOverrideActive": \(hasOverride),
           "systemPromptFingerprint": "\(fingerprint)..."
         }
