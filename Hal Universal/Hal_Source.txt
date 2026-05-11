@@ -12751,6 +12751,94 @@ final class HalWatchBridge: NSObject, WCSessionDelegate {
 // ==== LEGO END: 31 Hal Watch Bridge ====
 
 
+// MARK: - MemoryStore Document API helpers (used by LocalAPIServer)
+extension MemoryStore {
+
+    struct DocumentRecord {
+        let sourceID: String
+        let displayName: String  // filename extracted from metadata, or source_id prefix
+        let chunks: Int
+        let createdAt: Int       // Unix timestamp
+    }
+
+    func listDocuments() -> [DocumentRecord] {
+        guard let db else { return [] }
+        var records: [DocumentRecord] = []
+        let sql = """
+            SELECT source_id, COUNT(*) as chunks, MIN(timestamp) as created_at,
+                   MIN(metadata_json) as meta
+            FROM unified_content
+            WHERE source_type = 'document'
+            GROUP BY source_id
+            ORDER BY created_at DESC;
+        """
+        var stmt: OpaquePointer?
+        guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else { return [] }
+        defer { sqlite3_finalize(stmt) }
+        while sqlite3_step(stmt) == SQLITE_ROW {
+            let sourceID = String(cString: sqlite3_column_text(stmt, 0))
+            let chunks   = Int(sqlite3_column_int(stmt, 1))
+            let created  = Int(sqlite3_column_int64(stmt, 2))
+            let metaB64  = sqlite3_column_text(stmt, 3).map { String(cString: $0) } ?? ""
+            // Decode base64 JSON -> {"filePath": "..."} to extract filename
+            var displayName = String(sourceID.prefix(8))
+            if let data = Data(base64Encoded: metaB64),
+               let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+               let path = json["filePath"] as? String {
+                displayName = URL(fileURLWithPath: path).lastPathComponent
+            }
+            records.append(DocumentRecord(sourceID: sourceID, displayName: displayName, chunks: chunks, createdAt: created))
+        }
+        return records
+    }
+
+    @discardableResult
+    func deleteDocument(sourceID: String) -> Int {
+        guard let db else { return 0 }
+        let sql = "DELETE FROM unified_content WHERE source_type = 'document' AND source_id = ?;"
+        var stmt: OpaquePointer?
+        guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else { return 0 }
+        defer { sqlite3_finalize(stmt) }
+        sqlite3_bind_text(stmt, 1, (sourceID as NSString).utf8String, -1, nil)
+        sqlite3_step(stmt)
+        let deleted = Int(sqlite3_changes(db))
+        totalDocuments = max(0, totalDocuments - 1)
+        print("HALDEBUG-API: Deleted \(deleted) chunks for document \(sourceID.prefix(8))")
+        return deleted
+    }
+}
+
+// MARK: - DocumentImportManager API helper (path-based, no UIKit security scoping)
+extension DocumentImportManager {
+
+    /// Import a document from a plain file-system path. Safe on Mac Catalyst;
+    /// on iOS the file must already be inside the app sandbox.
+    func importFromPath(_ path: String, chatViewModel: ChatViewModel) async -> (success: Bool, message: String) {
+        let url = URL(fileURLWithPath: path)
+        guard FileManager.default.fileExists(atPath: path) else {
+            return (false, "File not found: \(path)")
+        }
+        // On macOS startAccessingSecurityScopedResource always returns true for plain paths.
+        // On iOS the file must be in an accessible location (e.g. the app's Documents dir).
+        let needsStop = url.startAccessingSecurityScopedResource()
+        defer { if needsStop { url.stopAccessingSecurityScopedResource() } }
+
+        let (processed, skipped) = await processURLImmediatelyWithEntities(url)
+        if processed.isEmpty {
+            return (false, "Could not process file (skipped: \(skipped))")
+        }
+        await storeDocumentsInMemoryWithEntities(processed)
+        await generateImportMessages(
+            documentSummaries: processed.map { $0.filename },
+            totalProcessed: processed.count,
+            totalEntities: processed.reduce(0) { $0 + $1.entities.count },
+            chatViewModel: chatViewModel
+        )
+        return (true, "Imported \(processed.count) document(s): \(processed.map(\.filename).joined(separator: ", "))")
+    }
+}
+
+
 // ==== LEGO START: 32 HalTestConsole (macOS Test Harness) ====
 //
 // SELF-AWARENESS NOTE (for Hal reading this code):
@@ -13099,6 +13187,24 @@ class HalTestConsole: ObservableObject {
             MLXModelDownloader.shared.cancelDownload(modelID: modelID)
             print("HALDEBUG-TESTCONSOLE: Cancelled download for \(modelID)")
             return "{\"status\":\"ok\",\"command\":\"CANCEL_DOWNLOAD\",\"modelID\":\"\(jsonStringEscape(modelID))\"}"
+
+        } else if trimmed.hasPrefix("IMPORT_DOCUMENT:") {
+            let path = String(trimmed.dropFirst("IMPORT_DOCUMENT:".count)).trimmingCharacters(in: .whitespaces)
+            let (ok, msg) = await DocumentImportManager.shared.importFromPath(path, chatViewModel: vm)
+            let status = ok ? "ok" : "error"
+            return "{\"status\":\"\(status)\",\"message\":\"\(jsonStringEscape(msg))\"}"
+
+        } else if trimmed == "LIST_DOCUMENTS" {
+            let docs = vm.memoryStore.listDocuments()
+            let entries = docs.map { d -> String in
+                "{\"sourceID\":\"\(d.sourceID)\",\"name\":\"\(jsonStringEscape(d.displayName))\",\"chunks\":\(d.chunks),\"createdAt\":\(d.createdAt)}"
+            }.joined(separator: ",")
+            return "{\"status\":\"ok\",\"count\":\(docs.count),\"documents\":[\(entries)]}"
+
+        } else if trimmed.hasPrefix("DELETE_DOCUMENT:") {
+            let sourceID = String(trimmed.dropFirst("DELETE_DOCUMENT:".count)).trimmingCharacters(in: .whitespaces)
+            let deleted = vm.memoryStore.deleteDocument(sourceID: sourceID)
+            return "{\"status\":\"ok\",\"command\":\"DELETE_DOCUMENT\",\"sourceID\":\"\(jsonStringEscape(sourceID))\",\"chunksDeleted\":\(deleted)}"
 
         } else if trimmed == "GET_REFLECTIONS" {
             let reflections = vm.memoryStore.getShareableReflections()

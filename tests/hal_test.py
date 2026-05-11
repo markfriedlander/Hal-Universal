@@ -34,6 +34,11 @@ Thread management:
   python3 tests/hal_test.py memory_stats               # DB row counts
   python3 tests/hal_test.py reflections                # recent self-reflection entries
 
+Document management:
+  python3 tests/hal_test.py list_documents             # list imported documents
+  python3 tests/hal_test.py import_document <path>     # import a file into RAG
+  python3 tests/hal_test.py delete_document <source_id># remove document from RAG
+
 Scripted file format:
   # comment lines are ignored
   > This is a user turn sent to Hal
@@ -393,6 +398,41 @@ def cmd_reflections(config):
         print(f"[{rtype} @ turn {r.get('turn', '?')}]  {r.get('text', '')}\n")
 
 
+# ─── Document Management ─────────────────────────────────────────────────────
+
+def cmd_list_documents(config):
+    result = send_command("LIST_DOCUMENTS", config)
+    docs = result.get("documents", [])
+    total = result.get("count", 0)
+    if total == 0:
+        print("No documents imported.")
+        return
+    print(f"\n{total} document(s):\n")
+    print(f"{'Source ID':<38} {'Chunks':>6}  Name")
+    print("-" * 70)
+    for d in docs:
+        print(f"{d['sourceID']:<38} {d.get('chunks', '?'):>6}  {d.get('name', '?')}")
+
+
+def cmd_import_document(path, config):
+    abs_path = os.path.abspath(path)
+    if not os.path.exists(abs_path):
+        print(f"File not found: {abs_path}")
+        return
+    print(f"Importing: {abs_path}")
+    result = send_command(f"IMPORT_DOCUMENT:{abs_path}", config)
+    print(f"Result: {result}")
+
+
+def cmd_delete_document(source_id, config):
+    confirm = input(f"Delete document {source_id[:12]}...? This removes it from RAG. [y/N] ").strip().lower()
+    if confirm != "y":
+        print("Cancelled.")
+        return
+    result = send_command(f"DELETE_DOCUMENT:{source_id}", config)
+    print(f"Delete result: {result}")
+
+
 # ─── Main ────────────────────────────────────────────────────────────────────
 
 def main():
@@ -572,6 +612,31 @@ def main():
             print("ERROR: HTTP config required. Run setup first.")
             sys.exit(1)
         cmd_reflections(config)
+
+    # Document management commands
+    elif subcommand == "list_documents":
+        if not config:
+            print("ERROR: HTTP config required. Run setup first.")
+            sys.exit(1)
+        cmd_list_documents(config)
+
+    elif subcommand == "import_document":
+        if not config:
+            print("ERROR: HTTP config required. Run setup first.")
+            sys.exit(1)
+        if len(args) < 2:
+            print("Usage: hal_test.py import_document <path>")
+            sys.exit(1)
+        cmd_import_document(args[1], config)
+
+    elif subcommand == "delete_document":
+        if not config:
+            print("ERROR: HTTP config required. Run setup first.")
+            sys.exit(1)
+        if len(args) < 2:
+            print("Usage: hal_test.py delete_document <source_id>")
+            sys.exit(1)
+        cmd_delete_document(args[1], config)
 
     else:
         print(f"Unknown subcommand: {subcommand}")
