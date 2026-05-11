@@ -60,6 +60,7 @@ import MLX // Import MLX framework (conceptual, requires actual framework link)
 import MLXLLM
 import Hub
 import MLXLMCommon // FIXED: Added missing import for proper MLX API access
+import MLXHuggingFace // mlx-swift-lm 3.x: provides #huggingFaceTokenizerLoader macro
 import Tokenizers // FIXED: Added missing import for tokenizer decode method
 
 // MARK: - Hub Extension for MLX Model Downloads
@@ -3917,20 +3918,9 @@ class MLXWrapper: ObservableObject {
         print("HALDEBUG-MLX: Attempting to load MLX model: \(modelConfig.displayName) (ID: \(modelConfig.id))")
 
         do {
-            // Build MLX ModelConfiguration from Hal's ModelConfiguration
-            let mlxConfig: MLXLMCommon.ModelConfiguration
-            
-            if let localPath = modelConfig.localPath, FileManager.default.fileExists(atPath: localPath.path) {
-                // Use existing local model
-                mlxConfig = MLXLMCommon.ModelConfiguration(
-                    directory: localPath,
-                    defaultPrompt: "Tell me about the history of Spain."
-                )
-                print("HALDEBUG-MLX: Loading from local path: \(localPath.path)")
-            } else {
-                // CHANGE 2/2: No auto-redownload - throw error instead
-                print("HALDEBUG-MLX: âŒ Model files not found at expected location")
-                let errorMessage = "Yes. Unfortunately looks like I can't find the \(modelConfig.displayName) 'brain' files on this deviceâ€”they might have been cleared or deleted. You can re-download \(modelConfig.displayName) from the Model Library whenever you're ready. For now, I've switched over to Apple Intelligence so we can keep chatting without interruption."
+            guard let localPath = modelConfig.localPath, FileManager.default.fileExists(atPath: localPath.path) else {
+                print("HALDEBUG-MLX: Model files not found at expected location")
+                let errorMessage = "Yes. Unfortunately looks like I can't find the \(modelConfig.displayName) 'brain' files on this device. They might have been cleared or deleted. You can re-download \(modelConfig.displayName) from the Model Library whenever you're ready."
                 await MainActor.run {
                     self.isModelLoaded = false
                     self.loadingProgress = 0.0
@@ -3939,23 +3929,25 @@ class MLXWrapper: ObservableObject {
                 }
                 return
             }
-            
+
+            print("HALDEBUG-MLX: Loading from local path: \(localPath.path)")
+
             // Set GPU memory cache limit for iOS optimization
             MLX.GPU.set(cacheLimit: 64 * 1024 * 1024)   // 64 MB
-            
+
             await MainActor.run {
                 self.loadingProgress = 0.2
                 self.loadingMessage = "Configuring model..."
             }
 
-            // Load model container using LLMModelFactory
+            // Load model container from local directory (mlx-swift-lm 3.x API)
             let container = try await LLMModelFactory.shared.loadContainer(
-                configuration: mlxConfig
-            ) { progress in
-                Task { @MainActor in
-                    self.loadingProgress = 0.2 + (progress.fractionCompleted * 0.8)
-                    self.loadingMessage = "Loading MLX model... (\(Int(self.loadingProgress * 100))%)"
-                }
+                from: localPath,
+                using: #huggingFaceTokenizerLoader()
+            )
+            await MainActor.run {
+                self.loadingProgress = 0.9
+                self.loadingMessage = "Finalizing model..."
             }
 
             self.modelContainer = container
@@ -4018,7 +4010,7 @@ class MLXWrapper: ObservableObject {
                     parameters: GenerateParameters(temperature: Float(temperature)),
                     context: context
                 ) { (tokens: [Int]) in
-                    let textSoFar = context.tokenizer.decode(tokens: tokens)
+                    let textSoFar = context.tokenizer.decode(tokenIds: tokens)
                     if textSoFar.hasSuffix("\nUser:") || textSoFar.hasSuffix("\nAssistant:") || textSoFar.hasSuffix("###") {
                         return .stop
                     }
@@ -4032,7 +4024,7 @@ class MLXWrapper: ObservableObject {
 
             // FIX: Explicit String type for proper method resolution
             // Trim trailing stop signals from the generated output
-            var cleanOutput: String = result.trimmingCharacters(in: .whitespacesAndNewlines)
+            var cleanOutput: String = result.trimmingCharacters(in: CharacterSet.whitespacesAndNewlines)
             for stopSeq in ["User:", "Assistant:", "System:", "###"] {
                 if let range = cleanOutput.range(of: stopSeq, options: [.caseInsensitive, .backwards]) {
                     cleanOutput = String(cleanOutput[..<range.lowerBound]).trimmingCharacters(in: .whitespacesAndNewlines)

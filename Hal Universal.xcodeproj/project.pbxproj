@@ -19,6 +19,9 @@
 		855E386F2EA94F460029C420 /* MLXNN in Frameworks */ = {isa = PBXBuildFile; productRef = 855E386E2EA94F460029C420 /* MLXNN */; };
 		858DA3262EA956AC00A44B2F /* MLXLLM in Frameworks */ = {isa = PBXBuildFile; productRef = 858DA3252EA956AC00A44B2F /* MLXLLM */; };
 		858DA3282EA956AC00A44B2F /* MLXLMCommon in Frameworks */ = {isa = PBXBuildFile; productRef = 858DA3272EA956AC00A44B2F /* MLXLMCommon */; };
+		858DA32C2EA956AC00A44B2F /* Hub in Frameworks */ = {isa = PBXBuildFile; productRef = 858DA32A2EA956AC00A44B2F /* Hub */; };
+		858DA32D2EA956AC00A44B2F /* Tokenizers in Frameworks */ = {isa = PBXBuildFile; productRef = 858DA32B2EA956AC00A44B2F /* Tokenizers */; };
+		858DA32E2EA956AC00A44B2F /* MLXHuggingFace in Frameworks */ = {isa = PBXBuildFile; productRef = 858DA32F2EA956AC00A44B2F /* MLXHuggingFace */; };
 		85C74A1B2EC6EC4600C52EF5 /* README.md in Resources */ = {isa = PBXBuildFile; fileRef = 85C74A1A2EC6EC4500C52EF5 /* README.md */; };
 /* End PBXBuildFile section */
 
@@ -93,6 +96,9 @@
 				855E38622EA94A730029C420 /* NaturalLanguage.framework in Frameworks */,
 				855E38692EA94F460029C420 /* MLX in Frameworks */,
 				855E38602EA94A620029C420 /* FoundationModels.framework in Frameworks */,
+				858DA32C2EA956AC00A44B2F /* Hub in Frameworks */,
+				858DA32D2EA956AC00A44B2F /* Tokenizers in Frameworks */,
+				858DA32E2EA956AC00A44B2F /* MLXHuggingFace in Frameworks */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -181,6 +187,9 @@
 				855E386E2EA94F460029C420 /* MLXNN */,
 				858DA3252EA956AC00A44B2F /* MLXLLM */,
 				858DA3272EA956AC00A44B2F /* MLXLMCommon */,
+				858DA32A2EA956AC00A44B2F /* Hub */,
+				858DA32B2EA956AC00A44B2F /* Tokenizers */,
+				858DA32F2EA956AC00A44B2F /* MLXHuggingFace */,
 			);
 			productName = "Hal Universal";
 			productReference = 85B3C57D2EA943560060BCEC /* Hal Universal.app */;
@@ -216,7 +225,8 @@
 			minimizedProjectReferenceProxies = 1;
 			packageReferences = (
 				855E38672EA94F460029C420 /* XCRemoteSwiftPackageReference "mlx-swift" */,
-				858DA3242EA956AC00A44B2F /* XCRemoteSwiftPackageReference "mlx-swift-examples" */,
+				858DA3242EA956AC00A44B2F /* XCRemoteSwiftPackageReference "mlx-swift-lm" */,
+				858DA3292EA956AC00A44B2F /* XCRemoteSwiftPackageReference "swift-transformers" */,
 			);
 			preferredProjectObjectVersion = 77;
 			productRefGroup = 85B3C57E2EA943560060BCEC /* Products */;
@@ -570,12 +580,20 @@
 				minimumVersion = 0.29.1;
 			};
 		};
-		858DA3242EA956AC00A44B2F /* XCRemoteSwiftPackageReference "mlx-swift-examples" */ = {
+		858DA3242EA956AC00A44B2F /* XCRemoteSwiftPackageReference "mlx-swift-lm" */ = {
 			isa = XCRemoteSwiftPackageReference;
-			repositoryURL = "https://github.com/ml-explore/mlx-swift-examples";
+			repositoryURL = "https://github.com/ml-explore/mlx-swift-lm";
 			requirement = {
 				kind = upToNextMajorVersion;
-				minimumVersion = 2.29.1;
+				minimumVersion = 3.0.0;
+			};
+		};
+		858DA3292EA956AC00A44B2F /* XCRemoteSwiftPackageReference "swift-transformers" */ = {
+			isa = XCRemoteSwiftPackageReference;
+			repositoryURL = "https://github.com/huggingface/swift-transformers";
+			requirement = {
+				kind = upToNextMajorVersion;
+				minimumVersion = 1.0.0;
 			};
 		};
 /* End XCRemoteSwiftPackageReference section */
@@ -603,13 +621,28 @@
 		};
 		858DA3252EA956AC00A44B2F /* MLXLLM */ = {
 			isa = XCSwiftPackageProductDependency;
-			package = 858DA3242EA956AC00A44B2F /* XCRemoteSwiftPackageReference "mlx-swift-examples" */;
+			package = 858DA3242EA956AC00A44B2F /* XCRemoteSwiftPackageReference "mlx-swift-lm" */;
 			productName = MLXLLM;
 		};
 		858DA3272EA956AC00A44B2F /* MLXLMCommon */ = {
 			isa = XCSwiftPackageProductDependency;
-			package = 858DA3242EA956AC00A44B2F /* XCRemoteSwiftPackageReference "mlx-swift-examples" */;
+			package = 858DA3242EA956AC00A44B2F /* XCRemoteSwiftPackageReference "mlx-swift-lm" */;
 			productName = MLXLMCommon;
+		};
+		858DA32A2EA956AC00A44B2F /* Hub */ = {
+			isa = XCSwiftPackageProductDependency;
+			package = 858DA3292EA956AC00A44B2F /* XCRemoteSwiftPackageReference "swift-transformers" */;
+			productName = Hub;
+		};
+		858DA32B2EA956AC00A44B2F /* Tokenizers */ = {
+			isa = XCSwiftPackageProductDependency;
+			package = 858DA3292EA956AC00A44B2F /* XCRemoteSwiftPackageReference "swift-transformers" */;
+			productName = Tokenizers;
+		};
+		858DA32F2EA956AC00A44B2F /* MLXHuggingFace */ = {
+			isa = XCSwiftPackageProductDependency;
+			package = 858DA3242EA956AC00A44B2F /* XCRemoteSwiftPackageReference "mlx-swift-lm" */;
+			productName = MLXHuggingFace;
 		};
 /* End XCSwiftPackageProductDependency section */
 	};
