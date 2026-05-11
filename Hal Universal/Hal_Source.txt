@@ -4951,6 +4951,14 @@ struct iOSChatView: View {
                             )
                             .listRowInsets(EdgeInsets(top: 6, leading: 12, bottom: 6, trailing: 12))
                             .listRowSeparator(.hidden)
+                            // Explicit clear background to prevent the "footer-visible-but-text-
+                            // missing-after-reload" bug. SwiftUI's default list row background
+                            // can occasionally paint over bubble content when the List is
+                            // recreated via `.id(messagesVersion)` after a conversation reload —
+                            // the row background sits ABOVE the bubble's text but BELOW its
+                            // footer position. Setting an explicit clear background removes the
+                            // default row-background layer entirely.
+                            .listRowBackground(Color.clear)
                             .id(message.id)
                         }
                         // Invisible anchor: auto-scroll target + bottom-detection for resume/pause.
@@ -7742,6 +7750,13 @@ struct WidgetTestView: View {
                 if message.isPartial {
                     print("HALDEBUG-UI: Displaying partial message bubble (turn \(actualTurnNumber))")
                 }
+                // Diagnostic for the "footer visible but text missing after reload"
+                // bug. If we ever render a non-partial bubble with empty / whitespace-
+                // only content while the footer still claims a real turn, log it.
+                let trimmed = message.content.trimmingCharacters(in: .whitespacesAndNewlines)
+                if !message.isPartial && trimmed.isEmpty {
+                    halLog("HALDEBUG-UI: ⚠️ Non-partial bubble rendered with empty content (turn \(actualTurnNumber), id \(message.id.uuidString.prefix(8)), isFromUser=\(message.isFromUser), recordedByModel=\(message.recordedByModel))")
+                }
             }
             .onChange(of: message.isPartial) { _, newValue in
                 if !newValue && message.content.count > 0 {
@@ -7792,9 +7807,21 @@ struct MarkdownView: View {
     let text: String
 
     var body: some View {
+        let blocks = parseBlocks(text)
         VStack(alignment: .leading, spacing: 10) {
-            ForEach(Array(parseBlocks(text).enumerated()), id: \.offset) { _, block in
-                blockView(block)
+            if blocks.isEmpty && !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                // Defensive fallback: parseBlocks returned nothing for non-empty input.
+                // Should never happen in normal use, but if it does, render the raw text
+                // so the user sees SOMETHING rather than empty space with just a footer.
+                // This addresses the "footer visible but text missing after reload" report.
+                Text(text)
+                    .font(.title3)
+                    .lineSpacing(6)
+                    .foregroundColor(.primary)
+            } else {
+                ForEach(Array(blocks.enumerated()), id: \.offset) { _, block in
+                    blockView(block)
+                }
             }
         }
         .frame(maxWidth: .infinity, alignment: .leading)
