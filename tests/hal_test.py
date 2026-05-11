@@ -31,9 +31,13 @@ Model management (requires LocalAPIServer running):
 Thread management:
   python3 tests/hal_test.py threads                    # list all threads
   python3 tests/hal_test.py switch_thread <id>         # switch to existing thread
-  python3 tests/hal_test.py messages                   # print messages in current thread
+  python3 tests/hal_test.py messages                   # print messages in current thread (from DB)
   python3 tests/hal_test.py memory_stats               # DB row counts
   python3 tests/hal_test.py reflections                # recent self-reflection entries
+
+UI observation (what's on screen vs what's in the DB):
+  python3 tests/hal_test.py ui_state                   # current view, sheets, typing state, error banners, input draft
+  python3 tests/hal_test.py rendered_messages          # messages bound to chat view (vm.messages, includes partials)
 
 Document management:
   python3 tests/hal_test.py list_documents             # list imported documents
@@ -389,6 +393,32 @@ def cmd_memory_stats(config):
     print(json.dumps(result, indent=2))
 
 
+def cmd_ui_state(config):
+    """What the user actually sees on screen, including which sheet is presented,
+    typing state, error banners, input-field draft, and partial streaming content."""
+    result = send_command("GET_UI_STATE", config)
+    print(json.dumps(result, indent=2))
+
+
+def cmd_rendered_messages(config):
+    """Messages currently bound to the chat view's ForEach (vm.messages), distinct
+    from GET_MESSAGES which reads from the SQLite memoryStore. Use this to see
+    in-flight partial messages and detect DB/UI drift."""
+    result = send_command("GET_RENDERED_MESSAGES", config)
+    msgs = result.get("messages", [])
+    count = result.get("renderedMessageCount", 0)
+    cid = result.get("conversationId", "?")
+    print(f"Rendered in thread {cid[:8]}...  ({count} messages)\n")
+    for m in msgs:
+        role = m.get("role", "?").upper()
+        partial = " (PARTIAL)" if m.get("isPartial") else ""
+        recorded = m.get("recordedByModel", "?")
+        turn = m.get("turnNumber", "?")
+        text = m.get("content", "")
+        trunc = " [truncated]" if m.get("truncated") else ""
+        print(f"[{role}{partial}  turn={turn}  by={recorded}] {text}{trunc}\n")
+
+
 def cmd_reflections(config):
     result = send_command("GET_REFLECTIONS", config)
     entries = result.get("reflections", [])
@@ -630,6 +660,18 @@ def main():
             print("ERROR: HTTP config required. Run setup first.")
             sys.exit(1)
         cmd_memory_stats(config)
+
+    elif subcommand == "ui_state":
+        if not config:
+            print("ERROR: HTTP config required. Run setup first.")
+            sys.exit(1)
+        cmd_ui_state(config)
+
+    elif subcommand == "rendered_messages":
+        if not config:
+            print("ERROR: HTTP config required. Run setup first.")
+            sys.exit(1)
+        cmd_rendered_messages(config)
 
     elif subcommand == "reflections":
         if not config:

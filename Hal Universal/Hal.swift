@@ -4652,12 +4652,11 @@ import SwiftUI
 struct iOSChatView: View {
     @EnvironmentObject var chatViewModel: ChatViewModel
     @State private var scrollToBottomTrigger = UUID()
-    @State private var showingSettings: Bool = false
-    @State private var showingDocumentPicker: Bool = false
+    // Sheet flags moved to ChatViewModel.showingSettings / showingThreadPanel /
+    // showingDocumentPicker so the LocalAPIServer can read them via GET_UI_STATE.
     @FocusState private var isInputFocused: Bool // NEW: Track text field focus
     @State private var watchBridge: HalWatchBridge? = nil
     @State private var userHasScrolled = false
-    @State private var showingThreadPanel: Bool = false
 
     var body: some View {
         NavigationStack {
@@ -4780,34 +4779,34 @@ struct iOSChatView: View {
             .toolbar {
                 ToolbarItem(placement: .navigationBarLeading) {
                     Button {
-                        showingThreadPanel = true
+                        chatViewModel.showingThreadPanel = true
                     } label: {
                         Image(systemName: "line.3.horizontal")
                     }
                 }
                 ToolbarItem(placement: .navigationBarTrailing) {
                     Button {
-                        showingSettings = true
+                        chatViewModel.showingSettings = true
                     } label: {
                         Image(systemName: "gearshape")
                     }
                 }
             }
-            .sheet(isPresented: $showingThreadPanel) {
-                ThreadPanelView(isPresented: $showingThreadPanel)
+            .sheet(isPresented: $chatViewModel.showingThreadPanel) {
+                ThreadPanelView(isPresented: $chatViewModel.showingThreadPanel)
                     .environmentObject(chatViewModel)
             }
 
             // Unified Settings sheet
-            .sheet(isPresented: $showingSettings) {
-                ActionsView(showingDocumentPicker: $showingDocumentPicker)
+            .sheet(isPresented: $chatViewModel.showingSettings) {
+                ActionsView(showingDocumentPicker: $chatViewModel.showingDocumentPicker)
                     .environmentObject(chatViewModel)
                     .environmentObject(DocumentImportManager.shared)
                     .environmentObject(MLXModelDownloader.shared)
             }
 
             // Document picker sheet
-            .sheet(isPresented: $showingDocumentPicker) {
+            .sheet(isPresented: $chatViewModel.showingDocumentPicker) {
                 DocumentPicker()
                     .environmentObject(chatViewModel)
                     .environmentObject(DocumentImportManager.shared)
@@ -7998,6 +7997,14 @@ class ChatViewModel: ObservableObject {
     
     // Settings flow tracking for dialogue injection
     @Published var isInSettingsFlow: Bool = false
+
+    // MARK: - UI Observation (top-level sheet presentation state)
+    // Hoisted from iOSChatView's local @State so the LocalAPIServer can report
+    // what the user actually sees. Read by GET_UI_STATE; written by iOSChatView's
+    // toolbar buttons and by .sheet(isPresented:) auto-dismiss.
+    @Published var showingSettings: Bool = false
+    @Published var showingThreadPanel: Bool = false
+    @Published var showingDocumentPicker: Bool = false
     
     // Lightweight mirrors of downloader state for binding
     var mlxIsDownloading: Bool { MLXModelDownloader.shared.isDownloading }
@@ -13221,6 +13228,12 @@ class HalTestConsole: ObservableObject {
             let ms = vm.memoryStore
             return "{\"status\":\"ok\",\"totalConversations\":\(ms.totalConversations),\"totalTurns\":\(ms.totalTurns),\"totalDocuments\":\(ms.totalDocuments),\"totalDocumentChunks\":\(ms.totalDocumentChunks),\"activeThreadMessages\":\(vm.messages.filter{!$0.isPartial}.count)}"
 
+        } else if trimmed == "GET_UI_STATE" {
+            return buildUIStateJSON(vm: vm)
+
+        } else if trimmed == "GET_RENDERED_MESSAGES" {
+            return buildRenderedMessagesJSON(vm: vm)
+
         } else if trimmed.hasPrefix("CANCEL_DOWNLOAD:") {
             let modelID = String(trimmed.dropFirst("CANCEL_DOWNLOAD:".count)).trimmingCharacters(in: .whitespaces)
             MLXModelDownloader.shared.cancelDownload(modelID: modelID)
@@ -13408,6 +13421,98 @@ class HalTestConsole: ObservableObject {
         let state = buildStateJSON(vm: vm)
         try? FileManager.default.createDirectory(at: baseDir, withIntermediateDirectories: true)
         try? state.write(to: stateFile, atomically: true, encoding: .utf8)
+    }
+
+    // MARK: - UI Observation JSON
+    //
+    // GET_UI_STATE and GET_RENDERED_MESSAGES expose what the user actually sees,
+    // not just what's in the database. The distinction matters when:
+    //   - A sheet/modal is presented over the chat view
+    //   - vm.messages (rendered) drifts from memoryStore (persisted) — e.g. partial
+    //     streaming messages that exist in memory but haven't been saved
+    //   - Error banners are visible
+    //   - The user has typed but not sent text in the input field
+    //
+    // These exist so a remote API caller (CC, hal_test.py, future tools) never needs
+    // to ask a human "what do you see on screen?" — the answer is always queryable.
+
+    func buildUIStateJSON(vm: ChatViewModel) -> String {
+        // Top-most presented view, in z-order. documentPicker is presented from
+        // ActionsView (settings) so it's above settings; settings is above chat.
+        let currentView: String
+        if vm.showingDocumentPicker        { currentView = "documentPicker" }
+        else if vm.showingSettings         { currentView = "settings" }
+        else if vm.showingThreadPanel      { currentView = "threadPanel" }
+        else                                { currentView = "chat" }
+
+        let renderedMessages = vm.messages
+        let partialMessages = renderedMessages.filter { $0.isPartial }
+        let lastPartial = partialMessages.last
+        let partialContent = lastPartial.map { jsonStringEscape(String($0.content.prefix(500))) }
+
+        let thinkingDuration: String
+        if let start = vm.thinkingStart {
+            thinkingDuration = String(format: "%.2f", Date().timeIntervalSince(start))
+        } else {
+            thinkingDuration = "null"
+        }
+
+        let liveModelID = vm.llmService.activeModelID
+        let selectedModelDisplayName = jsonStringEscape(vm.selectedModel.displayName)
+        let errorMsg = vm.errorMessage.map { jsonStringEscape(String($0.prefix(500))) }
+        let inputFieldText = jsonStringEscape(String(vm.currentMessage.prefix(2000)))
+
+        let mlxLoading = vm.llmService.mlxWrapper.loadingProgress
+        let mlxLoadingMessage = jsonStringEscape(vm.llmService.mlxWrapper.loadingMessage)
+        let mlxIsLoaded = vm.llmService.mlxWrapper.isModelLoaded
+
+        return """
+        {
+          "status": "ok",
+          "currentView": "\(currentView)",
+          "visibleThreadID": "\(vm.conversationId)",
+          "renderedMessageCount": \(renderedMessages.count),
+          "renderedPartialCount": \(partialMessages.count),
+          "isAIResponding": \(vm.isAIResponding),
+          "thinkingDurationSec": \(thinkingDuration),
+          "aiPartialContent": \(partialContent.map { "\"\($0)\"" } ?? "null"),
+          "inputFieldText": "\(inputFieldText)",
+          "isSendingMessage": \(vm.isSendingMessage),
+          "isModelSwitching": \(vm.isModelSwitching),
+          "errorMessage": \(errorMsg.map { "\"\($0)\"" } ?? "null"),
+          "showingSettings": \(vm.showingSettings),
+          "showingThreadPanel": \(vm.showingThreadPanel),
+          "showingDocumentPicker": \(vm.showingDocumentPicker),
+          "selectedModelID": "\(jsonStringEscape(vm.selectedModelID))",
+          "selectedModelDisplayName": "\(selectedModelDisplayName)",
+          "activeModelID": "\(jsonStringEscape(liveModelID))",
+          "mlxModelLoaded": \(mlxIsLoaded),
+          "mlxLoadingProgress": \(String(format: "%.2f", mlxLoading)),
+          "mlxLoadingMessage": "\(mlxLoadingMessage)"
+        }
+        """
+    }
+
+    func buildRenderedMessagesJSON(vm: ChatViewModel) -> String {
+        // vm.messages is the in-memory array bound to the chat view's ForEach.
+        // This is precisely what the user sees in the chat scroll. Differs from
+        // GET_MESSAGES (which reads from memoryStore / SQLite) in that it:
+        //   - Includes isPartial messages currently streaming
+        //   - Reflects in-flight ordering before persistence
+        //   - Includes per-message metadata (id, isPartial, recordedByModel, turnNumber)
+        let entries = vm.messages.map { m -> String in
+            let role = m.isFromUser ? "user" : "assistant"
+            let content = jsonStringEscape(String(m.content.prefix(500)))
+            let truncated = m.content.count > 500
+            let ts = Int(m.timestamp.timeIntervalSince1970)
+            let recBy = jsonStringEscape(m.recordedByModel)
+            return """
+            {"id":"\(m.id.uuidString)","role":"\(role)","content":"\(content)","truncated":\(truncated),"timestamp":\(ts),"isPartial":\(m.isPartial),"recordedByModel":"\(recBy)","turnNumber":\(m.turnNumber)}
+            """
+        }.joined(separator: ",")
+        return """
+        {"status":"ok","conversationId":"\(vm.conversationId)","renderedMessageCount":\(vm.messages.count),"messages":[\(entries)]}
+        """
     }
 
     // MARK: - Input File Channel
