@@ -4074,6 +4074,92 @@ class MLXWrapper: ObservableObject {
             throw LLMService.LLMError.predictionFailed(error)
         }
     }
+
+    // MARK: - Chat-Message Generation (new path)
+    //
+    // generateChat is the chat-message-based equivalent of generate(prompt:).
+    // It takes [HalChatMessage] (system/user/assistant turns), converts them to
+    // MLXLMCommon's Chat.Message types, and feeds them through UserInput(chat:)
+    // so the model's chat template properly wraps each role with its own tokens.
+    //
+    // Unlike generate(prompt:), this lets Gemma (and other chat-template models)
+    // see real conversation structure instead of marker-delimited prose-as-user-input.
+    func generateChat(messages: [HalChatMessage], temperature: Double = 0.7) async throws -> String {
+        guard isModelLoaded, let container = self.modelContainer else {
+            throw LLMService.LLMError.modelNotLoaded
+        }
+
+        print("HALDEBUG-MLX-CHAT: Generating from \(messages.count) chat messages (roles: \(messages.map { $0.role.rawValue }.joined(separator: ",")))")
+        let generateStart = Date.timeIntervalSinceReferenceDate
+
+        do {
+            // Convert Hal's role-tagged messages to MLXLMCommon's Chat.Message types.
+            let chatMessages: [Chat.Message] = messages.map { m in
+                switch m.role {
+                case .system:    return .system(m.content)
+                case .user:      return .user(m.content)
+                case .assistant: return .assistant(m.content)
+                }
+            }
+
+            // additionalContext matches Apple's LLMEval reference pattern. Some chat
+            // templates (Qwen3, possibly Gemma 4) consult `enable_thinking` in the
+            // template's Jinja logic; when missing, the template can take a branch
+            // that produces only internal reasoning and no visible output. Empirical
+            // observation: Hal-via-UserInput(chat:) returned empty content for Gemma
+            // until we matched LLMEval's argument shape here.
+            // Seed RNG per LLMEval reference. Without this MLX uses a deterministic
+            // default seed which can produce degenerate sampling sequences.
+            MLX.seed(UInt64(Date.timeIntervalSinceReferenceDate * 1000))
+
+            let userInput = UserInput(
+                chat: chatMessages,
+                additionalContext: ["enable_thinking": false]
+            )
+            let lmInput = try await container.prepare(input: userInput)
+            let promptTokenCount = lmInput.text.tokens.size
+            print("HALDEBUG-MLX-CHAT: Input prepared in \(String(format: "%.2f", Date.timeIntervalSinceReferenceDate - generateStart))s; prompt tokens: \(promptTokenCount)")
+
+            // Near-exact LLMEval parameter shape: temp 0.6, maxTokens 50 to match the
+            // working benchmark. Once Gemma generates real prose, we'll raise these.
+            let parameters = GenerateParameters(maxTokens: 50, temperature: 0.6)
+            let stream = try await container.generate(input: lmInput, parameters: parameters)
+            let streamStart = Date.timeIntervalSinceReferenceDate
+
+            // Explicit iterator pattern matching LLMEval line-for-line.
+            var iterator = stream.makeAsyncIterator()
+            var fullText = ""
+
+            if let first = await iterator.next() {
+                let ttft = (Date.timeIntervalSinceReferenceDate - streamStart) * 1000
+                print("HALDEBUG-MLX-CHAT: First token at \(String(format: "%.0f", ttft))ms")
+                switch first {
+                case .chunk(let text): fullText += text
+                case .info(let info):
+                    print("HALDEBUG-MLX-CHAT: Generation complete (first): \(info.generationTokenCount) tokens at \(String(format: "%.1f", info.tokensPerSecond)) tok/s")
+                case .toolCall(_): break
+                }
+
+                while let next = await iterator.next() {
+                    switch next {
+                    case .chunk(let text): fullText += text
+                    case .info(let info):
+                        print("HALDEBUG-MLX-CHAT: Generation complete: \(info.generationTokenCount) tokens at \(String(format: "%.1f", info.tokensPerSecond)) tok/s")
+                    case .toolCall(_): break
+                    }
+                }
+            } else {
+                print("HALDEBUG-MLX-CHAT: Stream produced no items at all (Gemma generated 0 tokens)")
+            }
+
+            MLX.GPU.clearCache()
+            print("HALDEBUG-MLX-CHAT: Returning fullText (\(fullText.count) chars): \(fullText.prefix(150))")
+            return fullText.trimmingCharacters(in: CharacterSet.whitespacesAndNewlines)
+        } catch {
+            print("HALDEBUG-MLX-CHAT: Error during MLX chat generation: \(error.localizedDescription)")
+            throw LLMService.LLMError.predictionFailed(error)
+        }
+    }
 }
 
 // MARK: - LLM Service (Wrapper for Foundation Models and MLX)
@@ -4172,6 +4258,58 @@ class LLMService: ObservableObject {
             print("HALDEBUG-MLX: Generating non-streaming from MLX model for prompt (first 200 chars): \(prompt.prefix(200)).....")
             // TEMPERATURE CHANGE 5/6: Pass temperature parameter to MLX wrapper
             return try await mlxWrapper.generate(prompt: prompt, temperature: temperature)
+        }
+    }
+
+    // MARK: - Chat-Message Generation (new unified path)
+    //
+    // generateChatResponse is the chat-message-based equivalent of generateResponse.
+    // Both AFM and MLX route through here. Each backend converts [HalChatMessage]
+    // into its own native types and lets the chat template handle role tagging.
+    //
+    // The intent is to replace generateResponse over time. For now, both exist;
+    // sendMessage/runSingleModelTurn picks the new path. Subsystems like
+    // summarization can keep using generateResponse temporarily.
+    func generateChatResponse(messages: [HalChatMessage], temperature: Double = 0.7) async throws -> String {
+        print("HALDEBUG-RESPONSE: \(currentModel.displayName) (\(currentModel.source)) is responding [chat-path]")
+        print("HALDEBUG-LLM: generateChatResponse called - \(messages.count) messages, currentModel: \(currentModel.displayName)")
+
+        switch currentModel.source {
+        case .appleFoundation:
+            // For AFM, the system message becomes Instructions (if present).
+            // Conversation history (.user/.assistant entries before the last .user)
+            // will eventually map to a Transcript; for step 0 we have only system+user.
+            let systemMessage = messages.first(where: { $0.role == .system })?.content
+            let lastUser = messages.last(where: { $0.role == .user })?.content ?? ""
+
+            let session: LanguageModelSession
+            if let sys = systemMessage, !sys.isEmpty {
+                session = LanguageModelSession(instructions: Instructions(sys))
+                print("HALDEBUG-LLM-CHAT: AFM session with Instructions (\(sys.count) chars)")
+            } else {
+                session = LanguageModelSession()
+                print("HALDEBUG-LLM-CHAT: AFM session without Instructions")
+            }
+
+            do {
+                var accumulatedText = ""
+                let stream = session.streamResponse(options: GenerationOptions(temperature: temperature)) { Prompt(lastUser) }
+                for try await snapshot in stream {
+                    accumulatedText = snapshot.content
+                }
+                print("HALDEBUG-LLM-CHAT: AFM response length: \(accumulatedText.count)")
+                return accumulatedText
+            } catch {
+                print("HALDEBUG-LLM-CHAT: AFM chat generation error: \(error.localizedDescription)")
+                throw LLMError.predictionFailed(error)
+            }
+
+        case .mlx:
+            guard mlxWrapper.isModelLoaded else {
+                print("HALDEBUG-MLX-CHAT: Cannot generate - MLX model not loaded")
+                throw LLMError.modelNotLoaded
+            }
+            return try await mlxWrapper.generateChat(messages: messages, temperature: temperature)
         }
     }
 
@@ -7981,6 +8119,28 @@ struct SalonConfiguration: Codable, Equatable {
     }
 }
 
+// MARK: - Chat Message Abstraction (model-agnostic)
+//
+// HalChatMessage is Hal's internal chat-shaped representation, used by the
+// chat-message-based generation path. Each LLM backend converts these into
+// its own native types:
+//   - MLXLMCommon: → [Chat.Message] via UserInput(chat:)
+//   - FoundationModels: → Instructions + Prompt (and eventually Transcript for history)
+//
+// This is the foundation for moving away from the HelPML marker-delimited
+// string-prompt design (which chat-template models mirror back instead of
+// answering). Each ChatViewModel.buildChatMessages() turn produces a sequence
+// of these that flows uniformly through LLMService.generateChatResponse(...).
+struct HalChatMessage {
+    enum Role: String { case system, user, assistant }
+    let role: Role
+    let content: String
+
+    static func system(_ s: String) -> HalChatMessage { .init(role: .system, content: s) }
+    static func user(_ s: String) -> HalChatMessage { .init(role: .user, content: s) }
+    static func assistant(_ s: String) -> HalChatMessage { .init(role: .assistant, content: s) }
+}
+
 @MainActor
 class ChatViewModel: ObservableObject {
     @Published var messages: [ChatMessage] = []
@@ -9339,7 +9499,45 @@ class ChatViewModel: ObservableObject {
                                                                             return currentPrompt
                                                                         }
 
-                                                                        
+                                                                        // MARK: - Chat-Message-Based Prompt Construction (new path)
+                                                                        //
+                                                                        // buildChatMessages is the replacement for buildPromptHistory. Instead of
+                                                                        // producing a single marker-delimited string (HelPML format), it produces
+                                                                        // a [HalChatMessage] sequence that flows through LLMService.generateChatResponse.
+                                                                        //
+                                                                        // This is being built up incrementally. Each step adds one piece of the
+                                                                        // original feature stack from buildPromptHistory and verifies it survives
+                                                                        // the transition to chat form. The minimal foundation (step 0) is just:
+                                                                        //   [.system(<effectiveSystemPrompt>), .user(<currentInput>)]
+                                                                        //
+                                                                        // Subsequent steps will fold in: conversation history as turn pairs,
+                                                                        // temporal context, summary, RAG snippets, self-knowledge. See
+                                                                        // HANDOFF_BRIEF "prompt format" section for rationale.
+                                                                        func buildChatMessages(currentInput: String) async -> [HalChatMessage] {
+                                                                            print("HALDEBUG-CHAT: Building chat messages for input: '\(currentInput.prefix(60))…'")
+
+                                                                            var msgs: [HalChatMessage] = []
+
+                                                                            // STEP 0: System message = Hal's identity from effectiveSystemPrompt.
+                                                                            // This works cleanly for AFM (validated May 11, 2026: clean on-character
+                                                                            // response "Hello! I'm Hal, your friendly AI assistant. How can I help you today?").
+                                                                            //
+                                                                            // KNOWN BUG (open): Gemma 4 E2B 4-bit produces degenerate output through
+                                                                            // this same code path — empty / prompt-echo / repetition. LLMEval reference
+                                                                            // app on the same phone with the same model produces clean prose at 33.5
+                                                                            // tok/s. Tested: with/without system, LLMEval's exact temp/maxTokens/seed/
+                                                                            // additionalContext, iterator vs for-await — no fix found. Suspected:
+                                                                            // memory pressure (LLMEval still has Gemma loaded), or a Gemma 4 chat-
+                                                                            // template edge case we're triggering and LLMEval isn't. Investigation
+                                                                            // requires device console access (HALDEBUG-MLX-CHAT prints).
+                                                                            msgs.append(.system(effectiveSystemPrompt))
+                                                                            msgs.append(.user(currentInput))
+
+                                                                            print("HALDEBUG-CHAT: Built \(msgs.count) chat messages (step 0 — system + user)")
+                                                                            return msgs
+                                                                        }
+
+
 // ==== LEGO END: 20.1 ChatViewModel (Session Tracking & Main Prompt Builder) ====
     
     
@@ -9842,25 +10040,25 @@ class ChatViewModel: ObservableObject {
                                                                         }
                                                                         try? await Task.sleep(nanoseconds: 300_000_000) // Brief readability delay
 
-                                                                        // Build prompt with status callbacks (stages 1 & 2 handled inside)
-                                                                        let prompt = await buildPromptHistory(currentInput: userInput, historyMessagesOverride: historyMessagesOverride) { status in
-                                                                            if let i = self.messages.firstIndex(where: { $0.id == pid }) {
-                                                                                self.messages[i].content = status
-                                                                                // FIXED: Removed NotificationCenter post
-                                                                            }
-                                                                        }
-
-                                                                        // Status Stage 3: LLM inference
+                                                                        // NEW PATH (May 11, 2026): chat-message-based generation.
+                                                                        // The old marker-delimited string prompt (buildPromptHistory) is bypassed
+                                                                        // here but left in place for reference and for systems that still need it
+                                                                        // (e.g. auto-summarization, salon mode context-aware prompts).
+                                                                        // Step 0 minimal: just system persona + current user message.
+                                                                        // Steps 1+ will fold in history, RAG, summary, etc. incrementally.
                                                                         if let i = messages.firstIndex(where: { $0.id == pid }) {
                                                                             messages[i].content = "Formulating a reply..."
-                                                                            // FIXED: Removed NotificationCenter post
                                                                         }
-                                                                        try? await Task.sleep(nanoseconds: 300_000_000) // Brief readability delay
+                                                                        try? await Task.sleep(nanoseconds: 200_000_000)
 
-                                                                        print("HALDEBUG-MODEL: Sending prompt to language model (\(prompt.count) chars)")
+                                                                        let chatMessages = await buildChatMessages(currentInput: userInput)
+                                                                        // For diagnostics & legacy fields (fullPromptUsed, tokenBreakdown), keep
+                                                                        // a synthetic "prompt" string that approximates what was sent.
+                                                                        let prompt = chatMessages.map { "[\($0.role.rawValue)] \($0.content)" }.joined(separator: "\n\n")
+
+                                                                        print("HALDEBUG-MODEL: Sending \(chatMessages.count) chat messages to language model")
                                                                         let t0 = Date()
-                                                                        // TEMPERATURE CHANGE 6/6: Pass temperature parameter to generateResponse
-                                                                        finalText = try await llmService.generateResponse(prompt: prompt, temperature: temperature)
+                                                                        finalText = try await llmService.generateChatResponse(messages: chatMessages, temperature: temperature)
                                                                         modelTime = Date().timeIntervalSince(t0)
                                                                         print("HALDEBUG-LLM: ÃƒÆ’Ã‚Â¢Ãƒâ€¦Ã¢â‚¬Å“ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â¦ Non-streaming generation complete. Length: \(finalText.count)")
 
