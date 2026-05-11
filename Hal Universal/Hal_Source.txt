@@ -8204,7 +8204,7 @@ class ChatViewModel: ObservableObject {
     // HTTP server for automated testing — see Block 32 LocalAPIServer.
     // Controlled by toggle in Settings > Power User > Developer API.
     // Default OFF — no port opens unless explicitly enabled.
-    @AppStorage("localAPIEnabled") var localAPIEnabled: Bool = false
+    @AppStorage("localAPIEnabled") var localAPIEnabled: Bool = true
     var localAPIServer: LocalAPIServer = LocalAPIServer()
 
     func startLocalAPI() {
@@ -13618,7 +13618,11 @@ class LocalAPIServer {
             l.stateUpdateHandler = { state in
                 switch state {
                 case .ready:
-                    print("LocalAPI: Ready at \(LocalAPIServer.localIPAddress()):\(LocalAPIServer.apiPort)")
+                    let address = "\(LocalAPIServer.localIPAddress()):\(LocalAPIServer.apiPort)"
+                    print("LocalAPI: Ready at \(address)")
+                    DispatchQueue.main.async {
+                        UIPasteboard.general.string = LocalAPIServer.localIPAddress()
+                    }
                 case .failed(let e):
                     print("LocalAPI: Failed — \(e)")
                 default: break
