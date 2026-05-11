@@ -78,7 +78,7 @@ def load_config():
     return None
 
 
-def http_post(path, payload, config, timeout=300):
+def http_post(path, payload, config, timeout=600):
     """POST JSON to Hal's LocalAPIServer. Returns parsed JSON response."""
     url = f"http://{config['host']}:{config['port']}{path}"
     body = json.dumps(payload).encode()

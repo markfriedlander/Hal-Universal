@@ -3934,8 +3934,9 @@ class MLXWrapper: ObservableObject {
 
             print("HALDEBUG-MLX: Loading from local path: \(localPath.path)")
 
-            // Set GPU memory cache limit for iOS optimization
-            MLX.GPU.set(cacheLimit: 64 * 1024 * 1024)   // 64 MB
+            // Buffer recycling cache — per MLX docs, this controls reuse of intermediate computation
+            // buffers, NOT the KV cache. 20 MB is the documented iOS example; 64 MB is fine.
+            MLX.GPU.set(cacheLimit: 64 * 1024 * 1024)    // 64 MB (per MLX iOS docs)
 
             await MainActor.run {
                 self.loadingProgress = 0.2
@@ -3998,35 +3999,69 @@ class MLXWrapper: ObservableObject {
         }
 
         print("HALDEBUG-MLX: Generating response using MLX model for prompt: \(prompt.prefix(100))...")
+        let generateStart = Date.timeIntervalSinceReferenceDate
 
         do {
-            // Use proper MLXLMCommon API for generation
-            let result = try await container.perform { context in
-                let userInput = UserInput(prompt: prompt)
-                let input = try await context.processor.prepare(input: userInput)
+            // PORTED FROM Apple's LLMEval reference app (Applications/LLMEval/ViewModels/LLMEvaluator.swift).
+            //
+            // Critical pattern:
+            //   1. container.prepare(input:) — thread-safe, brief lock acquisition for tokenization
+            //   2. container.generate(input:parameters:) — holds lock ONLY for prefill (TokenIterator
+            //      creation), then releases BEFORE returning the stream. Generation Task runs free.
+            //   3. Iterate the stream OUTSIDE any lock — generation Task on background thread yields
+            //      tokens to this consumer which is free to run on the cooperative thread pool.
+            //
+            // The previous implementation used `container.perform { ... }` which holds the AsyncMutex
+            // for the entire body duration. Combined with the synchronous generate callback (or even
+            // for-await inside the perform block), this serialized the generation onto the actor's
+            // executor, producing ~150-200s for a 50-token response. Apple's LLMEval, using this
+            // pattern, achieves 33.5 tok/s on the same iPhone 16 Plus with the same 3.58GB Gemma 4
+            // E2B 4-bit model — measured by Mark on May 11, 2026.
+            //
+            // maxTokens hard-caps output length so a runaway can't reach 150+ seconds even at 1 tok/s.
+            // Safety floor; we'll raise it once we've measured Hal's actual throughput.
 
-                // TEMPERATURE CHANGE 2/6: Pass temperature parameter to GenerateParameters (convert Double to Float)
-                // Updated token callback to stop on Phi-3 role markers
-                let generateResult = try MLXLMCommon.generate(
-                    input: input,
-                    parameters: GenerateParameters(temperature: Float(temperature)),
-                    context: context
-                ) { (tokens: [Int]) in
-                    let textSoFar = context.tokenizer.decode(tokenIds: tokens)
-                    if textSoFar.hasSuffix("\nUser:") || textSoFar.hasSuffix("\nAssistant:") || textSoFar.hasSuffix("###") {
-                        return .stop
+            let lmInput = try await container.prepare(input: UserInput(prompt: prompt))
+            let prepareTime = Date.timeIntervalSinceReferenceDate - generateStart
+            print("HALDEBUG-MLX: Input prepared in \(String(format: "%.2f", prepareTime))s; prompt tokens: \(lmInput.text.tokens.size)")
+
+            let stream = try await container.generate(
+                input: lmInput,
+                parameters: GenerateParameters(maxTokens: 50, temperature: Float(temperature))
+            )
+            let streamStart = Date.timeIntervalSinceReferenceDate
+
+            var fullText = ""
+            var firstTokenTime: TimeInterval? = nil
+            var tokenChunks = 0
+
+            streamLoop: for await generation in stream {
+                switch generation {
+                case .chunk(let text):
+                    if firstTokenTime == nil {
+                        firstTokenTime = Date.timeIntervalSinceReferenceDate
+                        let ttft = (firstTokenTime! - streamStart) * 1000
+                        print("HALDEBUG-MLX: First token at \(String(format: "%.0f", ttft))ms")
                     }
-                    return .more
+                    fullText += text
+                    tokenChunks += 1
+                    // Stop on role markers to prevent runaway past assistant turn
+                    if fullText.hasSuffix("\nUser:") || fullText.hasSuffix("\nAssistant:") || fullText.hasSuffix("###") {
+                        break streamLoop
+                    }
+                case .info(let info):
+                    print("HALDEBUG-MLX: Generation complete: \(info.generationTokenCount) tokens at \(String(format: "%.1f", info.tokensPerSecond)) tok/s (generate \(String(format: "%.2f", info.generateTime))s, prompt \(String(format: "%.2f", info.promptTime))s)")
+                case .toolCall(_):
+                    break
                 }
-
-                // Extract the generated text from the result
-                return generateResult.output
             }
-            MLX.GPU.clearCache() // Clear K-V cache after generation
 
-            // FIX: Explicit String type for proper method resolution
-            // Trim trailing stop signals from the generated output
-            var cleanOutput: String = result.trimmingCharacters(in: CharacterSet.whitespacesAndNewlines)
+            let totalElapsed = Date.timeIntervalSinceReferenceDate - generateStart
+            print("HALDEBUG-MLX: Total wall time: \(String(format: "%.2f", totalElapsed))s, chunks: \(tokenChunks), chars: \(fullText.count)")
+
+            MLX.GPU.clearCache()
+
+            var cleanOutput: String = fullText.trimmingCharacters(in: CharacterSet.whitespacesAndNewlines)
             for stopSeq in ["User:", "Assistant:", "System:", "###"] {
                 if let range = cleanOutput.range(of: stopSeq, options: [.caseInsensitive, .backwards]) {
                     cleanOutput = String(cleanOutput[..<range.lowerBound]).trimmingCharacters(in: .whitespacesAndNewlines)
@@ -4035,7 +4070,7 @@ class MLXWrapper: ObservableObject {
             }
             return cleanOutput
         } catch {
-            print("HALDEBUG-MLX: Error during MLX non-streaming generation: \(error.localizedDescription)")
+            print("HALDEBUG-MLX: Error during MLX generation: \(error.localizedDescription)")
             throw LLMService.LLMError.predictionFailed(error)
         }
     }
@@ -8901,8 +8936,12 @@ class ChatViewModel: ObservableObject {
                                                                             """
 
                                                                             do {
-                                                                                let response = try await llmService.generateResponse(prompt: toolDecisionPrompt, temperature: 0.1)
-                                                                                let answer = response.trimmingCharacters(in: .whitespacesAndNewlines).uppercased()
+                                                                                // RAG gate always uses AFM — fast, always available, never the slow local model
+                                                                                let gateSession = LanguageModelSession()
+                                                                                var gateResponse = ""
+                                                                                let gateStream = gateSession.streamResponse(options: GenerationOptions(temperature: 0.1)) { Prompt(toolDecisionPrompt) }
+                                                                                for try await snapshot in gateStream { gateResponse = snapshot.content }
+                                                                                let answer = gateResponse.trimmingCharacters(in: .whitespacesAndNewlines).uppercased()
                                                                                 if answer.hasPrefix("YES") {
                                                                                     print("HALDEBUG-TOOLS: Gate → YES (memory search needed)")
                                                                                     return ToolDecision(tools: ["memory_search"], reasoning: "Gate answered YES")
@@ -13331,14 +13370,14 @@ class HalTestConsole: ObservableObject {
 
     // MARK: - State JSON
 
-    func writeStateJSON(vm: ChatViewModel) {
+    func buildStateJSON(vm: ChatViewModel) -> String {
         let promptText = vm.effectiveSystemPrompt
         let fingerprint = String(promptText.prefix(60)).replacingOccurrences(of: "\n", with: " ")
         let hasOverride = systemPromptOverride != nil
         let liveID = vm.llmService.activeModelID
         let hasSummary = !vm.injectedSummary.isEmpty
         let ms = vm.memoryStore
-        let state = """
+        return """
         {
           "modelID": "\(liveID)",
           "conversationId": "\(vm.conversationId)",
@@ -13363,6 +13402,11 @@ class HalTestConsole: ObservableObject {
           "systemPromptFingerprint": "\(fingerprint)..."
         }
         """
+    }
+
+    func writeStateJSON(vm: ChatViewModel) {
+        let state = buildStateJSON(vm: vm)
+        try? FileManager.default.createDirectory(at: baseDir, withIntermediateDirectories: true)
         try? state.write(to: stateFile, atomically: true, encoding: .utf8)
     }
 
@@ -13618,9 +13662,9 @@ class LocalAPIServer {
             l.stateUpdateHandler = { state in
                 switch state {
                 case .ready:
-                    let address = "\(LocalAPIServer.localIPAddress()):\(LocalAPIServer.apiPort)"
-                    print("LocalAPI: Ready at \(address)")
                     let token = Self.loadOrCreateToken()
+                    let address = "\(LocalAPIServer.localIPAddress()):\(LocalAPIServer.apiPort)"
+                    print("LocalAPI: Ready at \(address) token:\(token)")
                     DispatchQueue.main.async {
                         UIPasteboard.general.string = "\(LocalAPIServer.localIPAddress()):\(LocalAPIServer.apiPort):\(token)"
                     }
@@ -13792,13 +13836,8 @@ class LocalAPIServer {
         }
         return await withCheckedContinuation { cont in
             Task { @MainActor in
-                vm.testConsole.writeStateJSON(vm: vm)
-                if let data = try? Data(contentsOf: vm.testConsole.stateFile),
-                   let json = String(data: data, encoding: .utf8) {
-                    cont.resume(returning: (200, json))
-                } else {
-                    cont.resume(returning: (500, "{\"error\":\"State unavailable\"}"))
-                }
+                let json = vm.testConsole.buildStateJSON(vm: vm)
+                cont.resume(returning: (200, json))
             }
         }
     }

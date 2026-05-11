@@ -1,7 +1,7 @@
 # Hal Universal — Handoff Brief
-**Updated:** May 2026
+**Updated:** May 11, 2026 (post-architectural-fix landing)
 **For:** Next Claude Code instance
-**Written by:** CC instance, end-of-context (mlx-experiment branch)
+**Branch:** mlx-experiment
 
 ---
 
@@ -11,107 +11,194 @@ After any significant code change, build, or test run — update this file and m
 
 ---
 
+## Latest Win (May 11, 2026): MLX Architectural Fix Landed
+
+### What changed
+`MLXWrapper.generate()` in Hal.swift was rewritten using Apple's reference pattern from `mlx-swift-examples/Applications/LLMEval/ViewModels/LLMEvaluator.swift`. Replaced:
+
+```swift
+// OLD — deprecated synchronous callback, ran inside container.perform which holds
+// the AsyncMutex for the entire duration → ~150-200s per response
+let result = try await container.perform { context in
+    try MLXLMCommon.generate(input:, parameters:, context:) { tokens in ... }
+}
+```
+
+With:
+
+```swift
+// NEW — Apple's LLMEval pattern. Lock held only for prefill, stream iterated free.
+let lmInput = try await container.prepare(input: UserInput(prompt: prompt))
+let stream = try await container.generate(input: lmInput, parameters: ...)
+for await generation in stream { ... }
+```
+
+### Measured impact
+- Before: 150-200 seconds per response (one short turn against Gemma 4 E2B 4-bit on iPhone 16 Plus)
+- After: 11-14 seconds per response (same model, same phone, same prompt)
+- **~13x speedup**
+
+### How we proved MLX was the path taken
+Added temporary `[MLX-WAS-USED]` prefix to MLXWrapper.generate's return value, redeployed, sent a turn. Response came back tagged `[MLX-WAS-USED] ...`. Removed the diagnostic before committing. The current iPhone build still has the diagnostic baked in — next deploy will replace it with the clean version.
+
+### Ground truth from Apple's own code
+Built and deployed `LLMEval` (from `/Users/markfriedlander/Desktop/Fun/mlx-swift-examples/`) to the same iPhone 16 Plus with Gemma 4 E2B 4-bit. Result:
+- **33.5 tokens/sec sustained**
+- **2.25s time-to-first-token**
+- **50 tokens generated in 1.5s**
+- **Memory: 2.45 GB**
+
+This is the iPhone Gemma 4 E2B 4-bit tok/s number that no one had published. We now have it.
+
+### Why the prior synchronous code was so slow
+`ModelContainer.perform` calls `SerialAccessContainer.read` which holds an `AsyncMutex` for the entire body. With the synchronous callback API, `runSynchronousGenerationLoop` runs inside this lock. Putting `for await` inside `container.perform` doesn't help either — the generation Task inherits the actor isolation and competes for the same serial executor as the consumer. The correct pattern releases the lock after prefill (in `container.generate`) and iterates the stream outside any lock. The MLX team designed `ModelContainer.generate(input:parameters:)` (lines 184-206 of ModelContainer.swift) precisely for this.
+
+---
+
+## ⚠️ Big Open Issue: Hal's Prompt Format is Incompatible with Chat Models
+
+This is the **next priority** after the MLX speed fix.
+
+### Symptom
+After the speed fix, Gemma generates fast — but its output is the prompt structure echoed back. Example: ask "Hi" with maxTokens=50, response is:
+
+```
+#=== BEGIN MEMORY_SHORT ===#
+
+Recent conversation history (verbatim):
+[user]: Hi
+
+#=== END MEMORY_SHORT ===#
+#=== BEGIN USER ===#
+
+Hi
+
+#=== END USER#
+#
+```
+
+(Truncated mid-marker because maxTokens=50.)
+
+### Root cause
+Hal's prompt builder (`buildPromptHistory`) constructs a single prompt string with custom `#=== BEGIN SECTION ===#` / `#=== END SECTION ===#` markers. This design was for **raw completion models** like Phi-3 base, where the model continues from the prompt's end without any chat template wrapping.
+
+Gemma 4 (and AFM, and most modern instruction-tuned models) are **chat-template models**. When `UserInput(prompt: prompt)` is constructed, the model's chat template wraps the entire Hal prompt as a single user message. Gemma then sees the marker pattern in its "user input" and treats it as a structural pattern to continue — so it emits more markers instead of natural content.
+
+### What needs to happen
+Refactor Hal's prompt construction to produce proper chat structures:
+
+```swift
+let userInput = UserInput(
+    chat: [
+        .system(systemPromptText),
+        .user(userMessageText)
+    ],
+    additionalContext: ["enable_thinking": false]
+)
+```
+
+The current marker-delimited sections (SYSTEM, MEMORY_SHORT, SUMMARY, MEMORY_LONG, USER, etc.) need to be reorganized into either:
+- A single rich system message + a clean user message, or
+- The system message + a multi-turn chat history (`[.system, .assistant, .user, .assistant, .user, ...]`)
+
+The latter is more idiomatic and would let chat models use their training to recognize conversation flow. But it requires Hal to track the chat history natively rather than reconstructing it as one big string.
+
+This is a substantial refactor — likely 1-2 sessions of careful work. Discussion required with Mark before starting.
+
+### Same issue affects AFM too
+Same prompt format is used for AFM (line 4127-4143 in Hal.swift, `LanguageModelSession().streamResponse { Prompt(prompt) }`). AFM also wraps responses in marker syntax. AFM tolerates it better (still produces some real content) but the architecture is wrong for chat models.
+
+---
+
+## Display Bug: vm.selectedModel.id vs llmService.activeModelID
+
+Minor cosmetic issue, not blocking but worth knowing about:
+
+- `buildStateJSON` reads `vm.llmService.activeModelID` — correct, follows LLMService.currentModel
+- `buildOutputJSON` reads `vm.selectedModel.id` — vm.selectedModel is a computed property using `ModelCatalogService.shared.getModel(byID: selectedModelID)` which **falls back to ModelConfiguration.appleFoundation when the catalog doesn't have the model**
+
+Hal's catalog appears to start empty for non-AFM models until UI interaction fetches it from HuggingFace. So when SWITCH_MODEL routes Gemma via `switchToModel`'s fallback path (line 13296+ in Hal.swift), LLMService gets a proper Gemma config but the catalog never receives one. Result: `vm.selectedModel` returns AFM as fallback. The `/chat` response payload then shows `"model": "apple-foundation-models"` even though Gemma did the work.
+
+**Fix:** Either (a) populate ModelCatalogService when switchToModel uses the minimal-config fallback, or (b) change buildOutputJSON to use `vm.llmService.activeModelID`.
+
+---
+
 ## Current Branch: `mlx-experiment`
 
-This branch is **the philosophical Hal** — the full version with MLX local inference, multi-model support, and the complete philosophical architecture. It branches from commit `4146bc8` ("Freeze: Philosophical Hal — architecture complete, suspended pending better local model generation").
+This branch is **the philosophical Hal** — the full version with MLX local inference, multi-model support, and the complete philosophical architecture. Branches from `4146bc8`.
 
 The main branch contains **Hal LMC** (stripped to AFM-only private memory layer). These are parallel futures. mlx-experiment is where local model quality is being validated.
 
-### Git History (This Work)
-- `c892830` — mlx-experiment: LocalAPIServer + model management commands
-- `64fe574` — mlx-experiment: LocalAPIServer + HalTestConsole rewrite (fixes)
-- `cc0742c` — mlx-experiment: Thread navigation, memory stats, recency, cancel download
-- `da7c24c` — mlx-experiment: Document import/list/delete via API
+### Git History (mlx-experiment)
+- `c892830` — LocalAPIServer + model management commands
+- `64fe574` — LocalAPIServer + HalTestConsole rewrite
+- `cc0742c` — Thread navigation, memory stats, recency, cancel download
+- `da7c24c` — Document import/list/delete via API
+- `6788d47` — Update HANDOFF_BRIEF for mlx-experiment branch state
+- `5b23faa` — API on by default, copies IP to clipboard on start
+- `6424989` — Clipboard ip:port:token format + autodiscover command
+- **(this session)** — MLX architectural fix landed
 
 ---
 
-## The Mission Right Now
-
-Validate whether **Gemma 4 E2B 4-bit** (3.58 GB, `mlx-community/gemma-4-e2b-it-4bit`) can run on iPhone 16 and produce quality sufficient for the philosophical Hal use case.
-
-**Primary target: iPhone 16.** Not Mac. If it doesn't run on iPhone, the philosophical branch doesn't work.
-
-**Open question:** 4-bit at 3.58 GB may OOM on iPhone 16 (8GB RAM, iOS aggressive about memory). Community reports suggest ~40 tok/s, but it's tight. If it fails, the 2-bit path requires cloud conversion (~18GB RAM, Mark's 8GB Mac is insufficient).
-
-**No 2-bit MLX Gemma 4 exists yet.** Only GGUF (Unsloth 2-bit UD-IQ2_M at 2.29 GB). GGUF requires an entirely separate inference engine — not currently supported, not recommended unless 4-bit definitively fails on iPhone.
-
----
-
-## Autonomous Build + Launch
+## Autonomous Build + Launch (iPhone 16 Plus)
 
 ```bash
 # Build
 xcodebuild build \
   -project "/Users/markfriedlander/Desktop/Fun/Hal Universal/Hal Universal.xcodeproj" \
   -scheme "Hal Universal" \
-  -destination "id=00008112-0010193C3A88C01E" \
+  -destination "id=D24FB384-9C55-5D33-9B0D-DAEBFA6528D6" \
   -configuration Debug \
   2>&1 | grep -E "error:|BUILD SUCCEEDED|BUILD FAILED"
 
-# Install + Launch (requires Xcode open with project loaded)
-osascript << 'EOF'
-tell application "Xcode"
-    stop active workspace document
-    delay 2
-    run active workspace document
-end tell
-EOF
+# Install
+xcrun devicectl device install app \
+  --device D24FB384-9C55-5D33-9B0D-DAEBFA6528D6 \
+  "/Users/markfriedlander/Library/Developer/Xcode/DerivedData/Hal_Universal-cchnecnyhpxmoeczheicasvhbcqp/Build/Products/Debug-iphoneos/Hal Universal.app"
+
+# Launch
+xcrun devicectl device process launch \
+  --device D24FB384-9C55-5D33-9B0D-DAEBFA6528D6 \
+  com.MarkFriedlander.Hal-Universal
 ```
 
-**Mac destination ID:** `00008112-0010193C3A88C01E`  
-**Container:** `~/Library/Containers/68B65A35-9706-4B97-B34C-43E2F6C8DA20/`  
-**DB:** `~/Library/Containers/68B65A35-9706-4B97-B34C-43E2F6C8DA20/Data/Documents/hal_conversations.sqlite`  
-**Nuclear reset:** `rm -rf ~/Library/Containers/68B65A35-9706-4B97-B34C-43E2F6C8DA20/`
+**iPhone 16 Plus device ID:** `D24FB384-9C55-5D33-9B0D-DAEBFA6528D6`
+**WiFi IP:** `192.168.12.206` (may drift — verify via `tests/.hal_api_config.json`)
+**API token:** `e9ee9ec5b315467fa655bd4296873f43`
+**Bundle ID for devicectl:** `com.MarkFriedlander.Hal-Universal`
+
+---
+
+## Reference: LLMEval Test App (Validated Baseline)
+
+Located at: `/Users/markfriedlander/Desktop/Fun/mlx-swift-examples/Applications/LLMEval/`
+
+- Config modified to use Gemma 4 E2B 4-bit (LLMEvaluator.swift line 50)
+- maxTokens capped at 50 (LLMEvaluator.swift line 21)
+- DEVELOPMENT_TEAM set to `FBUNBDS7R7` in project.pbxproj (14 instances)
+- Bundle ID on iPhone: `mlx.LLMEvalFBUNBDS7R7`
+
+**Use this app whenever Hal generation looks suspicious.** It's our ground truth. If LLMEval is fast and Hal is slow, the bug is in Hal. If both are slow, the bug is downstream (model, MLX framework, hardware).
 
 ---
 
 ## Test Runner — `tests/hal_test.py`
 
-Single durable test runner. Never reinvent. Run from project root.
+Run from project root. Existing config in `tests/.hal_api_config.json`.
 
-### First-Time HTTP Setup (one-time per device)
-1. In Hal: Settings → Power User → Developer API → toggle ON
-2. Copy the token shown in the UI
-3. `python3 tests/hal_test.py setup <ip> 8765 <token>`
-4. Config saved to `tests/.hal_api_config.json` — auto-used forever after
-
-**Existing config:** `tests/.hal_api_config.json` with `{"host": "127.0.0.1", "port": 8765, "token": "6e03f0b11dd8497cb6bea95c004f34c1"}`  
-(Token was copied from UI — verify it's still valid after any nuclear reset)
-
-### Commands
+### Commands used this session
 ```bash
-python3 tests/hal_test.py setup <ip> 8765 <token>   # One-time HTTP config
-python3 tests/hal_test.py state                      # Print full state
-python3 tests/hal_test.py reset                      # Nuclear reset + fresh start
-python3 tests/hal_test.py new                        # New thread (keep memory/settings)
-python3 tests/hal_test.py turn "Hello"               # Single turn
-python3 tests/hal_test.py cmd SET_TEMPERATURE:0.8    # Any command
-python3 tests/hal_test.py chat                       # Interactive REPL (reactive — reads each response)
-
-# Model management
-python3 tests/hal_test.py models                     # List all models + download status
-python3 tests/hal_test.py current_model              # Which model is active
-python3 tests/hal_test.py download <model_id>        # Start download
-python3 tests/hal_test.py model_status <model_id>    # Check progress (with bar)
-python3 tests/hal_test.py switch_model <model_id>    # Switch active model
-python3 tests/hal_test.py delete_model <model_id>    # Delete downloaded model
-python3 tests/hal_test.py cancel_download <model_id> # Cancel in-flight download
-
-# Thread management
-python3 tests/hal_test.py threads                    # List all threads
-python3 tests/hal_test.py switch_thread <id>         # Switch to thread
-python3 tests/hal_test.py messages                   # Messages in current thread
-python3 tests/hal_test.py memory_stats               # DB stats
-python3 tests/hal_test.py reflections                # Stored reflections
-
-# Documents
-python3 tests/hal_test.py list_docs                  # List imported documents
-python3 tests/hal_test.py import_doc <path>          # Import a document
-python3 tests/hal_test.py delete_doc <source_id>     # Delete a document
-
-# Scripted test files
-python3 tests/hal_test.py run tests/conversations/quality_test.txt
+python3 tests/hal_test.py state                                          # Current state
+python3 tests/hal_test.py turn "Hi"                                      # Single turn
+python3 tests/hal_test.py switch_model "mlx-community/gemma-4-e2b-it-4bit"
+python3 tests/hal_test.py cmd "SWITCH_MODEL:apple-foundation-models"     # ID is "apple-foundation-models" not "apple-foundation"
+python3 tests/hal_test.py download "mlx-community/gemma-4-e2b-it-4bit"
+python3 tests/hal_test.py cmd "DELETE_MODEL:mlx-community/gemma-4-e2b-it-4bit"
+python3 tests/hal_test.py cmd "NEW_THREAD"
 ```
+
+**Watch out:** AFM's full ID is `apple-foundation-models`, not `apple-foundation`. Using the wrong ID triggers the catalog-fallback path in `switchToModel` which creates a fake MLX config.
 
 ---
 
@@ -123,8 +210,8 @@ All commands via `POST /command {"command": "..."}` or `cmd` in test runner.
 | Command | Description |
 |---------|-------------|
 | `LIST_MODELS` | All available models with downloaded/active/sizeGB |
-| `CURRENT_MODEL` | Active model ID |
-| `SWITCH_MODEL:<id>` | Switch to model (must be downloaded or AFM) |
+| `CURRENT_MODEL` | Active model ID + display name |
+| `SWITCH_MODEL:<id>` | Switch to model (use full IDs!) |
 | `DOWNLOAD_MODEL:<id>` | Start background download |
 | `MODEL_STATUS:<id>` | Download progress (0.0–1.0) |
 | `CANCEL_DOWNLOAD:<id>` | Cancel in-flight download |
@@ -173,47 +260,6 @@ All commands via `POST /command {"command": "..."}` or `cmd` in test runner.
 
 ---
 
-## Pending Test Plan
-
-**Step 1: Build and deploy**
-```bash
-xcodebuild build ... && osascript ...  # (see above)
-```
-
-**Step 2: Enable Developer API in app**
-- Settings → Power User → Developer API → ON
-- Verify token matches `tests/.hal_api_config.json`
-
-**Step 3: Verify connection**
-```bash
-python3 tests/hal_test.py state
-```
-
-**Step 4: Download Gemma 4 E2B 4-bit**
-```bash
-python3 tests/hal_test.py download mlx-community/gemma-4-e2b-it-4bit
-python3 tests/hal_test.py model_status mlx-community/gemma-4-e2b-it-4bit  # Poll until 1.0
-```
-
-**Step 5: Switch to Gemma and test**
-```bash
-python3 tests/hal_test.py switch_model mlx-community/gemma-4-e2b-it-4bit
-python3 tests/hal_test.py chat
-```
-
-**Step 6: Quality evaluation**
-- Philosophical depth — can it engage with questions about consciousness, identity, uncertainty?
-- Coherence over a long conversation
-- Does it respect the soul document / self-knowledge?
-- Does it confabulate or hallucinate?
-
-**Step 7: iPhone test**
-- Deploy to iPhone 16 (not Mac)
-- Does the model load without OOM?
-- Is generation speed acceptable?
-
----
-
 ## Architecture Notes (mlx-experiment)
 
 ### What's Active
@@ -224,30 +270,20 @@ python3 tests/hal_test.py chat
 - Document import (text, PDF) → RAG-searchable
 - Source code self-knowledge (Hal.swift → RAG)
 - Temporal awareness
-- Self-knowledge DB table (exists, but prompt injection has a known bug)
 - LocalAPIServer (Block 32) — HTTP on port 8765
 - HalTestConsole (Block 32) — full programmatic control
 
-### Gemma 4 Architecture
-- Registered in mlx-swift-lm 3.31.3 as `"gemma4"` and `"gemma4_text"` in LLMModelFactory
-- Three API migration fixes were applied in an earlier session:
-  - `loadContainer` signature update
-  - `tokenIds:` rename
-  - `CharacterSet` explicit type
-- Build is clean — the architecture issue is resolved
+### Gemma 4 E2B 4-bit Status
+- Architecture registered in mlx-swift-lm 3.31.3 as `"gemma4"` and `"gemma4_text"`
+- Model loads in ~30s on iPhone 16 Plus, uses ~2.5 GB RAM
+- **Generation works at ~30 tok/s (LLMEval-measured) when prompt format is correct**
+- **Generation in Hal is fast (11-14s/turn) but content is broken due to prompt format**
 
-### VincentGourbin vs Official
-- Used **official** `mlx-swift-lm 3.31.3` from ml-explore (NOT VincentGourbin)
-- VincentGourbin's Gemma4Swift was a pre-release proof-of-concept, superseded by official support
-- Gemma 4 works natively in the official package
-
-### Memory Architecture (unchanged from main)
-- `buildExclusionClause` uses surgical STM-only exclusion (`turn_number IN (excludeTurns)`)
-- `decideTools()` YES/NO RAG gate with real STM context
-- `injectedSummary` persists across turns once set
-- Summarization blocks the next response (`summarizationTask` awaited at turn start)
+### Memory Architecture (unchanged)
+- `buildExclusionClause` uses surgical STM-only exclusion
+- `decideTools()` hardwired to AFM (RAG gate never uses Gemma — fixes double-MLX-call bug)
 - Cosine similarity dedup before RAG injection (threshold 0.85 default)
-- CONVERSATION_FACTS: **fully removed** — not in DB, not in code
+- CONVERSATION_FACTS: fully removed
 
 ---
 
@@ -258,21 +294,12 @@ python3 tests/hal_test.py chat
 
 ---
 
-## Open Bugs / Known Issues
-- Self-knowledge table exists but is **NOT injected into prompts correctly** (known bug, not fixed)
-- Mac UI rendering is broken (low priority — iPhone is primary)
-- Apple Watch times out (not priority for Phase 1)
-- `sizeGB` may be nil at download start causing progress jump — add `HALDEBUG-PROGRESS` if needed
-
----
-
-## If 4-bit Fails on iPhone
-
-Option A: **Wait** — MLX community is actively working on 2-bit Gemma 4 MLX.
-
-Option B: **Cloud conversion** — `mlx_lm.convert --hf-path mlx-community/gemma-4-e2b-it-4bit --quantize --q-bits 2` requires ~18GB RAM. Mark's M2 Mac has 8GB — insufficient. Needs cloud machine.
-
-Option C: **GGUF** — Unsloth 2-bit Gemma 4 E2B exists at 2.29 GB. Requires entirely separate inference engine (llama.cpp). Not implemented. Only pursue if MLX path is definitively dead.
+## Open Bugs / Known Issues (Priority Order)
+1. **🔴 Prompt format incompatible with chat models** — see big section above. Gemma & AFM both echo Hal's `#=== BEGIN ===#` markers. Top priority.
+2. **🟡 vm.selectedModel.id catalog fallback** — display bug only, response tags wrong model name. See above.
+3. Self-knowledge table exists but is NOT injected into prompts correctly (predates today)
+4. Mac UI rendering is broken (low priority)
+5. Apple Watch times out (not priority)
 
 ---
 
@@ -280,5 +307,7 @@ Option C: **GGUF** — Unsloth 2-bit Gemma 4 E2B exists at 2.29 GB. Requires ent
 - **No third-party libraries** without explicit discussion
 - **One block at a time** — surgical changes, build clean after each block
 - **Discussion before code** — always
-- **CONVERSATION_FACTS is gone** — do not re-introduce without full design discussion
-- **iPhone is primary target** — Mac is secondary; evaluate all decisions against iPhone 16 constraints
+- **CONVERSATION_FACTS is gone** — do not re-introduce
+- **iPhone is primary target** — evaluate all decisions against iPhone 16 constraints
+- **120-second MLX test timeout** — never let a generation test run more than 2 minutes without a result
+- **Test with LLMEval first** when in doubt about whether MLX/model/hardware is working — it's ground truth
