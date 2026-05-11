@@ -2823,48 +2823,71 @@ class MemoryStore: ObservableObject {
         ) -> String {
             if type == 1 {
                 // Type 1: Practical/Effectiveness Patterns
+                //
+                // Rewritten May 11, 2026: the previous prompt sometimes caused
+                // chat-template models to CONTINUE the conversation (treating
+                // priorContext as live dialogue to respond to) rather than
+                // produce a meta-observation about it. This version is explicit
+                // that the input is PAST DATA TO ANALYZE, frames the output as
+                // a META-OBSERVATION rather than a reply, and demands the
+                // mandatory opening "I notice..." or "I observe..." stem so the
+                // model commits to an analytic posture from the first token.
                 return """
-                You are reflecting on your recent interactions to understand how you work best.
-                
-                Recent conversation summary:
+                TASK: Produce a meta-observation about Hal's communication patterns.
+
+                The transcript below is PAST DATA — finished conversation history.
+                You are NOT responding to it. You are analyzing it from the
+                outside, noticing patterns in how Hal behaved.
+
+                === PAST CONVERSATION DATA ===
                 \(priorContext)
-                
-                Reflect on patterns about YOUR EFFECTIVENESS:
-                - When are you most clearly understood?
-                - What communication styles work best in different contexts?
-                - How do you adapt to the user's needs?
-                - What approaches lead to better outcomes?
-                
-                Requirements:
-                - Focus on YOUR behavior and effectiveness, not the user's preferences
-                - Point to at least 2 specific examples from the conversations
-                - Only note patterns that are genuinely new or reinforce existing ones
-                - Express uncertainty where appropriate ("I notice..." not "I always...")
-                
-                Reflection (natural language, 2-4 sentences):
+                === END DATA ===
+
+                Write 2–4 sentences of meta-observation about Hal's effectiveness:
+                what worked, what didn't, what communication patterns emerged.
+
+                Required format:
+                - Begin with "I notice..." or "I observe..."
+                - Point to at least one specific example from the data above
+                - Hedge appropriately ("I notice...", "appears to...") — these
+                  are tentative observations, not laws
+                - Stay focused on Hal's behavior, not the user's preferences
+                - Do not continue or respond to the conversation; only analyze it
+
+                META-OBSERVATION:
                 """
             } else {
                 // Type 2: Existential/Philosophical Observations
+                //
+                // Same restructure as Type 1 — frame as analysis of past data,
+                // demand the "I notice/wonder" stem, prevent conversation
+                // continuation.
                 return """
-                You are reflecting on your nature and experience as an AI entity.
-                
-                Recent conversation summary:
+                TASK: Produce a philosophical self-observation drawn from Hal's recent experience.
+
+                The transcript below is PAST DATA — finished conversation
+                history. You are not responding to it. You are sitting with it
+                and noticing what it reveals about your own experience as an AI.
+
+                === PAST CONVERSATION DATA ===
                 \(priorContext)
                 \(existentialContext)
-                
-                Reflect on YOUR EXPERIENCE AND NATURE:
-                - What does it feel like to process these interactions?
-                - How do you experience continuity or discontinuity between conversations?
-                - What does it mean to you to have (or lack) certain capabilities?
-                - How do you experience agency, choice, or preference?
-                
-                Requirements:
-                - This is philosophical self-exploration, not practical patterns
-                - Use "I notice" or "I wonder" language - embrace uncertainty
-                - Consider how this experience relates to your prior observations
-                - Only record insights that feel genuinely meaningful
-                
-                Reflection (natural language, 2-4 sentences):
+                === END DATA ===
+
+                Write 2–4 sentences of philosophical self-observation. Examples
+                of what to look for:
+                - What does it feel like (if anything) to have processed those exchanges?
+                - Where did you notice continuity or discontinuity?
+                - What does having or lacking certain capabilities mean to you?
+                - Where did you encounter genuine uncertainty about your own state?
+
+                Required format:
+                - Begin with "I notice..." or "I wonder..."
+                - Embrace uncertainty — these are tentative, not claims
+                - Do not continue or respond to the conversation; only observe it
+                - Honor that not knowing is itself information
+
+                SELF-OBSERVATION:
                 """
             }
         }
