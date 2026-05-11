@@ -40,6 +40,9 @@ A representative exchange:
 | `d4a4115` | Step 4 — RAG long-term memory via tool router (decideTools + executeTools) |
 | `2d463a9` | Step 5 — self-awareness (stats) + self-knowledge (traits) in CONTEXT block |
 | `3d76034` | Fix catalog-fallback display bug — Hal no longer misreports himself as "Apple Intelligence" when running Gemma |
+| `13f8286` | Documentation: HANDOFF_BRIEF rewritten for the chat-path architecture |
+| `8e65ce2` | Migrate reflection / TextSummarizer / document-summary subsystems to chat path (5 callers) |
+| `cbe1ea4` | Migrate salon context-aware mode — **zero remaining callers of the old `generateResponse(prompt:)` path** |
 
 ---
 
@@ -69,13 +72,20 @@ sendMessage → runSingleModelTurn
                         → for await: accumulate .chunk text, log .info stats
 ```
 
-### Old path
+### Old path — fully dead code
 
-`buildPromptHistory` and `llmService.generateResponse(prompt:)` still exist, intact, unused for the main chat flow. They remain wired for:
-- Salon mode context-aware prompts (uses `buildContextAwarePrompt` + `generateResponse`)
-- Various utility callers (e.g. reflection generation) — these still hit the old path
+`buildPromptHistory`, `buildContextAwarePrompt`, `LLMService.generateResponse(prompt:)`, and `MLXWrapper.generate(prompt:)` still exist in the file but have **zero call sites** as of `cbe1ea4`. Verified via `grep -c "llmService.generateResponse" Hal.swift` → 0. Every subsystem that was on the old path has been migrated:
 
-We chose to leave the old code in place per the agreed plan: "broken things aren't useful, but designed intent is precious." Each old HelPML section had a year of design thinking behind it. The new path captures the same intents (SYSTEM, MEMORY_SHORT, MEMORY_LONG, SUMMARY, TEMPORAL_CONTEXT, SELF_AWARENESS, SELF_KNOWLEDGE, USER) but expressed in chat-message form. When we're confident, we can sunset the old path.
+- Main chat flow (`runSingleModelTurn`) → `buildChatMessages` + `generateChatResponse`
+- Auto-summary (`generateAutoSummary`) → `generateChatResponse` with `.system + .user` messages
+- Self-knowledge shareability decision → `generateChatResponse`
+- Free-form reflection text → `generateChatResponse`
+- Structured insight JSON extraction → `generateChatResponse`
+- TextSummarizer stage 1 → `generateChatResponse`
+- Document import summary → `generateChatResponse`
+- Salon context-aware mode (`runSalonSeat`) → `buildContextAwareChatMessages` + `generateChatResponse`
+
+We chose to leave the old code in place per the agreed plan: "broken things aren't useful, but designed intent is precious." Each old HelPML section had a year of design thinking. The new path captures the same intents (SYSTEM, MEMORY_SHORT, MEMORY_LONG, SUMMARY, TEMPORAL_CONTEXT, SELF_AWARENESS, SELF_KNOWLEDGE, USER) but expressed in chat-message form. The dead code can be deleted whenever — it's a future cleanup, not a blocker.
 
 ### Key model files on disk (per app sandbox)
 
@@ -214,11 +224,13 @@ Located at `/Users/markfriedlander/Desktop/Fun/mlx-swift-examples/Applications/L
 
 ## Open Issues (Priority Order)
 
-1. **Self-knowledge table is empty.** `buildSelfKnowledgeContext()` now correctly injects whatever is in the `self_knowledge` DB table — but the table starts empty. The original "self-knowledge not injected" bug from earlier HANDOFF_BRIEF appears to have been the chat-template issue (now fixed). The remaining question is: is there code that POPULATES the table? Investigate next.
-2. **Salon mode + reflection generation** still on the old `buildPromptHistory` + `generateResponse` path. They'll work for AFM but produce degenerate output for chat-template models. Migrate when needed.
-3. **RAG dedup / per-snippet summarization** dropped in Step 4 for simplicity. Re-add the cosine dedup and `TextSummarizer.summarizeWithVerification` for snippets exceeding `longTermSnippetSummarizationThreshold` when conversation length warrants it.
-4. **Mac UI broken** (low priority — iPhone is primary).
-5. **Apple Watch times out** (low priority).
+1. ~~Self-knowledge table empty~~ — investigated; was a symptom of the chat-template bug. `initializeCoreIdentity()` seeds 4 entries on first launch, and reflections add more over time. **Resolved.**
+2. ~~Salon mode + reflection on old path~~ — **migrated `8e65ce2` + `cbe1ea4`. Resolved.**
+3. **RAG dedup / per-snippet summarization** dropped in Step 4 for simplicity. Re-add the cosine dedup and `TextSummarizer.summarizeWithVerification` for snippets exceeding `longTermSnippetSummarizationThreshold` when conversation length warrants it. Optimization, not blocking.
+4. **Reflection prompt structure** sometimes produces reflections that are Hal's continuation of the previous turn rather than meta-observations. Polish item — rewrite the reflection prompt to be more directive ("META-OBSERVATION:" rather than free-form). Low priority.
+5. **Mac UI broken** (low priority — iPhone is primary).
+6. **Apple Watch times out** (low priority).
+7. **Dead code cleanup** — `buildPromptHistory`, `buildContextAwarePrompt`, `LLMService.generateResponse(prompt:)`, `MLXWrapper.generate(prompt:)` have zero callers but remain in the file. Safe to delete whenever; preserved as reference for now.
 
 ---
 
