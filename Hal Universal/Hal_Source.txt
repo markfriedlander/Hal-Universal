@@ -9610,8 +9610,11 @@ class ChatViewModel: ObservableObject {
                                                                             //   STEP 2: temporal awareness (date, time of day, weekday, device, etc.)
                                                                             //   STEP 3: injected conversation summary when older turns compressed
                                                                             //   STEP 4: RAG snippets from long-term memory (relevant past content)
+                                                                            //   STEP 5: self-awareness (stats) + self-knowledge (persistent traits)
+                                                                            //           when enableSelfKnowledge is true
                                                                             // Original intent: situate Hal in time + carry compressed and retrieved
-                                                                            // context. Chat form folds it all into the system message as background.
+                                                                            // context + give Hal awareness of himself. Chat form folds it all into
+                                                                            // the system message as background.
                                                                             var contextSections: [String] = []
 
                                                                             let temporalRaw = buildTemporalContext()
@@ -9625,6 +9628,30 @@ class ChatViewModel: ObservableObject {
 
                                                                             if !injectedSummary.isEmpty {
                                                                                 contextSections.append("Summary of earlier conversation:\n\(injectedSummary)")
+                                                                            }
+
+                                                                            // STEP 5: Self-awareness (stats) + self-knowledge (persistent traits).
+                                                                            // Mapping: old SELF_AWARENESS + SELF_KNOWLEDGE marker sections fold into
+                                                                            // the same CURRENT CONTEXT block. Only included when the user has
+                                                                            // enableSelfKnowledge turned on.
+                                                                            if enableSelfKnowledge {
+                                                                                let selfAwarenessRaw = buildSelfAwarenessContext()
+                                                                                let selfAwarenessBody = selfAwarenessRaw
+                                                                                    .replacingOccurrences(of: "#=== BEGIN SELF_AWARENESS ===#", with: "")
+                                                                                    .replacingOccurrences(of: "#=== END SELF_AWARENESS ===#", with: "")
+                                                                                    .trimmingCharacters(in: .whitespacesAndNewlines)
+                                                                                if !selfAwarenessBody.isEmpty {
+                                                                                    contextSections.append(selfAwarenessBody)
+                                                                                }
+
+                                                                                let selfKnowledgeRaw = buildSelfKnowledgeContext()
+                                                                                let selfKnowledgeBody = selfKnowledgeRaw
+                                                                                    .replacingOccurrences(of: "#=== BEGIN SELF_KNOWLEDGE ===#", with: "")
+                                                                                    .replacingOccurrences(of: "#=== END SELF_KNOWLEDGE ===#", with: "")
+                                                                                    .trimmingCharacters(in: .whitespacesAndNewlines)
+                                                                                if !selfKnowledgeBody.isEmpty {
+                                                                                    contextSections.append(selfKnowledgeBody)
+                                                                                }
                                                                             }
 
                                                                             // STEP 4: RAG via tool router. decideTools is a YES/NO gate (AFM-routed
