@@ -10572,18 +10572,21 @@ class ChatViewModel: ObservableObject {
                                                                         }
                                                                         try? await Task.sleep(nanoseconds: 300_000_000)
                                                                         
-                                                                        // Build Context-Aware prompt with slim system prompt and summarized history
-                                                                        let prompt = await buildContextAwarePrompt(userInput: userInput, seatPosition: seatPosition)
-                                                                        
+                                                                        // Build Context-Aware messages with slim system prompt and summarized history
+                                                                        let chatMessages = await buildContextAwareChatMessages(userInput: userInput, seatPosition: seatPosition)
+                                                                        // Synthetic "prompt" string for downstream diagnostics (tokenBreakdown,
+                                                                        // fullPromptUsed) — same approach as runSingleModelTurn.
+                                                                        let prompt = chatMessages.map { "[\($0.role.rawValue)] \($0.content)" }.joined(separator: "\n\n")
+
                                                                         // Status: Formulating reply
                                                                         if let i = messages.firstIndex(where: { $0.id == pid }) {
                                                                             messages[i].content = "Formulating a reply..."
                                                                         }
                                                                         try? await Task.sleep(nanoseconds: 300_000_000)
-                                                                        
-                                                                        print("HALDEBUG-SALON: Sending context-aware prompt to model (\(prompt.count) chars)")
+
+                                                                        print("HALDEBUG-SALON: Sending \(chatMessages.count) context-aware chat messages to model")
                                                                         let t0 = Date()
-                                                                        finalText = try await llmService.generateResponse(prompt: prompt, temperature: temperature)
+                                                                        finalText = try await llmService.generateChatResponse(messages: chatMessages, temperature: temperature)
                                                                         modelTime = Date().timeIntervalSince(t0)
                                                                         print("HALDEBUG-SALON: Context-aware generation complete. Length: \(finalText.count)")
                                                                         
@@ -10671,6 +10674,38 @@ class ChatViewModel: ObservableObject {
                                                                 }
                                                                 
                                                                 // Build Context-Aware prompt with slim system and summarized history
+                                                                /// Chat-message-shaped equivalent of buildContextAwarePrompt. Same intent
+                                                                /// (slim multi-perspective system prompt + conversation summary + current
+                                                                /// user input) but expressed as [HalChatMessage] so it can flow through
+                                                                /// generateChatResponse with chat-template models like Gemma 4.
+                                                                private func buildContextAwareChatMessages(userInput: String, seatPosition: Int) async -> [HalChatMessage] {
+                                                                    let slimSystemPrompt = """
+                                                                    You are Hal, an AI assistant participating in a multi-perspective discussion.
+
+                                                                    Your role: Provide your unique perspective on the user's question.
+
+                                                                    Guidelines:
+                                                                    - Be concise and focused
+                                                                    - Complement other perspectives, don't repeat them
+                                                                    - Stay relevant to the user's question
+                                                                    """
+
+                                                                    let currentTurnSeats = getCurrentTurnSeatsResponses(beforeSeat: seatPosition)
+                                                                    let conversationSummary = await generateSalonContextSummary(includeCurrentTurnSeats: currentTurnSeats)
+
+                                                                    let systemMessage: String
+                                                                    if conversationSummary.isEmpty {
+                                                                        systemMessage = slimSystemPrompt
+                                                                    } else {
+                                                                        systemMessage = "\(slimSystemPrompt)\n\nCONVERSATION SO FAR (summarised):\n\(conversationSummary)"
+                                                                    }
+
+                                                                    return [
+                                                                        .system(systemMessage),
+                                                                        .user(userInput)
+                                                                    ]
+                                                                }
+
                                                                 private func buildContextAwarePrompt(userInput: String, seatPosition: Int) async -> String {
                                                                     // Slim system prompt for context-aware mode
                                                                     let slimSystemPrompt = """
