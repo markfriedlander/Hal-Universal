@@ -7540,12 +7540,37 @@ struct WidgetTestView: View {
         let messageIndex: Int
         @EnvironmentObject var chatViewModel: ChatViewModel
         @State private var showingDetails: Bool = false
-        // Provide screen width directly
+
+        // Provide screen width directly.
+        //
+        // BUG FIX (Mark report, May 11, 2026): the original implementation
+        // filtered scenes by `activationState == .foregroundActive`. On a
+        // freshly-reloaded conversation (cold launch, app returning from
+        // background, or list rebuilt via `.id(messagesVersion)`), the scene
+        // can briefly be in `.foregroundInactive` while views are computing
+        // layout. That made screenWidth return 0, which collapsed
+        // `.frame(maxWidth: screenWidth * 0.90)` to 0 — text wrapped to zero
+        // width and became invisible while the footer (which has no width
+        // constraint) still rendered. Tapping the input gave the keyboard
+        // safe-area-change re-layout that re-evaluated this property when
+        // the scene was finally `.foregroundActive`, hence "the text shows
+        // again after I tap the box."
+        //
+        // Fixed by:
+        //   1. Accepting any non-background scene (handles `.foregroundInactive`)
+        //   2. Falling back to UIScreen.main.bounds.width if no scene resolves
+        //   3. Final fallback to 390 (iPhone 16 logical width) so we never
+        //      return 0 even in pathological launch sequences
         private var screenWidth: CGFloat {
-            let scene = UIApplication.shared.connectedScenes
-                .compactMap { $0 as? UIWindowScene }
-                .first { $0.activationState == .foregroundActive }
-            return scene?.screen.bounds.width ?? 0
+            if let scene = UIApplication.shared.connectedScenes
+                .compactMap({ $0 as? UIWindowScene })
+                .first(where: { $0.activationState != .background }) {
+                let w = scene.screen.bounds.width
+                if w > 0 { return w }
+            }
+            let mainWidth = UIScreen.main.bounds.width
+            if mainWidth > 0 { return mainWidth }
+            return 390 // iPhone 16 logical width — safe fallback so maxWidth is never 0
         }
         
         // SALON MODE FIX: Use stored turnNumber from database instead of calculating from array position
