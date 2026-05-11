@@ -4106,6 +4106,11 @@ class MLXWrapper: ObservableObject {
 
     // TEMPERATURE CHANGE 1/6: Add temperature parameter with default
     // Function to generate response using the MLX model (non-streaming)
+    //
+    // ⚠️ DEAD CODE — INTENTIONALLY PRESERVED.
+    // Replaced by `generateChat(messages:temperature:)`. As of cbe1ea4
+    // (May 11, 2026) nothing calls this function. Kept as reference for the
+    // single-string-prompt design pattern. Safe to delete whenever.
     func generate(prompt: String, temperature: Double = 0.7) async throws -> String {
         guard isModelLoaded, let container = self.modelContainer else {
             throw LLMService.LLMError.modelNotLoaded
@@ -4339,6 +4344,12 @@ class LLMService: ObservableObject {
 
     // TEMPERATURE CHANGE 3/6: Add temperature parameter with default
     // Public non-streaming response function (routes to active LLM for summarization, etc.)
+    //
+    // ⚠️ DEAD CODE — INTENTIONALLY PRESERVED.
+    // Replaced by `generateChatResponse(messages:temperature:)`. As of cbe1ea4
+    // (May 11, 2026) nothing in the codebase calls this function — all
+    // subsystems flow through the chat-message path. Kept as reference for
+    // the legacy single-string-prompt design. Safe to delete whenever.
     func generateResponse(prompt: String, temperature: Double = 0.7) async throws -> String {
         // CHANGE 1/2: Add response logging to identify which model is responding
         print("HALDEBUG-RESPONSE: ðŸŽ¤ \(currentModel.displayName) (\(currentModel.source)) is responding")
@@ -9290,6 +9301,15 @@ class ChatViewModel: ObservableObject {
                                                                         /// 4. Retrieved Context/RAG (Semantically relevant facts from database)
                                                                         /// 5. Metadata (Temporal, Self-Awareness, Self-Knowledge - LOWEST PRIORITY, removed first)
                                                                         /// 6. Current User Input (The immediate query, truncated only as last resort)
+                                                                        ///
+                                                                        /// ⚠️ DEAD CODE — INTENTIONALLY PRESERVED.
+                                                                        /// As of cbe1ea4 (May 11, 2026) nothing in the codebase calls this function.
+                                                                        /// The chat-message path in `buildChatMessages` is the replacement; it
+                                                                        /// captures the same intents (system/short-term/summary/RAG/temporal/
+                                                                        /// self-awareness/self-knowledge/user) but expressed as [HalChatMessage]
+                                                                        /// for chat-template models. This function is preserved as reference for
+                                                                        /// the design thinking the HelPML format represents. Safe to delete
+                                                                        /// whenever — see HANDOFF_BRIEF "dead code cleanup" open item.
                                                                         func buildPromptHistory(
                                                                             currentInput: String = "",
                                                                             historyMessagesOverride: [ChatMessage]? = nil,
@@ -10729,6 +10749,10 @@ class ChatViewModel: ObservableObject {
                                                                     ]
                                                                 }
 
+                                                                /// ⚠️ DEAD CODE — INTENTIONALLY PRESERVED.
+                                                                /// Replaced by `buildContextAwareChatMessages(userInput:seatPosition:)`
+                                                                /// (May 11, 2026 / commit cbe1ea4). Salon mode context-aware now uses
+                                                                /// the chat-message path.
                                                                 private func buildContextAwarePrompt(userInput: String, seatPosition: Int) async -> String {
                                                                     // Slim system prompt for context-aware mode
                                                                     let slimSystemPrompt = """
