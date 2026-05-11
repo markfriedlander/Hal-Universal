@@ -4305,6 +4305,17 @@ class LLMService: ObservableObject {
         print("HALDEBUG-LLM: currentModel updated to: \(self.currentModel.displayName) (source: \(self.currentModel.source))")
         self.initializationError = nil // Clear previous errors
 
+        // Ensure this model is in the catalog. Otherwise vm.selectedModel /
+        // chat-bubble footers / Hal's self-awareness all fall back to AFM
+        // when looking up message.recordedByModel — visible as "Apple
+        // Intelligence" appearing in footers even when running Gemma.
+        // The HuggingFace catalog fetch only runs when the user enters the
+        // Model Library UI, so on a fresh launch with a downloaded MLX
+        // model selected, the catalog is empty for that model.
+        Task { @MainActor in
+            ModelCatalogService.shared.addModelIfAbsent(model)
+        }
+
         if model.source == .mlx {
             // SWITCHING TO MLX MODEL: Check if we need to load a different model
             let needsLoad = !mlxWrapper.isModelLoaded ||
