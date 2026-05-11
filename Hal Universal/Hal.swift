@@ -13002,7 +13002,19 @@ class ModelCatalogService: ObservableObject {
     func getModel(byID modelID: String) -> ModelConfiguration? {
         return availableModels.first { $0.id == modelID }
     }
-    
+
+    /// Adds a model to the catalog if its id is not already present. Used when
+    /// SWITCH_MODEL is called with a model whose full HF metadata hasn't been
+    /// fetched yet — registers a minimal configuration so subsequent
+    /// getModel(byID:) lookups return it instead of falling back to AFM
+    /// (which was previously causing vm.selectedModel to misreport).
+    func addModelIfAbsent(_ model: ModelConfiguration) {
+        if !availableModels.contains(where: { $0.id == model.id }) {
+            availableModels.append(model)
+            print("HALDEBUG-CATALOG: Registered fallback model \(model.id) (\(model.displayName))")
+        }
+    }
+
     /// Refreshes the download status for all models in catalog
     func refreshDownloadStates() {
         let downloadManager = MLXModelDownloader.shared
@@ -13720,9 +13732,14 @@ class HalTestConsole: ObservableObject {
                 sizeGB: nil, contextWindow: 4096, license: nil, description: nil,
                 isDownloaded: localPath != nil, localPath: localPath
             )
+            // Register the minimal config in the catalog so vm.selectedModel's
+            // getModel(byID:) lookup succeeds and stops falling back to AFM.
+            // Otherwise Hal would report itself as "Apple Intelligence" in
+            // SELF_AWARENESS even while actually running on this MLX model.
+            ModelCatalogService.shared.addModelIfAbsent(config)
             vm.selectedModelID = modelID
             vm.llmService.setupLLM(for: config)
-            print("HALDEBUG-TESTCONSOLE: Switched to \(shortName) (minimal config)")
+            print("HALDEBUG-TESTCONSOLE: Switched to \(shortName) (minimal config, registered in catalog)")
         }
     }
 
