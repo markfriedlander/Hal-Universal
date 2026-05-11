@@ -8883,16 +8883,19 @@ class ChatViewModel: ObservableObject {
                         fullConversationText += "\(speaker): \(message.content)\n\n"
                     }
 
-                    let summaryPrompt = """
-                    Summarize this conversation briefly. Capture the key topics, information exchanged, and any important context. Be concise. Skip greetings.
+                    // Route auto-summary through the new chat-message path so it works
+                        // for chat-template models (Gemma 4, etc.). The old generateResponse
+                        // path produces degenerate output for these models when the system
+                        // prompt is missing role markers.
+                    let summaryMessages: [HalChatMessage] = [
+                        .system("You produce brief, accurate summaries of conversations. Capture key topics, exchanged information, and important context. Be concise. Skip greetings."),
+                        .user("Summarize this conversation:\n\n\(fullConversationText)")
+                    ]
 
-                    \(fullConversationText)
-                    """
-
-                    print("HALDEBUG-MODEL: Sending summarization prompt (\(summaryPrompt.count) characters)")
+                    print("HALDEBUG-MODEL: Sending summarization via chat path (\(fullConversationText.count) characters of content)")
 
                     do {
-                        let proseSummary = try await llmService.generateResponse(prompt: summaryPrompt)
+                        let proseSummary = try await llmService.generateChatResponse(messages: summaryMessages, temperature: 0.3)
 
                         // Use await MainActor.run (not DispatchQueue.main.async) so state is
                         // guaranteed written before summarizationTask.value returns in the next turn.
@@ -9602,22 +9605,33 @@ class ChatViewModel: ObservableObject {
 
                                                                             var msgs: [HalChatMessage] = []
 
-                                                                            // STEP 0 + STEP 2: System message = Hal's identity + CURRENT CONTEXT block.
-                                                                            // The CONTEXT block carries temporal awareness (date, time of day, weekday,
-                                                                            // device, thread age, conversation pace, last inference duration). Original
-                                                                            // intent: let Hal situate himself in time and rhythm. Mapping: buildPromptHistory
-                                                                            // put TEMPORAL_CONTEXT in its own marker section; chat form folds it into
-                                                                            // the system message so the model treats it as orienting background.
+                                                                            // System message = persona + CURRENT CONTEXT block.
+                                                                            // The CONTEXT block carries:
+                                                                            //   STEP 2: temporal awareness (date, time of day, weekday, device,
+                                                                            //           thread age, pace, last inference duration)
+                                                                            //   STEP 3: conversation summary when older turns have been compressed
+                                                                            //           by generateAutoSummary (injectedSummary is non-empty)
+                                                                            // Original intent: situate Hal in time + carry compressed context
+                                                                            // beyond the verbatim short-term window. In chat form this all goes
+                                                                            // into the system message so the model treats it as background.
                                                                             let temporalRaw = buildTemporalContext()
                                                                             let temporalBody = temporalRaw
                                                                                 .replacingOccurrences(of: "#=== BEGIN TEMPORAL_CONTEXT ===#", with: "")
                                                                                 .replacingOccurrences(of: "#=== END TEMPORAL_CONTEXT ===#", with: "")
                                                                                 .trimmingCharacters(in: .whitespacesAndNewlines)
+                                                                            var contextSections: [String] = []
+                                                                            if !temporalBody.isEmpty {
+                                                                                contextSections.append(temporalBody)
+                                                                            }
+                                                                            if !injectedSummary.isEmpty {
+                                                                                contextSections.append("Summary of earlier conversation:\n\(injectedSummary)")
+                                                                            }
                                                                             let systemMessage: String
-                                                                            if temporalBody.isEmpty {
+                                                                            if contextSections.isEmpty {
                                                                                 systemMessage = effectiveSystemPrompt
                                                                             } else {
-                                                                                systemMessage = "\(effectiveSystemPrompt)\n\nCURRENT CONTEXT:\n\(temporalBody)"
+                                                                                let contextBlock = contextSections.joined(separator: "\n\n")
+                                                                                systemMessage = "\(effectiveSystemPrompt)\n\nCURRENT CONTEXT:\n\(contextBlock)"
                                                                             }
                                                                             msgs.append(.system(systemMessage))
 
