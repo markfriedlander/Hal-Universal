@@ -4204,9 +4204,9 @@ class MLXWrapper: ObservableObject {
             let promptTokenCount = lmInput.text.tokens.size
             halLog("HALDEBUG-MLX-CHAT: Input prepared in \(String(format: "%.2f", Date.timeIntervalSinceReferenceDate - generateStart))s; prompt tokens: \(promptTokenCount)")
 
-            // Near-exact LLMEval parameter shape: temp 0.6, maxTokens 50 to match the
-            // working benchmark. Once Gemma generates real prose, we'll raise these.
-            let parameters = GenerateParameters(maxTokens: 50, temperature: 0.6)
+            // maxTokens raised to 512 now that Gemma generates clean prose (chat-
+            // template fix landed in 71bbd3f). temperature uses Hal's setting.
+            let parameters = GenerateParameters(maxTokens: 512, temperature: Float(temperature))
             let stream = try await container.generate(input: lmInput, parameters: parameters)
             let streamStart = Date.timeIntervalSinceReferenceDate
 
@@ -9602,22 +9602,45 @@ class ChatViewModel: ObservableObject {
 
                                                                             var msgs: [HalChatMessage] = []
 
-                                                                            // STEP 0: System message = Hal's identity from effectiveSystemPrompt.
-                                                                            // This works cleanly for AFM (validated May 11, 2026: clean on-character
-                                                                            // response "Hello! I'm Hal, your friendly AI assistant. How can I help you today?").
-                                                                            //
-                                                                            // KNOWN BUG (open): Gemma 4 E2B 4-bit produces degenerate output through
-                                                                            // this same code path — empty / prompt-echo / repetition. LLMEval reference
-                                                                            // app on the same phone with the same model produces clean prose at 33.5
-                                                                            // tok/s. Tested: with/without system, LLMEval's exact temp/maxTokens/seed/
-                                                                            // additionalContext, iterator vs for-await — no fix found. Suspected:
-                                                                            // memory pressure (LLMEval still has Gemma loaded), or a Gemma 4 chat-
-                                                                            // template edge case we're triggering and LLMEval isn't. Investigation
-                                                                            // requires device console access (HALDEBUG-MLX-CHAT prints).
+                                                                            // STEP 0: System message — Hal's identity (effectiveSystemPrompt).
                                                                             msgs.append(.system(effectiveSystemPrompt))
+
+                                                                            // STEP 1: Conversation history as alternating .user/.assistant turns.
+                                                                            //
+                                                                            // Replaces buildPromptHistory's MEMORY_SHORT section. Original intent:
+                                                                            // give the model the most recent verbatim turns so it can reference
+                                                                            // what was just said. In chat form this becomes actual turn pairs —
+                                                                            // chat-template models understand this natively (they were trained on
+                                                                            // multi-turn conversations exactly like this).
+                                                                            //
+                                                                            // Source: vm.messages (in-memory). Filter partials (in-flight streaming
+                                                                            // placeholders). Drop the trailing user message when it equals
+                                                                            // currentInput — sendMessage() already appended it before calling us,
+                                                                            // but we'll add it ourselves at the end so role order is correct.
+                                                                            //
+                                                                            // Depth: effectiveMemoryDepth turns × 2 messages-per-turn.
+                                                                            let historyDepth = effectiveMemoryDepth * 2
+                                                                            let nonPartial = messages.filter { !$0.isPartial }
+                                                                            let trailingIsCurrentTurn: Bool = {
+                                                                                guard let last = nonPartial.last else { return false }
+                                                                                return last.isFromUser && last.content == currentInput
+                                                                            }()
+                                                                            let history: [ChatMessage] = trailingIsCurrentTurn
+                                                                                ? Array(nonPartial.dropLast().suffix(historyDepth))
+                                                                                : Array(nonPartial.suffix(historyDepth))
+
+                                                                            for msg in history {
+                                                                                if msg.isFromUser {
+                                                                                    msgs.append(.user(msg.content))
+                                                                                } else {
+                                                                                    msgs.append(.assistant(msg.content))
+                                                                                }
+                                                                            }
+
+                                                                            // Final .user — the current turn
                                                                             msgs.append(.user(currentInput))
 
-                                                                            halLog("HALDEBUG-CHAT: Built \(msgs.count) chat messages (step 0 — system + user)")
+                                                                            halLog("HALDEBUG-CHAT: Built \(msgs.count) chat messages (step 1: system + \(history.count) history + current user, depth=\(effectiveMemoryDepth))")
                                                                             return msgs
                                                                         }
 
