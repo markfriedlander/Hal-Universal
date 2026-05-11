@@ -2327,8 +2327,12 @@ class MemoryStore: ObservableObject {
             """
             
             do {
-                // Call LLM with low temperature for consistent decisions
-                let response = try await llmService.generateResponse(prompt: prompt, temperature: 0.3)
+                // Call LLM with low temperature for consistent decisions.
+                // Uses chat-message path so chat-template models (Gemma 4, etc.) work.
+                let response = try await llmService.generateChatResponse(
+                    messages: [.system("You are Hal, evaluating self-knowledge for shareability. Respond only with valid JSON."), .user(prompt)],
+                    temperature: 0.3
+                )
                 
                 // Parse JSON response
                 guard let jsonStart = response.range(of: "["),
@@ -2876,8 +2880,9 @@ class MemoryStore: ObservableObject {
                 // Type 2 (existential): 0.85 for exploratory philosophical thinking
                 let reflectionTemperature = (reflectionType == 1) ? 0.5 : 0.85
                 
-                let reflection = try await llmService.generateResponse(
-                    prompt: prompt,
+                // Chat-message path so chat-template models work.
+                let reflection = try await llmService.generateChatResponse(
+                    messages: [.system("You are Hal reflecting on your own experience and patterns."), .user(prompt)],
                     temperature: reflectionTemperature
                 )
                 
@@ -2931,9 +2936,10 @@ class MemoryStore: ObservableObject {
             """
             
             do {
-                // MODIFIED: Use temperature 0.3 for deterministic JSON generation
-                let response = try await llmService.generateResponse(
-                    prompt: structuringPrompt,
+                // Temperature 0.3 for deterministic JSON. Chat-message path so
+                // chat-template models work.
+                let response = try await llmService.generateChatResponse(
+                    messages: [.system("You are Hal converting reflection text into structured JSON. Respond ONLY with the JSON array — no markdown, no commentary."), .user(structuringPrompt)],
                     temperature: 0.3
                 )
                 
@@ -4526,7 +4532,11 @@ struct TextSummarizer {
         }
         
         do {
-            let result = try await llmService.generateResponse(prompt: prompt)
+            // Chat-message path so chat-template models (Gemma 4, etc.) work.
+            let result = try await llmService.generateChatResponse(
+                messages: [.system("You compress text faithfully while preserving meaning and attribution."), .user(prompt)],
+                temperature: 0.3
+            )
             return result.trimmingCharacters(in: .whitespacesAndNewlines)
         } catch {
             print("HALDEBUG-SUMMARIZER: LLM summarization failed: \(error.localizedDescription)")
@@ -11722,7 +11732,11 @@ class DocumentImportManager: ObservableObject {
             
             // PRIVACY FIX: Use active model from chatViewModel
             let llmService = LLMService(model: chatViewModel.selectedModel)
-            let summary = try await llmService.generateResponse(prompt: prompt)
+            // Chat-message path so chat-template models work.
+            let summary = try await llmService.generateChatResponse(
+                messages: [.system("You produce concise one-sentence document summaries."), .user(prompt)],
+                temperature: 0.3
+            )
             print("HALDEBUG-IMPORT: Generated entity-enhanced summary: \(summary)")
             return summary
 
