@@ -13620,8 +13620,9 @@ class LocalAPIServer {
                 case .ready:
                     let address = "\(LocalAPIServer.localIPAddress()):\(LocalAPIServer.apiPort)"
                     print("LocalAPI: Ready at \(address)")
+                    let token = Self.loadOrCreateToken()
                     DispatchQueue.main.async {
-                        UIPasteboard.general.string = LocalAPIServer.localIPAddress()
+                        UIPasteboard.general.string = "\(LocalAPIServer.localIPAddress()):\(LocalAPIServer.apiPort):\(token)"
                     }
                 case .failed(let e):
                     print("LocalAPI: Failed — \(e)")

@@ -9,7 +9,8 @@ File mode (fallback, no config):
   Polls output_latest.json via mtime. Slower, for when HTTP is unavailable.
 
 Usage:
-  python3 tests/hal_test.py setup <ip> 8765 <token>   # one-time config
+  python3 tests/hal_test.py autodiscover               # read ip:port:token from clipboard (app copies on start)
+  python3 tests/hal_test.py setup <ip> 8765 <token>   # one-time manual config
   python3 tests/hal_test.py reset                      # nuclear reset
   python3 tests/hal_test.py new                        # new thread (keep memory)
   python3 tests/hal_test.py turn "Hello"               # single turn
@@ -457,6 +458,29 @@ def main():
         if "error" in result:
             print(f"Connection failed: {result['error']}")
             print("Make sure the app is running and Developer API is enabled in Settings > Power User.")
+        else:
+            print("Connection OK!")
+            print(json.dumps(result, indent=2))
+        return
+
+    # Autodiscover: read ip:port:token from clipboard (copied by app on start)
+    if subcommand == "autodiscover":
+        import subprocess
+        clipboard = subprocess.run(["pbpaste"], capture_output=True, text=True).stdout.strip()
+        parts = clipboard.split(":")
+        if len(parts) != 3:
+            print(f"ERROR: Clipboard does not contain ip:port:token format.")
+            print(f"Clipboard contents: {clipboard!r}")
+            sys.exit(1)
+        ip, port, token = parts[0], parts[1], parts[2]
+        config = {"host": ip, "port": int(port), "token": token}
+        with open(CONFIG_FILE, "w") as f:
+            json.dump(config, f, indent=2)
+        print(f"Discovered: {ip}:{port}")
+        print(f"Testing connection...")
+        result = http_get("/state", config)
+        if "error" in result:
+            print(f"Connection failed: {result['error']}")
         else:
             print("Connection OK!")
             print(json.dumps(result, indent=2))
