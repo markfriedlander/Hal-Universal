@@ -62,6 +62,8 @@ import Hub
 import MLXLMCommon // FIXED: Added missing import for proper MLX API access
 import MLXHuggingFace // mlx-swift-lm 3.x: provides #huggingFaceTokenizerLoader macro
 import Tokenizers // FIXED: Added missing import for tokenizer decode method
+import Network  // LocalAPIServer (NWListener)
+import Security // LocalAPIServer (Keychain token storage)
 
 // MARK: - Hub Extension for MLX Model Downloads
 extension HubApi {
@@ -5401,6 +5403,7 @@ struct PowerUserView: View {
                 settingsResetSection
                 cacheManagementSection
                 dataManagementSection
+                developerAPISection
                 if ProcessInfo.processInfo.isiOSAppOnMac {
                     testConsoleSection
                 }
@@ -5690,6 +5693,82 @@ struct PowerUserView: View {
         } footer: {
             Text("Database statistics and data management options")
                 .font(.caption2)
+        }
+    }
+
+    // MARK: - Developer API Section
+
+    private var developerAPISection: some View {
+        DeveloperAPISectionView(viewModel: chatViewModel)
+    }
+
+    struct DeveloperAPISectionView: View {
+        @ObservedObject var viewModel: ChatViewModel
+        @State private var copiedField: String? = nil
+
+        var body: some View {
+            Section {
+                Toggle(isOn: Binding(
+                    get: { viewModel.localAPIEnabled },
+                    set: { enabled in
+                        if enabled { viewModel.startLocalAPI() }
+                        else       { viewModel.stopLocalAPI()  }
+                    }
+                )) {
+                    Label("Local API Access", systemImage: "network")
+                }
+                if viewModel.localAPIEnabled {
+                    VStack(alignment: .leading, spacing: 8) {
+                        copyableRow(label: "Address",
+                                    value: viewModel.localAPIServer.connectionURL,
+                                    field: "address",
+                                    font: .caption)
+                        copyableRow(label: "Port",
+                                    value: "\(LocalAPIServer.apiPort)",
+                                    field: "port",
+                                    font: .caption)
+                        copyableRow(label: "Token",
+                                    value: viewModel.localAPIServer.apiToken,
+                                    field: "token",
+                                    font: .system(.caption2, design: .monospaced))
+                    }
+                    .padding(.vertical, 4)
+                }
+            } header: {
+                Label("Developer API", systemImage: "terminal")
+            } footer: {
+                Text(viewModel.localAPIEnabled
+                    ? "Tap any field to copy. Setup: python3 tests/hal_test.py setup 127.0.0.1 8765 <token>"
+                    : "Enables a local HTTP API for automated testing. Off by default.")
+                    .font(.caption2)
+            }
+        }
+
+        @ViewBuilder
+        private func copyableRow(label: String, value: String, field: String, font: Font) -> some View {
+            HStack(alignment: .top) {
+                Text(label)
+                    .font(.caption)
+                    .foregroundColor(.secondary)
+                Spacer()
+                HStack(spacing: 4) {
+                    Text(copiedField == field ? "Copied!" : value)
+                        .font(font)
+                        .foregroundColor(copiedField == field ? .green : .primary)
+                        .multilineTextAlignment(.trailing)
+                        .textSelection(.enabled)
+                    Image(systemName: "doc.on.doc")
+                        .font(.caption2)
+                        .foregroundColor(copiedField == field ? .green : .secondary)
+                }
+                .onTapGesture {
+                    UIPasteboard.general.string = value
+                    withAnimation { copiedField = field }
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) {
+                        withAnimation { if copiedField == field { copiedField = nil } }
+                    }
+                }
+            }
         }
     }
 
@@ -8121,6 +8200,23 @@ class ChatViewModel: ObservableObject {
     // File-based pipeline test harness — see Block 32
     var testConsole: HalTestConsole = HalTestConsole()
 
+    // MARK: - Local API Server (Developer API)
+    // HTTP server for automated testing — see Block 32 LocalAPIServer.
+    // Controlled by toggle in Settings > Power User > Developer API.
+    // Default OFF — no port opens unless explicitly enabled.
+    @AppStorage("localAPIEnabled") var localAPIEnabled: Bool = false
+    var localAPIServer: LocalAPIServer = LocalAPIServer()
+
+    func startLocalAPI() {
+        localAPIEnabled = true
+        localAPIServer.start(chatViewModel: self)
+    }
+
+    func stopLocalAPI() {
+        localAPIEnabled = false
+        localAPIServer.stop()
+    }
+
     init() {
         // STEP 1: Check for legacy LLMType and migrate to ModelConfiguration
         if let oldTypeRaw = UserDefaults.standard.string(forKey: "selectedLLMType") {
@@ -8203,6 +8299,11 @@ class ChatViewModel: ObservableObject {
 
         // Connect test console to this view model
         testConsole.configure(chatViewModel: self)
+
+        // Auto-start Local API server if user had it enabled last session
+        if localAPIEnabled {
+            localAPIServer.start(chatViewModel: self)
+        }
 
         print("HALDEBUG-INIT: ChatViewModel initialization complete")
     }
@@ -12651,27 +12752,21 @@ final class HalWatchBridge: NSObject, WCSessionDelegate {
 
 
 // ==== LEGO START: 32 HalTestConsole (macOS Test Harness) ====
-
+//
 // SELF-AWARENESS NOTE (for Hal reading this code):
 // This is a development tool that lets Claude Code converse with your pipeline directly,
-// bypassing the UI entirely. It works through a simple file-based protocol:
+// bypassing the UI entirely. It works through two channels:
 //
-//   1. An external process writes a message to ~/Documents/hal_test/input.txt
-//   2. HalTestConsole detects the write via DispatchSource (no polling)
-//   3. The message is injected into the real ChatViewModel.sendMessage() pipeline
-//   4. Full response + diagnostics are written to ~/Documents/hal_test/output_latest.json
-//      and ~/Documents/hal_test/output_NNNN.json (numbered per turn)
+// 1. FILE CHANNEL: Write a message to ~/Documents/hal_test/input.txt
+//    HalTestConsole detects the write via DispatchSource and injects into the pipeline.
+//    Write commands to ~/Documents/hal_test/commands.txt.
+//    Full response + diagnostics written to output_latest.json.
 //
-// The JSON output includes: the full prompt that was built, every HelPML section that was
-// injected, every memory snippet retrieved (with relevance scores), token breakdown by
-// section, tools used, and the complete response.
-//
-// This gives complete observability into what you're actually experiencing per turn —
-// not what the code is supposed to do, but what it actually did.
+// 2. HTTP CHANNEL (LocalAPIServer): POST /chat, POST /command, GET /state
+//    Bearer token auth. Enable in Settings > Power User > Developer API.
+//    Both channels share the same executeCommand() dispatch function.
 //
 // Enable via Power User settings. Runs until stopped or app quits.
-// Note: Designed for use when running on macOS (as iOS app on Mac), but compiled on all platforms
-// since all required APIs (DispatchSource, FileManager, open()) are available on iOS too.
 
 @MainActor
 class HalTestConsole: ObservableObject {
@@ -12680,7 +12775,6 @@ class HalTestConsole: ObservableObject {
     @Published var turnCount: Int = 0
     @Published var statusMessage: String = "Stopped"
 
-    // Persists across relaunches so the console auto-starts without manual toggle
     @AppStorage("halTestConsoleAutoStart") var autoStart: Bool = false
 
     private weak var chatViewModel: ChatViewModel?
@@ -12694,7 +12788,6 @@ class HalTestConsole: ObservableObject {
     let stateFile: URL
     let outputLatestFile: URL
 
-    // SET_SYSTEM_PROMPT override (non-persisted; reverts on app restart)
     private(set) var systemPromptOverride: String? = nil
 
     private var commandsWatcher: DispatchSourceFileSystemObject?
@@ -12712,7 +12805,6 @@ class HalTestConsole: ObservableObject {
 
     func configure(chatViewModel: ChatViewModel) {
         self.chatViewModel = chatViewModel
-        // Auto-start if the console was left running when the app last quit
         if autoStart {
             Task { @MainActor in self.start() }
         }
@@ -12720,40 +12812,32 @@ class HalTestConsole: ObservableObject {
 
     func start() {
         guard !isRunning else { return }
-        autoStart = true   // Persist so next launch auto-starts
+        autoStart = true
 
-        // Create directory and input file if needed
         try? FileManager.default.createDirectory(at: baseDir, withIntermediateDirectories: true)
         if !FileManager.default.fileExists(atPath: inputFile.path) {
             FileManager.default.createFile(atPath: inputFile.path, contents: Data())
         }
-
-        // Create commands file if needed
         if !FileManager.default.fileExists(atPath: commandsFile.path) {
             FileManager.default.createFile(atPath: commandsFile.path, contents: Data())
         }
 
-        // Write ready status so the caller knows where to look
         let ready = """
         {
           "status": "ready",
           "inputFile": "\(inputFile.path)",
           "commandsFile": "\(commandsFile.path)",
           "stateFile": "\(stateFile.path)",
-          "outputFile": "\(outputLatestFile.path)",
-          "instructions": "Write a message to input.txt. Write commands to commands.txt. Hal processes them and writes diagnostics here."
+          "outputFile": "\(outputLatestFile.path)"
         }
         """
         try? ready.write(to: outputLatestFile, atomically: true, encoding: .utf8)
 
-        // Set up commands.txt watcher
         startCommandsWatcher()
 
-        // Open file descriptor for watching
         let fd = open(inputFile.path, O_EVTONLY)
         guard fd != -1 else {
             statusMessage = "Error: could not open input file for watching"
-            print("HALDEBUG-TESTCONSOLE: Failed to open fd for \(inputFile.path)")
             return
         }
         watchedFD = fd
@@ -12763,31 +12847,23 @@ class HalTestConsole: ObservableObject {
             eventMask: .write,
             queue: .main
         )
-
         source.setEventHandler { [weak self] in
             guard let self = self else { return }
             Task { @MainActor in
-                // Brief delay to let the write fully flush before reading
                 try? await Task.sleep(nanoseconds: 150_000_000)
                 await self.handleInputFileChange()
             }
         }
-
         source.setCancelHandler { [weak self] in
             guard let self = self else { return }
-            if self.watchedFD != -1 {
-                close(self.watchedFD)
-                self.watchedFD = -1
-            }
+            if self.watchedFD != -1 { close(self.watchedFD); self.watchedFD = -1 }
         }
-
         fileWatcher = source
         source.resume()
 
         isRunning = true
         statusMessage = "Watching \(inputFile.lastPathComponent)"
         print("HALDEBUG-TESTCONSOLE: Started. Input: \(inputFile.path)")
-        print("HALDEBUG-TESTCONSOLE: Output: \(outputLatestFile.path)")
     }
 
     func stop() {
@@ -12796,7 +12872,7 @@ class HalTestConsole: ObservableObject {
         commandsWatcher?.cancel()
         commandsWatcher = nil
         isRunning = false
-        autoStart = false  // Don't auto-start next launch if manually stopped
+        autoStart = false
         statusMessage = "Stopped"
         lastProcessedContent = ""
         lastProcessedCommand = ""
@@ -12804,23 +12880,13 @@ class HalTestConsole: ObservableObject {
         print("HALDEBUG-TESTCONSOLE: Stopped.")
     }
 
-
     // MARK: - Commands Channel
 
     private func startCommandsWatcher() {
         let fd = open(commandsFile.path, O_EVTONLY)
-        guard fd != -1 else {
-            print("HALDEBUG-TESTCONSOLE: Failed to open commands.txt for watching")
-            return
-        }
+        guard fd != -1 else { return }
         commandsWatchedFD = fd
-
-        let source = DispatchSource.makeFileSystemObjectSource(
-            fileDescriptor: fd,
-            eventMask: .write,
-            queue: .main
-        )
-
+        let source = DispatchSource.makeFileSystemObjectSource(fileDescriptor: fd, eventMask: .write, queue: .main)
         source.setEventHandler { [weak self] in
             guard let self = self else { return }
             Task { @MainActor in
@@ -12828,145 +12894,285 @@ class HalTestConsole: ObservableObject {
                 await self.handleCommandFileChange()
             }
         }
-
         source.setCancelHandler { [weak self] in
             guard let self = self else { return }
-            if self.commandsWatchedFD != -1 {
-                close(self.commandsWatchedFD)
-                self.commandsWatchedFD = -1
-            }
+            if self.commandsWatchedFD != -1 { close(self.commandsWatchedFD); self.commandsWatchedFD = -1 }
         }
-
         commandsWatcher = source
         source.resume()
-        print("HALDEBUG-TESTCONSOLE: Commands watcher started on \(commandsFile.lastPathComponent)")
     }
 
-    // Called when commands.txt is written to. Commands execute synchronously on main queue.
     private func handleCommandFileChange() async {
         guard let content = try? String(contentsOf: commandsFile, encoding: .utf8) else { return }
         let trimmed = content.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty, trimmed != lastProcessedCommand else { return }
         lastProcessedCommand = trimmed
-
-        guard let vm = chatViewModel else {
-            print("HALDEBUG-TESTCONSOLE: Command ignored -- ChatViewModel unavailable")
-            return
-        }
-
+        guard let vm = chatViewModel else { return }
         print("HALDEBUG-TESTCONSOLE: Command received: \(trimmed.prefix(80))")
         statusMessage = "CMD: \(trimmed.prefix(40))"
+        let result = await executeCommand(trimmed, vm: vm)
+        // Write result to state file so file-mode callers can read it
+        if let data = result.data(using: .utf8) {
+            try? data.write(to: stateFile)
+        }
+        statusMessage = "CMD done: \(trimmed.prefix(30))"
+    }
 
-        if trimmed.hasPrefix("SET_MODEL:") {
-            let modelID = String(trimmed.dropFirst("SET_MODEL:".count)).trimmingCharacters(in: .whitespaces)
-            if modelID == "apple-foundation-models" {
-                vm.selectedModelID = modelID
-                vm.llmService.setupLLM(for: .appleFoundation)
-                print("HALDEBUG-TESTCONSOLE: Model set to Apple Foundation Models")
-            } else if let model = ModelCatalogService.shared.getModel(byID: modelID) {
-                vm.selectedModelID = modelID
-                vm.llmService.setupLLM(for: model)
-                print("HALDEBUG-TESTCONSOLE: Model set to \(model.displayName)")
-            } else {
-                // Catalog cold -- construct minimal config from downloader
-                let localPath = MLXModelDownloader.shared.getModelPath(modelID)
-                let shortName = modelID.split(separator: "/").last.map(String.init) ?? modelID
-                let minimalConfig = ModelConfiguration(
-                    id: modelID,
-                    displayName: shortName,
-                    source: .mlx,
-                    sizeGB: nil,
-                    contextWindow: 4096,
-                    license: nil,
-                    description: nil,
-                    isDownloaded: localPath != nil,
-                    localPath: localPath
-                )
-                vm.selectedModelID = modelID
-                vm.llmService.setupLLM(for: minimalConfig)
-                print("HALDEBUG-TESTCONSOLE: Model set to \(shortName) (minimal config)")
-            }
+    // MARK: - Shared Command Dispatch
+    // Used by both the file watcher and LocalAPIServer. Returns JSON result string.
+
+    @discardableResult
+    func executeCommand(_ cmd: String, vm: ChatViewModel) async -> String {
+        let trimmed = cmd.trimmingCharacters(in: .whitespacesAndNewlines)
+
+        if trimmed.hasPrefix("SET_MODEL:") || trimmed.hasPrefix("SWITCH_MODEL:") {
+            let prefix = trimmed.hasPrefix("SET_MODEL:") ? "SET_MODEL:" : "SWITCH_MODEL:"
+            let modelID = String(trimmed.dropFirst(prefix.count)).trimmingCharacters(in: .whitespaces)
+            await switchToModel(modelID, vm: vm)
             writeStateJSON(vm: vm)
+            return "{\"status\":\"ok\",\"command\":\"SWITCH_MODEL\",\"modelID\":\"\(modelID)\"}"
+
+        } else if trimmed == "CURRENT_MODEL" {
+            let liveID = vm.llmService.activeModelID
+            let displayName = vm.selectedModel.displayName
+            return "{\"status\":\"ok\",\"modelID\":\"\(liveID)\",\"displayName\":\"\(jsonStringEscape(displayName))\"}"
+
+        } else if trimmed == "LIST_MODELS" {
+            return buildModelListJSON(vm: vm)
+
+        } else if trimmed.hasPrefix("DOWNLOAD_MODEL:") {
+            let modelID = String(trimmed.dropFirst("DOWNLOAD_MODEL:".count)).trimmingCharacters(in: .whitespaces)
+            return await startModelDownload(modelID, vm: vm)
+
+        } else if trimmed.hasPrefix("MODEL_STATUS:") {
+            let modelID = String(trimmed.dropFirst("MODEL_STATUS:".count)).trimmingCharacters(in: .whitespaces)
+            return buildModelStatusJSON(modelID)
+
+        } else if trimmed.hasPrefix("DELETE_MODEL:") {
+            let modelID = String(trimmed.dropFirst("DELETE_MODEL:".count)).trimmingCharacters(in: .whitespaces)
+            return await deleteModel(modelID)
 
         } else if trimmed == "NEW_THREAD" {
             vm.startNewConversation()
-            print("HALDEBUG-TESTCONSOLE: New thread created -- conversationId: \(vm.conversationId.prefix(8))")
+            print("HALDEBUG-TESTCONSOLE: New thread — \(vm.conversationId.prefix(8))")
             writeStateJSON(vm: vm)
+            return "{\"status\":\"ok\",\"command\":\"NEW_THREAD\",\"conversationId\":\"\(vm.conversationId)\"}"
 
         } else if trimmed == "RESET_THREAD" {
             vm.memoryStore.deleteThread(id: vm.conversationId)
             vm.startNewConversation()
-            print("HALDEBUG-TESTCONSOLE: Thread reset -- new conversationId: \(vm.conversationId.prefix(8))")
+            print("HALDEBUG-TESTCONSOLE: Thread reset — \(vm.conversationId.prefix(8))")
             writeStateJSON(vm: vm)
+            return "{\"status\":\"ok\",\"command\":\"RESET_THREAD\",\"conversationId\":\"\(vm.conversationId)\"}"
 
         } else if trimmed.hasPrefix("SET_SYSTEM_PROMPT:") {
             let promptText = String(trimmed.dropFirst("SET_SYSTEM_PROMPT:".count)).trimmingCharacters(in: .whitespaces)
             systemPromptOverride = promptText
-            print("HALDEBUG-TESTCONSOLE: System prompt override set (\(promptText.count) chars)")
+            return "{\"status\":\"ok\",\"command\":\"SET_SYSTEM_PROMPT\"}"
 
         } else if trimmed == "CLEAR_SYSTEM_PROMPT" {
             systemPromptOverride = nil
-            print("HALDEBUG-TESTCONSOLE: System prompt override cleared")
+            return "{\"status\":\"ok\",\"command\":\"CLEAR_SYSTEM_PROMPT\"}"
+
+        } else if trimmed.hasPrefix("SET_SYSTEM_PROMPT_STORED:") {
+            let promptText = String(trimmed.dropFirst("SET_SYSTEM_PROMPT_STORED:".count)).trimmingCharacters(in: .whitespaces)
+            vm.systemPrompt = promptText
+            writeStateJSON(vm: vm)
+            return "{\"status\":\"ok\",\"command\":\"SET_SYSTEM_PROMPT_STORED\"}"
 
         } else if trimmed.hasPrefix("SET_MEMORY_DEPTH:") {
             let depthStr = String(trimmed.dropFirst("SET_MEMORY_DEPTH:".count)).trimmingCharacters(in: .whitespaces)
             if let depth = Int(depthStr), depth >= 1 {
                 let clamped = min(depth, vm.maxMemoryDepth)
                 vm.memoryDepth = clamped
-                print("HALDEBUG-TESTCONSOLE: memoryDepth set to \(clamped)\(clamped < depth ? " (clamped from \(depth) — model limit is \(vm.maxMemoryDepth))" : "")")
                 writeStateJSON(vm: vm)
-            } else {
-                print("HALDEBUG-TESTCONSOLE: SET_MEMORY_DEPTH: invalid value '\(depthStr)' — must be integer >= 1")
+                return "{\"status\":\"ok\",\"memoryDepth\":\(clamped)}"
             }
+            return "{\"status\":\"error\",\"message\":\"SET_MEMORY_DEPTH: must be integer >= 1\"}"
+
+        } else if trimmed.hasPrefix("SET_TEMPERATURE:") {
+            let valStr = String(trimmed.dropFirst("SET_TEMPERATURE:".count)).trimmingCharacters(in: .whitespaces)
+            if let val = Double(valStr), val >= 0.0, val <= 1.0 {
+                vm.temperature = val
+                writeStateJSON(vm: vm)
+                return "{\"status\":\"ok\",\"temperature\":\(val)}"
+            }
+            return "{\"status\":\"error\",\"message\":\"SET_TEMPERATURE: must be 0.0–1.0\"}"
+
+        } else if trimmed.hasPrefix("SET_SELF_KNOWLEDGE:") {
+            let valStr = String(trimmed.dropFirst("SET_SELF_KNOWLEDGE:".count)).trimmingCharacters(in: .whitespaces).lowercased()
+            if valStr == "true" || valStr == "false" {
+                vm.enableSelfKnowledge = (valStr == "true")
+                writeStateJSON(vm: vm)
+                return "{\"status\":\"ok\",\"enableSelfKnowledge\":\(vm.enableSelfKnowledge)}"
+            }
+            return "{\"status\":\"error\",\"message\":\"SET_SELF_KNOWLEDGE: must be true or false\"}"
+
+        } else if trimmed.hasPrefix("SET_SIMILARITY_THRESHOLD:") {
+            let valStr = String(trimmed.dropFirst("SET_SIMILARITY_THRESHOLD:".count)).trimmingCharacters(in: .whitespaces)
+            if let val = Double(valStr), val >= 0.0, val <= 1.0 {
+                vm.memoryStore.relevanceThreshold = val
+                writeStateJSON(vm: vm)
+                return "{\"status\":\"ok\",\"relevanceThreshold\":\(val)}"
+            }
+            return "{\"status\":\"error\",\"message\":\"SET_SIMILARITY_THRESHOLD: must be 0.0–1.0\"}"
+
+        } else if trimmed.hasPrefix("SET_MAX_RAG_CHARS:") {
+            let valStr = String(trimmed.dropFirst("SET_MAX_RAG_CHARS:".count)).trimmingCharacters(in: .whitespaces)
+            if let val = Double(valStr), val >= 200 {
+                vm.maxRagSnippetsCharacters = val
+                writeStateJSON(vm: vm)
+                return "{\"status\":\"ok\",\"maxRagSnippetsCharacters\":\(Int(val))}"
+            }
+            return "{\"status\":\"error\",\"message\":\"SET_MAX_RAG_CHARS: must be >= 200\"}"
+
+        } else if trimmed.hasPrefix("SET_RAG_DEDUP:") {
+            let valStr = String(trimmed.dropFirst("SET_RAG_DEDUP:".count)).trimmingCharacters(in: .whitespaces)
+            if let val = Double(valStr), val >= 0.0, val <= 1.0 {
+                vm.ragDedupSimilarityThreshold = val
+                writeStateJSON(vm: vm)
+                return "{\"status\":\"ok\",\"ragDedupThreshold\":\(val)}"
+            }
+            return "{\"status\":\"error\",\"message\":\"SET_RAG_DEDUP: must be 0.0–1.0\"}"
+
+        } else if trimmed == "RESET_SETTINGS" {
+            vm.resetSettingsToDefaults()
+            writeStateJSON(vm: vm)
+            return "{\"status\":\"ok\",\"command\":\"RESET_SETTINGS\"}"
+
+        } else if trimmed == "NUCLEAR_RESET" {
+            let (threads, facts, messages) = vm.memoryStore.clearAllConversationData()
+            vm.resetSettingsToDefaults()
+            vm.startNewConversation()
+            print("HALDEBUG-TESTCONSOLE: NUCLEAR_RESET — \(threads) threads, \(messages) messages deleted")
+            return "{\"status\":\"ok\",\"command\":\"NUCLEAR_RESET\",\"threadsDeleted\":\(threads),\"factsDeleted\":\(facts),\"messagesDeleted\":\(messages),\"newConversationId\":\"\(vm.conversationId)\"}"
 
         } else if trimmed == "GET_STATE" {
             writeStateJSON(vm: vm)
-            print("HALDEBUG-TESTCONSOLE: State written to \(stateFile.lastPathComponent)")
+            if let data = try? Data(contentsOf: stateFile),
+               let json = String(data: data, encoding: .utf8) { return json }
+            return "{\"status\":\"error\",\"message\":\"Could not read state\"}"
 
         } else if trimmed == "CLEAR_TEST_DATA" {
-            // Wipe all conversation threads, messages, facts, and artifacts from the DB.
-            // Preserves documents, source code, and self-knowledge.
-            // After clearing, starts a fresh thread so the app is in a known clean state.
             let (threads, facts, messages) = vm.memoryStore.clearAllConversationData()
             vm.startNewConversation()
-            let result = """
-            {
-              "command": "CLEAR_TEST_DATA",
-              "threadsDeleted": \(threads),
-              "factsDeleted": \(facts),
-              "messagesDeleted": \(messages),
-              "newConversationId": "\(vm.conversationId)"
-            }
-            """
-            try? result.write(to: stateFile, atomically: true, encoding: .utf8)
-            print("HALDEBUG-TESTCONSOLE: CLEAR_TEST_DATA — \(threads) threads, \(facts) facts, \(messages) messages deleted. New thread: \(vm.conversationId.prefix(8))")
+            return "{\"status\":\"ok\",\"command\":\"CLEAR_TEST_DATA\",\"threadsDeleted\":\(threads),\"factsDeleted\":\(facts),\"messagesDeleted\":\(messages),\"newConversationId\":\"\(vm.conversationId)\"}"
 
         } else {
             print("HALDEBUG-TESTCONSOLE: Unknown command: \(trimmed.prefix(60))")
+            return "{\"status\":\"error\",\"message\":\"Unknown command: \(jsonStringEscape(String(trimmed.prefix(60))))\"}"
         }
-
-        statusMessage = "CMD done: \(trimmed.prefix(30))"
     }
 
-    private func writeStateJSON(vm: ChatViewModel) {
+    // MARK: - Model Management Helpers
+
+    private func switchToModel(_ modelID: String, vm: ChatViewModel) async {
+        if modelID == "apple-foundation-models" {
+            vm.selectedModelID = modelID
+            vm.llmService.setupLLM(for: .appleFoundation)
+            print("HALDEBUG-TESTCONSOLE: Switched to Apple Foundation Models")
+        } else if let model = ModelCatalogService.shared.getModel(byID: modelID) {
+            vm.selectedModelID = modelID
+            vm.llmService.setupLLM(for: model)
+            print("HALDEBUG-TESTCONSOLE: Switched to \(model.displayName)")
+        } else {
+            let localPath = MLXModelDownloader.shared.getModelPath(modelID)
+            let shortName = modelID.split(separator: "/").last.map(String.init) ?? modelID
+            let config = ModelConfiguration(
+                id: modelID, displayName: shortName, source: .mlx,
+                sizeGB: nil, contextWindow: 4096, license: nil, description: nil,
+                isDownloaded: localPath != nil, localPath: localPath
+            )
+            vm.selectedModelID = modelID
+            vm.llmService.setupLLM(for: config)
+            print("HALDEBUG-TESTCONSOLE: Switched to \(shortName) (minimal config)")
+        }
+    }
+
+    private func buildModelListJSON(vm: ChatViewModel) -> String {
+        // Refresh download states so the list is accurate
+        ModelCatalogService.shared.refreshDownloadStates()
+        let activeID = vm.llmService.activeModelID
+        var entries: [String] = []
+
+        // AFM entry
+        let afmActive = activeID == "apple-foundation-models"
+        entries.append("{\"id\":\"apple-foundation-models\",\"displayName\":\"Apple Foundation Models\",\"downloaded\":true,\"active\":\(afmActive),\"sizeGB\":null}")
+
+        // MLX catalog entries
+        let catalog = ModelCatalogService.shared.availableModels
+        for model in catalog {
+            let isActive = model.id == activeID
+            let sizeStr = model.sizeGB.map { String(format: "%.1f", $0) } ?? "null"
+            let sizeVal = model.sizeGB != nil ? sizeStr : "null"
+            entries.append("{\"id\":\"\(jsonStringEscape(model.id))\",\"displayName\":\"\(jsonStringEscape(model.displayName))\",\"downloaded\":\(model.isDownloaded),\"active\":\(isActive),\"sizeGB\":\(sizeVal)}")
+        }
+
+        return "{\"status\":\"ok\",\"models\":[\(entries.joined(separator: ","))]}"
+    }
+
+    private func startModelDownload(_ modelID: String, vm: ChatViewModel) async -> String {
+        if MLXModelDownloader.shared.isModelDownloaded(modelID) {
+            return "{\"status\":\"ok\",\"modelID\":\"\(jsonStringEscape(modelID))\",\"note\":\"already downloaded\"}"
+        }
+        // Build config for downloader
+        let model: ModelConfiguration
+        if let catalogModel = ModelCatalogService.shared.getModel(byID: modelID) {
+            model = catalogModel
+        } else {
+            let shortName = modelID.split(separator: "/").last.map(String.init) ?? modelID
+            model = ModelConfiguration(
+                id: modelID, displayName: shortName, source: .mlx,
+                sizeGB: nil, contextWindow: 4096, license: nil, description: nil,
+                isDownloaded: false, localPath: nil
+            )
+        }
+        // Start download on a background task — startDownload is async and long-running
+        Task { await MLXModelDownloader.shared.startDownload(modelID: model.id, repoID: model.id, sizeGB: model.sizeGB) }
+        print("HALDEBUG-TESTCONSOLE: Download started for \(modelID)")
+        return "{\"status\":\"ok\",\"command\":\"DOWNLOAD_MODEL\",\"modelID\":\"\(jsonStringEscape(modelID))\",\"note\":\"download started\"}"
+    }
+
+    private func buildModelStatusJSON(_ modelID: String) -> String {
+        let downloader = MLXModelDownloader.shared
+        let isDownloaded = downloader.isModelDownloaded(modelID)
+        let isDownloading = downloader.isDownloading && downloader.currentDownloadID == modelID
+        let prog = isDownloading ? String(format: "%.3f", downloader.progress) : (isDownloaded ? "1.0" : "0.0")
+        let errorStr = (downloader.downloadError != nil && downloader.currentDownloadID == modelID)
+            ? "\"\(jsonStringEscape(downloader.downloadError!))\""
+            : "null"
+        return "{\"status\":\"ok\",\"modelID\":\"\(jsonStringEscape(modelID))\",\"isDownloaded\":\(isDownloaded),\"isDownloading\":\(isDownloading),\"progress\":\(prog),\"error\":\(errorStr)}"
+    }
+
+    private func deleteModel(_ modelID: String) async -> String {
+        await MLXModelDownloader.shared.deleteModel(modelID: modelID)
+        print("HALDEBUG-TESTCONSOLE: Model deleted: \(modelID)")
+        return "{\"status\":\"ok\",\"command\":\"DELETE_MODEL\",\"modelID\":\"\(jsonStringEscape(modelID))\"}"
+    }
+
+    // MARK: - State JSON
+
+    func writeStateJSON(vm: ChatViewModel) {
         let promptText = vm.effectiveSystemPrompt
         let fingerprint = String(promptText.prefix(60)).replacingOccurrences(of: "\n", with: " ")
         let hasOverride = systemPromptOverride != nil
-        // Report both AppStorage value and the model actually loaded in LLMService.
-        // If these differ, it means the init path set the wrong model.
-        let appStorageID = vm.selectedModelID
         let liveID = vm.llmService.activeModelID
-        let idsMatch = appStorageID == liveID
+        let hasSummary = !vm.injectedSummary.isEmpty
         let state = """
         {
-          "appStorageModelID": "\(appStorageID)",
-          "liveModelID": "\(liveID)",
-          "modelIDsMatch": \(idsMatch),
+          "modelID": "\(liveID)",
           "conversationId": "\(vm.conversationId)",
           "turnCount": \(turnCount),
           "memoryDepth": \(vm.memoryDepth),
           "maxMemoryDepth": \(vm.maxMemoryDepth),
+          "temperature": \(String(format: "%.2f", vm.temperature)),
+          "selfKnowledgeEnabled": \(vm.enableSelfKnowledge),
+          "similarityThreshold": \(String(format: "%.2f", vm.memoryStore.relevanceThreshold)),
+          "maxRagSnippetsCharacters": \(Int(vm.maxRagSnippetsCharacters)),
+          "ragDedupThreshold": \(String(format: "%.2f", vm.ragDedupSimilarityThreshold)),
           "lastSummarizedTurnCount": \(vm.lastSummarizedTurnCount),
+          "injectedSummaryActive": \(hasSummary),
+          "injectedSummaryLength": \(vm.injectedSummary.count),
           "systemPromptOverrideActive": \(hasOverride),
           "systemPromptFingerprint": "\(fingerprint)..."
         }
@@ -12974,13 +13180,11 @@ class HalTestConsole: ObservableObject {
         try? state.write(to: stateFile, atomically: true, encoding: .utf8)
     }
 
-    // Called when input.txt is written to
-    private func handleInputFileChange() async {
+    // MARK: - Input File Channel
 
+    private func handleInputFileChange() async {
         guard let content = try? String(contentsOf: inputFile, encoding: .utf8) else { return }
         let trimmed = content.trimmingCharacters(in: .whitespacesAndNewlines)
-
-        // Skip empty or already-processed content (DispatchSource can fire multiple times per write)
         guard !trimmed.isEmpty, trimmed != lastProcessedContent else { return }
         lastProcessedContent = trimmed
 
@@ -12989,41 +13193,47 @@ class HalTestConsole: ObservableObject {
             return
         }
 
+        // Wait for any in-flight turn to complete (up to 120s)
+        if vm.isAIResponding {
+            var waited = 0
+            while vm.isAIResponding && waited < 120 {
+                try? await Task.sleep(nanoseconds: 1_000_000_000)
+                waited += 1
+            }
+            if vm.isAIResponding {
+                statusMessage = "Error: previous turn timed out"
+                return
+            }
+        }
+
         turnCount += 1
         let turnNum = turnCount
         statusMessage = "Turn \(turnNum): processing…"
         print("HALDEBUG-TESTCONSOLE: Turn \(turnNum) — \"\(trimmed.prefix(60))\"")
 
         let startTime = Date()
-
-        // Inject into the real pipeline — same path the UI takes
         vm.currentMessage = trimmed
         await vm.sendMessage()
-
         let elapsed = Date().timeIntervalSince(startTime)
 
-        // Grab the last completed AI message
         let aiMessages = vm.messages.filter { !$0.isFromUser && !$0.isPartial }
         guard let lastAI = aiMessages.last else {
             statusMessage = "Turn \(turnNum): no AI response found"
-            print("HALDEBUG-TESTCONSOLE: Turn \(turnNum) — no AI message in messages array")
             return
         }
 
-        // Write diagnostic JSON output
         let json = buildOutputJSON(turn: turnNum, userMessage: trimmed, aiMessage: lastAI, elapsed: elapsed, vm: vm)
         let numberedOutput = baseDir.appendingPathComponent(String(format: "output_%04d.json", turnNum))
-
         try? json.write(to: outputLatestFile, atomically: true, encoding: .utf8)
         try? json.write(to: numberedOutput, atomically: true, encoding: .utf8)
 
         statusMessage = "Turn \(turnNum): done (\(String(format: "%.1f", elapsed))s)"
-        print("HALDEBUG-TESTCONSOLE: Turn \(turnNum) complete in \(String(format: "%.1f", elapsed))s — \(outputLatestFile.lastPathComponent)")
+        print("HALDEBUG-TESTCONSOLE: Turn \(turnNum) complete in \(String(format: "%.1f", elapsed))s")
     }
 
-    private func buildOutputJSON(turn: Int, userMessage: String, aiMessage: ChatMessage, elapsed: TimeInterval, vm: ChatViewModel) -> String {
+    // MARK: - Output JSON Builder
 
-        // Token breakdown
+    func buildOutputJSON(turn: Int, userMessage: String, aiMessage: ChatMessage, elapsed: TimeInterval, vm: ChatViewModel) -> String {
         let tokenJSON: String
         if let tb = aiMessage.tokenBreakdown {
             tokenJSON = """
@@ -13044,7 +13254,6 @@ class HalTestConsole: ObservableObject {
             tokenJSON = "null"
         }
 
-        // Memory retrieved
         let memoryJSON: String
         if let snippets = aiMessage.usedContextSnippets, !snippets.isEmpty {
             let items = snippets.map { s in
@@ -13062,7 +13271,6 @@ class HalTestConsole: ObservableObject {
             memoryJSON = "[]"
         }
 
-        // Tools used
         let toolsJSON: String
         if let tools = aiMessage.toolsUsed, !tools.isEmpty {
             toolsJSON = "[" + tools.map { "\"\($0)\"" }.joined(separator: ", ") + "]"
@@ -13070,16 +13278,15 @@ class HalTestConsole: ObservableObject {
             toolsJSON = "[]"
         }
 
-        // Infer which HelPML sections were injected by scanning the prompt
         let prompt = aiMessage.fullPromptUsed ?? ""
         let sections = [
-            prompt.contains("#=== BEGIN SYSTEM ===#")          ? "\"system\""           : nil,
-            prompt.contains("#=== BEGIN MEMORY_SHORT ===#")   ? "\"short_term_memory\"" : nil,
-            prompt.contains("#=== BEGIN SUMMARY ===#")         ? "\"summary\""           : nil,
-            prompt.contains("#=== BEGIN TEMPORAL_CONTEXT ===#") ? "\"temporal_context\"" : nil,
-            prompt.contains("#=== BEGIN MEMORY_LONG ===#")    ? "\"rag\""               : nil,
-            prompt.contains("#=== BEGIN SELF_AWARENESS ===#") ? "\"self_awareness\""    : nil,
-            prompt.contains("#=== BEGIN SELF_KNOWLEDGE ===#") ? "\"self_knowledge\""    : nil,
+            prompt.contains("#=== BEGIN SYSTEM ===#")           ? "\"system\""            : nil,
+            prompt.contains("#=== BEGIN MEMORY_SHORT ===#")    ? "\"short_term_memory\""  : nil,
+            prompt.contains("#=== BEGIN SUMMARY ===#")          ? "\"summary\""            : nil,
+            prompt.contains("#=== BEGIN TEMPORAL_CONTEXT ===#") ? "\"temporal_context\""  : nil,
+            prompt.contains("#=== BEGIN MEMORY_LONG ===#")     ? "\"rag\""                : nil,
+            prompt.contains("#=== BEGIN SELF_AWARENESS ===#")  ? "\"self_awareness\""     : nil,
+            prompt.contains("#=== BEGIN SELF_KNOWLEDGE ===#")  ? "\"self_knowledge\""     : nil,
         ].compactMap { $0 }.joined(separator: ", ")
 
         let promptContent = prompt.isEmpty ? "(not captured — check HALDEBUG-PROMPT logs)" : prompt
@@ -13103,7 +13310,8 @@ class HalTestConsole: ObservableObject {
         """
     }
 
-    // JSON string escaping
+    // MARK: - JSON Helpers
+
     private func jsonEscape(_ s: String) -> String {
         let escaped = s
             .replacingOccurrences(of: "\\", with: "\\\\")
@@ -13112,6 +13320,315 @@ class HalTestConsole: ObservableObject {
             .replacingOccurrences(of: "\r", with: "\\r")
             .replacingOccurrences(of: "\t", with: "\\t")
         return "\"\(escaped)\""
+    }
+
+    private func jsonStringEscape(_ s: String) -> String {
+        s.replacingOccurrences(of: "\\", with: "\\\\")
+         .replacingOccurrences(of: "\"", with: "\\\"")
+         .replacingOccurrences(of: "\n", with: "\\n")
+    }
+}
+
+// MARK: - Local HTTP API Server
+//
+// Programmatic access to Hal's pipeline for automated testing and tooling.
+// Replaces file-polling with a clean synchronous HTTP interface.
+//
+// Endpoints (all require Authorization: Bearer <token>):
+//   POST /chat      {"message": "..."}           → full diagnostic JSON
+//   POST /command   {"command": "NUCLEAR_RESET"}  → JSON result
+//   GET  /state                                   → settings state JSON
+//
+// Commands available via POST /command:
+//   Model management: LIST_MODELS, DOWNLOAD_MODEL:<id>, MODEL_STATUS:<id>,
+//                     SWITCH_MODEL:<id>, DELETE_MODEL:<id>, CURRENT_MODEL
+//   Thread control:   NEW_THREAD, RESET_THREAD, NUCLEAR_RESET, CLEAR_TEST_DATA
+//   Settings:         SET_TEMPERATURE:<f>, SET_MEMORY_DEPTH:<n>, SET_SELF_KNOWLEDGE:<bool>,
+//                     SET_SIMILARITY_THRESHOLD:<f>, SET_MAX_RAG_CHARS:<n>, SET_RAG_DEDUP:<f>,
+//                     SET_SYSTEM_PROMPT:<text>, SET_SYSTEM_PROMPT_STORED:<text>,
+//                     CLEAR_SYSTEM_PROMPT, RESET_SETTINGS
+//   Info:             GET_STATE, CURRENT_MODEL, LIST_MODELS, MODEL_STATUS:<id>
+//
+// Enable: Settings → Power User → Developer API toggle (default OFF).
+// Setup:  python3 tests/hal_test.py setup <ip> 8765 <token>
+
+class LocalAPIServer {
+
+    static let apiPort: UInt16 = 8765
+
+    private var listener: NWListener?
+    private weak var chatViewModel: ChatViewModel?
+
+    var isRunning: Bool { listener != nil }
+
+    // MARK: - Token (Keychain-backed)
+
+    private static let keychainService = "com.MarkFriedlander.Hal10000"
+    private static let keychainAccount = "localAPIToken"
+
+    static func loadOrCreateToken() -> String {
+        let query: [CFString: Any] = [
+            kSecClass:       kSecClassGenericPassword,
+            kSecAttrService: keychainService as CFString,
+            kSecAttrAccount: keychainAccount as CFString,
+            kSecReturnData:  true
+        ]
+        var item: AnyObject?
+        if SecItemCopyMatching(query as CFDictionary, &item) == errSecSuccess,
+           let data = item as? Data,
+           let token = String(data: data, encoding: .utf8) {
+            return token
+        }
+        let token = UUID().uuidString.replacingOccurrences(of: "-", with: "").lowercased()
+        let add: [CFString: Any] = [
+            kSecClass:       kSecClassGenericPassword,
+            kSecAttrService: keychainService as CFString,
+            kSecAttrAccount: keychainAccount as CFString,
+            kSecValueData:   Data(token.utf8) as CFData
+        ]
+        SecItemAdd(add as CFDictionary, nil)
+        return token
+    }
+
+    var apiToken: String { Self.loadOrCreateToken() }
+
+    // MARK: - Local Network Address
+
+    static func localIPAddress() -> String {
+        var best = "127.0.0.1"
+        var ifaddr: UnsafeMutablePointer<ifaddrs>?
+        guard getifaddrs(&ifaddr) == 0 else { return best }
+        defer { freeifaddrs(ifaddr) }
+        var ptr = ifaddr
+        while let iface = ptr?.pointee {
+            defer { ptr = ptr?.pointee.ifa_next }
+            guard iface.ifa_addr.pointee.sa_family == UInt8(AF_INET) else { continue }
+            let name = String(cString: iface.ifa_name)
+            guard name.hasPrefix("en") else { continue }
+            var hostname = [CChar](repeating: 0, count: Int(NI_MAXHOST))
+            getnameinfo(iface.ifa_addr, socklen_t(iface.ifa_addr.pointee.sa_len),
+                        &hostname, socklen_t(hostname.count), nil, 0, NI_NUMERICHOST)
+            let ip = String(cString: hostname)
+            if !ip.isEmpty && ip != "0.0.0.0" { best = ip }
+        }
+        return best
+    }
+
+    var connectionURL: String { "\(Self.localIPAddress()):\(Self.apiPort)" }
+
+    // MARK: - Lifecycle
+
+    func start(chatViewModel: ChatViewModel) {
+        guard !isRunning else { return }
+        self.chatViewModel = chatViewModel
+        do {
+            let params = NWParameters.tcp
+            params.allowLocalEndpointReuse = true
+            let l = try NWListener(using: params, on: NWEndpoint.Port(rawValue: Self.apiPort)!)
+            l.newConnectionHandler = { [weak self] conn in
+                conn.start(queue: .global(qos: .userInitiated))
+                Task { await self?.handleConnection(conn) }
+            }
+            l.stateUpdateHandler = { state in
+                switch state {
+                case .ready:
+                    print("LocalAPI: Ready at \(LocalAPIServer.localIPAddress()):\(LocalAPIServer.apiPort)")
+                case .failed(let e):
+                    print("LocalAPI: Failed — \(e)")
+                default: break
+                }
+            }
+            l.start(queue: .global(qos: .userInitiated))
+            self.listener = l
+        } catch {
+            print("LocalAPI: Could not start NWListener — \(error)")
+        }
+    }
+
+    func stop() {
+        listener?.cancel()
+        listener = nil
+        print("LocalAPI: Stopped")
+    }
+
+    // MARK: - Connection Handling
+
+    private func handleConnection(_ conn: NWConnection) async {
+        guard let data = await receiveRequest(conn),
+              let req  = parseRequest(data) else {
+            respond(conn, status: 400, body: "{\"error\":\"Bad request\"}")
+            return
+        }
+        guard req.token == apiToken else {
+            respond(conn, status: 401, body: "{\"error\":\"Unauthorized\"}")
+            return
+        }
+        let (status, body) = await route(req)
+        respond(conn, status: status, body: body)
+    }
+
+    private func receiveRequest(_ conn: NWConnection) async -> Data? {
+        await withCheckedContinuation { cont in
+            var buf = Data()
+            func next() {
+                conn.receive(minimumIncompleteLength: 1, maximumLength: 65_536) { chunk, _, done, err in
+                    if let chunk { buf.append(chunk) }
+                    if let text = String(data: buf, encoding: .utf8), text.contains("\r\n\r\n") {
+                        let parts = text.components(separatedBy: "\r\n\r\n")
+                        let hdr   = parts[0]
+                        let body  = parts.dropFirst().joined(separator: "\r\n\r\n")
+                        if let clLine = hdr.components(separatedBy: "\r\n")
+                            .first(where: { $0.lowercased().hasPrefix("content-length:") }),
+                           let cl = Int(clLine.components(separatedBy: ":").last?
+                                            .trimmingCharacters(in: .whitespaces) ?? "") {
+                            if body.utf8.count >= cl { cont.resume(returning: buf); return }
+                        } else {
+                            cont.resume(returning: buf); return
+                        }
+                    }
+                    if done || err != nil { cont.resume(returning: buf.isEmpty ? nil : buf) }
+                    else { next() }
+                }
+            }
+            next()
+        }
+    }
+
+    // MARK: - HTTP Parsing
+
+    private struct ParsedRequest {
+        let method: String
+        let path: String
+        let token: String?
+        let body: Data?
+    }
+
+    private func parseRequest(_ data: Data) -> ParsedRequest? {
+        guard let text = String(data: data, encoding: .utf8) else { return nil }
+        let split = text.components(separatedBy: "\r\n\r\n")
+        guard let hdrBlock = split.first else { return nil }
+        let lines = hdrBlock.components(separatedBy: "\r\n")
+        guard let reqLine = lines.first else { return nil }
+        let rp = reqLine.components(separatedBy: " ")
+        guard rp.count >= 2 else { return nil }
+        var token: String?
+        for line in lines.dropFirst() {
+            if line.lowercased().hasPrefix("authorization: bearer ") {
+                token = String(line.dropFirst("authorization: bearer ".count))
+                    .trimmingCharacters(in: .whitespacesAndNewlines)
+                break
+            }
+        }
+        let bodyStr  = split.dropFirst().joined(separator: "\r\n\r\n")
+        let bodyData = bodyStr.isEmpty ? nil : bodyStr.data(using: .utf8)
+        return ParsedRequest(method: rp[0], path: rp[1], token: token, body: bodyData)
+    }
+
+    // MARK: - Routing
+
+    private func route(_ req: ParsedRequest) async -> (Int, String) {
+        switch (req.method, req.path) {
+        case ("POST", "/chat"):    return await handleChat(body: req.body)
+        case ("POST", "/command"): return await handleCommand(body: req.body)
+        case ("GET",  "/state"):   return await handleState()
+        default:                   return (404, "{\"error\":\"Not found\"}")
+        }
+    }
+
+    private func handleChat(body: Data?) async -> (Int, String) {
+        guard let body,
+              let json    = try? JSONSerialization.jsonObject(with: body) as? [String: Any],
+              let message = json["message"] as? String, !message.isEmpty else {
+            return (400, "{\"error\":\"Missing 'message'\"}")
+        }
+        guard let vm = chatViewModel else {
+            return (503, "{\"error\":\"ChatViewModel unavailable\"}")
+        }
+        return await withCheckedContinuation { cont in
+            Task { @MainActor in
+                var waited = 0
+                while vm.isAIResponding && waited < 120 {
+                    try? await Task.sleep(nanoseconds: 1_000_000_000)
+                    waited += 1
+                }
+                guard !vm.isAIResponding else {
+                    cont.resume(returning: (503, "{\"error\":\"Previous turn timed out\"}"))
+                    return
+                }
+                let start = Date()
+                vm.currentMessage = message
+                await vm.sendMessage()
+                let elapsed = Date().timeIntervalSince(start)
+                let aiMessages = vm.messages.filter { !$0.isFromUser && !$0.isPartial }
+                guard let lastAI = aiMessages.last else {
+                    cont.resume(returning: (500, "{\"error\":\"No response generated\"}"))
+                    return
+                }
+                vm.testConsole.turnCount += 1
+                let responseJSON = vm.testConsole.buildOutputJSON(
+                    turn: vm.testConsole.turnCount,
+                    userMessage: message,
+                    aiMessage: lastAI,
+                    elapsed: elapsed,
+                    vm: vm
+                )
+                cont.resume(returning: (200, responseJSON))
+            }
+        }
+    }
+
+    private func handleCommand(body: Data?) async -> (Int, String) {
+        guard let body,
+              let json = try? JSONSerialization.jsonObject(with: body) as? [String: Any],
+              let cmd  = json["command"] as? String, !cmd.isEmpty else {
+            return (400, "{\"error\":\"Missing 'command'\"}")
+        }
+        guard let vm = chatViewModel else {
+            return (503, "{\"error\":\"ChatViewModel unavailable\"}")
+        }
+        let result: String = await withCheckedContinuation { cont in
+            Task { @MainActor in
+                let r = await vm.testConsole.executeCommand(cmd, vm: vm)
+                cont.resume(returning: r)
+            }
+        }
+        return (200, result)
+    }
+
+    private func handleState() async -> (Int, String) {
+        guard let vm = chatViewModel else {
+            return (503, "{\"error\":\"ChatViewModel unavailable\"}")
+        }
+        return await withCheckedContinuation { cont in
+            Task { @MainActor in
+                vm.testConsole.writeStateJSON(vm: vm)
+                if let data = try? Data(contentsOf: vm.testConsole.stateFile),
+                   let json = String(data: data, encoding: .utf8) {
+                    cont.resume(returning: (200, json))
+                } else {
+                    cont.resume(returning: (500, "{\"error\":\"State unavailable\"}"))
+                }
+            }
+        }
+    }
+
+    // MARK: - HTTP Response
+
+    private func respond(_ conn: NWConnection, status: Int, body: String) {
+        let phrase: String
+        switch status {
+        case 200: phrase = "OK"
+        case 400: phrase = "Bad Request"
+        case 401: phrase = "Unauthorized"
+        case 404: phrase = "Not Found"
+        case 503: phrase = "Service Unavailable"
+        default:  phrase = "Internal Server Error"
+        }
+        let bodyData = body.data(using: .utf8) ?? Data()
+        let header   = "HTTP/1.1 \(status) \(phrase)\r\nContent-Type: application/json\r\nContent-Length: \(bodyData.count)\r\nConnection: close\r\n\r\n"
+        var resp     = header.data(using: .utf8)!
+        resp.append(bodyData)
+        conn.send(content: resp, completion: .contentProcessed { _ in conn.cancel() })
     }
 }
 
