@@ -9607,25 +9607,51 @@ class ChatViewModel: ObservableObject {
 
                                                                             // System message = persona + CURRENT CONTEXT block.
                                                                             // The CONTEXT block carries:
-                                                                            //   STEP 2: temporal awareness (date, time of day, weekday, device,
-                                                                            //           thread age, pace, last inference duration)
-                                                                            //   STEP 3: conversation summary when older turns have been compressed
-                                                                            //           by generateAutoSummary (injectedSummary is non-empty)
-                                                                            // Original intent: situate Hal in time + carry compressed context
-                                                                            // beyond the verbatim short-term window. In chat form this all goes
-                                                                            // into the system message so the model treats it as background.
+                                                                            //   STEP 2: temporal awareness (date, time of day, weekday, device, etc.)
+                                                                            //   STEP 3: injected conversation summary when older turns compressed
+                                                                            //   STEP 4: RAG snippets from long-term memory (relevant past content)
+                                                                            // Original intent: situate Hal in time + carry compressed and retrieved
+                                                                            // context. Chat form folds it all into the system message as background.
+                                                                            var contextSections: [String] = []
+
                                                                             let temporalRaw = buildTemporalContext()
                                                                             let temporalBody = temporalRaw
                                                                                 .replacingOccurrences(of: "#=== BEGIN TEMPORAL_CONTEXT ===#", with: "")
                                                                                 .replacingOccurrences(of: "#=== END TEMPORAL_CONTEXT ===#", with: "")
                                                                                 .trimmingCharacters(in: .whitespacesAndNewlines)
-                                                                            var contextSections: [String] = []
                                                                             if !temporalBody.isEmpty {
                                                                                 contextSections.append(temporalBody)
                                                                             }
+
                                                                             if !injectedSummary.isEmpty {
                                                                                 contextSections.append("Summary of earlier conversation:\n\(injectedSummary)")
                                                                             }
+
+                                                                            // STEP 4: RAG via tool router. decideTools is a YES/NO gate (AFM-routed
+                                                                            // for speed and stability — see decideTools comments). executeTools
+                                                                            // runs the memory search and returns up to 10 snippets within the
+                                                                            // model's RAG token budget.
+                                                                            if !currentInput.isEmpty {
+                                                                                let limits = HalModelLimits.config(for: selectedModel)
+                                                                                let toolDecision = await decideTools(userInput: currentInput)
+                                                                                let shortTermTurns = getShortTermTurns(currentTurns: countCompletedTurns())
+                                                                                let toolResults = await executeTools(
+                                                                                    decision: toolDecision,
+                                                                                    userInput: currentInput,
+                                                                                    excludeTurns: shortTermTurns,
+                                                                                    tokenBudget: limits.maxRagTokens
+                                                                                )
+                                                                                if let snippets = toolResults.memorySearchResults, !snippets.isEmpty {
+                                                                                    fullRAGContext = snippets
+                                                                                    var ragLines: [String] = []
+                                                                                    for (idx, s) in snippets.enumerated() {
+                                                                                        ragLines.append("[\(idx + 1)] \(s.source) | relevance \(String(format: "%.2f", s.relevance))\n\(s.content)")
+                                                                                    }
+                                                                                    contextSections.append("Relevant past context:\n\(ragLines.joined(separator: "\n\n"))")
+                                                                                    halLog("HALDEBUG-CHAT: Folded in \(snippets.count) RAG snippets")
+                                                                                }
+                                                                            }
+
                                                                             let systemMessage: String
                                                                             if contextSections.isEmpty {
                                                                                 systemMessage = effectiveSystemPrompt
