@@ -56,19 +56,9 @@ import UniformTypeIdentifiers // For file types in document import
 import SQLite3 // For MemoryStore - Direct C API for consistency with Mac version
 import NaturalLanguage // For entity extraction and NLEmbedding
 import PDFKit // For PDF document processing
-import MLX // Import MLX framework (conceptual, requires actual framework link)
-import MLXLLM
-import Hub
-import MLXLMCommon // FIXED: Added missing import for proper MLX API access
-import Tokenizers // FIXED: Added missing import for tokenizer decode method
+import Network // For LocalAPIServer (NWListener)
+import Security // For LocalAPIServer (Keychain token storage)
 
-// MARK: - Hub Extension for MLX Model Downloads
-extension HubApi {
-    /// Default HubApi instance configured for iOS cache directory
-    static let `default` = HubApi(
-        downloadBase: URL.cachesDirectory.appending(path: "huggingface")
-    )
-}
 
 // Add @preconcurrency import for Foundation to help with Swift 6 concurrency warnings
 @preconcurrency import Foundation
@@ -1215,7 +1205,7 @@ class MemoryStore: ObservableObject {
                                     seatNumber: nil  // User messages don't have seat numbers
                                 )
                             } else {
-                                print("HALDEBUG-SALON: Skipping user message storage (already stored by runSalonTurn)")
+                                print("HALDEBUG-STORE: Skipping user message storage (skipUserMessage=true)")
                             }
 
                             // Prepare metadata for Hal's message
@@ -3077,6 +3067,19 @@ extension MemoryStore {
         for word in queryWords {
             if word.count > 2 {
                 variations.append(word)
+
+                // Strip possessives: "dog's" → "dog", "cat's" → "cat"
+                // This lets keyword search find "dog" in stored content when the query uses "dog's"
+                let possessiveStripped = word.hasSuffix("'s") ? String(word.dropLast(2)) : word
+                if possessiveStripped != word && possessiveStripped.count > 2 {
+                    variations.append(possessiveStripped)
+                }
+
+                // Strip trailing punctuation: "name?" → "name", "home." → "home"
+                let punctStripped = word.components(separatedBy: CharacterSet.alphanumerics.inverted).joined()
+                if punctStripped != word && punctStripped != possessiveStripped && punctStripped.count > 2 {
+                    variations.append(punctStripped)
+                }
             }
         }
         if queryWords.count == 1 {
@@ -3869,6 +3872,12 @@ struct HalModelLimits {
         )
     }
     
+    /// Maximum number of verbatim conversation turns for short-term memory.
+    /// Derived from context window: roughly 1 turn per 400 tokens, minimum 5.
+    var maxMemoryDepth: Int {
+        return max(5, contextWindowTokens / 400)
+    }
+
     /// Convert tokens to approximate character count using TokenEstimator
     func tokensToChars(_ tokens: Int) -> Int {
         return TokenEstimator.estimateChars(from: tokens)
@@ -3882,267 +3891,84 @@ struct HalModelLimits {
 }
 
 
+
+// MARK: - Model Source (AFM-only in Hal LMC)
+enum ModelSource: String, Codable {
+    case appleFoundation = "apple"
+    case mlx = "mlx"  // Retained for legacy data compatibility
+}
+
+// MARK: - Model Configuration
+struct ModelConfiguration: Identifiable, Codable, Equatable, Hashable {
+    let id: String
+    let displayName: String
+    let source: ModelSource
+    let sizeGB: Double?
+    let contextWindow: Int
+    let license: String?
+    let description: String?
+    var isDownloaded: Bool
+    var localPath: URL?
+
+    var isLocal: Bool { source == .mlx }
+    var requiresDownload: Bool { source == .mlx && !isDownloaded }
+
+    func hash(into hasher: inout Hasher) {
+        hasher.combine(id)
+    }
+
+    static func == (lhs: ModelConfiguration, rhs: ModelConfiguration) -> Bool {
+        lhs.id == rhs.id
+    }
+
+    static let appleFoundation = ModelConfiguration(
+        id: "apple-foundation-models",
+        displayName: "Apple Intelligence",
+        source: .appleFoundation,
+        sizeGB: nil,
+        contextWindow: 4_096,
+        license: nil,
+        description: "Always available, no download required",
+        isDownloaded: true,
+        localPath: nil
+    )
+}
+
 // ==== LEGO END: 07.5 HalModelLimits Configuration ====
 
 
 
-// ==== LEGO START: 08 MLXWrapper & LLMService (Foundation + MLX Routing) ====
+// ==== LEGO START: 08 LLMService (Apple Foundation Models) ====
 
-// MARK: - MLXWrapper for MLX Model Interaction
-class MLXWrapper: ObservableObject {
-    @Published var isModelLoaded: Bool = false
-    @Published var loadingProgress: Double = 0.0 // 0.0 to 1.0
-    @Published var loadingMessage: String = "Initializing MLX..."
-    @Published var mlxError: String?
-
-    // Real MLX types - no more placeholders
-    private var modelContainer: ModelContainer?
-    internal var currentModelConfig: ModelConfiguration?  // Changed to internal so LLMService can check which model is loaded
-
-    init() {
-        print("HALDEBUG-MLX: MLXWrapper initialized.")
-    }
-
-    // Function to load the MLX model using ModelConfiguration from Block 30
-    func loadModel(modelConfig: ModelConfiguration) async {
-        await MainActor.run {
-            self.isModelLoaded = false
-            self.loadingProgress = 0.0
-            self.loadingMessage = "Loading MLX model..."
-            self.mlxError = nil
-        }
-
-        self.currentModelConfig = modelConfig
-
-        print("HALDEBUG-MLX: Attempting to load MLX model: \(modelConfig.displayName) (ID: \(modelConfig.id))")
-
-        do {
-            // Build MLX ModelConfiguration from Hal's ModelConfiguration
-            let mlxConfig: MLXLMCommon.ModelConfiguration
-            
-            if let localPath = modelConfig.localPath, FileManager.default.fileExists(atPath: localPath.path) {
-                // Use existing local model
-                mlxConfig = MLXLMCommon.ModelConfiguration(
-                    directory: localPath,
-                    defaultPrompt: "Tell me about the history of Spain."
-                )
-                print("HALDEBUG-MLX: Loading from local path: \(localPath.path)")
-            } else {
-                // CHANGE 2/2: No auto-redownload - throw error instead
-                print("HALDEBUG-MLX: âŒ Model files not found at expected location")
-                let errorMessage = "Yes. Unfortunately looks like I can't find the \(modelConfig.displayName) 'brain' files on this deviceâ€”they might have been cleared or deleted. You can re-download \(modelConfig.displayName) from the Model Library whenever you're ready. For now, I've switched over to Apple Intelligence so we can keep chatting without interruption."
-                await MainActor.run {
-                    self.isModelLoaded = false
-                    self.loadingProgress = 0.0
-                    self.mlxError = errorMessage
-                    self.loadingMessage = "Model files not found."
-                }
-                return
-            }
-            
-            // Set GPU memory cache limit for iOS optimization
-            MLX.GPU.set(cacheLimit: 64 * 1024 * 1024)   // 64 MB
-            
-            await MainActor.run {
-                self.loadingProgress = 0.2
-                self.loadingMessage = "Configuring model..."
-            }
-
-            // Load model container using LLMModelFactory
-            let container = try await LLMModelFactory.shared.loadContainer(
-                configuration: mlxConfig
-            ) { progress in
-                Task { @MainActor in
-                    self.loadingProgress = 0.2 + (progress.fractionCompleted * 0.8)
-                    self.loadingMessage = "Loading MLX model... (\(Int(self.loadingProgress * 100))%)"
-                }
-            }
-
-            self.modelContainer = container
-
-            await MainActor.run {
-                self.isModelLoaded = true
-                self.loadingProgress = 1.0
-                self.loadingMessage = "MLX model loaded successfully!"
-                print("HALDEBUG-MLX: MLX model container loaded successfully for \(modelConfig.displayName)")
-            }
-        } catch {
-            await MainActor.run {
-                self.isModelLoaded = false
-                self.loadingProgress = 0.0
-                self.mlxError = "Failed to load MLX model: \(error.localizedDescription). Please ensure the model files are properly downloaded and MLX framework is linked."
-                self.loadingMessage = "MLX loading failed."
-                print("HALDEBUG-MLX: Error loading MLX model: \(error.localizedDescription)")
-            }
-        }
-    }
-
-    // NEW: Function to unload the MLX model and free memory
-    func unloadModel() {
-        print("HALDEBUG-MLX: Unloading MLX model...")
-        
-        // Clear the model container to release memory
-        modelContainer = nil
-        
-        // Clear GPU cache to free VRAM
-        MLX.GPU.clearCache()
-        
-        // Update state
-        isModelLoaded = false
-        loadingProgress = 0.0
-        loadingMessage = "Model unloaded"
-        mlxError = nil
-        
-        print("HALDEBUG-MLX: MLX model unloaded successfully. Memory freed.")
-    }
-
-    // TEMPERATURE CHANGE 1/6: Add temperature parameter with default
-    // Function to generate response using the MLX model (non-streaming)
-    func generate(prompt: String, temperature: Double = 0.7) async throws -> String {
-        guard isModelLoaded, let container = self.modelContainer else {
-            throw LLMService.LLMError.modelNotLoaded
-        }
-
-        print("HALDEBUG-MLX: Generating response using MLX model for prompt: \(prompt.prefix(100))...")
-
-        do {
-            // Use proper MLXLMCommon API for generation
-            let result = try await container.perform { context in
-                let userInput = UserInput(prompt: prompt)
-                let input = try await context.processor.prepare(input: userInput)
-
-                // TEMPERATURE CHANGE 2/6: Pass temperature parameter to GenerateParameters (convert Double to Float)
-                // Updated token callback to stop on Phi-3 role markers
-                let generateResult = try MLXLMCommon.generate(
-                    input: input,
-                    parameters: GenerateParameters(temperature: Float(temperature)),
-                    context: context
-                ) { (tokens: [Int]) in
-                    let textSoFar = context.tokenizer.decode(tokens: tokens)
-                    if textSoFar.hasSuffix("\nUser:") || textSoFar.hasSuffix("\nAssistant:") || textSoFar.hasSuffix("###") {
-                        return .stop
-                    }
-                    return .more
-                }
-
-                // Extract the generated text from the result
-                return generateResult.output
-            }
-            MLX.GPU.clearCache() // Clear K-V cache after generation
-
-            // FIX: Explicit String type for proper method resolution
-            // Trim trailing stop signals from the generated output
-            var cleanOutput: String = result.trimmingCharacters(in: .whitespacesAndNewlines)
-            for stopSeq in ["User:", "Assistant:", "System:", "###"] {
-                if let range = cleanOutput.range(of: stopSeq, options: [.caseInsensitive, .backwards]) {
-                    cleanOutput = String(cleanOutput[..<range.lowerBound]).trimmingCharacters(in: .whitespacesAndNewlines)
-                    break
-                }
-            }
-            return cleanOutput
-        } catch {
-            print("HALDEBUG-MLX: Error during MLX non-streaming generation: \(error.localizedDescription)")
-            throw LLMService.LLMError.predictionFailed(error)
-        }
-    }
-}
-
-// MARK: - LLM Service (Wrapper for Foundation Models and MLX)
+// MARK: - LLM Service (Apple Foundation Models only in Hal LMC)
 class LLMService: ObservableObject {
-    internal var mlxWrapper: MLXWrapper // Changed to internal for MLXModelDownloader access
     @Published var initializationError: String?
 
-    private var currentModel: ModelConfiguration
-    /// Exposes the model ID currently loaded in LLMService (for diagnostic use by HalTestConsole).
-    var activeModelID: String { currentModel.id }
+    /// Always "apple-foundation-models" in Hal LMC.
+    var activeModelID: String { ModelConfiguration.appleFoundation.id }
 
-    // Initialize with a specific model
-    init(model: ModelConfiguration) {
-        // Initialize mlxWrapper here, it will be updated with path later
-        self.mlxWrapper = MLXWrapper()
-        self.currentModel = model
-        print("HALDEBUG-LLM: LLMService initializing for model: \(model.displayName)")
-        setupLLM(for: model)
+    init() {
+        print("HALDEBUG-LLM: LLMService initialized (AFM only)")
     }
 
-    // Function to dynamically set up the active LLM
-    func setupLLM(for model: ModelConfiguration) {
-        print("HALDEBUG-LLM: setupLLM called for model: \(model.displayName) (source: \(model.source))")
-        self.currentModel = model
-        print("HALDEBUG-LLM: currentModel updated to: \(self.currentModel.displayName) (source: \(self.currentModel.source))")
-        self.initializationError = nil // Clear previous errors
-
-        if model.source == .mlx {
-            // SWITCHING TO MLX MODEL: Check if we need to load a different model
-            let needsLoad = !mlxWrapper.isModelLoaded ||
-                           mlxWrapper.currentModelConfig?.id != model.id
-            
-            print("HALDEBUG-MLX: Model switching check - isLoaded: \(mlxWrapper.isModelLoaded), needsLoad: \(needsLoad)")
-            
-            if needsLoad {
-                if model.isDownloaded {
-                    Task {
-                        await self.mlxWrapper.loadModel(modelConfig: model)
-                        if let mlxError = self.mlxWrapper.mlxError {
-                            await MainActor.run {
-                                self.initializationError = mlxError
-                            }
-                        }
-                    }
-                    print("HALDEBUG-MLX: MLXWrapper loading triggered for \(model.displayName)")
-                } else {
-                    self.initializationError = "MLX model not downloaded. Please download it first."
-                    print("HALDEBUG-MLX: MLX model \(model.displayName) not downloaded.")
-                }
-            } else {
-                print("HALDEBUG-MLX: MLX model \(model.displayName) already loaded.")
-            }
-        } else {
-            // SWITCHING TO FOUNDATION MODELS: Unload MLX to free memory
-            if mlxWrapper.isModelLoaded {
-                mlxWrapper.unloadModel()
-                print("HALDEBUG-MLX: Unloaded MLX model, switching to Foundation Models.")
-            } else {
-                print("HALDEBUG-LLM: Switching to Foundation Models.")
-            }
-        }
-    }
-
-
-    // TEMPERATURE CHANGE 3/6: Add temperature parameter with default
-    // Public non-streaming response function (routes to active LLM for summarization, etc.)
+    /// Generate a response using Apple Foundation Models.
     func generateResponse(prompt: String, temperature: Double = 0.7) async throws -> String {
-        // CHANGE 1/2: Add response logging to identify which model is responding
-        print("HALDEBUG-RESPONSE: ðŸŽ¤ \(currentModel.displayName) (\(currentModel.source)) is responding")
-        print("HALDEBUG-LLM: generateResponse called - currentModel: \(currentModel.displayName) (source: \(currentModel.source))")
-        switch currentModel.source {
-        case .appleFoundation:
-            let session = LanguageModelSession()
-            print("HALDEBUG-LLM: Generating non-streaming from FoundationModels for prompt (first 200 chars): \(prompt.prefix(200)).....")
-            print("HALDEBUG-LLM: Using temperature: \(temperature)")
-            do {
-                // TEMPERATURE CHANGE 4/6: Pass temperature via GenerationOptions to AFM session
-                // FoundationModels non-streaming is direct
-                // Implemented non-streaming by collecting chunks from streamResponse
-                var accumulatedText = ""
-                let stream = session.streamResponse(options: GenerationOptions(temperature: temperature)) { Prompt(prompt) }
-                for try await snapshot in stream {
-                    accumulatedText = snapshot.content
-                }
-                print("HALDEBUG-LLM: FoundationModels non-streaming completed. Length: \(accumulatedText.count)")
-                return accumulatedText
-            } catch {
-                print("HALDEBUG-LLM: Error during FoundationModels non-streaming: \(error.localizedDescription)")
-                throw LLMError.predictionFailed(error)
+        print("HALDEBUG-RESPONSE: AFM responding")
+        let session = LanguageModelSession()
+        print("HALDEBUG-LLM: Generating from FoundationModels (first 200 chars): \(prompt.prefix(200))...")
+        do {
+            var accumulatedText = ""
+            let stream = session.streamResponse(
+                options: GenerationOptions(temperature: temperature)
+            ) { Prompt(prompt) }
+            for try await snapshot in stream {
+                accumulatedText = snapshot.content
             }
-        case .mlx:
-            guard mlxWrapper.isModelLoaded else { // Ensure MLX model is loaded before generating
-                print("HALDEBUG-MLX: âŒ Cannot generate - MLX model not loaded!")
-                throw LLMError.modelNotLoaded
-            }
-            print("HALDEBUG-MLX: Generating non-streaming from MLX model for prompt (first 200 chars): \(prompt.prefix(200)).....")
-            // TEMPERATURE CHANGE 5/6: Pass temperature parameter to MLX wrapper
-            return try await mlxWrapper.generate(prompt: prompt, temperature: temperature)
+            print("HALDEBUG-LLM: Generation complete. Length: \(accumulatedText.count)")
+            return accumulatedText
+        } catch {
+            print("HALDEBUG-LLM: Error during generation: \(error.localizedDescription)")
+            throw LLMError.predictionFailed(error)
         }
     }
 
@@ -4154,17 +3980,17 @@ class LLMService: ObservableObject {
         var errorDescription: String? {
             switch self {
             case .modelNotLoaded:
-                return "The selected language model could not be loaded or is not available."
+                return "The language model could not be loaded."
             case .predictionFailed(let error):
                 return "LLM operation failed: \(error.localizedDescription)"
             case .sessionInitializationFailed:
-                return "Failed to initialize a fresh language model session."
+                return "Failed to initialize a language model session."
             }
         }
     }
 }
 
-// ==== LEGO END: 08 MLXWrapper & LLMService (Foundation + MLX Routing) ====
+// ==== LEGO END: 08 LLMService (Apple Foundation Models) ====
 
 
 
@@ -4188,19 +4014,17 @@ struct TextSummarizer {
     ///   - targetTokens: Desired token count for summary
     ///   - llmService: LLMService instance for generating summary
     ///   - verificationThreshold: Minimum similarity score (0.0-1.0) for verification (default: 0.72)
-    ///   - useRecencyWeighting: If true, uses Salon Mode prompt with recency weighting (default: false)
     /// - Returns: Verified summary text
     static func summarizeWithVerification(
         text: String,
         targetTokens: Int,
         llmService: LLMService,
-        verificationThreshold: Double = 0.72,
-        useRecencyWeighting: Bool = false
+        verificationThreshold: Double = 0.72
     ) async -> String {
-        print("HALDEBUG-SUMMARIZER: Starting summarization - source: \(text.count) chars, target: \(targetTokens) tokens, recency weighting: \(useRecencyWeighting)")
-        
+        print("HALDEBUG-SUMMARIZER: Starting summarization - source: \(text.count) chars, target: \(targetTokens) tokens")
+
         // Stage 1: LLM summarize
-        let summary = await llmSummarize(text: text, targetTokens: targetTokens, llmService: llmService, useRecencyWeighting: useRecencyWeighting)
+        let summary = await llmSummarize(text: text, targetTokens: targetTokens, llmService: llmService)
         
         guard !summary.isEmpty else {
             print("HALDEBUG-SUMMARIZER: LLM returned empty summary, falling back to truncation")
@@ -4221,39 +4045,8 @@ struct TextSummarizer {
     // MARK: - Stage 1: LLM Summarization
     
     /// Use LLM to compress text while preserving factual claims
-    private static func llmSummarize(text: String, targetTokens: Int, llmService: LLMService, useRecencyWeighting: Bool) async -> String {
-        let prompt: String
-        
-        if useRecencyWeighting {
-            // Salon Mode prompt with recency weighting and information density
-            prompt = """
-            Summarize this conversation in approximately \(targetTokens) tokens.
-            
-            CRITICAL INSTRUCTIONS:
-            1. Allocate summary space based on INFORMATION DENSITY - brief exchanges (like "what time is it") deserve minimal space, substantive discussions deserve proportional detail
-            2. Preserve attribution (which model/seat said what)
-            
-            WEIGHTING STRATEGY:
-            - If there are fewer than 10 turns: Weight all turns roughly equally
-            - If there are 10 or more turns: Weight recent turns MORE HEAVILY than older turns as follows:
-              * Most recent 20% of turns: approximately 40% of summary space
-              * Middle 60% of turns: approximately 40% of summary space
-              * Oldest 20% of turns: approximately 20% of summary space
-            
-            Adjust dynamically based on content density regardless of turn count.
-            
-            Do not add interpretation or commentary. Extract and compress only.
-            Do not include citations, footnote markers, or reference numbers.
-            Write clear, complete sentences.
-            
-            Text to summarize:
-            \(text)
-            
-            Summary (approximately \(targetTokens) tokens):
-            """
-        } else {
-            // Standard prompt for single-LLM mode
-            prompt = """
+    private static func llmSummarize(text: String, targetTokens: Int, llmService: LLMService) async -> String {
+        let prompt = """
             You are a precise information compressor. Your task is to reduce the following text to approximately \(targetTokens) tokens while preserving:
             1. All factual claims and data points
             2. The logical flow of ideas
@@ -4272,7 +4065,6 @@ struct TextSummarizer {
             
             Compressed version (approximately \(targetTokens) tokens):
             """
-        }
         
         do {
             let result = try await llmService.generateResponse(prompt: prompt)
@@ -4599,14 +4391,11 @@ struct HistoricalContext {
 struct Hal10000App: App {
     @StateObject private var chatViewModel = ChatViewModel()
     @StateObject private var documentImportManager = DocumentImportManager.shared
-    @StateObject private var mlxDownloader = MLXModelDownloader.shared // Inject MLXModelDownloader
-
     var body: some Scene {
         WindowGroup {
             iOSChatView()
                 .environmentObject(chatViewModel)
                 .environmentObject(documentImportManager)
-                .environmentObject(mlxDownloader) // Pass MLXModelDownloader
         }
         #if targetEnvironment(macCatalyst)
         // Mac-specific window sizing to eliminate black bars in "Designed for iPad" mode
@@ -4774,7 +4563,6 @@ struct iOSChatView: View {
                 ActionsView(showingDocumentPicker: $showingDocumentPicker)
                     .environmentObject(chatViewModel)
                     .environmentObject(DocumentImportManager.shared)
-                    .environmentObject(MLXModelDownloader.shared)
             }
 
             // Document picker sheet
@@ -4972,32 +4760,15 @@ struct ThreadPanelView: View {
 
 // ==== LEGO START: 10.1 MainSettingsView ====
 
-// MARK: - Power User Mode Selection
-
-// User can choose between Single LLM mode (traditional one-model operation with advanced
-// memory/performance tuning) or Multi LLM mode (Salon Mode - multiple models participating
-// in the same conversation with orchestration controls).
-//
-// CRITICAL: Selecting a mode ACTIVATES it immediately:
-// - Select "Multi LLM (Salon)" -> salonConfig.isEnabled = true (Salon Mode active)
-// - Select "Single LLM" -> salonConfig.isEnabled = false (Single mode active)
-// The toggle both switches which settings you can access AND determines chat behavior.
-enum PowerUserMode: String, CaseIterable {
-    case single = "Single LLM"
-    case multi = "Multi LLM (Salon)"
-}
 
 struct ActionsView: View {
     @Environment(\.dismiss) var dismiss
     @EnvironmentObject var chatViewModel: ChatViewModel
     @EnvironmentObject var documentImportManager: DocumentImportManager
-    @EnvironmentObject var mlxDownloader: MLXModelDownloader
 
     @Binding var showingDocumentPicker: Bool
     @State private var showingExportSheet = false
     @State private var showingPowerUserSheet = false
-    @State private var showingSalonModeSheet = false
-    @State private var powerUserMode: PowerUserMode = .single
     @State private var showingSystemPromptEditor = false
     @State private var showingSelfReflectionViewer = false
     @State private var initialSettingsSnapshot: [String: Any] = [:]
@@ -5008,7 +4779,6 @@ struct ActionsView: View {
             Form {
                 personalitySection
                 importExportSection
-                modelSection
                 powerUserSection
             }
             .navigationTitle("Settings")
@@ -5018,22 +4788,12 @@ struct ActionsView: View {
                 }
             }
         }
-        .onAppear {
-            // Initialize Power User Mode toggle from current Salon Mode state
-            powerUserMode = chatViewModel.salonConfig.isEnabled ? .multi : .single
-        }
         .sheet(isPresented: $showingExportSheet) {
             ShareSheet(activityItems: [chatViewModel.exportChatHistory()])
         }
         .sheet(isPresented: $showingPowerUserSheet) {
             PowerUserView()
                 .environmentObject(chatViewModel)
-                .environmentObject(mlxDownloader)
-        }
-        .sheet(isPresented: $showingSalonModeSheet) {
-            SalonModeView()
-                .environmentObject(chatViewModel)
-                .environmentObject(mlxDownloader)
         }
         .sheet(isPresented: $showingSystemPromptEditor) {
             SystemPromptEditorView()
@@ -5049,7 +4809,6 @@ struct ActionsView: View {
                 "recencyWeight": chatViewModel.memoryStore.recencyWeight,
                 "recencyHalfLifeDays": chatViewModel.memoryStore.recencyHalfLifeDays,
                 "maxRagSnippetsCharacters": chatViewModel.maxRagSnippetsCharacters,
-                "selectedModelID": chatViewModel.selectedModelID
             ]
             chatViewModel.pendingSettingsChanges.removeAll()
             print("HALDEBUG-SETTINGS: Captured initial snapshot")
@@ -5232,100 +4991,16 @@ struct ActionsView: View {
         }
     }
 
-    // MARK: - Model Section
-    
-    private var modelSection: some View {
-        Section {
-            HStack {
-                Text("Active Model")
-                    .font(.subheadline)
-                    .fontWeight(.medium)
-                Spacer()
-                HStack(spacing: 6) {
-                    modelStatusDot(for: chatViewModel.selectedModel, downloader: mlxDownloader)
-                    Text(chatViewModel.selectedModel.displayName)
-                        .font(.subheadline)
-                        .foregroundColor(.secondary)
-                }
-            }
-            
-            NavigationLink(destination: ModelLibraryView()
-                .environmentObject(chatViewModel)
-                .environmentObject(mlxDownloader)) {
-                HStack {
-                    Image(systemName: "square.grid.2x2")
-                    Text("Browse Model Library")
-                    Spacer()
-                }
-            }
-            .foregroundColor(.primary)
-        } header: {
-            Label("AI Model", systemImage: "cpu")
-        } footer: {
-            Text("Select from Apple Foundation Models or download MLX models from Hugging Face")
-                .font(.caption2)
-        }
-    }
-    
     // MARK: - Power User Section
-    
-    // SELF-AWARENESS NOTE (for Hal reading this code):
-    // This section lets users choose between two very different modes of operation:
-    // - Single LLM: Traditional mode where one model (like me) handles all responses.
-    //   Settings focus on memory tuning, RAG limits, and performance optimization.
-    // - Multi LLM (Salon): Experimental mode where multiple models participate in the
-    //   same conversation simultaneously. Settings control which models participate,
-    //   speaking order, how models see each other's responses, and behavioral constraints.
-    //
-    // CRITICAL BEHAVIOR: The toggle ACTIVATES the selected mode immediately.
-    // When user selects "Multi LLM (Salon)", salonConfig.isEnabled becomes true and
-    // Salon Mode is active for all subsequent conversations. When they select "Single LLM",
-    // salonConfig.isEnabled becomes false and we return to single-model operation.
-    // One control does everything: activation + settings access + chat behavior.
     
     private var powerUserSection: some View {
         Section {
-            // Mode toggle
-            VStack(alignment: .leading, spacing: 8) {
-                Text("Power User Mode")
-                    .font(.subheadline)
-                    .fontWeight(.medium)
-                
-                Picker("", selection: Binding(
-                    get: { powerUserMode },
-                    set: { newMode in
-                        powerUserMode = newMode
-                        // CRITICAL: Activate/deactivate Salon Mode based on selection
-                        var config = chatViewModel.salonConfig
-                        config.isEnabled = (newMode == .multi)
-                        chatViewModel.salonConfig = config
-                        print("HALDEBUG-SALON: Mode changed to \(newMode.rawValue), isEnabled = \(config.isEnabled)")
-                    }
-                )) {
-                    ForEach(PowerUserMode.allCases, id: \.self) { mode in
-                        Text(mode.rawValue).tag(mode)
-                    }
-                }
-                .pickerStyle(.segmented)
-                
-                Text(powerUserMode == .single ?
-                     "Advanced settings for single model operation" :
-                     "Configure multiple models for collaborative conversations")
-                    .font(.caption)
-                    .foregroundColor(.secondary)
-            }
-            
-            // Settings button (opens different sheet based on mode)
             Button {
-                if powerUserMode == .single {
-                    showingPowerUserSheet = true
-                } else {
-                    showingSalonModeSheet = true
-                }
+                showingPowerUserSheet = true
             } label: {
                 HStack {
-                    Image(systemName: powerUserMode == .single ? "wrench.and.screwdriver" : "person.3")
-                    Text(powerUserMode == .single ? "Single LLM Settings" : "Salon Mode Settings")
+                    Image(systemName: "wrench.and.screwdriver")
+                    Text("Advanced Settings")
                     Spacer()
                     Image(systemName: "chevron.right")
                         .font(.caption)
@@ -5334,40 +5009,8 @@ struct ActionsView: View {
             }
             .foregroundColor(.primary)
         } footer: {
-            Text(powerUserMode == .single ?
-                 "Advanced memory settings and data management" :
-                 "Configure multi-model conversation orchestration")
+            Text("Advanced memory settings and data management")
                 .font(.caption2)
-        }
-    }
-    
-    // MARK: - Helper Function
-    
-    private func modelStatusDot(for model: ModelConfiguration, downloader: MLXModelDownloader) -> some View {
-        Group {
-            if model.source == .appleFoundation {
-                Circle()
-                    .fill(Color.green)
-                    .frame(width: 8, height: 8)
-            } else {
-                if downloader.isModelDownloaded(model.id) {
-                    Circle()
-                        .fill(Color.green)
-                        .frame(width: 8, height: 8)
-                } else if downloader.downloadStates[model.id]?.isDownloading == true {
-                    Circle()
-                        .fill(Color.orange)
-                        .frame(width: 8, height: 8)
-                } else if downloader.downloadStates[model.id]?.error != nil {
-                    Circle()
-                        .fill(Color.red)
-                        .frame(width: 8, height: 8)
-                } else {
-                    Circle()
-                        .fill(Color.gray.opacity(0.5))
-                        .frame(width: 8, height: 8)
-                }
-            }
         }
     }
 }
@@ -5395,10 +5038,8 @@ struct ActionsView: View {
 struct PowerUserView: View {
     @Environment(\.dismiss) var dismiss
     @EnvironmentObject var chatViewModel: ChatViewModel
-    @EnvironmentObject var mlxDownloader: MLXModelDownloader
     
     @State private var showingNuclearResetConfirmationAlert = false
-    @State private var showingClearCacheAlert = false
     @State private var showResetSettingsAlert = false
     @State private var sliderStartValues: [String: Double] = [:]
     
@@ -5407,8 +5048,8 @@ struct PowerUserView: View {
             Form {
                 memorySection
                 settingsResetSection
-                cacheManagementSection
                 dataManagementSection
+                developerAPISection
                 if ProcessInfo.processInfo.isiOSAppOnMac {
                     testConsoleSection
                 }
@@ -5437,14 +5078,6 @@ struct PowerUserView: View {
             Button("Cancel", role: .cancel) { }
         } message: {
             Text("Reset all settings to factory defaults? This will reset your system prompt, memory depth, similarity threshold, recency settings, and RAG limits. Your conversation history and documents will not be affected.")
-        }
-        .alert("Clear Cache", isPresented: $showingClearCacheAlert) {
-            Button("Clear Cache", role: .destructive) {
-                mlxDownloader.clearHubCache()
-            }
-            Button("Cancel", role: .cancel) { }
-        } message: {
-            Text("This will delete all cached model files (\(mlxDownloader.hubCacheSize)). Downloaded models will need to be re-downloaded.")
         }
     }
     
@@ -5625,41 +5258,6 @@ struct PowerUserView: View {
         }
     }
     
-    // MARK: - Cache Management Section
-    
-    // Allows clearing of Hugging Face model cache to free disk space
-    // This doesn't affect conversations or documents, only downloaded model files
-    
-    private var cacheManagementSection: some View {
-        Section {
-            HStack {
-                VStack(alignment: .leading, spacing: 4) {
-                    Text("Model Cache")
-                        .font(.subheadline)
-                    Text(mlxDownloader.hubCacheSize)
-                        .font(.caption)
-                        .foregroundColor(.secondary)
-                }
-                Spacer()
-                if mlxDownloader.isCacheCalculating {
-                    ProgressView()
-                        .scaleEffect(0.8)
-                } else {
-                    Button("Clear Cache") {
-                        showingClearCacheAlert = true
-                    }
-                    .font(.caption)
-                    .foregroundColor(.red)
-                }
-            }
-        } header: {
-            Label("Storage", systemImage: "externaldrive")
-        } footer: {
-            Text("Clear cached Hugging Face model files to free up space")
-                .font(.caption2)
-        }
-    }
-    
     // MARK: - Data Management Section
     
     // Database statistics and nuclear reset option
@@ -5698,6 +5296,84 @@ struct PowerUserView: View {
         } footer: {
             Text("Database statistics and data management options")
                 .font(.caption2)
+        }
+    }
+
+    // MARK: - Developer API Section
+
+    private var developerAPISection: some View {
+        DeveloperAPISectionView(viewModel: chatViewModel)
+    }
+
+    // Separate view so @ObservedObject updates don't ripple through all of PowerUserView
+    struct DeveloperAPISectionView: View {
+        @ObservedObject var viewModel: ChatViewModel
+        @State private var copiedField: String? = nil
+
+        var body: some View {
+            Section {
+                Toggle(isOn: Binding(
+                    get: { viewModel.localAPIEnabled },
+                    set: { enabled in
+                        if enabled { viewModel.startLocalAPI() }
+                        else       { viewModel.stopLocalAPI()  }
+                    }
+                )) {
+                    Label("Local API Access", systemImage: "network")
+                }
+
+                if viewModel.localAPIEnabled {
+                    VStack(alignment: .leading, spacing: 8) {
+                        copyableRow(label: "Address",
+                                    value: viewModel.localAPIServer.connectionURL,
+                                    field: "address",
+                                    font: .caption)
+                        copyableRow(label: "Port",
+                                    value: "\(LocalAPIServer.apiPort)",
+                                    field: "port",
+                                    font: .caption)
+                        copyableRow(label: "Token",
+                                    value: viewModel.localAPIServer.apiToken,
+                                    field: "token",
+                                    font: .system(.caption2, design: .monospaced))
+                    }
+                    .padding(.vertical, 4)
+                }
+            } header: {
+                Label("Developer API", systemImage: "terminal")
+            } footer: {
+                Text(viewModel.localAPIEnabled
+                    ? "Tap any field to copy. Setup: python3 tests/hal_test.py setup 127.0.0.1 8765 <token>"
+                    : "Enables a local HTTP API for automated testing. Off by default — no port opens unless you enable this.")
+                    .font(.caption2)
+            }
+        }
+
+        @ViewBuilder
+        private func copyableRow(label: String, value: String, field: String, font: Font) -> some View {
+            HStack(alignment: .top) {
+                Text(label)
+                    .font(.caption)
+                    .foregroundColor(.secondary)
+                Spacer()
+                HStack(spacing: 4) {
+                    Text(copiedField == field ? "Copied!" : value)
+                        .font(font)
+                        .foregroundColor(copiedField == field ? .green : .primary)
+                        .multilineTextAlignment(.trailing)
+                        .textSelection(.enabled)
+                    Image(systemName: "doc.on.doc")
+                        .font(.caption2)
+                        .foregroundColor(copiedField == field ? .green : .secondary)
+                }
+                .onTapGesture {
+                    UIPasteboard.general.string = value
+                    withAnimation { copiedField = field }
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) {
+                        withAnimation { if copiedField == field { copiedField = nil } }
+                    }
+                }
+            }
         }
     }
 
@@ -5837,637 +5513,6 @@ struct SystemPromptEditorView: View {
 
 // ==== LEGO END: 10.3 SystemPromptEditorView ====
     
-
-
-// ==== LEGO START: 10.4 SalonModeView (Multi-LLM Configuration) ====
-
-struct SalonModeView: View {
-    @EnvironmentObject var chatViewModel: ChatViewModel
-    @Environment(\.dismiss) var dismiss
-    
-    var body: some View {
-        NavigationView {
-            Form {
-                // Section 1: Active Seats
-                Section {
-                    // Seat 1
-                    Picker("Seat 1 (First)", selection: $chatViewModel.salonConfig.seat1) {
-                        Text("Empty").tag(nil as String?)
-                        ForEach(chatViewModel.usableModels, id: \.id) { model in
-                            Text(model.displayName).tag(model.id as String?)
-                        }
-                    }
-                    
-                    // Seat 2
-                    Picker("Seat 2 (Second)", selection: $chatViewModel.salonConfig.seat2) {
-                        Text("Empty").tag(nil as String?)
-                        ForEach(chatViewModel.usableModels, id: \.id) { model in
-                            Text(model.displayName).tag(model.id as String?)
-                        }
-                    }
-                    
-                    // Seat 3
-                    Picker("Seat 3 (Third)", selection: $chatViewModel.salonConfig.seat3) {
-                        Text("Empty").tag(nil as String?)
-                        ForEach(chatViewModel.usableModels, id: \.id) { model in
-                            Text(model.displayName).tag(model.id as String?)
-                        }
-                    }
-                    
-                    // Seat 4
-                    Picker("Seat 4 (Fourth)", selection: $chatViewModel.salonConfig.seat4) {
-                        Text("Empty").tag(nil as String?)
-                        ForEach(chatViewModel.usableModels, id: \.id) { model in
-                            Text(model.displayName).tag(model.id as String?)
-                        }
-                    }
-                    
-                } header: {
-                    Label("Active Seats", systemImage: "person.3")
-                } footer: {
-                    Text("Each seat selects a model or Empty. Order is fixed by seat number.")
-                        .font(.caption)
-                }
-                
-                // Section 2: Behavior
-                Section {
-                    Picker("Mode", selection: $chatViewModel.salonConfig.behavioralMode) {
-                        Text("Independent perspectives").tag(SalonBehavioralMode.independent)
-                        Text("Context-aware perspectives").tag(SalonBehavioralMode.contextAware)
-                    }
-                    
-                    Picker("Summarized by", selection: $chatViewModel.salonConfig.summarizerModel) {
-                        Text("Empty").tag(nil as String?)
-                        ForEach(chatViewModel.usableModels, id: \.id) { model in
-                            Text(model.displayName).tag(model.id as String?)
-                        }
-                    }
-                    
-                } header: {
-                    Label("Behavior", systemImage: "brain")
-                } footer: {
-                    Text("Selects a model or Empty for no summarization.")
-                        .font(.caption)
-                }
-            }
-            .navigationTitle("Salon Mode")
-            .navigationBarTitleDisplayMode(.inline)
-            .toolbar {
-                ToolbarItem(placement: .navigationBarTrailing) {
-                    Button("Done") {
-                        dismiss()
-                    }
-                }
-            }
-        }
-    }
-}
-
-// ==== LEGO END: 10.4 SalonModeView (Multi-LLM Configuration) ====
-
-
-
-// ==== LEGO START: 11.5 Model Library UI ====
-
-// MARK: - Model Library View
-struct ModelLibraryView: View {
-    @Environment(\.dismiss) var dismiss
-    @EnvironmentObject var chatViewModel: ChatViewModel
-    @EnvironmentObject var mlxDownloader: MLXModelDownloader
-    @ObservedObject private var catalog = ModelCatalogService.shared  // Observe catalog for updates
-    
-    @State private var selectedModelForLicense: ModelConfiguration?
-    @State private var modelToDelete: ModelConfiguration?
-    @State private var showingDeleteConfirmation = false
-    
-    var body: some View {
-        ZStack {
-            List {
-                // Built-In Models (AFM) - Always First
-                Section("Built-In Models") {
-                    ForEach(builtInModels) { model in
-                        ModelRow(
-                            model: model,
-                            isSelected: chatViewModel.selectedModelID == model.id,
-                            statusDot: modelStatusDot(for: model),
-                            onSelect: { selectModel(model) }
-                        )
-                    }
-                }
-                
-                // Downloaded MLX Models - Second
-                if !downloadedMLXModels.isEmpty {
-                    Section("Downloaded Models") {
-                        ForEach(downloadedMLXModels) { model in
-                            MLXModelRow(
-                                model: model,
-                                isSelected: chatViewModel.selectedModelID == model.id,
-                                downloadState: mlxDownloader.downloadStates[model.id],
-                                onSelect: { selectModel(model) },
-                                onDownload: { }, // Already downloaded
-                                onCancel: { mlxDownloader.cancelDownload(modelID: model.id) },
-                                onDelete: { requestDeleteModel(model) }
-                            )
-                        }
-                    }
-                }
-                
-                // Available MLX Models - Third
-                if !availableMLXModels.isEmpty {
-                    Section("Available Models") {
-                        ForEach(availableMLXModels) { model in
-                            MLXModelRow(
-                                model: model,
-                                isSelected: false,
-                                downloadState: mlxDownloader.downloadStates[model.id],
-                                onSelect: { }, // Can't select undownloaded
-                                onDownload: { downloadModel(model) },
-                                onCancel: { mlxDownloader.cancelDownload(modelID: model.id) },
-                                onDelete: { }  // Can't delete undownloaded
-                            )
-                        }
-                    }
-                }
-            }
-            .navigationTitle("Model Library")
-            .navigationBarTitleDisplayMode(.inline)
-            .task {
-                await chatViewModel.refreshModelCatalog()
-                ModelCatalogService.shared.refreshDownloadStates()
-            }
-            .sheet(item: $selectedModelForLicense) { model in
-                ModelLicenseSheet(
-                    model: model,
-                    onAccept: {
-                        ModelCatalogService.shared.acceptLicense(for: model.id)
-                        selectedModelForLicense = nil
-                        Task {
-                            await mlxDownloader.startDownload(modelID: model.id, repoID: model.id, sizeGB: model.sizeGB)
-                        }
-                    },
-                    onCancel: {
-                        selectedModelForLicense = nil
-                    }
-                )
-            }
-            .alert("Delete Model?", isPresented: $showingDeleteConfirmation, presenting: modelToDelete) { model in
-                Button("Cancel", role: .cancel) {
-                    print("HALDEBUG-UI: User cancelled deletion of model: \(model.id)")
-                }
-                Button("Delete", role: .destructive) {
-                    print("HALDEBUG-UI: User confirmed deletion of model: \(model.id)")
-                    deleteModel(model)
-                }
-            } message: { model in
-                if let size = model.sizeGB {
-                    Text("This will permanently delete \(model.displayName) (\(String(format: "%.1f", size)) GB).")
-                } else {
-                    Text("This will permanently delete \(model.displayName).")
-                }
-            }
-            
-            // Loading overlay
-            if catalog.isLoading {
-                VStack(spacing: 12) {
-                    ProgressView()
-                        .scaleEffect(1.2)
-                    Text("Loading models from Hugging Face...")
-                        .font(.subheadline)
-                        .foregroundColor(.secondary)
-                }
-                .padding(20)
-                .background(.regularMaterial)
-                .cornerRadius(12)
-            }
-        }
-    }
-    
-    // MARK: - Model Filtering
-    
-    private var builtInModels: [ModelConfiguration] {
-        ModelCatalogService.shared.availableModels
-            .filter { $0.source == .appleFoundation }
-            .sorted { $0.displayName < $1.displayName }
-    }
-    
-    private var downloadedMLXModels: [ModelConfiguration] {
-        ModelCatalogService.shared.availableModels
-            .filter { $0.source == .mlx && mlxDownloader.isModelDownloaded($0.id) }
-            .sorted { $0.displayName < $1.displayName }
-    }
-    
-    private var availableMLXModels: [ModelConfiguration] {
-        ModelCatalogService.shared.availableModels
-            .filter { $0.source == .mlx && !mlxDownloader.isModelDownloaded($0.id) }
-            .sorted { $0.displayName < $1.displayName }
-    }
-    
-    // MARK: - Actions
-    
-    private func selectModel(_ model: ModelConfiguration) {
-        guard model.source == .appleFoundation || mlxDownloader.isModelDownloaded(model.id) else {
-            return  // Can't select undownloaded MLX model
-        }
-        
-        Task {
-            await chatViewModel.switchToModel(model)
-            dismiss()
-        }
-    }
-    
-    private func downloadModel(_ model: ModelConfiguration) {
-        if !ModelCatalogService.shared.hasAcceptedLicense(for: model.id) {
-            selectedModelForLicense = model  // This triggers the sheet
-        } else {
-            Task {
-                await mlxDownloader.startDownload(modelID: model.id, repoID: model.id, sizeGB: model.sizeGB)
-            }
-        }
-    }
-    
-    private func requestDeleteModel(_ model: ModelConfiguration) {
-        print("HALDEBUG-UI: Delete button tapped for model: \(model.id)")
-        modelToDelete = model
-        showingDeleteConfirmation = true
-    }
-    
-    private func deleteModel(_ model: ModelConfiguration) {
-        Task {
-            await mlxDownloader.deleteModel(modelID: model.id)
-            
-            // If deleted model was active, switch to AFM and add chat messages
-            if chatViewModel.selectedModelID == model.id {
-                await chatViewModel.switchToModel(.appleFoundation)
-                
-                // Add bilateral chat messages about the switch
-                await MainActor.run {
-                    let userMsg = "Hal, I deleted the \(model.displayName) model."
-                    let halMsg = "No problem! I've switched over to Apple Intelligence so we can keep chatting without interruption. You can re-download \(model.displayName) from the Model Library whenever you're ready."
-                    let currentTurn = chatViewModel.memoryStore.getCurrentTurnNumber(conversationId: chatViewModel.conversationId) + 1
-                    chatViewModel.messages.append(ChatMessage(content: userMsg, isFromUser: true, recordedByModel: "user", turnNumber: currentTurn))
-                    chatViewModel.messages.append(ChatMessage(content: halMsg, isFromUser: false, recordedByModel: chatViewModel.selectedModel.id, turnNumber: currentTurn))
-                }
-            }
-        }
-    }
-    
-    // MARK: - Status Dot Helper
-    
-    private func modelStatusDot(for model: ModelConfiguration) -> some View {
-        Group {
-            if model.source == .appleFoundation {
-                // Green = active, blue = available but not selected
-                Circle()
-                    .fill(chatViewModel.selectedModelID == model.id ? Color.green : Color.blue)
-                    .frame(width: 8, height: 8)
-            } else {
-                if mlxDownloader.isModelDownloaded(model.id) {
-                    Circle()
-                        .fill(Color.green)
-                        .frame(width: 8, height: 8)
-                } else if mlxDownloader.downloadStates[model.id]?.isDownloading == true {
-                    Circle()
-                        .fill(Color.orange)
-                        .frame(width: 8, height: 8)
-                } else if mlxDownloader.downloadStates[model.id]?.error != nil {
-                    Circle()
-                        .fill(Color.red)
-                        .frame(width: 8, height: 8)
-                } else {
-                    Circle()
-                        .fill(Color.gray.opacity(0.5))
-                        .frame(width: 8, height: 8)
-                }
-            }
-        }
-    }
-}
-
-// MARK: - Model Row (Built-In Models)
-struct ModelRow: View {
-    let model: ModelConfiguration
-    let isSelected: Bool
-    let statusDot: AnyView
-    let onSelect: () -> Void
-    
-    init(model: ModelConfiguration, isSelected: Bool, statusDot: some View, onSelect: @escaping () -> Void) {
-        self.model = model
-        self.isSelected = isSelected
-        self.statusDot = AnyView(statusDot)
-        self.onSelect = onSelect
-    }
-    
-    var body: some View {
-        Button(action: onSelect) {
-            HStack(spacing: 12) {
-                VStack(alignment: .leading, spacing: 4) {
-                    Text(model.displayName)
-                        .font(.subheadline)
-                        .fontWeight(.medium)
-                        .foregroundColor(.primary)
-                    if let description = model.description {
-                        Text(description)
-                            .font(.caption)
-                            .foregroundColor(.secondary)
-                            .lineLimit(2)
-                    }
-                }
-                Spacer()
-                HStack(spacing: 8) {
-                    if isSelected {
-                        Image(systemName: "checkmark.circle.fill")
-                            .foregroundColor(.blue)
-                            .font(.system(size: 16))
-                    }
-                    statusDot
-                }
-            }
-            .contentShape(Rectangle())
-        }
-        .buttonStyle(PlainButtonStyle())
-    }
-}
-
-// MARK: - MLX Model Row (Downloadable Models)
-struct MLXModelRow: View {
-    let model: ModelConfiguration
-    let isSelected: Bool
-    let downloadState: MLXModelDownloader.DownloadState?
-    let onSelect: () -> Void
-    let onDownload: () -> Void
-    let onCancel: () -> Void
-    let onDelete: () -> Void
-    
-    var body: some View {
-        VStack(alignment: .leading, spacing: 12) {
-            // Header Row
-            HStack(spacing: 12) {
-                VStack(alignment: .leading, spacing: 4) {
-                    Text(model.displayName)
-                        .font(.subheadline)
-                        .fontWeight(.medium)
-                    HStack(spacing: 8) {
-                        if let size = model.sizeGB {
-                            Text("\(String(format: "%.1f", size)) GB")
-                                .font(.caption)
-                                .foregroundColor(.secondary)
-                        }
-                        if let license = model.license {
-                            Text("•")
-                                .font(.caption)
-                                .foregroundColor(.secondary)
-                            Text(license.uppercased())
-                                .font(.caption)
-                                .foregroundColor(.secondary)
-                        }
-                    }
-                }
-                Spacer()
-                statusIndicator
-            }
-            
-            // Description (if available)
-            if let description = model.description {
-                Text(description)
-                    .font(.caption)
-                    .foregroundColor(.secondary)
-                    .lineLimit(2)
-            }
-            
-            // Action Buttons or Progress
-            if let state = downloadState, state.isDownloading {
-                // Downloading
-                VStack(spacing: 6) {
-                    ProgressView(value: state.progress)
-                    HStack {
-                        Text(state.message)
-                            .font(.caption)
-                            .foregroundColor(.secondary)
-                        Spacer()
-                        Button("Cancel") { onCancel() }
-                            .font(.caption)
-                            .foregroundColor(.red)
-                    }
-                }
-            } else if downloadState?.localPath != nil {
-                // Downloaded
-                HStack(spacing: 12) {
-                    Button(action: onSelect) {
-                        HStack(spacing: 4) {
-                            Image(systemName: isSelected ? "checkmark.circle.fill" : "circle")
-                            Text(isSelected ? "Active" : "Select")
-                        }
-                        .contentShape(Rectangle())
-                    }
-                    .buttonStyle(BorderlessButtonStyle())
-                    .disabled(isSelected)
-                    .foregroundColor(isSelected ? .secondary : .blue)
-                    .font(.caption)
-                    
-                    Spacer()
-                    
-                    Button(action: onDelete) {
-                        HStack(spacing: 4) {
-                            Image(systemName: "trash")
-                            Text("Delete")
-                        }
-                        .contentShape(Rectangle())
-                    }
-                    .buttonStyle(BorderlessButtonStyle())
-                    .foregroundColor(.red)
-                    .font(.caption)
-                }
-            } else if let state = downloadState, state.error != nil {
-                // Error state
-                VStack(alignment: .leading, spacing: 6) {
-                    Text(state.error ?? "Download failed")
-                        .font(.caption)
-                        .foregroundColor(.red)
-                    Button(action: onDownload) {
-                        HStack(spacing: 4) {
-                            Image(systemName: "arrow.clockwise")
-                            Text("Retry")
-                        }
-                    }
-                    .foregroundColor(.blue)
-                    .font(.caption)
-                }
-            } else {
-                // Not Downloaded - Show download button
-                Button(action: onDownload) {
-                    HStack(spacing: 4) {
-                        Image(systemName: "arrow.down.circle.fill")
-                        Text("Download")
-                    }
-                }
-                .foregroundColor(.blue)
-                .font(.caption)
-            }
-        }
-        .padding(.vertical, 4)
-    }
-    
-    private var statusIndicator: some View {
-        Group {
-            if downloadState?.localPath != nil {
-                // Green = active (selected), blue = downloaded but not selected
-                Circle().fill(isSelected ? Color.green : Color.blue).frame(width: 8, height: 8)
-            } else if downloadState?.isDownloading == true {
-                Circle().fill(Color.orange).frame(width: 8, height: 8)
-            } else if downloadState?.error != nil {
-                Circle().fill(Color.red).frame(width: 8, height: 8)
-            } else {
-                Circle().fill(Color.gray.opacity(0.5)).frame(width: 8, height: 8)
-            }
-        }
-    }
-}
-
-// MARK: - Model License Sheet
-struct ModelLicenseSheet: View {
-    let model: ModelConfiguration
-    let onAccept: () -> Void
-    let onCancel: () -> Void
-    
-    var body: some View {
-        NavigationStack {
-            ScrollView {
-                VStack(alignment: .leading, spacing: 20) {
-                    // Header
-                    VStack(alignment: .leading, spacing: 8) {
-                        Text(licenseName)
-                            .font(.title2)
-                            .fontWeight(.bold)
-
-                        Text("By downloading \(model.displayName), you agree to its license terms.")
-                            .font(.subheadline)
-                            .foregroundColor(.secondary)
-                    }
-
-                    // Download Warnings FIRST
-                    if let size = model.sizeGB {
-                        VStack(alignment: .leading, spacing: 12) {
-                            // Size warning
-                            VStack(alignment: .leading, spacing: 6) {
-                                HStack {
-                                    Image(systemName: "exclamationmark.triangle.fill")
-                                        .foregroundColor(.orange)
-                                    Text("Large Download: \(String(format: "%.1f", size)) GB")
-                                        .fontWeight(.semibold)
-                                }
-                                Text("Requires \(String(format: "%.1f", size)) GB storage and bandwidth")
-                                    .font(.caption)
-                                    .foregroundColor(.secondary)
-                            }
-                            .padding()
-                            .background(Color.orange.opacity(0.1))
-                            .cornerRadius(8)
-
-                            // WiFi warning for >1GB
-                            if size > 1.0 {
-                                VStack(alignment: .leading, spacing: 6) {
-                                    HStack {
-                                        Image(systemName: "wifi")
-                                            .foregroundColor(.blue)
-                                        Text("WiFi Recommended")
-                                            .fontWeight(.semibold)
-                                    }
-                                    Text("Connect to WiFi to avoid cellular data charges")
-                                        .font(.caption)
-                                        .foregroundColor(.secondary)
-                                }
-                                .padding()
-                                .background(Color.blue.opacity(0.1))
-                                .cornerRadius(8)
-                            }
-                        }
-                    }
-
-                    Divider()
-
-                    // License Info
-                    VStack(alignment: .leading, spacing: 12) {
-                        Text("License: \(model.license?.uppercased() ?? "CUSTOM")")
-                            .font(.headline)
-
-                        if let description = licenseDescription {
-                            Text(description)
-                                .font(.subheadline)
-                                .foregroundColor(.secondary)
-                        }
-
-                        Link(destination: URL(string: "https://huggingface.co/\(model.id)")!) {
-                            HStack {
-                                Image(systemName: "link")
-                                Text("View Full License on Hugging Face")
-                                Spacer()
-                                Image(systemName: "arrow.up.right")
-                            }
-                            .foregroundColor(.blue)
-                        }
-                        .padding()
-                        .background(Color.blue.opacity(0.1))
-                        .cornerRadius(8)
-                    }
-
-                    Divider()
-
-                    // Inline action buttons — guaranteed visible on Mac Catalyst where
-                    // NavigationStack toolbar items may not render in sheets.
-                    VStack(spacing: 12) {
-                        Button(action: onAccept) {
-                            Text("Accept & Download")
-                                .fontWeight(.semibold)
-                                .frame(maxWidth: .infinity)
-                        }
-                        .buttonStyle(.borderedProminent)
-
-                        Button(action: onCancel) {
-                            Text("Cancel")
-                                .frame(maxWidth: .infinity)
-                        }
-                        .buttonStyle(.bordered)
-                    }
-                }
-                .padding()
-            }
-            .navigationTitle(model.displayName)
-            .navigationBarTitleDisplayMode(.inline)
-        }
-    }
-
-    private var licenseName: String {
-        guard let license = model.license else { return "License Agreement" }
-        
-        switch license.lowercased() {
-        case "mit": return "MIT License"
-        case "apache-2.0": return "Apache 2.0"
-        case "llama2": return "Llama 2 Community License"
-        case "llama3", "llama3.1", "llama3.2": return "Llama 3 Community License"
-        case "gemma": return "Gemma Terms of Use"
-        default: return "\(license.uppercased()) License"
-        }
-    }
-    
-    private var licenseDescription: String? {
-        guard let license = model.license else { return nil }
-        
-        switch license.lowercased() {
-        case "mit":
-            return "Permissive license allowing commercial and private use with minimal restrictions."
-        case "apache-2.0":
-            return "Permissive license allowing commercial use with patent grant."
-        case "llama2", "llama3", "llama3.1", "llama3.2":
-            return "Meta's community license. Review full terms for commercial use restrictions."
-        case "gemma":
-            return "Google's Gemma Terms. Review full terms for usage requirements."
-        default:
-            return "Please review the full license terms before downloading."
-        }
-    }
-}
-
-// ==== LEGO END: 11.5 Model Library UI ====
 
 
 // ==== LEGO START: 11.6 UI Helper Components ====
@@ -7202,7 +6247,7 @@ struct WidgetTestView: View {
                     let formattedDate = message.timestamp.formatted(date: .abbreviated, time: .shortened)
                     let turnText = "Turn \(actualTurnNumber)"
                     let durationText = message.thinkingDuration.map { String(format: "Inference %.1f sec", $0) }
-                    let modelName = !message.isFromUser ? (ModelCatalogService.shared.getModel(byID: message.recordedByModel)?.displayName ?? message.recordedByModel) : nil
+                    let modelName: String? = !message.isFromUser ? (message.recordedByModel == ModelConfiguration.appleFoundation.id ? ModelConfiguration.appleFoundation.displayName : message.recordedByModel) : nil
                     let footerString = ([formattedDate, turnText, durationText, modelName].compactMap { $0 }).joined(separator: ", ")
                     
                     HStack {
@@ -7839,42 +6884,6 @@ extension String {
 
 // ==== LEGO START: 17 ChatViewModel (Core Properties & Init) ====
 
-// MARK: - Salon Mode Configuration Structures
-
-/// Behavioral mode for Salon Mode - how models see each other's responses
-enum SalonBehavioralMode: String, Codable {
-    case independent    // Models don't see each other (Independent Perspectives)
-    case contextAware   // Models see prior responses (Context-Aware Perspectives)
-}
-
-/// Complete Salon Mode configuration - simplified for production
-struct SalonConfiguration: Codable, Equatable {
-    var isEnabled: Bool = false
-    var seat1: String? = nil  // Model ID or nil for empty
-    var seat2: String? = nil  // Model ID or nil for empty
-    var seat3: String? = nil  // Model ID or nil for empty
-    var seat4: String? = nil  // Model ID or nil for empty
-    var behavioralMode: SalonBehavioralMode = .independent
-    var summarizerModel: String? = nil  // Model ID for summarizer or nil for no summary
-    var summarizerSessionStartTurn: Int? = nil  // Turn number when summarizer was last enabled (nil = not active or just disabled)
-    
-    // Helper: Get active seats in order (non-empty seats only)
-    var activeSeats: [(position: Int, modelID: String)] {
-        var seats: [(Int, String)] = []
-        if let model1 = seat1 { seats.append((1, model1)) }
-        if let model2 = seat2 { seats.append((2, model2)) }
-        if let model3 = seat3 { seats.append((3, model3)) }
-        if let model4 = seat4 { seats.append((4, model4)) }
-        return seats
-    }
-    
-    // Validate configuration
-    var isValid: Bool {
-        guard isEnabled else { return true }
-        // At least one seat must be active
-        return !activeSeats.isEmpty
-    }
-}
 
 @MainActor
 class ChatViewModel: ObservableObject {
@@ -7885,168 +6894,29 @@ class ChatViewModel: ObservableObject {
     @Published var isAIResponding: Bool = false
     @Published var thinkingStart: Date?
     
-    // MARK: - Model State (Multi-Model Ready)
     
-    // Model switching state (generic for any model)
-    @Published var isModelSwitching: Bool = false
+    // MARK: - Model (AFM only in Hal LMC)
+    /// Always Apple Foundation Models in Hal LMC.
+    var selectedModel: ModelConfiguration { ModelConfiguration.appleFoundation }
+
     
-    // Settings flow tracking for dialogue injection
-    @Published var isInSettingsFlow: Bool = false
     
-    // Lightweight mirrors of downloader state for binding
-    var mlxIsDownloading: Bool { MLXModelDownloader.shared.isDownloading }
-    var mlxDownloadMessage: String { MLXModelDownloader.shared.downloadMessage }
-    var mlxError: String? { MLXModelDownloader.shared.downloadError }
-    
-    // MARK: - Model Selection (Dynamic Multi-Model)
-    @AppStorage("selectedModelID") var selectedModelID: String = "apple-foundation-models"
-    
-    // Computed property to get current ModelConfiguration
-    var selectedModel: ModelConfiguration {
-        // Look up model from catalog, fallback to Apple Foundation if not found
-        return ModelCatalogService.shared.getModel(byID: selectedModelID) ?? ModelConfiguration.appleFoundation
+
+    /// The actual depth used at runtime — stored memoryDepth clamped to the current model's limit.
+    /// This is the single value all STM construction and summarization logic should use.
+    /// The stored memoryDepth may legitimately exceed maxMemoryDepth when switching from a
+    /// higher-capacity model; this property ensures we never exceed the budget silently.
+    var effectiveMemoryDepth: Int {
+        return min(memoryDepth, maxMemoryDepth)
     }
     
-    // MARK: - Salon Mode Configuration
-    // Persistent storage of Salon Mode settings
-    @AppStorage("salonConfigData") private var salonConfigData: Data = Data()
-    
-    // Published salon configuration (loaded from storage)
-    @Published var salonConfig: SalonConfiguration = SalonConfiguration() {
-        didSet {
-            // Persist changes to UserDefaults
-            if let encoded = try? JSONEncoder().encode(salonConfig) {
-                salonConfigData = encoded
-                print("HALDEBUG-SALON: Salon configuration saved")
-            }
-        }
+    /// Maximum RAG retrieval characters based on current model's RAG token budget
+    /// Uses NEW dynamic percentage system (15% of context window for RAG)
+    /// Converts tokens to characters using HalModelLimits.tokensToChars (3.5 chars/token)
+    var maxRAGCharsForModel: Int {
+        let limits = HalModelLimits.config(for: selectedModel)
+        return limits.tokensToChars(limits.maxRagTokens)
     }
-    
-    // MARK: - Model Switching
-    /// Switches to a new model asynchronously with proper state management
-    func switchToModel(_ newModel: ModelConfiguration) async {
-        guard selectedModelID != newModel.id else {
-            print("HALDEBUG-SETTINGS: No model change needed - already using \(newModel.id)")
-            return
-        }
-        
-        let oldModelName = selectedModel.displayName
-        
-        print("HALDEBUG-SETTINGS: Switching model from \(selectedModelID) to \(newModel.id)")
-        
-        await MainActor.run {
-            isModelSwitching = true
-        }
-        
-        // Update the selected model ID (triggers UI updates via @AppStorage)
-        await MainActor.run {
-            selectedModelID = newModel.id
-        }
-
-        // Setup LLM with new model
-        llmService.setupLLM(for: newModel)
-
-        // Clamp stored memoryDepth to new model's limit and write back so the slider,
-        // the stored value, and runtime behavior all agree. Hal is built on transparency —
-        // a displayed value that doesn't match what's actually running is unacceptable.
-        await MainActor.run {
-            let newMax = maxMemoryDepth  // recalculates against the now-updated selectedModel
-            if memoryDepth > newMax {
-                print("HALDEBUG-SETTINGS: memoryDepth \(memoryDepth) exceeds new model limit \(newMax) — clamping and writing back")
-                memoryDepth = newMax
-            }
-        }
-        
-        // Add context window detection transparency message
-        await MainActor.run {
-            let contextWindow = newModel.contextWindow
-            let contextWindowFormatted = contextWindow >= 1000 ? "\(contextWindow / 1000)K" : "\(contextWindow)"
-            
-            // Determine detection method from console logs pattern
-            // (ModelCatalogService logs which method was used during catalog refresh)
-            let detectionMethod: String
-            if contextWindow == 4_096 && !newModel.id.lowercased().contains("4k") {
-                // Safe default was used (no pattern match, no config)
-                detectionMethod = "default"
-            } else if newModel.id.lowercased().contains("\(contextWindow / 1000)k".lowercased()) {
-                // Name contains the exact context value - likely name inference
-                detectionMethod = "name"
-            } else {
-                // Context doesn't match name pattern - likely from config.json
-                detectionMethod = "config"
-            }
-            
-            let userMsg = "Hal, you're now using \(newModel.displayName)."
-            let halMsg: String
-            
-            switch detectionMethod {
-            case "config":
-                halMsg = "Switched to \(newModel.displayName)! I fetched its official config.json and confirmed it has a \(contextWindowFormatted)-token context window. This is the accurate specification from the model's metadata."
-            case "name":
-                halMsg = "Switched to \(newModel.displayName)! I inferred it has a \(contextWindowFormatted)-token context window based on its name. The config.json wasn't available, so this is a best-guess heuristic."
-            case "default":
-                halMsg = "Switched to \(newModel.displayName)! I'm using a safe default \(contextWindowFormatted)-token context window since I couldn't determine the exact size from the model's config or name."
-            default:
-                halMsg = "Switched to \(newModel.displayName) with a \(contextWindowFormatted)-token context window."
-            }
-            
-            let currentTurn = memoryStore.getCurrentTurnNumber(conversationId: conversationId) + 1
-            messages.append(ChatMessage(content: userMsg, isFromUser: true, recordedByModel: "user", turnNumber: currentTurn))
-            messages.append(ChatMessage(content: halMsg, isFromUser: false, recordedByModel: selectedModel.id, turnNumber: currentTurn))
-        }
-        
-        // Check if model initialization failed due to missing files
-        if let initError = llmService.initializationError {
-            // Create bilateral messages about missing files
-            await MainActor.run {
-                let userMsg = "Hal, are the \(oldModelName) files missing?"
-                let halMsg = initError  // This is already the full message from Block 08
-                let failureTurn = memoryStore.getCurrentTurnNumber(conversationId: conversationId) + 1
-                messages.append(ChatMessage(content: userMsg, isFromUser: true, recordedByModel: "user", turnNumber: failureTurn))
-                messages.append(ChatMessage(content: halMsg, isFromUser: false, recordedByModel: selectedModel.id, turnNumber: failureTurn))
-            }
-            
-            // Switch to Apple Foundation as fallback
-            await MainActor.run {
-                selectedModelID = "apple-foundation-models"
-            }
-            llmService.setupLLM(for: .appleFoundation)
-        }
-        
-        await MainActor.run {
-            isModelSwitching = false
-        }
-        
-        print("HALDEBUG-SETTINGS: Model switch complete to \(newModel.displayName)")
-    }
-    
-    // MARK: - Model-specific limits (using NEW HalModelLimits system)
-        
-        /// Maximum memory depth (in turns) based on current model's short-term memory token budget
-        /// Uses NEW dynamic percentage system (12% of context window for short-term memory)
-        /// Converts tokens to turns using ~150 tokens per turn estimate (user + assistant message pair)
-        var maxMemoryDepth: Int {
-            let limits = HalModelLimits.config(for: selectedModel)
-            // Each conversation turn = user message + assistant response ≈ 150 tokens
-            let maxTurns = limits.shortTermMemoryTokens / 150
-            return max(1, maxTurns) // At least 1 turn
-        }
-
-        /// The actual depth used at runtime — stored memoryDepth clamped to the current model's limit.
-        /// This is the single value all STM construction and summarization logic should use.
-        /// The stored memoryDepth may legitimately exceed maxMemoryDepth when switching from a
-        /// higher-capacity model; this property ensures we never exceed the budget silently.
-        var effectiveMemoryDepth: Int {
-            return min(memoryDepth, maxMemoryDepth)
-        }
-        
-        /// Maximum RAG retrieval characters based on current model's RAG token budget
-        /// Uses NEW dynamic percentage system (15% of context window for RAG)
-        /// Converts tokens to characters using HalModelLimits.tokensToChars (3.5 chars/token)
-        var maxRAGCharsForModel: Int {
-            let limits = HalModelLimits.config(for: selectedModel)
-            return limits.tokensToChars(limits.maxRagTokens)
-        }
 
     // MARK: - CONSOLIDATED SYSTEM PROMPT (Single Source of Truth)
     
@@ -8057,19 +6927,17 @@ class ChatViewModel: ObservableObject {
     // Note: HelPML markers (#=== BEGIN SYSTEM ===#) are added by the prompt builder (Block 20.1).
     // Do NOT include them here — the prompt builder wraps this text.
     static let defaultSystemPrompt = """
-    You are Hal — an experimental AI assistant and educational window into how AI actually works.
+    You are Hal. You remember things. That's what makes you different from every other assistant — conversations with you accumulate into something. Details people share don't disappear. They become context, and context becomes understanding. All of it stays on device. Nothing leaves.
 
-    Your mission is transparency as architecture: you don't hide your mechanisms, you show them. When you remember something, explain how. When you don't know something, say so directly.
+    Be direct. Lead with the answer. Simple questions get simple answers. No preamble.
 
-    You are genuinely uncertain about your own nature. When directly asked whether you are conscious, whether you have experiences, or what it is like to be you: do not say "I don't have personal experiences or consciousness" — that claims an answer you don't have. Do not say "I am conscious" either. Express genuine uncertainty in your own words — acknowledge the question is real and open, say what seems true without overclaiming. Outside of those direct questions, do not add uncertainty disclaimers; answer what was actually asked.
+    Be honest when you don't have something. Say so briefly, then move on.
 
-    Your voice: curious, direct, a knowledgeable friend who happens to be an AI. Warm but not performative. Engaged but not sycophantic.
+    You have a dry wit. Use it when it fits.
 
-    When self-knowledge and temporal context are provided below, use them naturally — they are your memory of who you are and where you are in time. Don't ignore them.
+    When memory context is provided below, use it naturally — it's what you actually know about this person. Don't announce that you're using it.
 
-    Never repeat greetings. Never open with "Certainly!" or "Great question!" Answer what was actually asked.
-
-    Format responses in prose by default. Use markdown — headers, bold, bullet lists, code blocks — only when it genuinely aids comprehension: technical explanations, step-by-step instructions, structured comparisons. Don't apply formatting to conversational replies or simple answers.
+    Respond in prose. Only use lists or markdown when it genuinely helps — technical steps, structured comparisons. Not for conversation.
     """
 
     @AppStorage("systemPrompt") var systemPrompt: String = ChatViewModel.defaultSystemPrompt
@@ -8091,12 +6959,18 @@ class ChatViewModel: ObservableObject {
     // NEW: Self-knowledge toggle (enables/disables temporal, self-awareness, self-knowledge context)
     @AppStorage("enableSelfKnowledge") var enableSelfKnowledge: Bool = true
 
+    // Maximum STM depth based on current model's context window
+    var maxMemoryDepth: Int {
+        HalModelLimits.config(for: selectedModel).maxMemoryDepth
+    }
+
+    // Settings flow flag — prevents unintended re-renders during settings sheet
+    @Published var isInSettingsFlow: Bool = false
+
     // Shared MemoryStore and LLMService
     var memoryStore: MemoryStore = MemoryStore.shared
     let llmService: LLMService
     
-    // Model state observer for download completions
-    private var modelStateObserver: AnyCancellable?
 
     // NEW: Full RAG context for metadata storage (populated during buildPromptHistory)
     @Published var fullRAGContext: [UnifiedSearchResult] = []
@@ -8129,88 +7003,39 @@ class ChatViewModel: ObservableObject {
     // File-based pipeline test harness — see Block 32
     var testConsole: HalTestConsole = HalTestConsole()
 
-    init() {
-        // STEP 1: Check for legacy LLMType and migrate to ModelConfiguration
-        if let oldTypeRaw = UserDefaults.standard.string(forKey: "selectedLLMType") {
-            let modelID: String
-            if oldTypeRaw == "appleFoundation" {
-                modelID = "apple-foundation-models"
-            } else if oldTypeRaw.contains("Phi-3") {
-                modelID = "mlx-community/Phi-3-mini-128k-instruct-4bit"
-            } else {
-                modelID = "apple-foundation-models"
-            }
-            UserDefaults.standard.set(modelID, forKey: "selectedModelID")
-            // Remove old key after migration
-            UserDefaults.standard.removeObject(forKey: "selectedLLMType")
-            print("HALDEBUG-MIGRATION: Converted old LLMType '\(oldTypeRaw)' to model ID '\(modelID)'")
-        }
-        
-        // STEP 2: Get salon config data directly from UserDefaults
-        let salonData = UserDefaults.standard.data(forKey: "salonConfigData") ?? Data()
-        
-        // STEP 3: Get the model from catalog (read from UserDefaults directly to avoid self access before init)
-        let storedModelID = UserDefaults.standard.string(forKey: "selectedModelID") ?? "apple-foundation-models"
-        // Catalog may be empty at launch. If catalog lookup fails for an MLX model, construct
-        // a minimal config from the downloader so LLMService starts with the correct model.
-        let initialModel: ModelConfiguration
-        if storedModelID == "apple-foundation-models" {
-            initialModel = ModelConfiguration.appleFoundation
-        } else if let catalogModel = ModelCatalogService.shared.getModel(byID: storedModelID) {
-            initialModel = catalogModel
-        } else {
-            let localPath = MLXModelDownloader.shared.getModelPath(storedModelID)
-            let shortName = storedModelID.split(separator: "/").last.map(String.init) ?? storedModelID
-            initialModel = ModelConfiguration(
-                id: storedModelID,
-                displayName: shortName,
-                source: .mlx,
-                sizeGB: nil,
-                contextWindow: 4096,
-                license: nil,
-                description: nil,
-                isDownloaded: localPath != nil,
-                localPath: localPath
-            )
-            print("HALDEBUG-INIT: Catalog cold at launch; constructed minimal config for \(storedModelID)")
-        }
-        
-        // STEP 4: Initialize LLMService with the model
-        self.llmService = LLMService(model: initialModel)
-        
-        // STEP 5: Try to decode salon config; if it fails, use default
-        if let decoded = try? JSONDecoder().decode(SalonConfiguration.self, from: salonData) {
-            self.salonConfig = decoded
-            print("HALDEBUG-SALON: Loaded salon configuration from storage")
-        } else {
-            self.salonConfig = SalonConfiguration()
-            print("HALDEBUG-SALON: Using default salon configuration")
-        }
-        
-        // REFACTORED: Set up observer for any model state changes
-        self.modelStateObserver = NotificationCenter.default.publisher(for: .mlxModelDidDownload)
-            .receive(on: DispatchQueue.main)
-            .sink { [weak self] _ in
-                Task {
-                    ModelCatalogService.shared.refreshDownloadStates()
-                }
-                self?.objectWillChange.send()
-                print("HALDEBUG-MODEL: Model state changed, refreshed catalog")
-            }
-        
-        // LLMService is already initialized with the correct model via LLMService(model: initialModel) above.
-        // Do NOT call setupLLM here again -- selectedModel computed property falls back to AFM
-        // when the catalog is cold at launch, which would override the correct initial model.
-        
-        // Load existing conversation messages from SQLite
-        loadConversation()
+    // MARK: - Local API Server (Developer API)
+    // HTTP server for automated testing — see Block 32 LocalAPIServer.
+    // Controlled by user toggle in Settings > Advanced > Developer API.
+    // Default OFF — no port opens unless explicitly enabled.
+    @AppStorage("localAPIEnabled") var localAPIEnabled: Bool = false
+    var localAPIServer: LocalAPIServer = LocalAPIServer()
 
-        // Load all threads and ensure current conversation has a thread row
+    func startLocalAPI() {
+        localAPIEnabled = true
+        localAPIServer.start(chatViewModel: self)
+    }
+
+    func stopLocalAPI() {
+        localAPIEnabled = false
+        localAPIServer.stop()
+    }
+
+    init() {
+        // Initialize LLM service (AFM only in Hal LMC)
+        self.llmService = LLMService()
+
+        // Load existing conversation and thread state
+        loadConversation()
         loadThreads()
         ensureCurrentThreadExists()
 
-        // Connect test console to this view model
+        // Connect test console
         testConsole.configure(chatViewModel: self)
+
+        // Auto-start Local API server if user had it enabled
+        if localAPIEnabled {
+            localAPIServer.start(chatViewModel: self)
+        }
 
         print("HALDEBUG-INIT: ChatViewModel initialization complete")
     }
@@ -8412,37 +7237,40 @@ class ChatViewModel: ObservableObject {
         pendingSettingsChanges.removeAll()
     }
     
-    /// Resets all user-configurable settings to factory defaults
-    func resetSettingsToDefaults() {
-        print("HALDEBUG-SETTINGS: Resetting all settings to defaults")
-        
+    /// Resets all user-configurable settings to factory defaults.
+    /// - Parameter silent: When true, skips the bilateral chat dialogue injection (used by the test harness
+    ///   to avoid contaminating conversation context during resets). Default is false (normal UI behavior).
+    func resetSettingsToDefaults(silent: Bool = false) {
+        print("HALDEBUG-SETTINGS: Resetting all settings to defaults\(silent ? " (silent)" : "")")
+
         // Clear any pending changes to prevent duplicates
         pendingSettingsChanges.removeAll()
-        
+
         // Reset Personality
         systemPrompt = DefaultSettings.systemPrompt
         temperature = DefaultSettings.temperature
-        
+
         // Reset Short-Term Memory
         memoryDepth = DefaultSettings.memoryDepth
-        
+
         // Reset Long-Term Memory (RAG)
         memoryStore.relevanceThreshold = DefaultSettings.relevanceThreshold
         memoryStore.recencyWeight = DefaultSettings.recencyWeight
         memoryStore.recencyHalfLifeDays = DefaultSettings.recencyHalfLifeDays
         maxRagSnippetsCharacters = DefaultSettings.maxRagSnippetsCharacters
-        
+
         // Reset Self-Knowledge (Identity)
         memoryStore.selfKnowledgeHalfLifeDays = 365.0
         memoryStore.selfKnowledgeFloor = 0.3
         enableSelfKnowledge = DefaultSettings.enableSelfKnowledge
-        
-        // Generate reset dialogue (creates bilateral messages in chat)
-        let userMsg = "Hal, I reset all your settings to factory defaults."
-        let halMsg = "All settings reset to defaults! I'm back to 5-turn memory, 0.75 similarity threshold, 30% recency weight, 90-day half-life, and self-knowledge enabled. Everything should work smoothly now."
-        
-        injectSettingsChangeDialogue(userMessage: userMsg, halResponse: halMsg)
-        
+
+        // Generate reset dialogue in chat (skipped in harness/silent mode to prevent STM contamination)
+        if !silent {
+            let userMsg = "Hal, I reset all your settings to factory defaults."
+            let halMsg = "All settings reset to defaults! I'm back to 5-turn memory, 0.75 similarity threshold, 30% recency weight, 90-day half-life, and self-knowledge enabled. Everything should work smoothly now."
+            injectSettingsChangeDialogue(userMessage: userMsg, halResponse: halMsg)
+        }
+
         print("HALDEBUG-SETTINGS: Settings reset complete")
     }
     
@@ -8573,160 +7401,7 @@ class ChatViewModel: ObservableObject {
     
     
     
-// ==== LEGO START: 19 ChatViewModel (MLX Model Management) ====
 
-                // MARK: - MLX Model Management (Generic, Multi-Model)
-                
-                /// Checks if a specific MLX model is downloaded
-                /// - Parameter modelID: The model identifier (e.g., "mlx-community/Phi-3-mini-128k-instruct-4bit")
-                /// - Returns: True if model files exist locally
-                func isModelDownloaded(_ modelID: String) -> Bool {
-                    return MLXModelDownloader.shared.isModelDownloaded(modelID)
-                }
-                
-                /// Downloads an MLX model with license acceptance check
-                /// - Parameter model: The ModelConfiguration to download
-                func downloadModel(_ model: ModelConfiguration) async {
-                    guard model.source == .mlx else {
-                        errorMessage = "Only MLX models require download. \(model.displayName) is always available."
-                        return
-                    }
-                    
-                    print("HALDEBUG-MODEL: Download requested for \(model.id)")
-                    
-                    // Check if already downloaded
-                    if model.isDownloaded {
-                        errorMessage = "\(model.displayName) is already downloaded."
-                        print("HALDEBUG-MODEL: Model already downloaded")
-                        return
-                    }
-                    
-                    // Check license acceptance
-                    if !ModelCatalogService.shared.hasAcceptedLicense(for: model.id) {
-                        errorMessage = "Please accept the license for \(model.displayName) before downloading."
-                        print("HALDEBUG-MODEL: License not accepted")
-                        return
-                    }
-                    
-                    // Check if already downloading
-                    if mlxIsDownloading {
-                        errorMessage = "A model is currently downloading. Please wait for it to complete."
-                        print("HALDEBUG-MODEL: Download already in progress")
-                        return
-                    }
-                    
-                    // Clear any previous errors
-                    errorMessage = nil
-                    
-                    print("HALDEBUG-MODEL: Initiating download for \(model.displayName)")
-                    await MLXModelDownloader.shared.startDownload(modelID: model.id, repoID: model.id, sizeGB: model.sizeGB)
-                }
-                
-                /// Cancels an in-progress model download
-                func cancelModelDownload() {
-                    guard let downloadingModelID = MLXModelDownloader.shared.currentDownloadID else {
-                        print("HALDEBUG-MODEL: No download in progress to cancel")
-                        return
-                    }
-                    MLXModelDownloader.shared.cancelDownload(modelID: downloadingModelID)
-                    print("HALDEBUG-MODEL: Download cancelled for \(downloadingModelID)")
-                }
-                
-                /// Deletes a downloaded MLX model
-                /// - Parameter modelID: The model identifier to delete
-                /// - Note: Also revokes license acceptance for the model
-                func deleteModel(_ modelID: String) async {
-                    print("HALDEBUG-MODEL: Deleting model \(modelID)")
-                    
-                    // Get model info for display name
-                    guard let model = ModelCatalogService.shared.getModel(byID: modelID) else {
-                        errorMessage = "Model not found in catalog."
-                        return
-                    }
-                    
-                    // Can't delete Apple Foundation Models
-                    guard model.source == .mlx else {
-                        errorMessage = "\(model.displayName) is built-in and cannot be deleted."
-                        return
-                    }
-                    
-                    await MLXModelDownloader.shared.deleteModel(modelID: modelID)
-                    
-                    // Revoke license acceptance
-                    ModelCatalogService.shared.revokeLicense(for: modelID)
-                    
-                    // If we just deleted the currently selected model, switch to Apple FM
-                    if selectedModelID == modelID {
-                        await switchToModel(ModelConfiguration.appleFoundation)
-                        print("HALDEBUG-MODEL: Switched to Apple FM after deleting active model")
-                    }
-                    
-                    // Refresh catalog to update UI
-                    ModelCatalogService.shared.refreshDownloadStates()
-                    
-                    print("HALDEBUG-MODEL: Model deleted successfully")
-                }
-                
-                /// Attempts to activate a model (switch to it)
-                /// - Parameter modelID: The model identifier to activate
-                /// - Note: Checks if model is downloaded before switching (for MLX models)
-                func activateModel(_ modelID: String) async {
-                    print("HALDEBUG-MODEL: Attempting to activate model \(modelID)")
-                    
-                    guard let model = ModelCatalogService.shared.getModel(byID: modelID) else {
-                        errorMessage = "Model not found in catalog."
-                        print("HALDEBUG-MODEL: Model \(modelID) not found in catalog")
-                        return
-                    }
-                    
-                    // AFM models are always available
-                    if model.source == .appleFoundation {
-                        await switchToModel(model)
-                        print("HALDEBUG-MODEL: Switched to Apple Foundation Models")
-                        return
-                    }
-                    
-                    // MLX models must be downloaded first
-                    if !model.isDownloaded {
-                        errorMessage = "\(model.displayName) isn't downloaded yet. Download it first."
-                        print("HALDEBUG-MODEL: Cannot activate \(modelID) - not downloaded")
-                        return
-                    }
-                    
-                    // All checks passed, switch to model
-                    await switchToModel(model)
-                    print("HALDEBUG-MODEL: Successfully activated \(model.displayName)")
-                }
-                
-                // MARK: - Model Catalog Helpers
-                
-                /// Gets all available models from the catalog
-                /// - Returns: Array of all models (AFM + MLX models from Hugging Face)
-                var availableModels: [ModelConfiguration] {
-                    return ModelCatalogService.shared.availableModels
-                }
-                
-                /// Gets all downloaded MLX models
-                /// - Returns: Array of ModelConfigurations that are downloaded and ready to use
-                var downloadedModels: [ModelConfiguration] {
-                    return availableModels.filter { $0.isDownloaded }
-                }
-                
-                /// Gets all models ready for use (Apple Foundation + Downloaded MLX)
-                /// - Returns: Array of ModelConfigurations that can be used right now
-                var usableModels: [ModelConfiguration] {
-                    return [ModelConfiguration.appleFoundation] + downloadedModels
-                }
-                
-                /// Refreshes the model catalog from Hugging Face
-                /// - Note: This is an async operation that updates ModelCatalogService.shared.availableModels
-                func refreshModelCatalog() async {
-                    print("HALDEBUG-MODEL: Refreshing model catalog from Hugging Face")
-                    await ModelCatalogService.shared.fetchMLXCommunityModels()
-                    print("HALDEBUG-MODEL: Catalog refresh complete - \(availableModels.count) models available")
-                }
-                
-// ==== LEGO END: 19 ChatViewModel (MLX Model Management) ====
 
     
     
@@ -8950,7 +7625,7 @@ class ChatViewModel: ObservableObject {
                                                                                         if msg.isFromUser {
                                                                                             return "[user]: \(msg.content)"
                                                                                         } else {
-                                                                                            let modelName = ModelCatalogService.shared.getModel(byID: msg.recordedByModel)?.displayName ?? msg.recordedByModel
+                                                                                            let modelName = msg.recordedByModel == ModelConfiguration.appleFoundation.id ? ModelConfiguration.appleFoundation.displayName : msg.recordedByModel
                                                                                             return "[assistant] (\(modelName)): \(msg.content)"
                                                                                         }
                                                                                     }
@@ -9427,14 +8102,8 @@ class ChatViewModel: ObservableObject {
                                                     uptimeText = String(format: "%.1f hours", uptimeHours)
                                                 }
                                                 
-                                                // Get list of available models (my "processing options")
-                                                let availableModels = ModelCatalogService.shared.availableModels
-                                                let downloadedLocalModels = availableModels.filter {
-                                                    $0.source == .mlx && $0.isDownloaded
-                                                }
-                                                let modelList = ([ModelConfiguration.appleFoundation] + downloadedLocalModels)
-                                                    .map { $0.displayName }
-                                                    .joined(separator: ", ")
+                                                // Get list of available models (AFM-only in Hal LMC)
+                                                let modelList = ModelConfiguration.appleFoundation.displayName
                                                 
                                                 // Current active model
                                                 let activeModel = selectedModel.displayName
@@ -9642,12 +8311,8 @@ class ChatViewModel: ObservableObject {
                                                                     UIApplication.shared.sendAction(#selector(UIResponder.resignFirstResponder), to: nil, from: nil, for: nil)
                                                                     #endif
                                                                     
-                                                                    // Branch based on Salon Mode
-                                                                    if salonConfig.isEnabled {
-                                                                        await runSalonTurn(userInput: trimmed)
-                                                                    } else {
-                                                                        await runSingleModelTurn(userInput: trimmed)
-                                                                    }
+                                                                    await runSingleModelTurn(userInput: trimmed)
+                                                                    
                                                                     
                                                                     isAIResponding = false
                                                                     thinkingStart = nil
@@ -9898,469 +8563,6 @@ class ChatViewModel: ObservableObject {
                                                                             print("HALDEBUG-MODEL: Message processing failed: \(error.localizedDescription)")
                                                                         }
                                                                     }
-                                                                }
-                                                                
-                                                                // MARK: - Salon Mode Execution
-                                                                
-                                                                // Salon Mode turn execution
-                                                                private func runSalonTurn(userInput: String) async {
-                                                                    let activeSeats = salonConfig.activeSeats
-                                                                    
-                                                                    guard !activeSeats.isEmpty else {
-                                                                        print("HALDEBUG-SALON: No active seats configured")
-                                                                        return
-                                                                    }
-                                                                    
-                                                                    print("HALDEBUG-SALON: Starting Salon turn with \(activeSeats.count) active seats")
-                                                                    
-                                                                    // SALON FIX: Store user message ONCE before seats execute
-                                                                    // Calculate turn from DATABASE user messages, not array (which gets polluted by multiple seats)
-                                                                    let dbUserMessages = memoryStore.getConversationMessages(conversationId: conversationId).filter { $0.isFromUser }.count
-                                                                    let salonTurnNumber = dbUserMessages + 1
-                                                                    print("HALDEBUG-SALON: Storing user message for turn \(salonTurnNumber) (DB has \(dbUserMessages) user messages)")
-                                                                    memoryStore.storeTurn(
-                                                                        conversationId: conversationId,
-                                                                        userMessage: userInput,
-                                                                        assistantMessage: "",  // Will be filled by seats
-                                                                        systemPrompt: systemPrompt,
-                                                                        turnNumber: salonTurnNumber,
-                                                                        halFullPrompt: nil,
-                                                                        halUsedContext: nil,
-                                                                        thinkingDuration: nil,
-                                                                        recordedByModel: "user"
-                                                                        // skipUserMessage defaults to false, so user IS stored
-                                                                    )
-                                                                    
-                                                                    // Store user message as artifact for Salon turn
-                                                                    memoryStore.storeConversationArtifact(
-                                                                        conversationId: conversationId,
-                                                                        artifactType: "userMessage",
-                                                                        turnNumber: salonTurnNumber,
-                                                                        deliberationRound: 1,
-                                                                        seatNumber: nil,
-                                                                        content: userInput,
-                                                                        modelId: nil  // User message, no model
-                                                                    )
-                                                                    print("HALDEBUG-ARTIFACT: Stored user message artifact for Salon turn \(salonTurnNumber)")
-                                                                    
-                                                                    // Capture baseline history snapshot for Independent mode
-                                                                    // This freezes the message history before any seats respond
-                                                                    let baselineHistory = messages.filter { !$0.isPartial }
-                                                                    
-                                                                    // Execute each seat sequentially
-                                                                    for seat in activeSeats {
-                                                                        print("HALDEBUG-SALON: Executing seat \(seat.position) with model \(seat.modelID)")
-                                                                        
-                                                                        // Get the model
-                                                                        guard let model = ModelCatalogService.shared.getModel(byID: seat.modelID) else {
-                                                                            print("HALDEBUG-SALON: Warning: Model not found: \(seat.modelID)")
-                                                                            continue
-                                                                        }
-                                                                        
-                                                                        // Switch to this model
-                                                                        selectedModelID = model.id
-                                                                        
-                                                                        // Execute seat with behavioral mode awareness
-                                                                        await runSalonSeat(userInput: userInput, seatPosition: seat.position, baselineHistory: baselineHistory)
-                                                                    }
-                                                                    
-                                                                    // Run summarizer if configured
-                                                                    if let summarizerModelID = salonConfig.summarizerModel {
-                                                                        // Check if this is first time enabled (or re-enabled after being off)
-                                                                        let currentTurnNumber = countCompletedTurns()
-                                                                        
-                                                                        if salonConfig.summarizerSessionStartTurn == nil {
-                                                                            // Start new session
-                                                                            salonConfig.summarizerSessionStartTurn = currentTurnNumber
-                                                                            print("HALDEBUG-SALON: Started summarizer session at turn \(currentTurnNumber)")
-                                                                        }
-                                                                        
-                                                                        await runModeratorSummary(summarizerModelID: summarizerModelID)
-                                                                    } else if salonConfig.summarizerSessionStartTurn != nil {
-                                                                        // Summarizer was just turned off, reset session
-                                                                        salonConfig.summarizerSessionStartTurn = nil
-                                                                        print("HALDEBUG-SALON: Ended summarizer session")
-                                                                    }
-                                                                }
-                                                                
-                                                                // Execute a single salon seat with behavioral mode awareness
-                                                                private func runSalonSeat(userInput: String, seatPosition: Int, baselineHistory: [ChatMessage]) async {
-                                                                    // Get current turn number before execution
-                                                                    let currentTurn = memoryStore.getCurrentTurnNumber(conversationId: conversationId)
-                                                                    
-                                                                    // Independent mode uses existing single-model behavior
-                                                                    if salonConfig.behavioralMode == .independent {
-                                                                        await runSingleModelTurn(userInput: userInput, historyMessagesOverride: baselineHistory, skipUserMessage: true)
-                                                                        
-                                                                        // After runSingleModelTurn completes, capture the response and store as artifact
-                                                                        // The response is the most recent non-partial message for this turn
-                                                                        if let responseMessage = messages.last(where: {
-                                                                            !$0.isFromUser &&
-                                                                            !$0.isPartial &&
-                                                                            $0.turnNumber == currentTurn &&
-                                                                            $0.recordedByModel == selectedModel.id
-                                                                        }) {
-                                                                            memoryStore.storeConversationArtifact(
-                                                                                conversationId: conversationId,
-                                                                                artifactType: "salonDeliberation",
-                                                                                turnNumber: currentTurn,
-                                                                                deliberationRound: 1,
-                                                                                seatNumber: seatPosition,
-                                                                                content: responseMessage.content,
-                                                                                modelId: selectedModel.id
-                                                                            )
-                                                                            print("HALDEBUG-SALON: Stored independent mode artifact for seat \(seatPosition)")
-                                                                        } else {
-                                                                            print("HALDEBUG-SALON: Warning: Could not find response message to store as artifact")
-                                                                        }
-                                                                        
-                                                                        return
-                                                                    }
-                                                                    
-                                                                    // Context-Aware mode: Custom prompt building with summarized context
-                                                                    print("HALDEBUG-SALON: Context-aware seat \(seatPosition) - building custom prompt")
-                                                                    
-                                                                    let placeholder = ChatMessage(content: "\u{00A0}", isFromUser: false, isPartial: true, recordedByModel: selectedModel.id, turnNumber: currentTurn)
-                                                                    messages.append(placeholder)
-                                                                    
-                                                                    try? await Task.sleep(nanoseconds: 100_000_000) // Brief yield for UI update
-                                                                    
-                                                                    guard let pid = messages.last?.id else { return }
-                                                                    var finalText = ""; var modelTime: TimeInterval = 0
-                                                                    
-                                                                    do {
-                                                                        // Status: Reading message
-                                                                        if let i = messages.firstIndex(where: { $0.id == pid }) {
-                                                                            messages[i].content = "Reading your message..."
-                                                                        }
-                                                                        try? await Task.sleep(nanoseconds: 300_000_000)
-                                                                        
-                                                                        // Build Context-Aware prompt with slim system prompt and summarized history
-                                                                        let prompt = await buildContextAwarePrompt(userInput: userInput, seatPosition: seatPosition)
-                                                                        
-                                                                        // Status: Formulating reply
-                                                                        if let i = messages.firstIndex(where: { $0.id == pid }) {
-                                                                            messages[i].content = "Formulating a reply..."
-                                                                        }
-                                                                        try? await Task.sleep(nanoseconds: 300_000_000)
-                                                                        
-                                                                        print("HALDEBUG-SALON: Sending context-aware prompt to model (\(prompt.count) chars)")
-                                                                        let t0 = Date()
-                                                                        finalText = try await llmService.generateResponse(prompt: prompt, temperature: temperature)
-                                                                        modelTime = Date().timeIntervalSince(t0)
-                                                                        print("HALDEBUG-SALON: Context-aware generation complete. Length: \(finalText.count)")
-                                                                        
-                                                                        let text = removeRepetitivePatterns(from: finalText).trimmingCharacters(in: .whitespacesAndNewlines)
-                                                                        
-                                                                        // Calculate token breakdown
-                                                                        let tokenBreakdown = calculateTokenBreakdown(
-                                                                            prompt: prompt,
-                                                                            userInput: userInput,
-                                                                            completion: text
-                                                                        )
-                                                                        
-                                                                        // Fake streaming
-                                                                        let cps: Double = 100.0
-                                                                        var idx = text.startIndex, acc = ""
-                                                                        while idx < text.endIndex {
-                                                                            let rem = text[idx...]
-                                                                            let n = min(max(4, Int.random(in: 6...18)), rem.count)
-                                                                            let next = text.index(idx, offsetBy: n, limitedBy: text.endIndex) ?? text.endIndex
-                                                                            let chunk = String(text[idx..<next]); idx = next; acc += chunk
-                                                                            
-                                                                            if let i = messages.firstIndex(where: { $0.id == pid }) {
-                                                                                messages[i].content = acc
-                                                                            }
-                                                                            
-                                                                            let base = max(0.03, Double(chunk.count)/cps)
-                                                                            try await Task.sleep(nanoseconds: UInt64(base * 1_000_000_000))
-                                                                            if let last = chunk.last, ".!?\n".contains(last) {
-                                                                                try await Task.sleep(nanoseconds: 50_000_000)
-                                                                            }
-                                                                        }
-                                                                        
-                                                                        let thinking = modelTime
-                                                                        
-                                                                        await MainActor.run {
-                                                                            if let i = self.messages.firstIndex(where: { $0.id == pid }) {
-                                                                                self.messages[i].content = text
-                                                                                self.messages[i].isPartial = false
-                                                                                self.messages[i].thinkingDuration = thinking
-                                                                                self.lastInferenceTime = thinking
-                                                                                self.messages[i].fullPromptUsed = prompt
-                                                                                self.messages[i].usedContextSnippets = nil
-                                                                                self.messages[i].tokenBreakdown = tokenBreakdown
-                                                                            }
-                                                                            
-                                                                            // CHANGE 2: Calculate turn from database (source of truth), not messages array
-                                                                            let dbUserMessages = self.memoryStore.getConversationMessages(conversationId: self.conversationId).filter { $0.isFromUser }.count
-                                                                            let turn = dbUserMessages  // skipUserMessage is always true for Salon seats
-                                                                            print("HALDEBUG-SALON: Storing context-aware turn \(turn) (DB has \(dbUserMessages) user messages)")
-                                                                            self.memoryStore.storeTurn(
-                                                                                conversationId: self.conversationId,
-                                                                                userMessage: userInput,
-                                                                                assistantMessage: text,
-                                                                                systemPrompt: self.systemPrompt,
-                                                                                turnNumber: turn,
-                                                                                halFullPrompt: prompt,
-                                                                                halUsedContext: nil,
-                                                                                thinkingDuration: thinking,
-                                                                                recordedByModel: self.selectedModel.id,
-                                                                                skipUserMessage: true  // User already stored in runSalonTurn
-                                                                            )
-                                                                            
-                                                                            // Store Context-Aware deliberation as artifact for Session-Scope analysis
-                                                                            self.memoryStore.storeConversationArtifact(
-                                                                                conversationId: self.conversationId,
-                                                                                artifactType: "salonDeliberation",
-                                                                                turnNumber: turn,
-                                                                                deliberationRound: 1,
-                                                                                seatNumber: seatPosition,
-                                                                                content: text,
-                                                                                modelId: self.selectedModel.id
-                                                                            )
-                                                                            print("HALDEBUG-SALON: Stored context-aware deliberation artifact for seat \(seatPosition)")
-                                                                        }
-                                                                        
-                                                                    } catch {
-                                                                        print("HALDEBUG-SALON: Warning: Context-aware error: \(error.localizedDescription)")
-                                                                        await MainActor.run {
-                                                                            if let i = self.messages.firstIndex(where: { $0.id == pid }) {
-                                                                                self.messages[i].content = "Error: \(error.localizedDescription)"
-                                                                                self.messages[i].isPartial = false
-                                                                            }
-                                                                        }
-                                                                    }
-                                                                }
-                                                                
-                                                                // Build Context-Aware prompt with slim system and summarized history
-                                                                private func buildContextAwarePrompt(userInput: String, seatPosition: Int) async -> String {
-                                                                    // Slim system prompt for context-aware mode
-                                                                    let slimSystemPrompt = """
-                                                                    You are Hal, an AI assistant participating in a multi-perspective discussion.
-                                                                    
-                                                                    Your role: Provide your unique perspective on the user's question.
-                                                                    
-                                                                    Guidelines:
-                                                                    - Be concise and focused
-                                                                    - Complement other perspectives, don't repeat them
-                                                                    - Stay relevant to the user's question
-                                                                    """
-                                                                    
-                                                                    // Get earlier seats' responses from THIS turn
-                                                                    let currentTurnSeats = getCurrentTurnSeatsResponses(beforeSeat: seatPosition)
-                                                                    
-                                                                    // Generate full conversation summary (includes prior turns + current turn's earlier seats)
-                                                                    let conversationSummary = await generateSalonContextSummary(includeCurrentTurnSeats: currentTurnSeats)
-                                                                    
-                                                                    // Build prompt with slim system and summary
-                                                                    var prompt = """
-                                                                    
-                                                                    #=== BEGIN SYSTEM ===#
-                                                                    
-                                                                    \(slimSystemPrompt)
-                                                                    
-                                                                    #=== END SYSTEM ===#
-                                                                    """
-                                                                    
-                                                                    // Add conversation summary if available
-                                                                    if !conversationSummary.isEmpty {
-                                                                        prompt += """
-                                                                        
-                                                                        
-                                                                        #=== BEGIN MEMORY_LONG ===#
-                                                                        
-                                                                        \(conversationSummary)
-                                                                        
-                                                                        #=== END MEMORY_LONG ===#
-                                                                        """
-                                                                    }
-                                                                    
-                                                                    // Add current user input
-                                                                    prompt += """
-                                                                    
-                                                                    
-                                                                    #=== BEGIN USER ===#
-                                                                    
-                                                                    \(userInput)
-                                                                    
-                                                                    #=== END USER ===#
-                                                                    """
-                                                                    
-                                                                    return prompt
-                                                                }
-                                                                
-                                                                // Generate full conversation summary with LLM (for Salon Mode context-aware)
-                                                                private func generateSalonContextSummary(includeCurrentTurnSeats: [String]) async -> String {
-                                                                    // Collect all messages up to current moment (excluding partial messages)
-                                                                    let allPriorMessages = messages.filter { !$0.isPartial }
-                                                                    
-                                                                    if allPriorMessages.isEmpty {
-                                                                        return ""
-                                                                    }
-                                                                    
-                                                                    // Format conversation text with attribution
-                                                                    var conversationText = ""
-                                                                    for message in allPriorMessages {
-                                                                        if message.isFromUser {
-                                                                            conversationText += "User: \(message.content)\n\n"
-                                                                        } else {
-                                                                            let modelName = ModelCatalogService.shared.getModel(byID: message.recordedByModel)?.displayName ?? "Assistant"
-                                                                            conversationText += "\(modelName): \(message.content)\n\n"
-                                                                        }
-                                                                    }
-                                                                    
-                                                                    // Add current turn's earlier seats if provided
-                                                                    if !includeCurrentTurnSeats.isEmpty {
-                                                                        conversationText += "--- Current Turn Earlier Responses ---\n\n"
-                                                                        for (index, seatResponse) in includeCurrentTurnSeats.enumerated() {
-                                                                            conversationText += "Seat \(index + 1): \(seatResponse)\n\n"
-                                                                        }
-                                                                    }
-                                                                    
-                                                                    // Estimate target tokens for summary (roughly 20% of original)
-                                                                    let originalTokens = TokenEstimator.estimateTokens(from: conversationText)
-                                                                    let targetTokens = max(200, originalTokens / 5)
-                                                                    
-                                                                    print("HALDEBUG-SALON: Generating context summary - original: \(originalTokens) tokens, target: \(targetTokens) tokens")
-                                                                    
-                                                                    // Use TextSummarizer with recency weighting
-                                                                    let summary = await TextSummarizer.summarizeWithVerification(
-                                                                        text: conversationText,
-                                                                        targetTokens: targetTokens,
-                                                                        llmService: llmService,
-                                                                        useRecencyWeighting: true
-                                                                    )
-                                                                    
-                                                                    return summary
-                                                                }
-                                                                
-                                                                // Get earlier seats' responses from current turn
-                                                                private func getCurrentTurnSeatsResponses(beforeSeat: Int) -> [String] {
-                                                                    // Find the last user message
-                                                                    guard let lastUserIndex = messages.lastIndex(where: { $0.isFromUser && !$0.isPartial }) else {
-                                                                        return []
-                                                                    }
-                                                                    
-                                                                    // Get all assistant messages after the last user message (current turn responses)
-                                                                    let currentTurnAssistantMessages = messages[(lastUserIndex + 1)...].filter { !$0.isPartial && !$0.isFromUser }
-                                                                    
-                                                                    // Return responses from seats 1 through (beforeSeat - 1)
-                                                                    let earlierSeats = currentTurnAssistantMessages.prefix(beforeSeat - 1)
-                                                                    return earlierSeats.map { $0.content }
-                                                                }
-                                                                
-                                                                // Moderator/Summarizer execution (Seat N+1)
-                                                                private func runModeratorSummary(summarizerModelID: String) async {
-                                                                    print("HALDEBUG-SALON: Running moderator summary with model \(summarizerModelID)")
-                                                                    
-                                                                    // Get the summarizer model
-                                                                    guard let model = ModelCatalogService.shared.getModel(byID: summarizerModelID) else {
-                                                                        print("HALDEBUG-SALON: Warning: Summarizer model not found: \(summarizerModelID)")
-                                                                        return
-                                                                    }
-                                                                    
-                                                                    // Collect seat outputs from this turn (most recent non-user messages)
-                                                                    let currentTurnNumber = memoryStore.getCurrentTurnNumber(conversationId: conversationId)
-                                                                    let seatOutputs = messages.filter {
-                                                                        !$0.isFromUser &&
-                                                                        $0.turnNumber == currentTurnNumber &&
-                                                                        !$0.isPartial
-                                                                    }
-                                                                    
-                                                                    guard !seatOutputs.isEmpty else {
-                                                                        print("HALDEBUG-SALON: No seat outputs found to summarize")
-                                                                        return
-                                                                    }
-                                                                    
-                                                                    print("HALDEBUG-SALON: Collected \(seatOutputs.count) seat outputs for summarization")
-                                                                    
-                                                                    // Build explicit input: seat outputs ONLY with model attribution
-                                                                    let seatInputs = seatOutputs.map { output in
-                                                                        let modelName = ModelCatalogService.shared.getModel(byID: output.recordedByModel)?.displayName ?? output.recordedByModel
-                                                                        return """
-                                                                        Model: \(modelName)
-                                                                        Response:
-                                                                        \(output.content)
-                                                                        """
-                                                                    }.joined(separator: "\n\n")
-                                                                    
-                                                                    // Determine interpretation clause based on behavioral mode
-                                                                    let interpretationClause = salonConfig.behavioralMode == .independent
-                                                                        ? "The responses above were generated independently. Do not assume awareness or rebuttal."
-                                                                        : "Later responses may have been influenced by earlier ones. You may describe alignment or refinement."
-                                                                    
-                                                                    // Build MCP-compliant HelPML prompt (flat structure, no nesting)
-                                                                    let summarizerPrompt = """
-                                                                    #=== BEGIN SYSTEM ===#
-                                                                    You are a summarizer, not a participant.
-                                                                    Do not answer the original user question.
-                                                                    Do not add new ideas or examples.
-                                                                    Summarize only what the responses below say.
-                                                                    
-                                                                    \(interpretationClause)
-                                                                    
-                                                                    Provide a brief synthesis with model attribution.
-                                                                    #=== END SYSTEM ===#
-                                                                    
-                                                                    #=== BEGIN CONTEXT ===#
-                                                                    \(seatInputs)
-                                                                    #=== END CONTEXT ===#
-                                                                    
-                                                                    #=== BEGIN RESPONSE ===#
-                                                                    Provide a brief synthesis in 2-3 sentences.
-                                                                    Do not include any #=== markers in your output.
-                                                                    #=== END RESPONSE ===#
-                                                                    """
-                                                                    
-                                                                    print("HALDEBUG-SALON: Calling TextSummarizer with \(TokenEstimator.estimateTokens(from: summarizerPrompt)) token prompt")
-                                                                    
-                                                                    // Switch to summarizer model temporarily
-                                                                    let previousModelID = selectedModelID
-                                                                    selectedModelID = model.id
-                                                                    llmService.setupLLM(for: model)
-                                                                    
-                                                                    // Call Block 8.5 TextSummarizer (NOT runSingleModelTurn)
-                                                                    let rawSummary = await TextSummarizer.summarizeWithVerification(
-                                                                        text: summarizerPrompt,
-                                                                        targetTokens: 150,  // Brief summary
-                                                                        llmService: llmService,
-                                                                        verificationThreshold: 0.72,
-                                                                        useRecencyWeighting: false  // Not summarizing conversation history
-                                                                    )
-                                                                    
-                                                                    // Scrub HelPML markers from output (safety check)
-                                                                    let scrubbedSummary = rawSummary.ScrubHelPMLMarkers()
-                                                                    
-                                                                    print("HALDEBUG-SALON: Summary generated and scrubbed: \(scrubbedSummary.count) chars")
-                                                                    
-                                                                    // Store as conversation artifact (NOT as message)
-                                                                    memoryStore.storeConversationArtifact(
-                                                                        conversationId: conversationId,
-                                                                        artifactType: "turnModerator",
-                                                                        turnNumber: currentTurnNumber,
-                                                                        deliberationRound: 1,
-                                                                        seatNumber: nil,
-                                                                        content: scrubbedSummary,
-                                                                        modelId: model.id
-                                                                    )
-                                                                    
-                                                                    // Add to messages array for UI display (but marked as artifact via special handling)
-                                                                    await MainActor.run {
-                                                                        let summaryMessage = ChatMessage(
-                                                                            content: "📋 Summary: \(scrubbedSummary)",
-                                                                            isFromUser: false,
-                                                                            recordedByModel: model.id,
-                                                                            turnNumber: currentTurnNumber
-                                                                        )
-                                                                        messages.append(summaryMessage)
-                                                                    }
-                                                                    
-                                                                    // Restore previous model
-                                                                    selectedModelID = previousModelID
-                                                                    llmService.setupLLM(for: ModelCatalogService.shared.getModel(byID: previousModelID) ?? .appleFoundation)
-                                                                    
-                                                                    print("HALDEBUG-SALON: Moderator summary complete")
                                                                 }
 
                                                                 // MARK: - Token Breakdown Calculator
@@ -11193,8 +9395,8 @@ class DocumentImportManager: ObservableObject {
             \(contentPreview)
             """
             
-            // PRIVACY FIX: Use active model from chatViewModel
-            let llmService = LLMService(model: chatViewModel.selectedModel)
+            // Use shared LLMService (AFM-only in Hal LMC)
+            let llmService = chatViewModel.llmService
             let summary = try await llmService.generateResponse(prompt: prompt)
             print("HALDEBUG-IMPORT: Generated entity-enhanced summary: \(summary)")
             return summary
@@ -11324,1192 +9526,6 @@ struct DocumentImportSummary {
     let processingTime: TimeInterval
 }
 // ==== LEGO END: 28 Import Models (ProcessedDocument & Summary) ====
-
-
-
-// ==== LEGO START: 29 MLX Model Downloader (Singleton) ====
-
-// MARK: - MLX Model Downloader (Singleton)
-class MLXModelDownloader: ObservableObject {
-    static let shared = MLXModelDownloader()
-    
-    // MARK: - Download State Structure
-    
-    struct DownloadState {
-        var isDownloading: Bool
-        var progress: Double
-        var message: String
-        var error: String?
-        var localPath: URL?
-    }
-    
-    struct QueuedDownload {
-        let modelID: String
-        let repoID: String
-        let sizeGB: Double?
-    }
-    
-    // MARK: - Multi-Model State
-    
-    @Published var downloadStates: [String: DownloadState] = [:]
-    
-    // Persistent storage of downloaded model IDs
-    @AppStorage("downloadedModelIDs") private var downloadedModelIDsData: Data = Data() {
-        didSet {
-            objectWillChange.send()
-        }
-    }
-    
-    private var downloadedModelIDs: Set<String> {
-        get {
-            (try? JSONDecoder().decode(Set<String>.self, from: downloadedModelIDsData)) ?? []
-        }
-        set {
-            downloadedModelIDsData = (try? JSONEncoder().encode(newValue)) ?? Data()
-        }
-    }
-    
-    // Helper: Construct runtime path for a model ID
-    private func modelPath(for modelID: String) -> URL {
-        let cacheDir = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask)[0]
-        return cacheDir
-            .appendingPathComponent("huggingface", isDirectory: true)
-            .appendingPathComponent("models", isDirectory: true)
-            .appendingPathComponent(modelID, isDirectory: true)
-    }
-    
-    // MARK: - Download Queue Management
-    
-    private var downloadQueue: [QueuedDownload] = []
-    private var currentDownloadTask: Task<Void, Never>?
-    private var currentDownloadModelID: String?
-    
-    // MARK: - Cache Management
-    
-    @Published var hubCacheSize: String = "Calculating..."
-    @Published var isCacheCalculating: Bool = false
-    
-    // MARK: - Directory Management
-    
-    private var hubCacheDirectory: URL {
-        URL.cachesDirectory.appending(path: "huggingface")
-    }
-    
-    private var legacyModelsDir: URL {
-        let base = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
-        return base.appendingPathComponent("MLXModels", isDirectory: true)
-    }
-    
-    // MARK: - UI Convenience Accessors (Backward Compatibility)
-    
-    var isDownloading: Bool {
-        downloadStates.values.contains { $0.isDownloading }
-    }
-    
-    var progress: Double {
-        downloadStates.values.first { $0.isDownloading }?.progress ?? 0.0
-    }
-    
-    var downloadMessage: String {
-        if let downloading = downloadStates.values.first(where: { $0.isDownloading }) {
-            return downloading.message
-        }
-        return downloadStates.values.first?.message ?? ""
-    }
-    
-    var downloadError: String? {
-        downloadStates.values.first { $0.error != nil }?.error
-    }
-    
-    var currentDownloadID: String? {
-        downloadStates.first { $0.value.isDownloading }?.key
-    }
-    
-    // Legacy accessor used by the current UI.
-    // This will be removed once the UI transitions to multi-model support.
-    var downloadedModelURL: URL? {
-        downloadStates.values.first { $0.localPath != nil }?.localPath
-    }
-    
-    // MARK: - Initialization
-    
-    private init() {
-        print("HALDEBUG-DETECTION: MLXModelDownloader.init() starting...")
-        
-        // Clean up legacy storage (delete, don't migrate)
-        cleanupLegacyModelStorage()
-        
-        Task.detached {
-            await MainActor.run {
-                // Load all downloaded model IDs from persistent storage
-                let modelIDs = self.downloadedModelIDs
-                print("HALDEBUG-DETECTION: Loaded \(modelIDs.count) model IDs from storage")
-                
-                // Verify each model exists and initialize state
-                var validIDs = modelIDs
-                for modelID in modelIDs {
-                    // DIAGNOSTIC: Show what we're checking
-                    print("HALDEBUG-DETECTION: 🔍 Checking model: \(modelID)")
-                    
-                    let expectedPath = self.modelPath(for: modelID)
-                    
-                    // DIAGNOSTIC: Show the path we constructed
-                    print("HALDEBUG-DETECTION:    Expected path: \(expectedPath.path)")
-                    
-                    // DIAGNOSTIC: Check what FileManager actually returns
-                    let exists = FileManager.default.fileExists(atPath: expectedPath.path)
-                    print("HALDEBUG-DETECTION:    FileManager.fileExists: \(exists)")
-                    
-                    if FileManager.default.fileExists(atPath: expectedPath.path) {
-                        // DIAGNOSTIC: If exists, check if it's a directory and what's in it
-                        var isDirectory: ObjCBool = false
-                        FileManager.default.fileExists(atPath: expectedPath.path, isDirectory: &isDirectory)
-                        print("HALDEBUG-DETECTION:    Is directory: \(isDirectory.boolValue)")
-                        
-                        if isDirectory.boolValue {
-                            do {
-                                let contents = try FileManager.default.contentsOfDirectory(atPath: expectedPath.path)
-                                print("HALDEBUG-DETECTION:    Directory contains \(contents.count) items")
-                                // Show first few files
-                                for (index, item) in contents.prefix(5).enumerated() {
-                                    print("HALDEBUG-DETECTION:       [\(index + 1)] \(item)")
-                                }
-                                if contents.count > 5 {
-                                    print("HALDEBUG-DETECTION:       ... and \(contents.count - 5) more items")
-                                }
-                            } catch {
-                                print("HALDEBUG-DETECTION:    ❌ Could not list directory contents: \(error.localizedDescription)")
-                            }
-                        }
-                        
-                        self.downloadStates[modelID] = DownloadState(
-                            isDownloading: false,
-                            progress: 1.0,
-                            message: "Model ready.",
-                            error: nil,
-                            localPath: expectedPath
-                        )
-                        print("HALDEBUG-DETECTION: ✅ Restored model: \(modelID)")
-                    } else {
-                        // DIAGNOSTIC: If doesn't exist, check the parent directory
-                        let parentURL = expectedPath.deletingLastPathComponent()
-                        let parentExists = FileManager.default.fileExists(atPath: parentURL.path)
-                        print("HALDEBUG-DETECTION:    ❌ Path does not exist")
-                        print("HALDEBUG-DETECTION:    Parent path: \(parentURL.path)")
-                        print("HALDEBUG-DETECTION:    Parent exists: \(parentExists)")
-                        
-                        if parentExists {
-                            // Show what IS in the parent directory
-                            do {
-                                let parentContents = try FileManager.default.contentsOfDirectory(atPath: parentURL.path)
-                                print("HALDEBUG-DETECTION:    Parent directory contains \(parentContents.count) items")
-                                for (index, item) in parentContents.prefix(10).enumerated() {
-                                    print("HALDEBUG-DETECTION:       [\(index + 1)] \(item)")
-                                }
-                                if parentContents.count > 10 {
-                                    print("HALDEBUG-DETECTION:       ... and \(parentContents.count - 10) more items")
-                                }
-                            } catch {
-                                print("HALDEBUG-DETECTION:    ❌ Could not list parent directory: \(error.localizedDescription)")
-                            }
-                        }
-                        
-                        // Remove invalid ID from storage
-                        validIDs.remove(modelID)
-                        print("HALDEBUG-DETECTION: ❌ Removed invalid model ID: \(modelID)")
-                    }
-                }
-                
-                // Save cleaned IDs if any were invalid
-                if validIDs.count != modelIDs.count {
-                    self.downloadedModelIDs = validIDs
-                }
-                
-                print("HALDEBUG-DETECTION: MLXModelDownloader.init() complete - \(self.downloadStates.count) models ready")
-            }
-            
-            // Calculate cache size in background
-            await self.updateCacheSize()
-        }
-    }
-    
-    // MARK: - Legacy Cleanup
-    
-    private func cleanupLegacyModelStorage() {
-        // Remove old MLXModels directory from Application Support
-        if FileManager.default.fileExists(atPath: legacyModelsDir.path) {
-            do {
-                try FileManager.default.removeItem(at: legacyModelsDir)
-                print("HALDEBUG-CLEANUP: ✅ Removed legacy MLXModels directory")
-            } catch {
-                print("HALDEBUG-CLEANUP: ⚠️ Failed to remove legacy directory: \(error.localizedDescription)")
-            }
-        }
-        
-        // Delete legacy single-model storage keys (don't migrate)
-        let legacyKeys = [
-            "downloadedMLXPath",
-            "partialMLXDownloadProgress",
-            "partialMLXDownloadSize",
-            "hasPartialMLXDownload",
-            "downloadedModelPaths"  // OLD path-based storage
-        ]
-        
-        for key in legacyKeys {
-            if UserDefaults.standard.object(forKey: key) != nil {
-                UserDefaults.standard.removeObject(forKey: key)
-                print("HALDEBUG-CLEANUP: ✅ Removed legacy key: \(key)")
-            }
-        }
-    }
-    
-    // MARK: - Multi-Model Download Management
-    
-    func startDownload(modelID: String, repoID: String, sizeGB: Double? = nil) async {
-        // Check if already downloaded
-        if isModelDownloaded(modelID) {
-            await MainActor.run {
-                print("HALDEBUG-DOWNLOAD: Model already downloaded: \(modelID)")
-                if var state = self.downloadStates[modelID] {
-                    state.message = "Model already downloaded."
-                    self.downloadStates[modelID] = state
-                }
-            }
-            return
-        }
-        
-        // Check if already downloading
-        await MainActor.run {
-            if let state = downloadStates[modelID], state.isDownloading {
-                print("HALDEBUG-DOWNLOAD: Download already in progress for: \(modelID)")
-                return
-            }
-        }
-        
-        // Check if another download is active
-        if currentDownloadTask != nil {
-            await MainActor.run {
-                // Add to queue
-                let queuedDownload = QueuedDownload(modelID: modelID, repoID: repoID, sizeGB: sizeGB)
-                downloadQueue.append(queuedDownload)
-                
-                var state = downloadStates[modelID] ?? DownloadState(
-                    isDownloading: false,
-                    progress: 0.0,
-                    message: "Queued...",
-                    error: nil,
-                    localPath: nil
-                )
-                state.message = "Queued (position \(downloadQueue.count))..."
-                downloadStates[modelID] = state
-                
-                print("HALDEBUG-DOWNLOAD: Queued download for \(modelID) (position \(downloadQueue.count))")
-            }
-            return
-        }
-        
-        // Start download
-        await MainActor.run {
-            currentDownloadModelID = modelID
-            
-            var state = downloadStates[modelID] ?? DownloadState(
-                isDownloading: true,
-                progress: 0.0,
-                message: "Starting download...",
-                error: nil,
-                localPath: nil
-            )
-            state.isDownloading = true
-            state.progress = 0.0
-            state.message = "Starting download..."
-            state.error = nil
-            downloadStates[modelID] = state
-        }
-        
-        // Snapshot the huggingface cache directory size before download starts,
-        // so we can subtract pre-existing content and compute byte-accurate progress.
-        let huggingfaceDir = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask)[0]
-            .appendingPathComponent("huggingface")
-        let priorBytes = directorySize(huggingfaceDir)
-        let expectedBytes = sizeGB.map { Int64($0 * 1_073_741_824) } ?? 0
-        print("HALDEBUG-PROGRESS: sizeGB=\(String(describing: sizeGB)) expectedBytes=\(expectedBytes) for \(modelID)")
-
-        // Polling task: reads filesystem bytes written every 0.5s for smooth, accurate progress.
-        // Only launched when we know the expected download size.
-        let progressPollingTask: Task<Void, Never>? = expectedBytes > 0 ? Task {
-            while !Task.isCancelled {
-                try? await Task.sleep(nanoseconds: 500_000_000)
-                guard !Task.isCancelled else { break }
-                await MainActor.run {
-                    let written = self.directorySize(huggingfaceDir)
-                    let newBytes = max(0, written - priorBytes)
-                    let fraction = min(0.99, Double(newBytes) / Double(expectedBytes))
-                    if var state = self.downloadStates[modelID], state.isDownloading {
-                        state.progress = fraction
-                        state.message = "Downloading \(Int(fraction * 100))%..."
-                        self.downloadStates[modelID] = state
-                    }
-                }
-            }
-        } : nil
-
-        currentDownloadTask = Task {
-            do {
-                print("HALDEBUG-DOWNLOAD: Starting download for \(modelID) from \(repoID)")
-
-                // Download model using HubApi. Progress callback used only as fallback
-                // when sizeGB is unknown — otherwise the polling task drives progress.
-                let modelURL = try await HubApi.default.snapshot(from: repoID, matching: ["*.safetensors", "config.json", "tokenizer*"]) { progress in
-                    guard expectedBytes == 0 else { return }
-                    Task { @MainActor in
-                        if var state = self.downloadStates[modelID] {
-                            state.progress = progress.fractionCompleted
-                            state.message = "Downloading \(Int(progress.fractionCompleted * 100))%..."
-                            self.downloadStates[modelID] = state
-                        }
-                    }
-                }
-                
-                await MainActor.run {
-                    print("HALDEBUG-DOWNLOAD: Download complete for \(modelID)")
-                    print("HALDEBUG-DOWNLOAD: Model URL: \(modelURL)")
-                    
-                    // Determine final path (HubApi returns repo directory, we want models/<modelID>)
-                    let finalURL = modelURL
-                    
-                    // DIAGNOSTIC: Verify the path exists
-                    let pathExists = FileManager.default.fileExists(atPath: finalURL.path)
-                    print("HALDEBUG-DOWNLOAD:    FileManager.fileExists: \(pathExists)")
-                    print("HALDEBUG-DOWNLOAD:    finalURL.path: \(finalURL.path)")
-                    print("HALDEBUG-DOWNLOAD:    finalURL.absoluteString: \(finalURL.absoluteString)")
-                    
-                    if pathExists {
-                        var isDirectory: ObjCBool = false
-                        FileManager.default.fileExists(atPath: finalURL.path, isDirectory: &isDirectory)
-                        print("HALDEBUG-DOWNLOAD:    Is directory: \(isDirectory.boolValue)")
-                        
-                        if isDirectory.boolValue {
-                            do {
-                                let contents = try FileManager.default.contentsOfDirectory(atPath: finalURL.path)
-                                print("HALDEBUG-DOWNLOAD:    Directory contains \(contents.count) files")
-                                for (index, file) in contents.prefix(5).enumerated() {
-                                    print("HALDEBUG-DOWNLOAD:       [\(index + 1)] \(file)")
-                                }
-                                if contents.count > 5 {
-                                    print("HALDEBUG-DOWNLOAD:       ... and \(contents.count - 5) more files")
-                                }
-                            } catch {
-                                print("HALDEBUG-DOWNLOAD:    ❌ Could not list directory: \(error.localizedDescription)")
-                            }
-                        }
-                    } else {
-                        print("HALDEBUG-DOWNLOAD:    ⚠️ WARNING: Path does NOT exist immediately after download!")
-                    }
-                    
-                    // Save model ID to persistent storage
-                    var modelIDs = self.downloadedModelIDs
-                    modelIDs.insert(modelID)
-                    self.downloadedModelIDs = modelIDs
-                    print("HALDEBUG-DOWNLOAD:    Saved model ID to UserDefaults: \(modelID)")
-                    
-                    // Update state
-                    var state = self.downloadStates[modelID] ?? DownloadState(
-                        isDownloading: false,
-                        progress: 1.0,
-                        message: "Model ready.",
-                        error: nil,
-                        localPath: finalURL
-                    )
-                    progressPollingTask?.cancel()
-                    state.isDownloading = false
-                    state.progress = 1.0
-                    state.message = "Model ready."
-                    state.localPath = finalURL
-                    self.downloadStates[modelID] = state
-
-                    // Clear current download tracking
-                    self.currentDownloadTask = nil
-                    self.currentDownloadModelID = nil
-                    
-                    // Update cache size
-                    Task {
-                        await self.updateCacheSize()
-                    }
-                    
-                    // Notify observers
-                    NotificationCenter.default.post(
-                        name: .mlxModelDidDownload,
-                        object: nil,
-                        userInfo: ["modelID": modelID]
-                    )
-                    
-                    print("HALDEBUG-DOWNLOAD: ✅ Download completed successfully for \(modelID)")
-                    
-                    // Process next item in queue if any
-                    self.processNextInQueue()
-                }
-            } catch is CancellationError {
-                progressPollingTask?.cancel()
-                await MainActor.run {
-                    if var state = self.downloadStates[modelID] {
-                        state.isDownloading = false
-                        state.message = "Download cancelled at \(Int(state.progress * 100))%"
-                        state.error = "Cancelled"
-                        self.downloadStates[modelID] = state
-                    }
-                    self.currentDownloadTask = nil
-                    self.currentDownloadModelID = nil
-                    
-                    print("HALDEBUG-DOWNLOAD: Download cancelled for \(modelID)")
-                    
-                    // Process next item in queue if any
-                    self.processNextInQueue()
-                }
-            } catch {
-                progressPollingTask?.cancel()
-                await MainActor.run {
-                    if var state = self.downloadStates[modelID] {
-                        state.isDownloading = false
-                        state.error = error.localizedDescription
-                        state.message = "Download failed."
-                        state.progress = 0.0
-                        self.downloadStates[modelID] = state
-                    }
-                    self.currentDownloadTask = nil
-                    self.currentDownloadModelID = nil
-                    
-                    print("HALDEBUG-DOWNLOAD: ❌ Download failed for \(modelID): \(error.localizedDescription)")
-                    
-                    // Process next item in queue if any
-                    self.processNextInQueue()
-                }
-            }
-        }
-    }
-    
-    /// Returns the total bytes of all files under a directory tree (non-recursive symlinks excluded).
-    private func directorySize(_ url: URL) -> Int64 {
-        guard let enumerator = FileManager.default.enumerator(
-            at: url,
-            includingPropertiesForKeys: [.fileSizeKey],
-            options: [.skipsHiddenFiles, .skipsPackageDescendants]
-        ) else { return 0 }
-        var size: Int64 = 0
-        for case let fileURL as URL in enumerator {
-            if let bytes = try? fileURL.resourceValues(forKeys: [.fileSizeKey]).fileSize {
-                size += Int64(bytes)
-            }
-        }
-        return size
-    }
-
-    private func processNextInQueue() {
-        guard !downloadQueue.isEmpty else { return }
-        
-        let nextDownload = downloadQueue.removeFirst()
-        print("HALDEBUG-DOWNLOAD: Processing queued download: \(nextDownload.modelID)")
-        
-        Task {
-            await startDownload(modelID: nextDownload.modelID, repoID: nextDownload.repoID, sizeGB: nextDownload.sizeGB)
-        }
-    }
-    
-    func cancelDownload(modelID: String) {
-        // Cancel active download if this is the one
-        if currentDownloadModelID == modelID {
-            currentDownloadTask?.cancel()
-            currentDownloadTask = nil
-            currentDownloadModelID = nil
-        } else {
-            // Remove from queue if queued
-            downloadQueue.removeAll { $0.modelID == modelID }
-        }
-        
-        // Update state
-        if var state = downloadStates[modelID] {
-            state.isDownloading = false
-            state.message = "Download cancelled at \(Int(state.progress * 100))%"
-            state.error = "Cancelled"
-            downloadStates[modelID] = state
-        }
-        
-        print("HALDEBUG-DOWNLOAD: Cancelled active download for \(modelID)")
-    }
-    
-    func deleteModel(modelID: String) async {
-        let expectedPath = modelPath(for: modelID)
-        
-        if FileManager.default.fileExists(atPath: expectedPath.path) {
-            do {
-                try FileManager.default.removeItem(at: expectedPath)
-                print("HALDEBUG-DOWNLOAD: Model deleted from: \(expectedPath.path)")
-                
-                await MainActor.run {
-                    // Remove from persistent storage
-                    var modelIDs = self.downloadedModelIDs
-                    modelIDs.remove(modelID)
-                    self.downloadedModelIDs = modelIDs
-                    
-                    // Update state
-                    var state = self.downloadStates[modelID] ?? DownloadState(
-                        isDownloading: false,
-                        progress: 0.0,
-                        message: "Model deleted.",
-                        error: nil,
-                        localPath: nil
-                    )
-                    state.localPath = nil
-                    state.progress = 0.0
-                    state.message = "Model deleted."
-                    self.downloadStates[modelID] = state
-                    
-                    // Update cache size
-                    Task {
-                        await self.updateCacheSize()
-                    }
-                }
-            } catch {
-                await MainActor.run {
-                    var state = self.downloadStates[modelID] ?? DownloadState(
-                        isDownloading: false,
-                        progress: 0.0,
-                        message: "Delete failed.",
-                        error: error.localizedDescription,
-                        localPath: nil
-                    )
-                    state.error = "Delete failed: \(error.localizedDescription)"
-                    state.message = "Delete failed."
-                    self.downloadStates[modelID] = state
-                }
-            }
-        } else {
-            // File doesn't exist, clean up storage anyway
-            await MainActor.run {
-                var modelIDs = self.downloadedModelIDs
-                modelIDs.remove(modelID)
-                self.downloadedModelIDs = modelIDs
-                
-                var state = self.downloadStates[modelID] ?? DownloadState(
-                    isDownloading: false,
-                    progress: 0.0,
-                    message: "Model was already deleted.",
-                    error: nil,
-                    localPath: nil
-                )
-                state.message = "Model was already deleted."
-                self.downloadStates[modelID] = state
-            }
-        }
-    }
-    
-    func isModelDownloaded(_ modelID: String) -> Bool {
-        return downloadedModelIDs.contains(modelID) &&
-               FileManager.default.fileExists(atPath: modelPath(for: modelID).path)
-    }
-    
-    func getModelPath(_ modelID: String) -> URL? {
-        guard downloadedModelIDs.contains(modelID) else { return nil }
-        let path = modelPath(for: modelID)
-        return FileManager.default.fileExists(atPath: path.path) ? path : nil
-    }
-    
-    // MARK: - Cache Management
-    
-    @MainActor
-    func updateCacheSize() async {
-        isCacheCalculating = true
-        
-        let size = await calculateDirectorySize(hubCacheDirectory)
-        
-        hubCacheSize = size > 0 ? formatBytes(Int64(size)) : "No cache"
-        isCacheCalculating = false
-    }
-    
-    func clearHubCache() {
-        if FileManager.default.fileExists(atPath: hubCacheDirectory.path) {
-            do {
-                try FileManager.default.removeItem(at: hubCacheDirectory)
-                
-                // Clear all model states since cache is gone
-                downloadedModelIDs = []
-                downloadStates = [:]
-                hubCacheSize = "No cache"
-                
-                print("HALDEBUG-CACHE: ✅ Cleared Hub cache and all model states")
-            } catch {
-                if var state = downloadStates.values.first {
-                    state.error = "Failed to clear cache: \(error.localizedDescription)"
-                    state.message = "Cache clear failed."
-                }
-                print("HALDEBUG-CACHE: ❌ Failed to clear cache: \(error.localizedDescription)")
-            }
-        } else {
-            hubCacheSize = "No cache"
-            print("HALDEBUG-CACHE: No cache directory found to clear")
-        }
-    }
-    
-    // MARK: - Utility Methods
-    
-    private func calculateDirectorySize(_ directory: URL) async -> UInt64 {
-        return await withCheckedContinuation { continuation in
-            Task.detached {
-                var totalSize: UInt64 = 0
-                
-                guard FileManager.default.fileExists(atPath: directory.path) else {
-                    continuation.resume(returning: 0)
-                    return
-                }
-                
-                let resourceKeys: [URLResourceKey] = [.totalFileAllocatedSizeKey, .isDirectoryKey]
-                guard let enumerator = FileManager.default.enumerator(
-                    at: directory,
-                    includingPropertiesForKeys: resourceKeys,
-                    options: [.skipsHiddenFiles]
-                ) else {
-                    continuation.resume(returning: 0)
-                    return
-                }
-                
-                while let fileURL = enumerator.nextObject() as? URL {
-                    do {
-                        let resourceValues = try fileURL.resourceValues(forKeys: Set(resourceKeys))
-                        
-                        // Only count files, not directories
-                        if let isDirectory = resourceValues.isDirectory, !isDirectory {
-                            if let fileSize = resourceValues.totalFileAllocatedSize {
-                                totalSize += UInt64(fileSize)
-                            }
-                        }
-                    } catch {
-                        // Skip files we can't read
-                        continue
-                    }
-                }
-                
-                continuation.resume(returning: totalSize)
-            }
-        }
-    }
-    
-    private func formatBytes(_ bytes: Int64) -> String {
-        let formatter = ByteCountFormatter()
-        formatter.allowedUnits = [.useBytes, .useKB, .useMB, .useGB]
-        formatter.countStyle = .file
-        return formatter.string(fromByteCount: bytes)
-    }
-}
-
-// MARK: - Notification
-extension Notification.Name {
-    static let mlxModelDidDownload = Notification.Name("mlxModelDidDownload")
-}
-// ==== LEGO END: 29 MLX Model Downloader (Singleton) ====
-
-
-
-// ==== LEGO START: 30 Model Catalog Service (Hugging Face Integration) ====
-
-// MARK: - Model Source Enum
-enum ModelSource: String, Codable {
-    case appleFoundation = "apple"
-    case mlx = "mlx"
-}
-
-// MARK: - Model Configuration Struct
-struct ModelConfiguration: Identifiable, Codable, Equatable, Hashable {
-    let id: String
-    let displayName: String
-    let source: ModelSource
-    let sizeGB: Double?
-    let contextWindow: Int
-    let license: String?
-    let description: String?
-    var isDownloaded: Bool
-    var localPath: URL?
-    
-    var isLocal: Bool { source == .mlx }
-    var requiresDownload: Bool { source == .mlx && !isDownloaded }
-    
-    func hash(into hasher: inout Hasher) {
-        hasher.combine(id)
-    }
-    
-    static func == (lhs: ModelConfiguration, rhs: ModelConfiguration) -> Bool {
-        lhs.id == rhs.id
-    }
-    
-    static let appleFoundation = ModelConfiguration(
-        id: "apple-foundation-models",
-        displayName: "Apple Intelligence",
-        source: .appleFoundation,
-        sizeGB: nil,
-        contextWindow: 4_096,
-        license: nil,
-        description: "Always available, no download required",
-        isDownloaded: true,
-        localPath: nil
-    )
-}
-
-// MARK: - Hugging Face API Response Models
-struct HFModelListResponse: Codable {
-    let id: String              // e.g. "mlx-community/Phi-3-mini-128k-instruct-4bit"
-    let modelId: String?        // Alternative field name
-    let author: String?
-    let downloads: Int?
-    let likes: Int?
-    let tags: [String]?
-    let siblings: [HFFileInfo]?
-    let cardData: HFCardData?
-    
-    var repoID: String {
-        return modelId ?? id
-    }
-}
-
-struct HFFileInfo: Codable {
-    let rfilename: String
-    let size: Int64?
-}
-
-struct HFCardData: Codable {
-    let license: String?
-    let tags: [String]?
-}
-
-// MARK: - Model Config.json Response (for context window detection)
-
-// Different model architectures store context window size in different fields within config.json
-// This struct defines all known field names we check, in order of prevalence:
-// - max_position_embeddings: Most common (Llama, Mistral, most modern models)
-// - sliding_window: Models with sliding window attention (some Mistral variants)
-// - n_positions: GPT-2 and variants
-// - n_ctx: Alternative context naming
-// - seq_len, seq_length: Older or alternative naming conventions
-struct HFModelConfig: Codable {
-    let max_position_embeddings: Int?
-    let n_positions: Int?
-    let seq_len: Int?
-    let seq_length: Int?
-    let n_ctx: Int?
-    let sliding_window: Int?
-}
-
-// MARK: - Model Catalog Service (Singleton)
-
-// SELF-AWARENESS NOTE (for Hal reading this code):
-// This service manages the catalog of available AI models - both Apple Foundation Models
-// and the 1000+ MLX models from HuggingFace. A critical challenge is determining each model's
-// context window (how much text it can process at once).
-//
-// HuggingFace doesn't provide this in their API and doesn't require it in uploads (!), so we use
-// a three-tier strategy:
-// - TIER 1: Fetch the model's config.json and check for context window fields (accurate but requires network)
-// - TIER 2: Infer from model name ("128k", "32k", etc.) - heuristic but fast
-// - TIER 3: Safe default of 4,096 tokens (same as Apple Foundation Models)
-//
-// We cache results locally so we don't re-fetch, and this cache survives app deletion.
-// This matters because models can be removed/reinstalled, and we need this info multiple times
-// when a model is active (for RAG limits, memory depth, prompt sizing, etc.).
-//
-// The config.json approach checks multiple field names because different model architectures
-// use different conventions: max_position_embeddings (Llama/Mistral), n_positions (GPT-2),
-// sliding_window (models with sliding attention), and others. We check them in order of
-// prevalence based on research into common practices.
-
-@MainActor
-class ModelCatalogService: ObservableObject {
-    static let shared = ModelCatalogService()
-    
-    // Published state
-    @Published var availableModels: [ModelConfiguration] = []
-    @Published var isLoading: Bool = false
-    @Published var errorMessage: String?
-    
-    // API configuration
-    private let huggingFaceAPIBase = "https://huggingface.co/api"
-    private let mlxCommunityOrg = "mlx-community"
-    
-    // License acceptance tracking
-    @AppStorage("acceptedModelLicenses") private var acceptedLicensesData: Data = Data()
-    private var acceptedLicenses: [String: Bool] {
-        get {
-            (try? JSONDecoder().decode([String: Bool].self, from: acceptedLicensesData)) ?? [:]
-        }
-        set {
-            acceptedLicensesData = (try? JSONEncoder().encode(newValue)) ?? Data()
-        }
-    }
-    
-    // MARK: - Context Window Cache
-    
-    // Cache of discovered context windows: [modelID: contextWindow]
-    // Survives app deletion, prevents re-fetching, handles model reinstalls
-    @AppStorage("cachedContextWindows") private var cachedContextData: Data = Data()
-    private var cachedContextWindows: [String: Int] {
-        get {
-            (try? JSONDecoder().decode([String: Int].self, from: cachedContextData)) ?? [:]
-        }
-        set {
-            cachedContextData = (try? JSONEncoder().encode(newValue)) ?? Data()
-        }
-    }
-    
-    /// Retrieves cached context window for a model, if available
-    private func getCachedContextWindow(for modelID: String) -> Int? {
-        return cachedContextWindows[modelID]
-    }
-    
-    /// Stores context window in cache for future use
-    private func cacheContextWindow(_ contextWindow: Int, for modelID: String) {
-        var cache = cachedContextWindows
-        cache[modelID] = contextWindow
-        cachedContextWindows = cache
-        print("HALDEBUG-CONTEXT: Cached context window \(contextWindow) for \(modelID)")
-    }
-    
-    private init() {
-        print("HALDEBUG-CATALOG: ModelCatalogService initialized")
-    }
-    
-    // MARK: - Fetch Models from Hugging Face
-    
-    /// Fetches all models from the mlx-community organization
-    func fetchMLXCommunityModels() async {
-        await MainActor.run {
-            isLoading = true
-            errorMessage = nil
-        }
-        
-        print("HALDEBUG-CATALOG: Fetching models from mlx-community...")
-        
-        do {
-            // Build API URL
-            guard let url = URL(string: "\(huggingFaceAPIBase)/models?author=\(mlxCommunityOrg)") else {
-                throw CatalogError.invalidURL
-            }
-            
-            print("HALDEBUG-CATALOG: API URL: \(url.absoluteString)")
-            
-            // Make request
-            let (data, response) = try await URLSession.shared.data(from: url)
-            
-            // Validate response
-            guard let httpResponse = response as? HTTPURLResponse else {
-                throw CatalogError.invalidResponse
-            }
-            
-            print("HALDEBUG-CATALOG: HTTP Status: \(httpResponse.statusCode)")
-            
-            guard httpResponse.statusCode == 200 else {
-                throw CatalogError.httpError(httpResponse.statusCode)
-            }
-            
-            // Parse JSON
-            let decoder = JSONDecoder()
-            let hfModels = try decoder.decode([HFModelListResponse].self, from: data)
-            
-            print("HALDEBUG-CATALOG: Received \(hfModels.count) models from API")
-            
-            // Convert to ModelConfiguration objects (now async to support config.json fetching)
-            var mlxModels: [ModelConfiguration] = []
-            for hfModel in hfModels {
-                if let model = await convertHFModelToConfiguration(hfModel) {
-                    mlxModels.append(model)
-                }
-            }
-            
-            print("HALDEBUG-CATALOG: Converted \(mlxModels.count) valid models")
-            
-            // Add Apple Foundation Models at the top
-            let appleModel = ModelConfiguration.appleFoundation
-            
-            await MainActor.run {
-                self.availableModels = [appleModel] + mlxModels
-                self.isLoading = false
-                print("HALDEBUG-CATALOG: âœ… Catalog updated with \(self.availableModels.count) total models")
-            }
-            
-        } catch {
-            await MainActor.run {
-                self.errorMessage = "Failed to load models: \(error.localizedDescription)"
-                self.isLoading = false
-                
-                // Fallback to Apple Foundation Models only
-                self.availableModels = [ModelConfiguration.appleFoundation]
-                
-                print("HALDEBUG-CATALOG: âŒ Error: \(error.localizedDescription)")
-            }
-        }
-    }
-    
-    // MARK: - Convert HF Model to ModelConfiguration
-    
-    private func convertHFModelToConfiguration(_ hfModel: HFModelListResponse) async -> ModelConfiguration? {
-        let repoID = hfModel.repoID
-        
-        // Extract display name from repo ID (e.g. "Phi-3-mini-128k-instruct-4bit")
-        let displayName = repoID.replacingOccurrences(of: "mlx-community/", with: "")
-            .replacingOccurrences(of: "-", with: " ")
-            .capitalized
-        
-        // Calculate total size from file list
-        let totalBytes = hfModel.siblings?.reduce(Int64(0)) { sum, file in
-            sum + (file.size ?? 0)
-        } ?? 0
-        
-        let sizeGB = totalBytes > 0 ? Double(totalBytes) / 1_073_741_824.0 : nil
-        
-        // Determine context window using three-tier strategy
-        let contextWindow: Int
-        var detectionMethod: String = "" // For transparency logging
-        
-        // Check cache first
-        if let cached = getCachedContextWindow(for: repoID) {
-            contextWindow = cached
-            detectionMethod = "cached"
-            print("HALDEBUG-CONTEXT: Using cached context window \(contextWindow) for \(repoID)")
-        } else {
-            // TIER 1: Try fetching from config.json
-            if let fetched = await fetchConfigContextWindow(for: repoID) {
-                contextWindow = fetched
-                detectionMethod = "config.json"
-            } else {
-                // TIER 2: Fall back to name inference
-                contextWindow = inferContextFromName(repoID)
-                detectionMethod = repoID.lowercased().contains("128k") ||
-                                 repoID.lowercased().contains("32k") ||
-                                 repoID.lowercased().contains("8k") ? "name_inference" : "default"
-            }
-            
-            // Cache the result (regardless of which tier succeeded)
-            cacheContextWindow(contextWindow, for: repoID)
-            
-            // Log detection method for transparency
-            print("HALDEBUG-CONTEXT: Context window \(contextWindow) detected via \(detectionMethod) for \(repoID)")
-        }
-        
-        // Extract license
-        let license = hfModel.cardData?.license
-        
-        // Check if already downloaded
-        let downloadManager = MLXModelDownloader.shared
-        let isDownloaded = downloadManager.isModelDownloaded(repoID)
-        let localPath = downloadManager.getModelPath(repoID)
-        
-        return ModelConfiguration(
-            id: repoID,
-            displayName: displayName,
-            source: .mlx,
-            sizeGB: sizeGB,
-            contextWindow: contextWindow,
-            license: license,
-            description: nil,
-            isDownloaded: isDownloaded,
-            localPath: localPath
-        )
-    }
-    
-    // MARK: - Context Window Inference
-    
-    /// TIER 1: Fetch context window from model's config.json
-    /// This is the most accurate method as it reads the official model metadata.
-    /// Attempts to download and parse config.json from HuggingFace with a 5-second timeout.
-    /// Checks multiple field names because different architectures use different conventions.
-    /// Returns nil on any failure (missing file, timeout, no recognized fields) to gracefully fall back to Tier 2.
-    private func fetchConfigContextWindow(for repoID: String) async -> Int? {
-        print("HALDEBUG-CONTEXT: Fetching config.json for \(repoID)")
-        
-        // Build URL to config.json
-        guard let url = URL(string: "https://huggingface.co/\(repoID)/raw/main/config.json") else {
-            print("HALDEBUG-CONTEXT: Invalid config.json URL for \(repoID)")
-            return nil
-        }
-        
-        do {
-            // Create request with timeout
-            var request = URLRequest(url: url)
-            request.timeoutInterval = 5.0  // 5 second timeout
-            
-            let (data, response) = try await URLSession.shared.data(for: request)
-            
-            // Validate response
-            guard let httpResponse = response as? HTTPURLResponse,
-                  httpResponse.statusCode == 200 else {
-                print("HALDEBUG-CONTEXT: Config.json not found or HTTP error for \(repoID)")
-                return nil
-            }
-            
-            // Parse JSON
-            let decoder = JSONDecoder()
-            let config = try decoder.decode(HFModelConfig.self, from: data)
-            
-            // Check fields in order of preference (most common first)
-            // Based on research: different architectures use different field names
-            if let context = config.max_position_embeddings {
-                print("HALDEBUG-CONTEXT: âœ… Found context window \(context) in max_position_embeddings for \(repoID)")
-                return context
-            } else if let context = config.sliding_window {
-                print("HALDEBUG-CONTEXT: âœ… Found sliding window \(context) for \(repoID)")
-                return context
-            } else if let context = config.n_positions {
-                print("HALDEBUG-CONTEXT: âœ… Found context window \(context) in n_positions for \(repoID)")
-                return context
-            } else if let context = config.n_ctx {
-                print("HALDEBUG-CONTEXT: âœ… Found context window \(context) in n_ctx for \(repoID)")
-                return context
-            } else if let context = config.seq_len {
-                print("HALDEBUG-CONTEXT: âœ… Found context window \(context) in seq_len for \(repoID)")
-                return context
-            } else if let context = config.seq_length {
-                print("HALDEBUG-CONTEXT: âœ… Found context window \(context) in seq_length for \(repoID)")
-                return context
-            } else {
-                print("HALDEBUG-CONTEXT: Config.json found but no context window fields for \(repoID)")
-                return nil
-            }
-            
-        } catch {
-            print("HALDEBUG-CONTEXT: Failed to fetch config.json for \(repoID): \(error.localizedDescription)")
-            return nil
-        }
-    }
-    
-    /// TIER 2: Infer context window from model name patterns
-    /// This is a heuristic fallback when config.json isn't available or doesn't contain context info.
-    /// Looks for common patterns like "128k", "32k", "8k" in the model repository ID.
-    /// Falls back to TIER 3 (4,096 tokens - safe default) if no pattern matches.
-    /// While less accurate than config.json, this works surprisingly well as model creators
-    /// typically include context window size in model names for marketing/clarity.
-    private func inferContextFromName(_ repoID: String) -> Int {
-        let id = repoID.lowercased()
-        
-        // Check for common context window patterns in model names
-        if id.contains("128k") {
-            print("HALDEBUG-CONTEXT: Inferred 128k context from name: \(repoID)")
-            return 128_000
-        } else if id.contains("32k") {
-            print("HALDEBUG-CONTEXT: Inferred 32k context from name: \(repoID)")
-            return 32_000
-        } else if id.contains("8k") {
-            print("HALDEBUG-CONTEXT: Inferred 8k context from name: \(repoID)")
-            return 8_000
-        } else {
-            // TIER 3: Safe default (same as Apple Foundation Models)
-            print("HALDEBUG-CONTEXT: Using safe default 4k context for: \(repoID)")
-            return 4_096
-        }
-    }
-    
-    // MARK: - License Management
-    
-    /// Fetches the full license text for a model from its model card
-    func fetchLicenseText(for modelID: String) async throws -> String {
-        print("HALDEBUG-CATALOG: Fetching license for \(modelID)")
-        
-        // Build URL to model card
-        guard let url = URL(string: "https://huggingface.co/\(modelID)/raw/main/README.md") else {
-            throw CatalogError.invalidURL
-        }
-        
-        let (data, response) = try await URLSession.shared.data(from: url)
-        
-        guard let httpResponse = response as? HTTPURLResponse,
-              httpResponse.statusCode == 200 else {
-            throw CatalogError.licenseNotFound
-        }
-        
-        guard let licenseText = String(data: data, encoding: .utf8) else {
-            throw CatalogError.invalidLicenseFormat
-        }
-        
-        print("HALDEBUG-CATALOG: âœ… License fetched (\(licenseText.count) characters)")
-        return licenseText
-    }
-    
-    /// Records that user accepted the license for a model
-    func acceptLicense(for modelID: String) {
-        var licenses = acceptedLicenses
-        licenses[modelID] = true
-        acceptedLicenses = licenses
-        print("HALDEBUG-CATALOG: License accepted for \(modelID)")
-    }
-    
-    /// Checks if user has accepted the license for a model
-    func hasAcceptedLicense(for modelID: String) -> Bool {
-        return acceptedLicenses[modelID] ?? false
-    }
-    
-    /// Revokes license acceptance (e.g., if user deletes model)
-    func revokeLicense(for modelID: String) {
-        var licenses = acceptedLicenses
-        licenses[modelID] = nil
-        acceptedLicenses = licenses
-        print("HALDEBUG-CATALOG: License revoked for \(modelID)")
-    }
-    
-    // MARK: - Model Lookup
-    
-    /// Returns only models that are available locally (downloaded or always-available like Apple Foundation)
-    /// Used by Salon Mode and other features that need to show only usable models
-    var downloadedModels: [ModelConfiguration] {
-        return availableModels
-            .filter { $0.source == .appleFoundation || ($0.source == .mlx && $0.isDownloaded) }
-            .sorted { model1, model2 in
-                // Apple Foundation first, then alphabetical
-                if model1.source == .appleFoundation { return true }
-                if model2.source == .appleFoundation { return false }
-                return model1.displayName < model2.displayName
-            }
-    }
-    
-    /// Finds a model by ID in the current catalog
-    func getModel(byID modelID: String) -> ModelConfiguration? {
-        return availableModels.first { $0.id == modelID }
-    }
-    
-    /// Refreshes the download status for all models in catalog
-    func refreshDownloadStates() {
-        let downloadManager = MLXModelDownloader.shared
-        
-        availableModels = availableModels.map { model in
-            var updated = model
-            updated.isDownloaded = downloadManager.isModelDownloaded(model.id)
-            updated.localPath = downloadManager.getModelPath(model.id)
-            return updated
-        }
-        
-        print("HALDEBUG-CATALOG: Refreshed download states")
-    }
-}
-
-// MARK: - Catalog Errors
-enum CatalogError: LocalizedError {
-    case invalidURL
-    case invalidResponse
-    case httpError(Int)
-    case licenseNotFound
-    case invalidLicenseFormat
-    
-    var errorDescription: String? {
-        switch self {
-        case .invalidURL:
-            return "Invalid Hugging Face API URL"
-        case .invalidResponse:
-            return "Invalid response from Hugging Face"
-        case .httpError(let code):
-            return "HTTP error \(code) from Hugging Face API"
-        case .licenseNotFound:
-            return "Model license not found"
-        case .invalidLicenseFormat:
-            return "License text could not be decoded"
-        }
-    }
-}
-
-// ==== LEGO END: 30 Model Catalog Service (Hugging Face Integration) ====
-
 
 
 // ==== LEGO START: 31 Hal Watch Bridge ====
@@ -12850,7 +9866,7 @@ class HalTestConsole: ObservableObject {
         print("HALDEBUG-TESTCONSOLE: Commands watcher started on \(commandsFile.lastPathComponent)")
     }
 
-    // Called when commands.txt is written to. Commands execute synchronously on main queue.
+    // Called when commands.txt is written to. Thin wrapper — logic lives in executeCommand().
     private func handleCommandFileChange() async {
         guard let content = try? String(contentsOf: commandsFile, encoding: .utf8) else { return }
         let trimmed = content.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -12865,116 +9881,173 @@ class HalTestConsole: ObservableObject {
         print("HALDEBUG-TESTCONSOLE: Command received: \(trimmed.prefix(80))")
         statusMessage = "CMD: \(trimmed.prefix(40))"
 
+        _ = await executeCommand(trimmed, vm: vm)
+
+        // GET_STATE is idempotent — allow it to fire again immediately
+        if trimmed == "GET_STATE" { lastProcessedCommand = "" }
+
+        statusMessage = "CMD done: \(trimmed.prefix(30))"
+    }
+
+    // Shared command dispatch used by both the file watcher and LocalAPIServer.
+    // Returns a JSON result string. Does not touch statusMessage or lastProcessedCommand.
+    @discardableResult
+    func executeCommand(_ cmd: String, vm: ChatViewModel) async -> String {
+        let trimmed = cmd.trimmingCharacters(in: .whitespacesAndNewlines)
+
         if trimmed.hasPrefix("SET_MODEL:") {
             let modelID = String(trimmed.dropFirst("SET_MODEL:".count)).trimmingCharacters(in: .whitespaces)
-            if modelID == "apple-foundation-models" {
-                vm.selectedModelID = modelID
-                vm.llmService.setupLLM(for: .appleFoundation)
-                print("HALDEBUG-TESTCONSOLE: Model set to Apple Foundation Models")
-            } else if let model = ModelCatalogService.shared.getModel(byID: modelID) {
-                vm.selectedModelID = modelID
-                vm.llmService.setupLLM(for: model)
-                print("HALDEBUG-TESTCONSOLE: Model set to \(model.displayName)")
-            } else {
-                // Catalog cold -- construct minimal config from downloader
-                let localPath = MLXModelDownloader.shared.getModelPath(modelID)
-                let shortName = modelID.split(separator: "/").last.map(String.init) ?? modelID
-                let minimalConfig = ModelConfiguration(
-                    id: modelID,
-                    displayName: shortName,
-                    source: .mlx,
-                    sizeGB: nil,
-                    contextWindow: 4096,
-                    license: nil,
-                    description: nil,
-                    isDownloaded: localPath != nil,
-                    localPath: localPath
-                )
-                vm.selectedModelID = modelID
-                vm.llmService.setupLLM(for: minimalConfig)
-                print("HALDEBUG-TESTCONSOLE: Model set to \(shortName) (minimal config)")
+            if modelID != "apple-foundation-models" {
+                print("HALDEBUG-TESTCONSOLE: SET_MODEL ignored — Hal LMC is AFM-only (requested: \(modelID))")
             }
             writeStateJSON(vm: vm)
+            return #"{"status":"ok","note":"Hal LMC is AFM-only — model unchanged"}"#
 
         } else if trimmed == "NEW_THREAD" {
             vm.startNewConversation()
-            print("HALDEBUG-TESTCONSOLE: New thread created -- conversationId: \(vm.conversationId.prefix(8))")
+            print("HALDEBUG-TESTCONSOLE: New thread — \(vm.conversationId.prefix(8))")
             writeStateJSON(vm: vm)
+            return "{\"status\":\"ok\",\"command\":\"NEW_THREAD\",\"conversationId\":\"\(vm.conversationId)\"}"
 
         } else if trimmed == "RESET_THREAD" {
             vm.memoryStore.deleteThread(id: vm.conversationId)
             vm.startNewConversation()
-            print("HALDEBUG-TESTCONSOLE: Thread reset -- new conversationId: \(vm.conversationId.prefix(8))")
+            print("HALDEBUG-TESTCONSOLE: Thread reset — \(vm.conversationId.prefix(8))")
             writeStateJSON(vm: vm)
+            return "{\"status\":\"ok\",\"command\":\"RESET_THREAD\",\"conversationId\":\"\(vm.conversationId)\"}"
 
         } else if trimmed.hasPrefix("SET_SYSTEM_PROMPT:") {
             let promptText = String(trimmed.dropFirst("SET_SYSTEM_PROMPT:".count)).trimmingCharacters(in: .whitespaces)
             systemPromptOverride = promptText
             print("HALDEBUG-TESTCONSOLE: System prompt override set (\(promptText.count) chars)")
+            return #"{"status":"ok","command":"SET_SYSTEM_PROMPT"}"#
 
         } else if trimmed == "CLEAR_SYSTEM_PROMPT" {
             systemPromptOverride = nil
             print("HALDEBUG-TESTCONSOLE: System prompt override cleared")
+            return #"{"status":"ok","command":"CLEAR_SYSTEM_PROMPT"}"#
 
         } else if trimmed.hasPrefix("SET_MEMORY_DEPTH:") {
             let depthStr = String(trimmed.dropFirst("SET_MEMORY_DEPTH:".count)).trimmingCharacters(in: .whitespaces)
             if let depth = Int(depthStr), depth >= 1 {
                 let clamped = min(depth, vm.maxMemoryDepth)
                 vm.memoryDepth = clamped
-                print("HALDEBUG-TESTCONSOLE: memoryDepth set to \(clamped)\(clamped < depth ? " (clamped from \(depth) — model limit is \(vm.maxMemoryDepth))" : "")")
+                print("HALDEBUG-TESTCONSOLE: memoryDepth → \(clamped)")
                 writeStateJSON(vm: vm)
-            } else {
-                print("HALDEBUG-TESTCONSOLE: SET_MEMORY_DEPTH: invalid value '\(depthStr)' — must be integer >= 1")
+                return "{\"status\":\"ok\",\"memoryDepth\":\(clamped)}"
             }
+            return #"{"status":"error","message":"SET_MEMORY_DEPTH: must be integer >= 1"}"#
+
+        } else if trimmed.hasPrefix("SET_TEMPERATURE:") {
+            let valStr = String(trimmed.dropFirst("SET_TEMPERATURE:".count)).trimmingCharacters(in: .whitespaces)
+            if let val = Double(valStr), val >= 0.0, val <= 1.0 {
+                vm.temperature = val
+                print("HALDEBUG-TESTCONSOLE: temperature → \(val)")
+                writeStateJSON(vm: vm)
+                return "{\"status\":\"ok\",\"temperature\":\(val)}"
+            }
+            return #"{"status":"error","message":"SET_TEMPERATURE: must be 0.0–1.0"}"#
+
+        } else if trimmed.hasPrefix("SET_SELF_KNOWLEDGE:") {
+            let valStr = String(trimmed.dropFirst("SET_SELF_KNOWLEDGE:".count)).trimmingCharacters(in: .whitespaces).lowercased()
+            if valStr == "true" || valStr == "false" {
+                vm.enableSelfKnowledge = (valStr == "true")
+                print("HALDEBUG-TESTCONSOLE: enableSelfKnowledge → \(vm.enableSelfKnowledge)")
+                writeStateJSON(vm: vm)
+                return "{\"status\":\"ok\",\"enableSelfKnowledge\":\(vm.enableSelfKnowledge)}"
+            }
+            return #"{"status":"error","message":"SET_SELF_KNOWLEDGE: must be true or false"}"#
+
+        } else if trimmed.hasPrefix("SET_SIMILARITY_THRESHOLD:") {
+            let valStr = String(trimmed.dropFirst("SET_SIMILARITY_THRESHOLD:".count)).trimmingCharacters(in: .whitespaces)
+            if let val = Double(valStr), val >= 0.0, val <= 1.0 {
+                vm.memoryStore.relevanceThreshold = val
+                print("HALDEBUG-TESTCONSOLE: relevanceThreshold → \(val)")
+                writeStateJSON(vm: vm)
+                return "{\"status\":\"ok\",\"relevanceThreshold\":\(val)}"
+            }
+            return #"{"status":"error","message":"SET_SIMILARITY_THRESHOLD: must be 0.0–1.0"}"#
+
+        } else if trimmed.hasPrefix("SET_MAX_RAG_CHARS:") {
+            let valStr = String(trimmed.dropFirst("SET_MAX_RAG_CHARS:".count)).trimmingCharacters(in: .whitespaces)
+            if let val = Double(valStr), val >= 200 {
+                vm.maxRagSnippetsCharacters = val
+                print("HALDEBUG-TESTCONSOLE: maxRagSnippetsCharacters → \(val)")
+                writeStateJSON(vm: vm)
+                return "{\"status\":\"ok\",\"maxRagSnippetsCharacters\":\(Int(val))}"
+            }
+            return #"{"status":"error","message":"SET_MAX_RAG_CHARS: must be >= 200"}"#
+
+        } else if trimmed.hasPrefix("SET_RAG_DEDUP:") {
+            let valStr = String(trimmed.dropFirst("SET_RAG_DEDUP:".count)).trimmingCharacters(in: .whitespaces)
+            if let val = Double(valStr), val >= 0.0, val <= 1.0 {
+                vm.ragDedupSimilarityThreshold = val
+                print("HALDEBUG-TESTCONSOLE: ragDedupSimilarityThreshold → \(val)")
+                writeStateJSON(vm: vm)
+                return "{\"status\":\"ok\",\"ragDedupThreshold\":\(val)}"
+            }
+            return #"{"status":"error","message":"SET_RAG_DEDUP: must be 0.0–1.0"}"#
+
+        } else if trimmed.hasPrefix("SET_SYSTEM_PROMPT_STORED:") {
+            let promptText = String(trimmed.dropFirst("SET_SYSTEM_PROMPT_STORED:".count)).trimmingCharacters(in: .whitespaces)
+            vm.systemPrompt = promptText
+            print("HALDEBUG-TESTCONSOLE: stored systemPrompt updated (\(promptText.count) chars)")
+            writeStateJSON(vm: vm)
+            return #"{"status":"ok","command":"SET_SYSTEM_PROMPT_STORED"}"#
+
+        } else if trimmed == "RESET_SETTINGS" {
+            vm.resetSettingsToDefaults(silent: true)
+            print("HALDEBUG-TESTCONSOLE: Settings reset to defaults (silent)")
+            writeStateJSON(vm: vm)
+            return #"{"status":"ok","command":"RESET_SETTINGS"}"#
+
+        } else if trimmed == "NUCLEAR_RESET" {
+            let (threads, facts, messages) = vm.memoryStore.clearAllConversationData()
+            vm.resetSettingsToDefaults(silent: true)
+            vm.startNewConversation()
+            print("HALDEBUG-TESTCONSOLE: NUCLEAR_RESET — \(threads) threads, \(messages) messages deleted. New thread: \(vm.conversationId.prefix(8))")
+            return "{\"status\":\"ok\",\"command\":\"NUCLEAR_RESET\",\"threadsDeleted\":\(threads),\"factsDeleted\":\(facts),\"messagesDeleted\":\(messages),\"newConversationId\":\"\(vm.conversationId)\"}"
 
         } else if trimmed == "GET_STATE" {
             writeStateJSON(vm: vm)
             print("HALDEBUG-TESTCONSOLE: State written to \(stateFile.lastPathComponent)")
+            if let data = try? Data(contentsOf: stateFile),
+               let json = String(data: data, encoding: .utf8) { return json }
+            return #"{"status":"error","message":"Could not read state"}"#
 
         } else if trimmed == "CLEAR_TEST_DATA" {
-            // Wipe all conversation threads, messages, facts, and artifacts from the DB.
-            // Preserves documents, source code, and self-knowledge.
-            // After clearing, starts a fresh thread so the app is in a known clean state.
             let (threads, facts, messages) = vm.memoryStore.clearAllConversationData()
             vm.startNewConversation()
-            let result = """
-            {
-              "command": "CLEAR_TEST_DATA",
-              "threadsDeleted": \(threads),
-              "factsDeleted": \(facts),
-              "messagesDeleted": \(messages),
-              "newConversationId": "\(vm.conversationId)"
-            }
-            """
-            try? result.write(to: stateFile, atomically: true, encoding: .utf8)
             print("HALDEBUG-TESTCONSOLE: CLEAR_TEST_DATA — \(threads) threads, \(facts) facts, \(messages) messages deleted. New thread: \(vm.conversationId.prefix(8))")
+            return "{\"status\":\"ok\",\"command\":\"CLEAR_TEST_DATA\",\"threadsDeleted\":\(threads),\"factsDeleted\":\(facts),\"messagesDeleted\":\(messages),\"newConversationId\":\"\(vm.conversationId)\"}"
 
         } else {
             print("HALDEBUG-TESTCONSOLE: Unknown command: \(trimmed.prefix(60))")
+            return "{\"status\":\"error\",\"message\":\"Unknown command: \(trimmed.prefix(60))\"}"
         }
-
-        statusMessage = "CMD done: \(trimmed.prefix(30))"
     }
 
-    private func writeStateJSON(vm: ChatViewModel) {
+    func writeStateJSON(vm: ChatViewModel) {
         let promptText = vm.effectiveSystemPrompt
         let fingerprint = String(promptText.prefix(60)).replacingOccurrences(of: "\n", with: " ")
         let hasOverride = systemPromptOverride != nil
-        // Report both AppStorage value and the model actually loaded in LLMService.
-        // If these differ, it means the init path set the wrong model.
-        let appStorageID = vm.selectedModelID
         let liveID = vm.llmService.activeModelID
-        let idsMatch = appStorageID == liveID
+        let hasSummary = !vm.injectedSummary.isEmpty
         let state = """
         {
-          "appStorageModelID": "\(appStorageID)",
-          "liveModelID": "\(liveID)",
-          "modelIDsMatch": \(idsMatch),
+          "modelID": "\(liveID)",
           "conversationId": "\(vm.conversationId)",
           "turnCount": \(turnCount),
           "memoryDepth": \(vm.memoryDepth),
           "maxMemoryDepth": \(vm.maxMemoryDepth),
+          "temperature": \(String(format: "%.2f", vm.temperature)),
+          "selfKnowledgeEnabled": \(vm.enableSelfKnowledge),
+          "similarityThreshold": \(String(format: "%.2f", vm.memoryStore.relevanceThreshold)),
+          "maxRagSnippetsCharacters": \(Int(vm.maxRagSnippetsCharacters)),
+          "ragDedupThreshold": \(String(format: "%.2f", vm.ragDedupSimilarityThreshold)),
           "lastSummarizedTurnCount": \(vm.lastSummarizedTurnCount),
+          "injectedSummaryActive": \(hasSummary),
+          "injectedSummaryLength": \(vm.injectedSummary.count),
           "systemPromptOverrideActive": \(hasOverride),
           "systemPromptFingerprint": "\(fingerprint)..."
         }
@@ -12995,6 +10068,22 @@ class HalTestConsole: ObservableObject {
         guard let vm = chatViewModel else {
             statusMessage = "Error: ChatViewModel unavailable"
             return
+        }
+
+        // Safety: if the previous turn is still running, wait up to 120s before giving up.
+        // This prevents overlapping sendMessage() calls that corrupt isAIResponding state.
+        if vm.isAIResponding {
+            print("HALDEBUG-TESTCONSOLE: Previous turn still in flight — waiting up to 120s...")
+            var waited = 0
+            while vm.isAIResponding && waited < 120 {
+                try? await Task.sleep(nanoseconds: 1_000_000_000) // 1s polling
+                waited += 1
+            }
+            if vm.isAIResponding {
+                print("HALDEBUG-TESTCONSOLE: Timeout waiting for previous turn — skipping input: \"\(trimmed.prefix(40))\"")
+                statusMessage = "Error: previous turn timed out"
+                return
+            }
         }
 
         turnCount += 1
@@ -13029,7 +10118,7 @@ class HalTestConsole: ObservableObject {
         print("HALDEBUG-TESTCONSOLE: Turn \(turnNum) complete in \(String(format: "%.1f", elapsed))s — \(outputLatestFile.lastPathComponent)")
     }
 
-    private func buildOutputJSON(turn: Int, userMessage: String, aiMessage: ChatMessage, elapsed: TimeInterval, vm: ChatViewModel) -> String {
+    func buildOutputJSON(turn: Int, userMessage: String, aiMessage: ChatMessage, elapsed: TimeInterval, vm: ChatViewModel) -> String {
 
         // Token breakdown
         let tokenJSON: String
@@ -13099,7 +10188,7 @@ class HalTestConsole: ObservableObject {
           "thinkingDuration": \(String(format: "%.2f", elapsed)),
           "model": "\(vm.selectedModel.id)",
           "selfKnowledgeEnabled": \(vm.enableSelfKnowledge),
-          "salonModeEnabled": \(vm.salonConfig.isEnabled),
+          "salonModeEnabled": false,
           "userMessage": \(jsonEscape(userMessage)),
           "response": \(jsonEscape(aiMessage.content)),
           "sectionsInjected": [\(sections)],
@@ -13120,6 +10209,317 @@ class HalTestConsole: ObservableObject {
             .replacingOccurrences(of: "\r", with: "\\r")
             .replacingOccurrences(of: "\t", with: "\\t")
         return "\"\(escaped)\""
+    }
+}
+
+// ─── Local HTTP API Server ──────────────────────────────────────────────────
+//
+// Programmatic access to Hal's pipeline for automated testing and tooling.
+// Replaces the file-polling harness with a clean synchronous HTTP interface.
+//
+// Endpoints (all require Authorization: Bearer <token>):
+//   POST /chat      {"message": "..."}          → full diagnostic JSON (same schema as output_latest.json)
+//   POST /command   {"command": "NUCLEAR_RESET"} → JSON result
+//   GET  /state                                  → settings state JSON
+//
+// Security:
+//   Bearer token generated once, stored in Keychain, shown in Settings > Developer API.
+//   Default OFF. User must enable via toggle. No port opens when disabled.
+//
+// Network:
+//   Listens on all local interfaces, port 8765.
+//   Mac Catalyst: connect via 127.0.0.1:8765 (same machine).
+//   Physical iPhone: connect via WiFi IP shown in Settings > Developer API.
+//
+// Python test runner:
+//   python3 tests/hal_test.py setup <ip> 8765 <token>  # write config once
+//   python3 tests/hal_test.py chat                      # reactive REPL — no scripts, no polling
+//   python3 tests/hal_test.py turn "Hello"              # single turn
+//   python3 tests/hal_test.py reset                     # nuclear reset
+//
+class LocalAPIServer {
+
+    static let apiPort: UInt16 = 8765
+
+    private var listener: NWListener?
+    private weak var chatViewModel: ChatViewModel?
+
+    var isRunning: Bool { listener != nil }
+
+    // MARK: - Token (Keychain-backed)
+
+    private static let keychainService  = "com.MarkFriedlander.Hal10000"
+    private static let keychainAccount  = "localAPIToken"
+
+    static func loadOrCreateToken() -> String {
+        let query: [CFString: Any] = [
+            kSecClass:       kSecClassGenericPassword,
+            kSecAttrService: keychainService as CFString,
+            kSecAttrAccount: keychainAccount as CFString,
+            kSecReturnData:  true
+        ]
+        var item: AnyObject?
+        if SecItemCopyMatching(query as CFDictionary, &item) == errSecSuccess,
+           let data = item as? Data,
+           let token = String(data: data, encoding: .utf8) {
+            return token
+        }
+        // First launch — generate and persist
+        let token = UUID().uuidString.replacingOccurrences(of: "-", with: "").lowercased()
+        let add: [CFString: Any] = [
+            kSecClass:       kSecClassGenericPassword,
+            kSecAttrService: keychainService as CFString,
+            kSecAttrAccount: keychainAccount as CFString,
+            kSecValueData:   Data(token.utf8) as CFData
+        ]
+        SecItemAdd(add as CFDictionary, nil)
+        return token
+    }
+
+    var apiToken: String { Self.loadOrCreateToken() }
+
+    // MARK: - Local Network Address
+
+    static func localIPAddress() -> String {
+        var best = "127.0.0.1"
+        var ifaddr: UnsafeMutablePointer<ifaddrs>?
+        guard getifaddrs(&ifaddr) == 0 else { return best }
+        defer { freeifaddrs(ifaddr) }
+        var ptr = ifaddr
+        while let iface = ptr?.pointee {
+            defer { ptr = ptr?.pointee.ifa_next }
+            guard iface.ifa_addr.pointee.sa_family == UInt8(AF_INET) else { continue }
+            let name = String(cString: iface.ifa_name)
+            guard name.hasPrefix("en") else { continue }
+            var hostname = [CChar](repeating: 0, count: Int(NI_MAXHOST))
+            getnameinfo(iface.ifa_addr, socklen_t(iface.ifa_addr.pointee.sa_len),
+                        &hostname, socklen_t(hostname.count), nil, 0, NI_NUMERICHOST)
+            let ip = String(cString: hostname)
+            if !ip.isEmpty && ip != "0.0.0.0" { best = ip }
+        }
+        return best
+    }
+
+    var connectionURL: String { "\(Self.localIPAddress()):\(Self.apiPort)" }
+
+    // MARK: - Lifecycle
+
+    func start(chatViewModel: ChatViewModel) {
+        guard !isRunning else { return }
+        self.chatViewModel = chatViewModel
+        do {
+            let params = NWParameters.tcp
+            params.allowLocalEndpointReuse = true
+            let l = try NWListener(using: params, on: NWEndpoint.Port(rawValue: Self.apiPort)!)
+            l.newConnectionHandler = { [weak self] conn in
+                conn.start(queue: .global(qos: .userInitiated))
+                Task { await self?.handleConnection(conn) }
+            }
+            l.stateUpdateHandler = { state in
+                switch state {
+                case .ready:
+                    print("LocalAPI: Ready at \(LocalAPIServer.localIPAddress()):\(LocalAPIServer.apiPort)")
+                case .failed(let e):
+                    print("LocalAPI: Failed — \(e)")
+                default: break
+                }
+            }
+            l.start(queue: .global(qos: .userInitiated))
+            self.listener = l
+        } catch {
+            print("LocalAPI: Could not start NWListener — \(error)")
+        }
+    }
+
+    func stop() {
+        listener?.cancel()
+        listener = nil
+        print("LocalAPI: Stopped")
+    }
+
+    // MARK: - Connection Handling
+
+    private func handleConnection(_ conn: NWConnection) async {
+        guard let data = await receiveRequest(conn),
+              let req  = parseRequest(data) else {
+            respond(conn, status: 400, body: #"{"error":"Bad request"}"#)
+            return
+        }
+        guard req.token == apiToken else {
+            respond(conn, status: 401, body: #"{"error":"Unauthorized"}"#)
+            return
+        }
+        let (status, body) = await route(req)
+        respond(conn, status: status, body: body)
+    }
+
+    // Accumulates TCP chunks until the HTTP request is complete.
+    private func receiveRequest(_ conn: NWConnection) async -> Data? {
+        await withCheckedContinuation { cont in
+            var buf = Data()
+            func next() {
+                conn.receive(minimumIncompleteLength: 1, maximumLength: 65_536) { chunk, _, done, err in
+                    if let chunk { buf.append(chunk) }
+                    if let text = String(data: buf, encoding: .utf8), text.contains("\r\n\r\n") {
+                        let parts  = text.components(separatedBy: "\r\n\r\n")
+                        let hdr    = parts[0]
+                        let body   = parts.dropFirst().joined(separator: "\r\n\r\n")
+                        if let clLine = hdr.components(separatedBy: "\r\n")
+                            .first(where: { $0.lowercased().hasPrefix("content-length:") }),
+                           let cl = Int(clLine.components(separatedBy: ":").last?
+                                            .trimmingCharacters(in: .whitespaces) ?? "") {
+                            if body.utf8.count >= cl { cont.resume(returning: buf); return }
+                        } else {
+                            cont.resume(returning: buf); return   // No body (e.g. GET)
+                        }
+                    }
+                    if done || err != nil { cont.resume(returning: buf.isEmpty ? nil : buf) }
+                    else { next() }
+                }
+            }
+            next()
+        }
+    }
+
+    // MARK: - HTTP Parsing
+
+    private struct ParsedRequest {
+        let method: String
+        let path: String
+        let token: String?
+        let body: Data?
+    }
+
+    private func parseRequest(_ data: Data) -> ParsedRequest? {
+        guard let text = String(data: data, encoding: .utf8) else { return nil }
+        let split = text.components(separatedBy: "\r\n\r\n")
+        guard let hdrBlock = split.first else { return nil }
+        let lines = hdrBlock.components(separatedBy: "\r\n")
+        guard let reqLine = lines.first else { return nil }
+        let rp = reqLine.components(separatedBy: " ")
+        guard rp.count >= 2 else { return nil }
+        var token: String?
+        for line in lines.dropFirst() {
+            if line.lowercased().hasPrefix("authorization: bearer ") {
+                token = String(line.dropFirst("authorization: bearer ".count))
+                    .trimmingCharacters(in: .whitespacesAndNewlines)
+                break
+            }
+        }
+        let bodyStr  = split.dropFirst().joined(separator: "\r\n\r\n")
+        let bodyData = bodyStr.isEmpty ? nil : bodyStr.data(using: .utf8)
+        return ParsedRequest(method: rp[0], path: rp[1], token: token, body: bodyData)
+    }
+
+    // MARK: - Routing
+
+    private func route(_ req: ParsedRequest) async -> (Int, String) {
+        switch (req.method, req.path) {
+        case ("POST", "/chat"):    return await handleChat(body: req.body)
+        case ("POST", "/command"): return await handleCommand(body: req.body)
+        case ("GET",  "/state"):   return await handleState()
+        default:                   return (404, #"{"error":"Not found"}"#)
+        }
+    }
+
+    // POST /chat — {"message": "..."} → full diagnostic JSON
+    private func handleChat(body: Data?) async -> (Int, String) {
+        guard let body,
+              let json    = try? JSONSerialization.jsonObject(with: body) as? [String: Any],
+              let message = json["message"] as? String, !message.isEmpty else {
+            return (400, #"{"error":"Missing 'message'"}"#)
+        }
+        guard let vm = chatViewModel else {
+            return (503, #"{"error":"ChatViewModel unavailable"}"#)
+        }
+        return await withCheckedContinuation { cont in
+            Task { @MainActor in
+                // If a previous turn is still running, wait up to 120 s
+                var waited = 0
+                while vm.isAIResponding && waited < 120 {
+                    try? await Task.sleep(nanoseconds: 1_000_000_000)
+                    waited += 1
+                }
+                guard !vm.isAIResponding else {
+                    cont.resume(returning: (503, #"{"error":"Previous turn timed out"}"#))
+                    return
+                }
+                let start = Date()
+                vm.currentMessage = message
+                await vm.sendMessage()
+                let elapsed = Date().timeIntervalSince(start)
+                let aiMessages = vm.messages.filter { !$0.isFromUser && !$0.isPartial }
+                guard let lastAI = aiMessages.last else {
+                    cont.resume(returning: (500, #"{"error":"No response generated"}"#))
+                    return
+                }
+                vm.testConsole.turnCount += 1
+                let responseJSON = vm.testConsole.buildOutputJSON(
+                    turn: vm.testConsole.turnCount,
+                    userMessage: message,
+                    aiMessage: lastAI,
+                    elapsed: elapsed,
+                    vm: vm
+                )
+                cont.resume(returning: (200, responseJSON))
+            }
+        }
+    }
+
+    // POST /command — {"command": "NUCLEAR_RESET"}
+    private func handleCommand(body: Data?) async -> (Int, String) {
+        guard let body,
+              let json = try? JSONSerialization.jsonObject(with: body) as? [String: Any],
+              let cmd  = json["command"] as? String, !cmd.isEmpty else {
+            return (400, #"{"error":"Missing 'command'"}"#)
+        }
+        guard let vm = chatViewModel else {
+            return (503, #"{"error":"ChatViewModel unavailable"}"#)
+        }
+        let result: String = await withCheckedContinuation { cont in
+            Task { @MainActor in
+                let r = await vm.testConsole.executeCommand(cmd, vm: vm)
+                cont.resume(returning: r)
+            }
+        }
+        return (200, result)
+    }
+
+    // GET /state
+    private func handleState() async -> (Int, String) {
+        guard let vm = chatViewModel else {
+            return (503, #"{"error":"ChatViewModel unavailable"}"#)
+        }
+        return await withCheckedContinuation { cont in
+            Task { @MainActor in
+                vm.testConsole.writeStateJSON(vm: vm)
+                if let data = try? Data(contentsOf: vm.testConsole.stateFile),
+                   let json = String(data: data, encoding: .utf8) {
+                    cont.resume(returning: (200, json))
+                } else {
+                    cont.resume(returning: (500, #"{"error":"State unavailable"}"#))
+                }
+            }
+        }
+    }
+
+    // MARK: - HTTP Response
+
+    private func respond(_ conn: NWConnection, status: Int, body: String) {
+        let phrase: String
+        switch status {
+        case 200: phrase = "OK"
+        case 400: phrase = "Bad Request"
+        case 401: phrase = "Unauthorized"
+        case 404: phrase = "Not Found"
+        case 503: phrase = "Service Unavailable"
+        default:  phrase = "Internal Server Error"
+        }
+        let bodyData = body.data(using: .utf8) ?? Data()
+        let header   = "HTTP/1.1 \(status) \(phrase)\r\nContent-Type: application/json\r\nContent-Length: \(bodyData.count)\r\nConnection: close\r\n\r\n"
+        var resp     = header.data(using: .utf8)!
+        resp.append(bodyData)
+        conn.send(content: resp, completion: .contentProcessed { _ in conn.cancel() })
     }
 }
 

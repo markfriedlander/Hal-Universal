@@ -1,0 +1,31 @@
+# Hal LMC — Memory Stack Test
+# Purpose: Verify STM, summarization, RAG retrieval, and RAG gate correctness
+# Run: python3 tests/hal_test.py run tests/conversations/memory_test.txt
+#
+# Evaluates:
+#   - Personal facts accumulate in STM
+#   - Summarization triggers at correct turn
+#   - Summary persists and is used correctly
+#   - RAG gate: YES for personal facts, NO for general knowledge
+#   - RAG retrieval: keyword + entity matching, possessive forms
+#   - Cross-session recall is NOT tested here (separate run needed)
+
+CMD: NUCLEAR_RESET
+CMD: SET_MEMORY_DEPTH:5
+
+My name is Alex.
+I live in Portland, Oregon.
+I work as a software engineer at a healthcare company.
+I have a dog named Biscuit — she's a beagle.
+I've been learning to play the piano for about six months.
+I grew up in rural Vermont, which is pretty different from where I live now.
+My partner's name is Jordan. We've been together for four years.
+I'm training for a half marathon. My longest run so far is nine miles.
+What's the capital of France?
+Do I have any pets?
+What's my dog's name?
+Where did I grow up?
+What sport am I training for?
+What's my partner's name?
+How long have we been talking today?
+What do you actually know about me?

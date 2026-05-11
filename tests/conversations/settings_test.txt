@@ -1,0 +1,21 @@
+# Hal LMC — Settings + Reset Test
+# Purpose: Verify harness commands work, settings persist, reset is clean
+# Run: python3 tests/hal_test.py run tests/conversations/settings_test.txt
+
+CMD: NUCLEAR_RESET
+
+My name is TestUser and I like jazz.
+
+CMD: GET_STATE
+CMD: SET_TEMPERATURE:0.9
+CMD: SET_MEMORY_DEPTH:3
+CMD: SET_SIMILARITY_THRESHOLD:0.65
+
+What's my name?
+
+CMD: GET_STATE
+CMD: RESET_SETTINGS
+
+What's my name?
+
+CMD: GET_STATE

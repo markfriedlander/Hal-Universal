@@ -1,0 +1,39 @@
+# Hal LMC — Conversational Quality Test
+# Purpose: Assess voice, personality, memory accumulation, topic switching, honesty
+# Run: python3 tests/hal_test.py run tests/conversations/quality_test.txt
+#
+# Evaluates:
+#   - First impression and tone
+#   - Personal detail accumulation (name, job)
+#   - Handling meta-questions about itself
+#   - Topic switching and following
+#   - Emotional/personal subject (memorial garden)
+#   - Memory retrieval mid-conversation
+#   - Self-awareness and honesty about limitations
+#   - Explicit memory verification at end
+
+CMD: NUCLEAR_RESET
+
+Hey. First time using you.
+I'm Sam. I work in landscape architecture.
+Do you actually remember things or is that just marketing copy?
+What's the best part of being an AI, from where you sit?
+What's hardest about conversations with humans?
+I've been designing a memorial garden for a friend who died last year. Keep hitting walls on it.
+She loved wildflowers. California poppies especially.
+I keep second-guessing whether to include a water feature.
+What do you know about water elements in memorial garden design?
+So lean into it or leave it out?
+Fair enough. Change of subject — what are you reading?
+Ha. What would you read if you could?
+Why Borges specifically?
+Do you think you actually understand stories or just pattern-match them?
+That's a surprisingly honest answer.
+Back to the garden for a second — what's my friend's name?
+Right. I didn't say. Her name was Margot.
+What native California plants pair well with poppies for a quiet, reflective space?
+I want something that blooms in winter too, when the garden is quieter.
+I've been doing this for 12 years. You'd think confidence would've shown up by now.
+Is that a professional opinion or are you just being kind?
+What do you actually remember about me from this conversation?
+That's the garden for Margot. What would you plant there?

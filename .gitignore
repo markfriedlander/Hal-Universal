@@ -1,0 +1,10 @@
+# Local API config (contains token)
+tests/.hal_api_config.json
+
+# macOS
+.DS_Store
+
+# Xcode
+*.xcuserstate
+xcuserdata/
+DerivedData/
