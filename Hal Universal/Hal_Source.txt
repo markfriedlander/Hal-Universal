@@ -6448,54 +6448,113 @@ struct ModelLibraryView: View {
     @State private var selectedModelForLicense: ModelConfiguration?
     @State private var modelToDelete: ModelConfiguration?
     @State private var showingDeleteConfirmation = false
-    
+    @State private var showingLibraryTier = false
+    @State private var showingHardwareDisclosure = false
+    @State private var pendingModelAfterDisclosure: ModelConfiguration?
+
+    // Surfaces a one-time hardware-compatibility warning the first time the
+    // user attempts to download or switch to any MLX model. Set true once
+    // the user dismisses the disclosure so we don't pester them again.
+    @AppStorage("hasSeenHardwareDisclosure") private var hasSeenHardwareDisclosure: Bool = false
+
     var body: some View {
         ZStack {
             List {
-                // Built-In Models (AFM) - Always First
-                Section("Built-In Models") {
-                    ForEach(builtInModels) { model in
-                        ModelRow(
-                            model: model,
-                            isSelected: chatViewModel.selectedModelID == model.id,
-                            statusDot: modelStatusDot(for: model),
-                            onSelect: { selectModel(model) }
-                        )
-                    }
-                }
-                
-                // Downloaded MLX Models - Second
-                if !downloadedMLXModels.isEmpty {
-                    Section("Downloaded Models") {
-                        ForEach(downloadedMLXModels) { model in
+                // ── ON DEVICE ──────────────────────────────────────────────
+                // AFM is always here. Any downloaded MLX models join it as
+                // they become available locally. This is the only tier the
+                // user can actually USE right now without action.
+                Section {
+                    ForEach(onDeviceModels) { model in
+                        if model.source == .appleFoundation {
+                            ModelRow(
+                                model: model,
+                                isSelected: chatViewModel.selectedModelID == model.id,
+                                statusDot: modelStatusDot(for: model),
+                                onSelect: { selectModel(model) }
+                            )
+                        } else {
                             MLXModelRow(
                                 model: model,
                                 isSelected: chatViewModel.selectedModelID == model.id,
                                 downloadState: mlxDownloader.downloadStates[model.id],
                                 onSelect: { selectModel(model) },
-                                onDownload: { }, // Already downloaded
+                                onDownload: { },
                                 onCancel: { mlxDownloader.cancelDownload(modelID: model.id) },
                                 onDelete: { requestDeleteModel(model) }
                             )
                         }
                     }
+                } header: {
+                    Label("On Device", systemImage: "iphone")
+                } footer: {
+                    Text("Models already on this iPhone. Apple Intelligence is always available; local models stay private and offline once downloaded.")
+                        .font(.caption2)
                 }
-                
-                // Available MLX Models - Third
-                if !availableMLXModels.isEmpty {
-                    Section("Available Models") {
-                        ForEach(availableMLXModels) { model in
+
+                // ── CURATED ────────────────────────────────────────────────
+                // The Hal-tested set. Each model here has a documented voice
+                // and is verified to load + generate + work in Salon Mode.
+                // Models the user has already downloaded are filtered out
+                // (they appear in On Device instead).
+                if !curatedAvailable.isEmpty {
+                    Section {
+                        ForEach(curatedAvailable) { model in
                             MLXModelRow(
                                 model: model,
                                 isSelected: false,
                                 downloadState: mlxDownloader.downloadStates[model.id],
-                                onSelect: { }, // Can't select undownloaded
+                                onSelect: { },
                                 onDownload: { downloadModel(model) },
                                 onCancel: { mlxDownloader.cancelDownload(modelID: model.id) },
-                                onDelete: { }  // Can't delete undownloaded
+                                onDelete: { }
                             )
                         }
+                    } header: {
+                        Label("Curated", systemImage: "checkmark.seal")
+                    } footer: {
+                        Text("These models have been tested with Hal. Each one brings a recognizably different \"voice\" — try mixing them in Salon Mode for multi-perspective conversations.")
+                            .font(.caption2)
                     }
+                }
+
+                // ── LIBRARY (EXPERIMENTAL) ─────────────────────────────────
+                // Anything in the catalog that isn't AFM and isn't in the
+                // curated set. These are reached via the HuggingFace fetch
+                // and are explicitly labeled as untested. Collapsed by
+                // default so the surface stays clean for the typical user.
+                Section {
+                    DisclosureGroup(isExpanded: $showingLibraryTier) {
+                        if experimentalModels.isEmpty {
+                            Text("Open Model Library after a successful network fetch to browse experimental models from mlx-community.")
+                                .font(.caption)
+                                .foregroundColor(.secondary)
+                                .padding(.vertical, 4)
+                        } else {
+                            ForEach(experimentalModels) { model in
+                                MLXModelRow(
+                                    model: model,
+                                    isSelected: false,
+                                    downloadState: mlxDownloader.downloadStates[model.id],
+                                    onSelect: { },
+                                    onDownload: { downloadModel(model) },
+                                    onCancel: { mlxDownloader.cancelDownload(modelID: model.id) },
+                                    onDelete: { }
+                                )
+                            }
+                        }
+                    } label: {
+                        HStack {
+                            Label("Library", systemImage: "books.vertical")
+                            Spacer()
+                            Text("Experimental")
+                                .font(.caption2)
+                                .foregroundColor(.orange)
+                        }
+                    }
+                } footer: {
+                    Text("Hundreds of models from mlx-community on HuggingFace. These have NOT been tested with Hal — chat templates may misbehave, responses may be unexpected, performance varies. Use at your own risk.")
+                        .font(.caption2)
                 }
             }
             .navigationTitle("Model Library")
@@ -6516,6 +6575,15 @@ struct ModelLibraryView: View {
                     },
                     onCancel: {
                         selectedModelForLicense = nil
+                    }
+                )
+            }
+            .sheet(isPresented: $showingHardwareDisclosure) {
+                HardwareDisclosureSheet(
+                    onContinue: { resumeAfterDisclosure() },
+                    onCancel: {
+                        pendingModelAfterDisclosure = nil
+                        showingHardwareDisclosure = false
                     }
                 )
             }
@@ -6551,37 +6619,56 @@ struct ModelLibraryView: View {
         }
     }
     
-    // MARK: - Model Filtering
+    // MARK: - Three-Tier Model Filtering
     //
-    // v1.x release: ship with exactly two user-facing model choices —
-    // Apple Intelligence (AFM) and Gemma 4 E2B. The catalog, downloader,
-    // and API infrastructure stay untouched and continue to see / handle
-    // every model ID. This is a UI-only allowlist applied in the three
-    // computed properties below. To re-expand the model picker in a
-    // future release: edit this set (or remove the filter call entirely).
-    private static let userVisibleModelIDs: Set<String> = [
-        "apple-foundation-models",
-        "mlx-community/gemma-4-e2b-it-4bit"
-    ]
+    // On Device   = AFM + any downloaded MLX model. Usable right now.
+    // Curated     = Hal-tested MLX models not yet downloaded. One-tap install.
+    // Library     = everything else from mlx-community (experimental, untested).
+    //
+    // Curated tier is sourced from ModelConfiguration.curatedSeeds so the same
+    // canonical list governs both the seed catalog and the UI grouping. Add a
+    // model to curatedSeeds → it shows up here automatically.
 
-    private var builtInModels: [ModelConfiguration] {
-        ModelCatalogService.shared.availableModels
-            .filter { Self.userVisibleModelIDs.contains($0.id) }
-            .filter { $0.source == .appleFoundation }
-            .sorted { $0.displayName < $1.displayName }
+    /// IDs that count as "curated" in the three-tier UI. Always-include AFM so
+    /// it never falls into the Library section.
+    private static var curatedModelIDs: Set<String> {
+        var ids: Set<String> = ["apple-foundation-models"]
+        for model in ModelConfiguration.curatedSeeds { ids.insert(model.id) }
+        return ids
     }
 
-    private var downloadedMLXModels: [ModelConfiguration] {
+    /// AFM + downloaded MLX models. Sorted with AFM first so the user sees
+    /// the always-available option at the top.
+    private var onDeviceModels: [ModelConfiguration] {
         ModelCatalogService.shared.availableModels
-            .filter { Self.userVisibleModelIDs.contains($0.id) }
-            .filter { $0.source == .mlx && mlxDownloader.isModelDownloaded($0.id) }
-            .sorted { $0.displayName < $1.displayName }
+            .filter { model in
+                if model.source == .appleFoundation { return true }
+                return mlxDownloader.isModelDownloaded(model.id)
+            }
+            .sorted { lhs, rhs in
+                if lhs.source == .appleFoundation && rhs.source != .appleFoundation { return true }
+                if rhs.source == .appleFoundation && lhs.source != .appleFoundation { return false }
+                return lhs.displayName < rhs.displayName
+            }
     }
 
-    private var availableMLXModels: [ModelConfiguration] {
+    /// Curated MLX models that are NOT yet downloaded. Sorted by their
+    /// declaration order in `curatedSeeds` so the philosopher (Gemma) leads
+    /// and the unhedged voice (Dolphin) lands last — a deliberate pedagogical
+    /// ordering for first-time browsers.
+    private var curatedAvailable: [ModelConfiguration] {
+        ModelConfiguration.curatedSeeds.filter { !mlxDownloader.isModelDownloaded($0.id) }
+    }
+
+    /// Everything else: MLX models in the catalog that aren't in the curated
+    /// set, aren't AFM, and aren't already downloaded.
+    private var experimentalModels: [ModelConfiguration] {
         ModelCatalogService.shared.availableModels
-            .filter { Self.userVisibleModelIDs.contains($0.id) }
-            .filter { $0.source == .mlx && !mlxDownloader.isModelDownloaded($0.id) }
+            .filter { model in
+                model.source == .mlx
+                    && !Self.curatedModelIDs.contains(model.id)
+                    && !mlxDownloader.isModelDownloaded(model.id)
+            }
             .sorted { $0.displayName < $1.displayName }
     }
     
@@ -6591,19 +6678,65 @@ struct ModelLibraryView: View {
         guard model.source == .appleFoundation || mlxDownloader.isModelDownloaded(model.id) else {
             return  // Can't select undownloaded MLX model
         }
-        
+
+        // First-time hardware disclosure: any switch away from AFM into a
+        // local MLX model triggers a one-time compatibility warning so users
+        // on older hardware know what to expect. Once acknowledged it never
+        // shows again (persisted in @AppStorage).
+        if model.source == .mlx && !hasSeenHardwareDisclosure {
+            pendingModelAfterDisclosure = model
+            showingHardwareDisclosure = true
+            return
+        }
+
         Task {
             await chatViewModel.switchToModel(model)
             dismiss()
         }
     }
-    
+
     private func downloadModel(_ model: ModelConfiguration) {
+        // First-time hardware disclosure also gates the very first MLX
+        // download — the model file is big and the storage requirement is
+        // worth setting expectations about before the user commits to the
+        // multi-gigabyte transfer.
+        if !hasSeenHardwareDisclosure {
+            pendingModelAfterDisclosure = model
+            showingHardwareDisclosure = true
+            return
+        }
+
         if !ModelCatalogService.shared.hasAcceptedLicense(for: model.id) {
             selectedModelForLicense = model  // This triggers the sheet
         } else {
             Task {
                 await mlxDownloader.startDownload(modelID: model.id, repoID: model.id, sizeGB: model.sizeGB)
+            }
+        }
+    }
+
+    /// Resume the pending action (select or download) once the user has
+    /// acknowledged the hardware-compatibility disclosure. Called from the
+    /// disclosure sheet's "Continue" button.
+    private func resumeAfterDisclosure() {
+        hasSeenHardwareDisclosure = true
+        guard let model = pendingModelAfterDisclosure else { return }
+        pendingModelAfterDisclosure = nil
+
+        if mlxDownloader.isModelDownloaded(model.id) {
+            // Was a select-existing-model attempt
+            Task {
+                await chatViewModel.switchToModel(model)
+                dismiss()
+            }
+        } else {
+            // Was a download attempt
+            if !ModelCatalogService.shared.hasAcceptedLicense(for: model.id) {
+                selectedModelForLicense = model
+            } else {
+                Task {
+                    await mlxDownloader.startDownload(modelID: model.id, repoID: model.id, sizeGB: model.sizeGB)
+                }
             }
         }
     }
@@ -6842,6 +6975,103 @@ struct MLXModelRow: View {
             } else {
                 Circle().fill(Color.gray.opacity(0.5)).frame(width: 8, height: 8)
             }
+        }
+    }
+}
+
+// MARK: - Hardware Disclosure Sheet
+//
+// Shown ONCE the first time the user attempts to download an MLX model or
+// switch from AFM to a downloaded MLX model. Sets expectations about which
+// hardware Hal's local-model pipe has been validated on so users with older
+// iPhones aren't surprised by slow generation or load failures. The
+// `hasSeenHardwareDisclosure` flag in @AppStorage gates re-presentation.
+struct HardwareDisclosureSheet: View {
+    let onContinue: () -> Void
+    let onCancel: () -> Void
+
+    var body: some View {
+        NavigationStack {
+            ScrollView {
+                VStack(alignment: .leading, spacing: 18) {
+                    HStack(spacing: 12) {
+                        Image(systemName: "iphone.gen3.radiowaves.left.and.right")
+                            .font(.system(size: 32))
+                            .foregroundColor(.accentColor)
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text("Local Models on Your iPhone")
+                                .font(.title2)
+                                .fontWeight(.semibold)
+                            Text("First-time setup")
+                                .font(.caption)
+                                .foregroundColor(.secondary)
+                        }
+                    }
+                    .padding(.top, 6)
+
+                    Text("Hal's local models run entirely on your iPhone — nothing leaves the device. The trade-off compared to Apple Intelligence is they need more memory and storage, and respond more slowly.")
+                        .font(.body)
+
+                    Divider()
+
+                    VStack(alignment: .leading, spacing: 10) {
+                        Label("Validated hardware", systemImage: "checkmark.seal.fill")
+                            .font(.headline)
+                            .foregroundColor(.green)
+                        Text("Hal's local models are tested and supported on:")
+                            .font(.subheadline)
+                        VStack(alignment: .leading, spacing: 4) {
+                            bullet("iPhone 16, 16 Plus, 16 Pro, 16 Pro Max")
+                            bullet("iPhone 17 and newer (should work or work better)")
+                        }
+                        Text("Older devices may work but are unverified. iPhone 15 Pro / 15 Pro Max are likely OK; iPhone 14 and earlier may run very slowly or fail to load larger models.")
+                            .font(.caption)
+                            .foregroundColor(.secondary)
+                    }
+
+                    Divider()
+
+                    VStack(alignment: .leading, spacing: 10) {
+                        Label("Storage & download", systemImage: "internaldrive")
+                            .font(.headline)
+                        VStack(alignment: .leading, spacing: 4) {
+                            bullet("Each curated model is roughly 2–4 GB")
+                            bullet("First download is one-time per model")
+                            bullet("Wi-Fi strongly recommended for the initial download")
+                            bullet("After download, the model runs fully offline")
+                        }
+                    }
+
+                    Divider()
+
+                    Text("You can revisit this information anytime in Settings → Power User → Local Models.")
+                        .font(.caption)
+                        .foregroundColor(.secondary)
+                }
+                .padding(20)
+            }
+            .navigationTitle("Before You Continue")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .cancellationAction) {
+                    Button("Cancel", action: onCancel)
+                }
+                ToolbarItem(placement: .confirmationAction) {
+                    Button("I Understand") { onContinue() }
+                        .fontWeight(.semibold)
+                }
+            }
+        }
+    }
+
+    @ViewBuilder
+    private func bullet(_ text: String) -> some View {
+        HStack(alignment: .firstTextBaseline, spacing: 8) {
+            Text("•")
+                .foregroundColor(.secondary)
+            Text(text)
+                .font(.subheadline)
+            Spacer(minLength: 0)
         }
     }
 }
@@ -13009,11 +13239,23 @@ struct ModelConfiguration: Identifiable, Codable, Equatable, Hashable {
         localPath: nil
     )
 
-    /// Hardcoded Gemma 4 E2B 4-bit entry for the v1.x release. Always present in
-    /// the catalog from app launch so the user can initiate the one-time
-    /// download even on first launch without an HF catalog fetch having completed.
-    /// On successful HF fetch the fetched record replaces this; on fetch failure
-    /// this constant keeps the model visible in the Model Library.
+    // MARK: - Curated MLX Models
+    //
+    // These are the models we have personally validated with Hal's pipe:
+    // - confirmed `mlx-community/...-4bit` builds exist on HuggingFace
+    // - chat template loads cleanly
+    // - extraEOSTokens registered correctly
+    // - tested in single-model chat and Salon Mode
+    //
+    // All four are seeded into ModelCatalogService.availableModels at launch
+    // so the Model Library can offer a one-tap download even before the HF
+    // catalog fetch completes. The ModelLibraryView surfaces them in a
+    // "Curated" tier with a Hal-tested badge.
+
+    /// Gemma 4 E2B 4-bit — the philosopher voice. ~35 tok/s on iPhone 16 Plus.
+    /// First curated MLX model shipped (v1.x). Multimodal-capable (text + audio
+    /// + image in newer revisions), Apache 2.0 licensed, PLE architecture gives
+    /// the 2B active model the representational depth of ~5B params.
     static let gemma4E2B4bit = ModelConfiguration(
         id: "mlx-community/gemma-4-e2b-it-4bit",
         displayName: "Gemma 4 E2B",
@@ -13021,10 +13263,87 @@ struct ModelConfiguration: Identifiable, Codable, Equatable, Hashable {
         sizeGB: 3.58,
         contextWindow: 32_768,
         license: "gemma",
-        description: "Fully private, on-device. One-time 3.58 GB download (WiFi recommended).",
+        description: "Fully private, on-device. The philosopher voice — conceptual, dialectical, comfortable with ambiguity. 3.58 GB download (WiFi recommended).",
         isDownloaded: false,
         localPath: nil
     )
+
+    /// Phi-4 Mini Instruct 4-bit — the reasoner voice. Microsoft's late-2025
+    /// small reasoning model (3.8B params). Strongest reasoning-per-parameter
+    /// in this class (beats o1-mini on math benchmarks). Slower than Gemma at
+    /// generation but more analytical.
+    static let phi4Mini4bit = ModelConfiguration(
+        id: "mlx-community/Phi-4-mini-instruct-4bit",
+        displayName: "Phi-4 Mini",
+        source: .mlx,
+        sizeGB: 2.3,
+        contextWindow: 128_000,
+        license: "mit",
+        description: "Fully private, on-device. The reasoner voice — analytical, math-strong, structured. 2.3 GB download.",
+        isDownloaded: false,
+        localPath: nil
+    )
+
+    /// Qwen 3.5 2B 4-bit — the versatile generalist voice. Alibaba's March 2026
+    /// release. Gated DeltaNet hybrid architecture, natively multimodal
+    /// (text + image + audio), Apache 2.0 licensed. Smallest of the curated tier.
+    static let qwen35_2B4bit = ModelConfiguration(
+        id: "mlx-community/Qwen3.5-2B-MLX-4bit",
+        displayName: "Qwen 3.5 2B",
+        source: .mlx,
+        sizeGB: 1.8,
+        contextWindow: 32_768,
+        license: "apache-2.0",
+        description: "Fully private, on-device. The versatile generalist — multimodal-ready, balanced voice. 1.8 GB download.",
+        isDownloaded: false,
+        localPath: nil
+    )
+
+    /// Llama 3.2 3B Instruct 4-bit — the workhorse voice. Meta's proven small
+    /// model, lots of community fine-tunes exist. Solid generalist baseline,
+    /// well-documented behavior.
+    static let llama32_3B4bit = ModelConfiguration(
+        id: "mlx-community/Llama-3.2-3B-Instruct-4bit",
+        displayName: "Llama 3.2 3B",
+        source: .mlx,
+        sizeGB: 2.0,
+        contextWindow: 128_000,
+        license: "llama3.2",
+        description: "Fully private, on-device. The workhorse voice — well-rounded, widely-tested baseline. 2.0 GB download.",
+        isDownloaded: false,
+        localPath: nil
+    )
+
+    /// Dolphin 3.0 Llama 3.2 3B 4-bit — the unhedged voice. Cognitive
+    /// Computations' fine-tune of Llama 3.2 3B with alignment/refusal patterns
+    /// removed. Designed to follow the system prompt rather than impose
+    /// guardrails. Useful for philosophical conversations where standard RLHF
+    /// reflexes (e.g. refusing to discuss consciousness) interfere with the
+    /// Five Maxims — especially Maxim #1, "Hal can say 'I don't know if I'm
+    /// conscious' without being overridden."
+    static let dolphin3Llama32_3B4bit = ModelConfiguration(
+        id: "mlx-community/dolphin3.0-llama3.2-3B-4Bit",
+        displayName: "Dolphin 3.0 (Llama 3.2 3B)",
+        source: .mlx,
+        sizeGB: 2.0,
+        contextWindow: 32_768,
+        license: "llama3.2",
+        description: "Fully private, on-device. The unhedged voice — fewer reflexive refusals, more willing to sit with hard questions. 2.0 GB download.",
+        isDownloaded: false,
+        localPath: nil
+    )
+
+    /// All MLX models Hal personally validates as part of the Curated tier.
+    /// AFM is intentionally excluded — it's system-managed, not downloadable,
+    /// and has its own permanent "On Device" status.
+    /// Order is the user-visible order in Model Library.
+    static let curatedSeeds: [ModelConfiguration] = [
+        .gemma4E2B4bit,
+        .phi4Mini4bit,
+        .qwen35_2B4bit,
+        .llama32_3B4bit,
+        .dolphin3Llama32_3B4bit
+    ]
 }
 
 // MARK: - Hugging Face API Response Models
@@ -13108,7 +13427,11 @@ class ModelCatalogService: ObservableObject {
     // about downloaded models until the user happens to open Model Library.
     @Published var availableModels: [ModelConfiguration] = [
         ModelConfiguration.appleFoundation,
-        ModelConfiguration.gemma4E2B4bit
+        ModelConfiguration.gemma4E2B4bit,
+        ModelConfiguration.phi4Mini4bit,
+        ModelConfiguration.qwen35_2B4bit,
+        ModelConfiguration.llama32_3B4bit,
+        ModelConfiguration.dolphin3Llama32_3B4bit
     ]
     @Published var isLoading: Bool = false
     @Published var errorMessage: String?
@@ -13221,26 +13544,26 @@ class ModelCatalogService: ObservableObject {
             
             await MainActor.run {
                 self.availableModels = [appleModel] + mlxModels
-                // v1.x release: guarantee the shipped Gemma entry is present even if
-                // the HF response didn't include it (e.g. transient API change).
-                if !self.availableModels.contains(where: { $0.id == ModelConfiguration.gemma4E2B4bit.id }) {
-                    self.availableModels.append(ModelConfiguration.gemma4E2B4bit)
+                // Guarantee every curated model is present even if the HF
+                // response didn't include one (transient API change, ID rename
+                // upstream, etc.). The seed has the canonical metadata
+                // (displayName, sizeGB, description) so the Model Library
+                // shows it correctly even if the HF record is missing.
+                for curated in ModelConfiguration.curatedSeeds where !self.availableModels.contains(where: { $0.id == curated.id }) {
+                    self.availableModels.append(curated)
                 }
                 self.isLoading = false
                 print("HALDEBUG-CATALOG: âœ… Catalog updated with \(self.availableModels.count) total models")
             }
-            
+
         } catch {
             await MainActor.run {
                 self.errorMessage = "Failed to load models: \(error.localizedDescription)"
                 self.isLoading = false
-                
-                // v1.x release: even on fetch failure, keep both shipped models
-                // visible so the Model Library is usable offline.
-                self.availableModels = [
-                    ModelConfiguration.appleFoundation,
-                    ModelConfiguration.gemma4E2B4bit
-                ]
+
+                // Even on fetch failure, keep AFM + all curated models visible
+                // so the Model Library is usable offline.
+                self.availableModels = [ModelConfiguration.appleFoundation] + ModelConfiguration.curatedSeeds
                 
                 print("HALDEBUG-CATALOG: âŒ Error: \(error.localizedDescription)")
             }
