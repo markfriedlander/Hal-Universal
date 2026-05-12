@@ -4308,9 +4308,16 @@ class LLMService: ObservableObject {
         setupLLM(for: model)
     }
 
-    // Function to dynamically set up the active LLM
-    func setupLLM(for model: ModelConfiguration) {
-        halLog("HALDEBUG-LLM: setupLLM called for model: \(model.displayName) (source: \(model.source))")
+    // Function to dynamically set up the active LLM.
+    //
+    // `keepMlxResident: true` is used by Salon Mode when sequentially
+    // switching seats — e.g. AFM seat 1 → Gemma seat 2. The default behavior
+    // unloads the MLX model when switching to AFM (to free memory in
+    // single-model mode). For Salon, that would force a fresh ~10s Gemma
+    // load on every turn that mixes AFM and MLX seats; with keepMlxResident
+    // the loaded MLX wrapper stays warm so seat 2 generation is instant.
+    func setupLLM(for model: ModelConfiguration, keepMlxResident: Bool = false) {
+        halLog("HALDEBUG-LLM: setupLLM called for model: \(model.displayName) (source: \(model.source), keepMlxResident: \(keepMlxResident))")
         self.currentModel = model
         halLog("HALDEBUG-LLM: currentModel updated to: \(self.currentModel.displayName) (source: \(self.currentModel.source))")
         self.initializationError = nil // Clear previous errors
@@ -4365,10 +4372,14 @@ class LLMService: ObservableObject {
                 halLog("HALDEBUG-MLX: MLX model \(model.displayName) already loaded.")
             }
         } else {
-            // SWITCHING TO FOUNDATION MODELS: Unload MLX to free memory
-            if mlxWrapper.isModelLoaded {
+            // SWITCHING TO FOUNDATION MODELS: Unload MLX to free memory…
+            // unless a caller (Salon Mode) needs it to stay resident across
+            // a multi-seat turn.
+            if mlxWrapper.isModelLoaded && !keepMlxResident {
                 mlxWrapper.unloadModel()
                 halLog("HALDEBUG-MLX: Unloaded MLX model, switching to Foundation Models.")
+            } else if mlxWrapper.isModelLoaded {
+                halLog("HALDEBUG-MLX: Keeping MLX model resident across AFM switch (Salon Mode).")
             } else {
                 halLog("HALDEBUG-LLM: Switching to Foundation Models.")
             }
@@ -5698,13 +5709,18 @@ struct ActionsView: View {
 
     // MARK: - v1.x Feature Flags
     //
-    // Salon Mode is feature-complete and its code paths are preserved
-    // (SalonModeView, salonConfig, runSalonTurn, runSalonSeat, etc.) per
-    // the standing "broken-but-precious" rule. For the v1.x App Store
-    // release we don't expose Salon Mode to users — flipping this flag
-    // back to `true` restores the segmented picker, the Salon Mode
-    // settings entry, and the multi-model chat behaviour.
-    private static let salonModeExposedInUI: Bool = false
+    // Salon Mode is alive again (May 12, 2026). The seat-switch path now
+    // actually calls setupLLM (previously it only set selectedModelID, so
+    // every seat used whatever model was loaded last). The MLX wrapper
+    // also supports keepMlxResident so a Gemma seat stays warm across an
+    // AFM seat without paying a fresh load on every salon turn.
+    // selectedModelID is saved and restored around the multi-seat turn so
+    // the user's chosen model isn't silently overwritten.
+    //
+    // Keep this constant in sync with `v1xSalonExposed` in
+    // ChatViewModel.init — both control the same exposure decision. Flip
+    // both back to false to hide Salon again.
+    private static let salonModeExposedInUI: Bool = true
     
     // MARK: - Helper Function
     
@@ -8763,14 +8779,13 @@ class ChatViewModel: ObservableObject {
         // surprise, and the corrected state is persisted to disk so future
         // launches see it too.
         //
-        // v1.x ships with Salon Mode hidden (ActionsView.salonModeExposedInUI
-        // = false). Upgraders who had `isEnabled = true` from a prior build
-        // would otherwise silently route through runSalonTurn even though
-        // the UI no longer exposes any way to control it. Force-off here
-        // closes that hazard. Keep the constant below in sync with
-        // ActionsView.salonModeExposedInUI; both flip together when Salon
-        // returns in a future release.
-        let v1xSalonExposed = false
+        // Salon Mode is exposed again (May 12, 2026). Keep this in sync
+        // with ActionsView.salonModeExposedInUI — when v1xSalonExposed is
+        // true, we don't force isEnabled=false at init; we trust whatever
+        // the user set last time. When both flip back to false (future
+        // release that hides Salon again), this re-armed upgrade-hazard
+        // guard quietly disables Salon on any upgrader's first launch.
+        let v1xSalonExposed = true
         var decodedSalon = (try? JSONDecoder().decode(SalonConfiguration.self, from: salonData)) ?? SalonConfiguration()
         if !v1xSalonExposed && decodedSalon.isEnabled {
             halLog("HALDEBUG-SALON: Upgrader had isEnabled=true; forcing off for v1.x and persisting corrected state.")
@@ -10687,13 +10702,13 @@ class ChatViewModel: ObservableObject {
                                                                         return
                                                                     }
                                                                     
-                                                                    print("HALDEBUG-SALON: Starting Salon turn with \(activeSeats.count) active seats")
-                                                                    
+                                                                    halLog("HALDEBUG-SALON: Starting Salon turn with \(activeSeats.count) active seats; userInput length=\(userInput.count)")
+
                                                                     // SALON FIX: Store user message ONCE before seats execute
                                                                     // Calculate turn from DATABASE user messages, not array (which gets polluted by multiple seats)
                                                                     let dbUserMessages = memoryStore.getConversationMessages(conversationId: conversationId).filter { $0.isFromUser }.count
                                                                     let salonTurnNumber = dbUserMessages + 1
-                                                                    print("HALDEBUG-SALON: Storing user message for turn \(salonTurnNumber) (DB has \(dbUserMessages) user messages)")
+                                                                    halLog("HALDEBUG-SALON: Storing user message for turn \(salonTurnNumber) (DB has \(dbUserMessages) user messages)")
                                                                     memoryStore.storeTurn(
                                                                         conversationId: conversationId,
                                                                         userMessage: userInput,
@@ -10717,28 +10732,64 @@ class ChatViewModel: ObservableObject {
                                                                         content: userInput,
                                                                         modelId: nil  // User message, no model
                                                                     )
-                                                                    print("HALDEBUG-ARTIFACT: Stored user message artifact for Salon turn \(salonTurnNumber)")
+                                                                    halLog("HALDEBUG-SALON: Stored user message artifact for Salon turn \(salonTurnNumber); about to capture baseline history")
                                                                     
                                                                     // Capture baseline history snapshot for Independent mode
                                                                     // This freezes the message history before any seats respond
                                                                     let baselineHistory = messages.filter { !$0.isPartial }
-                                                                    
+
+                                                                    // Capture the user's actual selected model so we can restore it
+                                                                    // after the multi-seat turn ends. Otherwise the model picker
+                                                                    // would silently end up showing whatever the last seat used.
+                                                                    let originalSelectedModelID = selectedModelID
+                                                                    halLog("HALDEBUG-SALON: Saving original selectedModelID=\(originalSelectedModelID) for restoration after \(activeSeats.count)-seat turn")
+
                                                                     // Execute each seat sequentially
                                                                     for seat in activeSeats {
-                                                                        print("HALDEBUG-SALON: Executing seat \(seat.position) with model \(seat.modelID)")
-                                                                        
+                                                                        halLog("HALDEBUG-SALON: Executing seat \(seat.position) with model \(seat.modelID)")
+
                                                                         // Get the model
                                                                         guard let model = ModelCatalogService.shared.getModel(byID: seat.modelID) else {
-                                                                            print("HALDEBUG-SALON: Warning: Model not found: \(seat.modelID)")
+                                                                            halLog("HALDEBUG-SALON: Warning: Model not found: \(seat.modelID)")
                                                                             continue
                                                                         }
-                                                                        
-                                                                        // Switch to this model
+
+                                                                        // Switch to this seat's model. Until this commit, the
+                                                                        // seat switch only updated the AppStorage var
+                                                                        // selectedModelID and never called setupLLM — meaning
+                                                                        // llmService.currentModel never changed and every seat
+                                                                        // generated with whatever model was loaded last. setupLLM
+                                                                        // is what actually swaps the wrapper's currentModel and
+                                                                        // (for MLX) loads weights. keepMlxResident keeps Gemma
+                                                                        // warm across AFM seats so we don't reload weights
+                                                                        // between every seat in a mixed-source salon.
                                                                         selectedModelID = model.id
-                                                                        
+                                                                        llmService.setupLLM(for: model, keepMlxResident: true)
+
+                                                                        // For MLX seats, wait briefly for the load to settle.
+                                                                        // loadModel is dispatched as an async Task inside setupLLM;
+                                                                        // if Gemma needs to load fresh, the seat would otherwise
+                                                                        // hit "Cannot generate - MLX model not loaded" the same
+                                                                        // way the API switch did before the load-fix. Poll the
+                                                                        // wrapper state with a short timeout.
+                                                                        if model.source == .mlx {
+                                                                            let loadStart = Date()
+                                                                            while !llmService.mlxWrapper.isModelLoaded && Date().timeIntervalSince(loadStart) < 30 {
+                                                                                try? await Task.sleep(nanoseconds: 100_000_000)
+                                                                            }
+                                                                            if !llmService.mlxWrapper.isModelLoaded {
+                                                                                halLog("HALDEBUG-SALON: Warning: MLX seat \(seat.position) timed out waiting for model load; proceeding anyway")
+                                                                            } else {
+                                                                                halLog("HALDEBUG-SALON: MLX seat \(seat.position) model ready after \(Int(Date().timeIntervalSince(loadStart) * 1000))ms")
+                                                                            }
+                                                                        }
+
+                                                                        halLog("HALDEBUG-SALON: → entering runSalonSeat for seat \(seat.position) (\(seat.modelID))")
                                                                         // Execute seat with behavioral mode awareness
                                                                         await runSalonSeat(userInput: userInput, seatPosition: seat.position, baselineHistory: baselineHistory)
+                                                                        halLog("HALDEBUG-SALON: ← returned from runSalonSeat for seat \(seat.position)")
                                                                     }
+                                                                    halLog("HALDEBUG-SALON: All \(activeSeats.count) seats executed; entering summarizer phase")
                                                                     
                                                                     // Run summarizer if configured
                                                                     if let summarizerModelID = salonConfig.summarizerModel {
@@ -10756,6 +10807,23 @@ class ChatViewModel: ObservableObject {
                                                                         // Summarizer was just turned off, reset session
                                                                         salonConfig.summarizerSessionStartTurn = nil
                                                                         print("HALDEBUG-SALON: Ended summarizer session")
+                                                                    }
+
+                                                                    // Restore the user's original selected model so the picker /
+                                                                    // chat state isn't left on whatever seat ran last. If the
+                                                                    // user disables Salon Mode after this turn, single-model
+                                                                    // chat resumes with the model they actually chose, not the
+                                                                    // last seat's.
+                                                                    if selectedModelID != originalSelectedModelID {
+                                                                        if let restored = ModelCatalogService.shared.getModel(byID: originalSelectedModelID) {
+                                                                            selectedModelID = originalSelectedModelID
+                                                                            llmService.setupLLM(for: restored, keepMlxResident: true)
+                                                                            halLog("HALDEBUG-SALON: Restored selectedModelID to \(originalSelectedModelID) after multi-seat turn")
+                                                                        } else if originalSelectedModelID == "apple-foundation-models" {
+                                                                            selectedModelID = originalSelectedModelID
+                                                                            llmService.setupLLM(for: .appleFoundation, keepMlxResident: true)
+                                                                            halLog("HALDEBUG-SALON: Restored selectedModelID to AFM after multi-seat turn")
+                                                                        }
                                                                     }
                                                                 }
                                                                 
@@ -14051,6 +14119,60 @@ class HalTestConsole: ObservableObject {
             vm.resetSettingsToDefaults()
             writeStateJSON(vm: vm)
             return "{\"status\":\"ok\",\"command\":\"RESET_SETTINGS\"}"
+
+        } else if trimmed == "SALON_GET_STATE" {
+            let cfg = vm.salonConfig
+            let seat1 = cfg.seat1 ?? ""
+            let seat2 = cfg.seat2 ?? ""
+            let seat3 = cfg.seat3 ?? ""
+            let seat4 = cfg.seat4 ?? ""
+            let summarizer = cfg.summarizerModel ?? ""
+            return "{\"status\":\"ok\",\"isEnabled\":\(cfg.isEnabled),\"seat1\":\"\(jsonStringEscape(seat1))\",\"seat2\":\"\(jsonStringEscape(seat2))\",\"seat3\":\"\(jsonStringEscape(seat3))\",\"seat4\":\"\(jsonStringEscape(seat4))\",\"behavioralMode\":\"\(cfg.behavioralMode.rawValue)\",\"summarizerModel\":\"\(jsonStringEscape(summarizer))\",\"activeSeatCount\":\(cfg.activeSeats.count)}"
+
+        } else if trimmed.hasPrefix("SALON_SET_ENABLED:") {
+            let raw = String(trimmed.dropFirst("SALON_SET_ENABLED:".count)).trimmingCharacters(in: .whitespaces).lowercased()
+            let on = (raw == "true" || raw == "1" || raw == "yes")
+            var cfg = vm.salonConfig
+            cfg.isEnabled = on
+            vm.salonConfig = cfg
+            return "{\"status\":\"ok\",\"command\":\"SALON_SET_ENABLED\",\"isEnabled\":\(on)}"
+
+        } else if trimmed.hasPrefix("SALON_SET_SEAT:") {
+            // Format: SALON_SET_SEAT:<position>:<modelID>  (modelID may be empty to clear the seat)
+            let body = String(trimmed.dropFirst("SALON_SET_SEAT:".count))
+            let parts = body.split(separator: ":", maxSplits: 1, omittingEmptySubsequences: false).map(String.init)
+            guard parts.count == 2, let position = Int(parts[0].trimmingCharacters(in: .whitespaces)), (1...4).contains(position) else {
+                return "{\"status\":\"error\",\"message\":\"Expected SALON_SET_SEAT:<1-4>:<modelID-or-empty>\"}"
+            }
+            let modelID = parts[1].trimmingCharacters(in: .whitespaces)
+            let assigned: String? = modelID.isEmpty ? nil : modelID
+            var cfg = vm.salonConfig
+            switch position {
+            case 1: cfg.seat1 = assigned
+            case 2: cfg.seat2 = assigned
+            case 3: cfg.seat3 = assigned
+            case 4: cfg.seat4 = assigned
+            default: break
+            }
+            vm.salonConfig = cfg
+            return "{\"status\":\"ok\",\"command\":\"SALON_SET_SEAT\",\"position\":\(position),\"modelID\":\"\(jsonStringEscape(assigned ?? ""))\"}"
+
+        } else if trimmed.hasPrefix("SALON_SET_MODE:") {
+            let raw = String(trimmed.dropFirst("SALON_SET_MODE:".count)).trimmingCharacters(in: .whitespaces)
+            guard let mode = SalonBehavioralMode(rawValue: raw) else {
+                return "{\"status\":\"error\",\"message\":\"Expected independent or contextAware\"}"
+            }
+            var cfg = vm.salonConfig
+            cfg.behavioralMode = mode
+            vm.salonConfig = cfg
+            return "{\"status\":\"ok\",\"command\":\"SALON_SET_MODE\",\"behavioralMode\":\"\(mode.rawValue)\"}"
+
+        } else if trimmed.hasPrefix("SALON_SET_SUMMARIZER:") {
+            let raw = String(trimmed.dropFirst("SALON_SET_SUMMARIZER:".count)).trimmingCharacters(in: .whitespaces)
+            var cfg = vm.salonConfig
+            cfg.summarizerModel = raw.isEmpty ? nil : raw
+            vm.salonConfig = cfg
+            return "{\"status\":\"ok\",\"command\":\"SALON_SET_SUMMARIZER\",\"summarizerModel\":\"\(jsonStringEscape(raw))\"}"
 
         } else if trimmed == "NUCLEAR_RESET" {
             let (threads, facts, messages) = vm.memoryStore.clearAllConversationData()
