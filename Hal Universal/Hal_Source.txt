@@ -12557,10 +12557,83 @@ class MLXModelDownloader: ObservableObject {
     }
     
     // MARK: - Download Queue Management
-    
+
     private var downloadQueue: [QueuedDownload] = []
     private var currentDownloadTask: Task<Void, Never>?
     private var currentDownloadModelID: String?
+
+    // MARK: - In-Flight Persistence (Background-Resume Support)
+    //
+    // iOS aggressively suspends/terminates apps that go to background while
+    // doing network work. The underlying HubApi snapshot is a foreground
+    // URLSession so its task is cancelled the moment iOS suspends us, even
+    // though partial files survive on disk. We use TWO mitigations:
+    //
+    // 1) `UIApplication.beginBackgroundTask` around the download to ask iOS
+    //    for a brief grace period (~30s) when the user leaves the app. Lets
+    //    brief app-switches and screen locks finish or significantly
+    //    advance the download.
+    //
+    // 2) Persist the in-flight model IDs to AppStorage. On next launch,
+    //    re-fire startDownload for any model that was in flight before
+    //    termination. HubApi.snapshot already resumes from partial files
+    //    (it checks per-file existence/size), so re-firing picks up where
+    //    we left off rather than restarting from zero.
+    //
+    // A proper URLSession.background-based downloader (true background
+    // downloads while app is suspended) is documented as a follow-up; that
+    // requires replacing HubApi.snapshot with our own file fetcher, which
+    // is a real refactor.
+    @AppStorage("inFlightDownloadIDs") private var inFlightDownloadIDsData: Data = Data()
+
+    private var inFlightDownloadIDs: Set<String> {
+        get { (try? JSONDecoder().decode(Set<String>.self, from: inFlightDownloadIDsData)) ?? [] }
+        set { inFlightDownloadIDsData = (try? JSONEncoder().encode(newValue)) ?? Data() }
+    }
+
+    private func markInFlight(_ modelID: String, repoID: String, sizeGB: Double?) {
+        var ids = inFlightDownloadIDs
+        ids.insert(modelID)
+        inFlightDownloadIDs = ids
+        // Persist the repoID + sizeGB so resume has all the args it needs.
+        var meta = (UserDefaults.standard.dictionary(forKey: "inFlightDownloadMeta") as? [String: [String: Any]]) ?? [:]
+        meta[modelID] = ["repoID": repoID, "sizeGB": sizeGB ?? 0.0]
+        UserDefaults.standard.set(meta, forKey: "inFlightDownloadMeta")
+    }
+
+    private func clearInFlight(_ modelID: String) {
+        var ids = inFlightDownloadIDs
+        ids.remove(modelID)
+        inFlightDownloadIDs = ids
+        var meta = (UserDefaults.standard.dictionary(forKey: "inFlightDownloadMeta") as? [String: [String: Any]]) ?? [:]
+        meta.removeValue(forKey: modelID)
+        UserDefaults.standard.set(meta, forKey: "inFlightDownloadMeta")
+    }
+
+    /// Re-fire any downloads that were in flight when the app was last
+    /// terminated. Called from init() after the existing models are detected.
+    /// Models already fully downloaded (detected by the existing loop) get
+    /// cleared from the in-flight set automatically.
+    private func resumeInFlightDownloadsIfAny() {
+        let pending = inFlightDownloadIDs
+        guard !pending.isEmpty else { return }
+        let meta = (UserDefaults.standard.dictionary(forKey: "inFlightDownloadMeta") as? [String: [String: Any]]) ?? [:]
+        print("HALDEBUG-DOWNLOAD: Found \(pending.count) in-flight download(s) to resume after relaunch")
+        for modelID in pending {
+            if isModelDownloaded(modelID) {
+                // Already done — clean up the stale in-flight marker.
+                clearInFlight(modelID)
+                print("HALDEBUG-DOWNLOAD: \(modelID) is already downloaded; clearing in-flight marker")
+                continue
+            }
+            let modelMeta = meta[modelID] ?? [:]
+            let repoID = modelMeta["repoID"] as? String ?? modelID
+            let sizeGB = modelMeta["sizeGB"] as? Double
+            let size = (sizeGB ?? 0.0) > 0.0 ? sizeGB : nil
+            print("HALDEBUG-DOWNLOAD: Auto-resuming download for \(modelID)")
+            Task { await self.startDownload(modelID: modelID, repoID: repoID, sizeGB: size) }
+        }
+    }
     
     // MARK: - Cache Management
     
@@ -12704,8 +12777,14 @@ class MLXModelDownloader: ObservableObject {
                 }
                 
                 print("HALDEBUG-DETECTION: MLXModelDownloader.init() complete - \(self.downloadStates.count) models ready")
+
+                // After model detection, re-fire any in-flight downloads
+                // that were interrupted by app termination. See the
+                // resumeInFlightDownloadsIfAny() comment block for the
+                // rationale and the two-mitigation design.
+                self.resumeInFlightDownloadsIfAny()
             }
-            
+
             // Calculate cache size in background
             await self.updateCacheSize()
         }
@@ -12831,7 +12910,36 @@ class MLXModelDownloader: ObservableObject {
             }
         } : nil
 
+        // Mark this download as in-flight BEFORE the network call so that
+        // if iOS terminates us mid-download, the next launch knows to
+        // resume it. Cleared in the success / cancel / error paths below.
+        markInFlight(modelID, repoID: repoID, sizeGB: sizeGB)
+
         currentDownloadTask = Task {
+            // Request a background-task assertion so iOS gives us a brief
+            // grace period (~30s) if the user backgrounds the app mid-
+            // download. Not a true background download — HubApi still uses
+            // a foreground URLSession — but enough that short app-switches
+            // and screen locks usually complete the transfer or get close
+            // enough that the resume-on-launch path picks up cleanly.
+            let bgTaskID = await MainActor.run { () -> UIBackgroundTaskIdentifier in
+                UIApplication.shared.beginBackgroundTask(withName: "ModelDownload-\(modelID)") {
+                    // Expiration handler — iOS is about to suspend us.
+                    // The in-flight marker is already persisted; resume
+                    // path will fire on next launch.
+                    print("HALDEBUG-DOWNLOAD: Background task expiring for \(modelID) — iOS will suspend; resume on next launch")
+                }
+            }
+
+            defer {
+                // Always end the background task, regardless of outcome.
+                Task { @MainActor in
+                    if bgTaskID != .invalid {
+                        UIApplication.shared.endBackgroundTask(bgTaskID)
+                    }
+                }
+            }
+
             do {
                 print("HALDEBUG-DOWNLOAD: Starting download for \(modelID) from \(repoID)")
 
@@ -12896,6 +13004,10 @@ class MLXModelDownloader: ObservableObject {
                     modelIDs.insert(modelID)
                     self.downloadedModelIDs = modelIDs
                     print("HALDEBUG-DOWNLOAD:    Saved model ID to UserDefaults: \(modelID)")
+
+                    // Clear the in-flight marker — download fully completed,
+                    // resume-on-launch won't fire for this model again.
+                    self.clearInFlight(modelID)
                     
                     // Update state
                     var state = self.downloadStates[modelID] ?? DownloadState(
@@ -12944,9 +13056,12 @@ class MLXModelDownloader: ObservableObject {
                     }
                     self.currentDownloadTask = nil
                     self.currentDownloadModelID = nil
-                    
-                    print("HALDEBUG-DOWNLOAD: Download cancelled for \(modelID)")
-                    
+
+                    // User explicitly cancelled — don't auto-resume on next launch.
+                    self.clearInFlight(modelID)
+
+                    print("HALDEBUG-DOWNLOAD: Download cancelled for \(modelID); in-flight marker cleared")
+
                     // Process next item in queue if any
                     self.processNextInQueue()
                 }
@@ -12956,15 +13071,22 @@ class MLXModelDownloader: ObservableObject {
                     if var state = self.downloadStates[modelID] {
                         state.isDownloading = false
                         state.error = error.localizedDescription
-                        state.message = "Download failed."
+                        state.message = "Download failed — will retry next launch."
                         state.progress = 0.0
                         self.downloadStates[modelID] = state
                     }
                     self.currentDownloadTask = nil
                     self.currentDownloadModelID = nil
-                    
-                    print("HALDEBUG-DOWNLOAD: ❌ Download failed for \(modelID): \(error.localizedDescription)")
-                    
+
+                    // Keep the in-flight marker. iOS-suspension cancellation arrives
+                    // here as a URLError (-999), not CancellationError, so leaving
+                    // the marker in place lets resumeInFlightDownloadsIfAny() pick
+                    // the download back up automatically when the user returns to
+                    // the app. If the error is a hard failure (no network, etc.),
+                    // the next launch's retry will fail the same way until the user
+                    // explicitly cancels via the UI.
+                    print("HALDEBUG-DOWNLOAD: ❌ Download failed for \(modelID): \(error.localizedDescription) — in-flight marker preserved for next-launch resume")
+
                     // Process next item in queue if any
                     self.processNextInQueue()
                 }
