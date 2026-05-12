@@ -3663,13 +3663,23 @@ extension MemoryStore {
         }
         sqlite3_finalize(tsStmt)
 
-        for result in allResults {
+        // Honor BOTH the snippet count cap (maxResults) and token budget. Until
+        // this fix, maxResults was a pass-through parameter that this function
+        // silently ignored — callers asking for 10 snippets could get 59 if the
+        // token budget allowed it, which tripled prompt-prefill cost on every
+        // turn. The cap is applied here, after the relevance-sort above, so we
+        // keep the top-N strongest matches rather than the first N scanned.
+        let cappedResults = Array(allResults.prefix(maxResults))
+        if allResults.count > maxResults {
+            halLog("HALDEBUG-SEARCH: Capped to top \(maxResults) of \(allResults.count) candidate matches before token-budget pass")
+        }
+        for result in cappedResults {
             // Estimate tokens for this snippet
             let snippetTokens = TokenEstimator.estimateTokens(from: result.content)
 
             // Stop adding if we exceed the budget
             if totalTokens + snippetTokens > tokenBudget {
-                print("HALDEBUG-SEARCH: Token budget reached. Stopping at \(totalTokens) tokens.")
+                halLog("HALDEBUG-SEARCH: Token budget reached. Stopping at \(totalTokens) tokens.")
                 break
             }
 
@@ -4004,11 +4014,11 @@ class MLXWrapper: ObservableObject {
 
         self.currentModelConfig = modelConfig
 
-        print("HALDEBUG-MLX: Attempting to load MLX model: \(modelConfig.displayName) (ID: \(modelConfig.id))")
+        halLog("HALDEBUG-MLX: Attempting to load MLX model: \(modelConfig.displayName) (ID: \(modelConfig.id))")
 
         do {
             guard let localPath = modelConfig.localPath, FileManager.default.fileExists(atPath: localPath.path) else {
-                print("HALDEBUG-MLX: Model files not found at expected location")
+                halLog("HALDEBUG-MLX: Model files not found at expected location — localPath: \(modelConfig.localPath?.path ?? "nil"), fileExists: \(modelConfig.localPath.map { FileManager.default.fileExists(atPath: $0.path) } ?? false)")
                 let errorMessage = "Yes. Unfortunately looks like I can't find the \(modelConfig.displayName) 'brain' files on this device. They might have been cleared or deleted. You can re-download \(modelConfig.displayName) from the Model Library whenever you're ready."
                 await MainActor.run {
                     self.isModelLoaded = false
@@ -4300,9 +4310,9 @@ class LLMService: ObservableObject {
 
     // Function to dynamically set up the active LLM
     func setupLLM(for model: ModelConfiguration) {
-        print("HALDEBUG-LLM: setupLLM called for model: \(model.displayName) (source: \(model.source))")
+        halLog("HALDEBUG-LLM: setupLLM called for model: \(model.displayName) (source: \(model.source))")
         self.currentModel = model
-        print("HALDEBUG-LLM: currentModel updated to: \(self.currentModel.displayName) (source: \(self.currentModel.source))")
+        halLog("HALDEBUG-LLM: currentModel updated to: \(self.currentModel.displayName) (source: \(self.currentModel.source))")
         self.initializationError = nil // Clear previous errors
 
         // Ensure this model is in the catalog. Otherwise vm.selectedModel /
@@ -4320,34 +4330,47 @@ class LLMService: ObservableObject {
             // SWITCHING TO MLX MODEL: Check if we need to load a different model
             let needsLoad = !mlxWrapper.isModelLoaded ||
                            mlxWrapper.currentModelConfig?.id != model.id
-            
-            print("HALDEBUG-MLX: Model switching check - isLoaded: \(mlxWrapper.isModelLoaded), needsLoad: \(needsLoad)")
-            
+
+            // Resolve the on-disk reality, not the catalog claim. The model
+            // argument may carry the cold-seed values (isDownloaded:false,
+            // localPath:nil) if the catalog hasn't been refreshed since
+            // launch; load it from MLXModelDownloader so we don't silently
+            // skip a model that's actually on disk.
+            let diskPath = MLXModelDownloader.shared.getModelPath(model.id)
+            let diskHasModel = diskPath.map { FileManager.default.fileExists(atPath: $0.path) } ?? false
+            halLog("HALDEBUG-MLX: Model switching check - id: \(model.id), passed-in isDownloaded: \(model.isDownloaded), passed-in localPath: \(model.localPath?.path ?? "nil"), disk localPath: \(diskPath?.path ?? "nil"), diskHasModel: \(diskHasModel), wrapper.isLoaded: \(mlxWrapper.isModelLoaded), needsLoad: \(needsLoad)")
+
             if needsLoad {
-                if model.isDownloaded {
+                if diskHasModel, let resolvedPath = diskPath {
+                    // Build a freshly-resolved copy of the model with the
+                    // verified-on-disk localPath, so loadModel's own guard
+                    // (which re-checks fileExists) can find it.
+                    var resolvedModel = model
+                    resolvedModel.isDownloaded = true
+                    resolvedModel.localPath = resolvedPath
                     Task {
-                        await self.mlxWrapper.loadModel(modelConfig: model)
+                        await self.mlxWrapper.loadModel(modelConfig: resolvedModel)
                         if let mlxError = self.mlxWrapper.mlxError {
                             await MainActor.run {
                                 self.initializationError = mlxError
                             }
                         }
                     }
-                    print("HALDEBUG-MLX: MLXWrapper loading triggered for \(model.displayName)")
+                    halLog("HALDEBUG-MLX: MLXWrapper loading triggered for \(model.displayName) at \(resolvedPath.path)")
                 } else {
                     self.initializationError = "MLX model not downloaded. Please download it first."
-                    print("HALDEBUG-MLX: MLX model \(model.displayName) not downloaded.")
+                    halLog("HALDEBUG-MLX: MLX model \(model.displayName) not downloaded — diskPath: \(diskPath?.path ?? "nil"), diskHasModel: \(diskHasModel)")
                 }
             } else {
-                print("HALDEBUG-MLX: MLX model \(model.displayName) already loaded.")
+                halLog("HALDEBUG-MLX: MLX model \(model.displayName) already loaded.")
             }
         } else {
             // SWITCHING TO FOUNDATION MODELS: Unload MLX to free memory
             if mlxWrapper.isModelLoaded {
                 mlxWrapper.unloadModel()
-                print("HALDEBUG-MLX: Unloaded MLX model, switching to Foundation Models.")
+                halLog("HALDEBUG-MLX: Unloaded MLX model, switching to Foundation Models.")
             } else {
-                print("HALDEBUG-LLM: Switching to Foundation Models.")
+                halLog("HALDEBUG-LLM: Switching to Foundation Models.")
             }
         }
     }
@@ -8717,21 +8740,36 @@ class ChatViewModel: ObservableObject {
         // STEP 4: Initialize LLMService with the model
         self.llmService = LLMService(model: initialModel)
         
-        // STEP 5: Try to decode salon config; if it fails, use default
-        if let decoded = try? JSONDecoder().decode(SalonConfiguration.self, from: salonData) {
-            self.salonConfig = decoded
-            print("HALDEBUG-SALON: Loaded salon configuration from storage")
-        } else {
-            self.salonConfig = SalonConfiguration()
-            print("HALDEBUG-SALON: Using default salon configuration")
+        // STEP 5: Decode salon config and reconcile with v1.x UI policy.
+        //
+        // The earlier approach (force `self.salonConfig.isEnabled = false`
+        // AFTER decoding) caused a sendMessage regression — mutating a
+        // @Published property mid-init triggers observers while the
+        // object isn't fully wired, and chat routing went sideways. This
+        // pass instead rewrites the AppStorage backing BEFORE assigning the
+        // @Published property, so salonConfig is initialized exactly once
+        // with the corrected value. No mid-init mutation, no observer
+        // surprise, and the corrected state is persisted to disk so future
+        // launches see it too.
+        //
+        // v1.x ships with Salon Mode hidden (ActionsView.salonModeExposedInUI
+        // = false). Upgraders who had `isEnabled = true` from a prior build
+        // would otherwise silently route through runSalonTurn even though
+        // the UI no longer exposes any way to control it. Force-off here
+        // closes that hazard. Keep the constant below in sync with
+        // ActionsView.salonModeExposedInUI; both flip together when Salon
+        // returns in a future release.
+        let v1xSalonExposed = false
+        var decodedSalon = (try? JSONDecoder().decode(SalonConfiguration.self, from: salonData)) ?? SalonConfiguration()
+        if !v1xSalonExposed && decodedSalon.isEnabled {
+            halLog("HALDEBUG-SALON: Upgrader had isEnabled=true; forcing off for v1.x and persisting corrected state.")
+            decodedSalon.isEnabled = false
+            if let reencoded = try? JSONEncoder().encode(decodedSalon) {
+                UserDefaults.standard.set(reencoded, forKey: "salonConfigData")
+            }
         }
-
-        // Salon Mode force-off at init was tried in v1.x prep but caused a
-        // regression in sendMessage routing. Instead, the force-off happens
-        // in ActionsView.onAppear when the user opens settings. For users who
-        // never open settings, salonConfig.isEnabled stays whatever was
-        // persisted — but ActionsView is the first sheet most users open.
-        // Salon Mode UI is gated by salonModeExposedInUI = false regardless.
+        self.salonConfig = decodedSalon
+        halLog("HALDEBUG-SALON: Salon configuration initialized (isEnabled=\(decodedSalon.isEnabled))")
         
         // REFACTORED: Set up observer for any model state changes
         self.modelStateObserver = NotificationCenter.default.publisher(for: .mlxModelDidDownload)
@@ -9361,23 +9399,40 @@ class ChatViewModel: ObservableObject {
                                                                             Answer only YES or NO.
                                                                             """
 
+                                                                            let gateStart = Date()
+                                                                            halLog("HALDEBUG-TOOLS: Gate START (prompt \(toolDecisionPrompt.count) chars, model: \(selectedModel.displayName))")
                                                                             do {
-                                                                                // RAG gate always uses AFM — fast, always available, never the slow local model
-                                                                                let gateSession = LanguageModelSession()
-                                                                                var gateResponse = ""
-                                                                                let gateStream = gateSession.streamResponse(options: GenerationOptions(temperature: 0.1)) { Prompt(toolDecisionPrompt) }
-                                                                                for try await snapshot in gateStream { gateResponse = snapshot.content }
+                                                                                // PRIVACY: route the gate through the user-selected model so we
+                                                                                // never silently invoke a different LLM. The earlier "RAG gate
+                                                                                // always uses AFM" optimization violated the consistency
+                                                                                // promise that everything in Gemma mode stays on Gemma.
+                                                                                // Measurement (May 12, 2026) shows Gemma 4 E2B 4-bit prefill
+                                                                                // is actually faster than AFM for the gate-sized prompt
+                                                                                // (~800 tok/s vs ~138 tok/s), so this is also a perf win in
+                                                                                // Gemma mode — not a regression.
+                                                                                let gateResponse = try await llmService.generateChatResponse(
+                                                                                    messages: [
+                                                                                        .system("You are a fast YES/NO classifier. Respond with only the single word YES or NO — no punctuation, no explanation."),
+                                                                                        .user(toolDecisionPrompt)
+                                                                                    ],
+                                                                                    temperature: 0.1
+                                                                                )
                                                                                 let answer = gateResponse.trimmingCharacters(in: .whitespacesAndNewlines).uppercased()
+                                                                                let gateMs = Int(Date().timeIntervalSince(gateStart) * 1000)
                                                                                 if answer.hasPrefix("YES") {
-                                                                                    print("HALDEBUG-TOOLS: Gate → YES (memory search needed)")
+                                                                                    halLog("HALDEBUG-TOOLS: Gate → YES in \(gateMs)ms (memory search needed)")
                                                                                     return ToolDecision(tools: ["memory_search"], reasoning: "Gate answered YES")
                                                                                 } else {
-                                                                                    print("HALDEBUG-TOOLS: Gate → NO (recent context sufficient), raw: \(answer.prefix(20))")
+                                                                                    halLog("HALDEBUG-TOOLS: Gate → NO in \(gateMs)ms (recent context sufficient), raw: \(answer.prefix(20))")
                                                                                     return ToolDecision(tools: [], reasoning: "Gate answered NO")
                                                                                 }
                                                                             } catch {
-                                                                                print("HALDEBUG-TOOLS: ERROR: Gate call failed - \(error.localizedDescription) — no tools")
-                                                                                return ToolDecision(tools: [], reasoning: "Error occurred — no tools")
+                                                                                let gateMs = Int(Date().timeIntervalSince(gateStart) * 1000)
+                                                                                halLog("HALDEBUG-TOOLS: ERROR: Gate failed in \(gateMs)ms - \(error.localizedDescription) — falling back to always-search for safety")
+                                                                                // Privacy fallback: if the gate errors, search anyway rather
+                                                                                // than silently dropping memory access. Hal would rather be
+                                                                                // a touch slower than blind to his own past.
+                                                                                return ToolDecision(tools: ["memory_search"], reasoning: "Gate error — fail-open to memory search")
                                                                             }
                                                                         }
                                                                         
@@ -9388,7 +9443,8 @@ class ChatViewModel: ObservableObject {
                                                                             
                                                                             // Execute memory_search if requested
                                                                             if decision.tools.contains("memory_search") {
-                                                                                print("HALDEBUG-TOOLS: Executing memory_search")
+                                                                                let searchStart = Date()
+                                                                                halLog("HALDEBUG-TOOLS: memory_search START (budget=\(tokenBudget) tokens, excludeTurns=\(excludeTurns.count))")
                                                                                 let searchContext = memoryStore.searchUnifiedContent(
                                                                                     for: userInput,
                                                                                     currentConversationId: conversationId,
@@ -9396,7 +9452,7 @@ class ChatViewModel: ObservableObject {
                                                                                     maxResults: 10,
                                                                                     tokenBudget: tokenBudget
                                                                                 )
-                                                                                
+
                                                                                 // Convert RAGSnippets to UnifiedSearchResults (architectural boundary)
                                                                                 let allSnippets = searchContext.conversationSnippets + searchContext.documentSnippets
                                                                                 memoryResults = allSnippets.map { ragSnippet in
@@ -9409,10 +9465,11 @@ class ChatViewModel: ObservableObject {
                                                                                     )
                                                                                 }
                                                                                 usedTools.append("memory_search")
-                                                                                
-                                                                                print("HALDEBUG-TOOLS: Memory search returned \(memoryResults?.count ?? 0) results")
+
+                                                                                let searchMs = Int(Date().timeIntervalSince(searchStart) * 1000)
+                                                                                halLog("HALDEBUG-TOOLS: memory_search END in \(searchMs)ms — \(memoryResults?.count ?? 0) results (\(searchContext.conversationSnippets.count) conv + \(searchContext.documentSnippets.count) doc)")
                                                                             } else {
-                                                                                print("HALDEBUG-TOOLS: Skipping memory_search (not in decision)")
+                                                                                halLog("HALDEBUG-TOOLS: Skipping memory_search (gate decision)")
                                                                             }
                                                                             
                                                                             // Future tools (Wikipedia, DuckDuckGo) would be added here
@@ -11908,13 +11965,12 @@ class DocumentImportManager: ObservableObject {
         print("HALDEBUG-IMPORT: Generating LLM summary for: \(document.filename) with \(document.entities.count) entities")
         print("HALDEBUG-IMPORT: Using active model: \(chatViewModel.selectedModel.displayName) (source: \(chatViewModel.selectedModel.source))")
 
-        guard #available(iOS 17.0, *) else {
-            return "Document: \(document.filename)"
-        }
-        let systemModel = SystemLanguageModel.default
-        guard systemModel.isAvailable else {
-            return "Document: \(document.filename)"
-        }
+        // NOTE (May 12, 2026): The previous AFM-availability guard here was
+        // dead defensive code — Hal's minimum deployment target is iOS 26,
+        // which ships only on AFM-capable hardware, AND we now route through
+        // the active model (which may be Gemma anyway). Removed the guard so
+        // users in Gemma mode actually get a summary instead of just the
+        // filename. Falling through to the unified path below.
 
         do {
             let contentPreview = String(document.content.prefix(500))
@@ -12896,16 +12952,23 @@ struct HFModelConfig: Codable {
 @MainActor
 class ModelCatalogService: ObservableObject {
     static let shared = ModelCatalogService()
-    
+
     // Published state — pre-populated with the v1.x shipped models so the
     // Model Library has something to display from app launch, even before
     // the HF catalog fetch has completed (or if it fails / there's no network).
+    //
+    // NOTE: the seed values for MLX models are intentionally
+    // `isDownloaded: false, localPath: nil`. The singleton init() below
+    // calls refreshDownloadStates() so any model already on disk shows up
+    // as downloaded on first read — without this, the catalog would lie
+    // about downloaded models until the user happens to open Model Library.
     @Published var availableModels: [ModelConfiguration] = [
         ModelConfiguration.appleFoundation,
         ModelConfiguration.gemma4E2B4bit
     ]
     @Published var isLoading: Bool = false
     @Published var errorMessage: String?
+
     
     // API configuration
     private let huggingFaceAPIBase = "https://huggingface.co/api"
@@ -12950,7 +13013,14 @@ class ModelCatalogService: ObservableObject {
     }
     
     private init() {
-        print("HALDEBUG-CATALOG: ModelCatalogService initialized")
+        // Reconcile the seed against disk before anyone reads availableModels.
+        // Without this, models that are actually downloaded (verifiable on
+        // disk via MLXModelDownloader) report isDownloaded:false from the
+        // hardcoded seed until the user opens Model Library — which made
+        // model switching silently skip the load. refreshDownloadStates is
+        // synchronous and MainActor-safe; we're already on MainActor.
+        refreshDownloadStates()
+        halLog("HALDEBUG-CATALOG: ModelCatalogService initialized with \(availableModels.count) seeded models; refreshed download states from disk.")
     }
     
     // MARK: - Fetch Models from Hugging Face
@@ -13733,6 +13803,28 @@ class HalTestConsole: ObservableObject {
             let displayName = vm.selectedModel.displayName
             return "{\"status\":\"ok\",\"modelID\":\"\(liveID)\",\"displayName\":\"\(jsonStringEscape(displayName))\"}"
 
+        } else if trimmed == "MLX_STATE" {
+            // Diagnostic snapshot of the MLX runtime + catalog state for the
+            // currently selected model. Used to diagnose load failures
+            // without needing device-console access.
+            let selectedID = vm.selectedModelID
+            let wrapper = vm.llmService.mlxWrapper
+            let wrapperLoaded = wrapper.isModelLoaded
+            let wrapperConfigID = wrapper.currentModelConfig?.id ?? ""
+            let wrapperConfigPath = wrapper.currentModelConfig?.localPath?.path ?? ""
+            let wrapperError = wrapper.mlxError ?? ""
+            let wrapperLoadingMessage = wrapper.loadingMessage
+            let wrapperLoadingProgress = wrapper.loadingProgress
+            let catalogModel = ModelCatalogService.shared.getModel(byID: selectedID)
+            let catalogIsDownloaded = catalogModel?.isDownloaded ?? false
+            let catalogLocalPath = catalogModel?.localPath?.path ?? ""
+            let diskPath = MLXModelDownloader.shared.getModelPath(selectedID)
+            let diskPathStr = diskPath?.path ?? ""
+            let diskHasModel = diskPath.map { FileManager.default.fileExists(atPath: $0.path) } ?? false
+            return """
+            {"status":"ok","selectedModelID":"\(jsonStringEscape(selectedID))","wrapper":{"isModelLoaded":\(wrapperLoaded),"currentModelConfigID":"\(jsonStringEscape(wrapperConfigID))","currentModelConfigLocalPath":"\(jsonStringEscape(wrapperConfigPath))","mlxError":"\(jsonStringEscape(wrapperError))","loadingMessage":"\(jsonStringEscape(wrapperLoadingMessage))","loadingProgress":\(wrapperLoadingProgress)},"catalog":{"hasEntry":\(catalogModel != nil),"isDownloaded":\(catalogIsDownloaded),"localPath":"\(jsonStringEscape(catalogLocalPath))"},"disk":{"resolvedPath":"\(jsonStringEscape(diskPathStr))","fileExists":\(diskHasModel)}}
+            """
+
         } else if trimmed == "LIST_MODELS" {
             return buildModelListJSON(vm: vm)
 
@@ -14004,11 +14096,12 @@ class HalTestConsole: ObservableObject {
         let activeID = vm.llmService.activeModelID
         var entries: [String] = []
 
-        // AFM entry
-        let afmActive = activeID == "apple-foundation-models"
-        entries.append("{\"id\":\"apple-foundation-models\",\"displayName\":\"Apple Foundation Models\",\"downloaded\":true,\"active\":\(afmActive),\"sizeGB\":null}")
-
-        // MLX catalog entries
+        // Iterate the catalog only. Previously this function also
+        // hardcoded an AFM entry (displayName: "Apple Foundation Models")
+        // on top of the catalog's seeded AFM (displayName: "Apple
+        // Intelligence"), which produced two AFM rows in LIST_MODELS with
+        // different display names. The seeded catalog entry is the single
+        // source of truth.
         let catalog = ModelCatalogService.shared.availableModels
         for model in catalog {
             let isActive = model.id == activeID

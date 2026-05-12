@@ -1,0 +1,64 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <!--
+        Hal Universal Privacy Manifest
+        ==============================
+        Hal does not track users, does not collect data, and does not run ads.
+        All inference (Apple Foundation Models OR Gemma 4 E2B local) runs on-device.
+        AFM may, in rare cases per Apple's policy, route to Private Cloud Compute
+        for complex queries; this is disclosed at https://security.apple.com.
+        Gemma stays 100% on-device.
+
+        The only network egress Hal initiates from user action is:
+          - huggingface.co — model catalog metadata + model download (user-initiated
+            via Model Library only; not on launch, not during chat).
+
+        This manifest declares:
+          - No tracking (NSPrivacyTracking = false, no tracking domains)
+          - No data collection (empty NSPrivacyCollectedDataTypes)
+          - Required-reason API usage:
+              * NSUserDefaults — @AppStorage for user preferences (model
+                selection, memory depth, temperature, etc.)
+              * NSFileManager attributesOfItem — file size check during
+                user-initiated document import
+
+        If/when we add:
+          - ProcessInfo.systemUptime / systemBootTime → add C617.1 / 35F9.1
+          - File timestamp APIs → add DDA9.1 / 3B52.1
+          - Disk space APIs → add E174.1 / 85F4.1
+    -->
+    <key>NSPrivacyTracking</key>
+    <false/>
+
+    <key>NSPrivacyTrackingDomains</key>
+    <array/>
+
+    <key>NSPrivacyCollectedDataTypes</key>
+    <array/>
+
+    <key>NSPrivacyAccessedAPITypes</key>
+    <array>
+        <!-- UserDefaults via @AppStorage for user preference persistence -->
+        <dict>
+            <key>NSPrivacyAccessedAPIType</key>
+            <string>NSPrivacyAccessedAPICategoryUserDefaults</string>
+            <key>NSPrivacyAccessedAPITypeReasons</key>
+            <array>
+                <string>CA92.1</string>
+            </array>
+        </dict>
+
+        <!-- File metadata (size) read during user-initiated document import -->
+        <dict>
+            <key>NSPrivacyAccessedAPIType</key>
+            <string>NSPrivacyAccessedAPICategoryFileTimestamp</string>
+            <key>NSPrivacyAccessedAPITypeReasons</key>
+            <array>
+                <string>DDA9.1</string>
+            </array>
+        </dict>
+    </array>
+</dict>
+</plist>

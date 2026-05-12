@@ -178,7 +178,7 @@ Root level:
 ## Technical Environment
 
 - **Language:** Swift / SwiftUI
-- **Minimum iOS:** 18+
+- **Minimum iOS:** 26 (Apple unified platform versions in 2025; iOS jumped from 18 → 26 to match the calendar year. iOS 26 ships only on AFM-capable hardware, so Apple Foundation Models is guaranteed available on any device that can run Hal.)
 - **Primary device:** iPhone 16+ (real device testing, not simulator)
 - **Mac:** M2 MacBook Air
 - **Key frameworks:** Apple FoundationModels, MLX, SQLite, NaturalLanguage
