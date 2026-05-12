@@ -9005,19 +9005,16 @@ class ChatViewModel: ObservableObject {
         let salonData = UserDefaults.standard.data(forKey: "salonConfigData") ?? Data()
         
         // STEP 3: Get the model from catalog (read from UserDefaults directly to avoid self access before init)
-        // v1.x release: clamp the stored model ID to the two user-visible models.
-        // If a prior install left a different MLX model (Phi-3, Qwen, etc.) as the
-        // selected model, the UI wouldn't show it in the Model Library so the user
-        // couldn't switch off it. Reset to AFM so the visible UI matches the active
-        // model. To allow more models, expand this set in lockstep with
-        // ModelLibraryView.userVisibleModelIDs.
-        let v1xVisibleModelIDs: Set<String> = [
-            "apple-foundation-models",
-            "mlx-community/gemma-4-e2b-it-4bit"
-        ]
+        // Clamp the stored model ID to the curated allowlist so an upgrader
+        // who had a now-removed experimental model selected gets a clean
+        // landing on AFM instead of a "model not found" loop. The curated
+        // set lives on ModelConfiguration.curatedSeeds + AFM, so adding a
+        // new curated model automatically extends the allowlist.
+        var curatedVisibleIDs: Set<String> = ["apple-foundation-models"]
+        for model in ModelConfiguration.curatedSeeds { curatedVisibleIDs.insert(model.id) }
         var storedModelID = UserDefaults.standard.string(forKey: "selectedModelID") ?? "apple-foundation-models"
-        if !v1xVisibleModelIDs.contains(storedModelID) {
-            print("HALDEBUG-INIT: v1.x — stored selectedModelID '\(storedModelID)' is not in the user-visible allowlist; resetting to apple-foundation-models")
+        if !curatedVisibleIDs.contains(storedModelID) {
+            print("HALDEBUG-INIT: stored selectedModelID '\(storedModelID)' is not in the curated allowlist; resetting to apple-foundation-models")
             storedModelID = "apple-foundation-models"
             UserDefaults.standard.set(storedModelID, forKey: "selectedModelID")
         }
