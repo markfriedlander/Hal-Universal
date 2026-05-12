@@ -5332,7 +5332,17 @@ struct ActionsView: View {
             }
         }
         .onAppear {
-            // Initialize Power User Mode toggle from current Salon Mode state
+            // v1.x release: force Salon Mode off in the live ChatViewModel state
+            // so any persisted `salonConfig.isEnabled = true` from prior builds
+            // (where the toggle existed) doesn't route chat through the salon
+            // path while the UI is hidden. Initialize the local picker state
+            // from the (now-forced-off) salon config.
+            if !Self.salonModeExposedInUI && chatViewModel.salonConfig.isEnabled {
+                var config = chatViewModel.salonConfig
+                config.isEnabled = false
+                chatViewModel.salonConfig = config
+                print("HALDEBUG-SALON: v1.x — forcing salonConfig.isEnabled = false on settings appear")
+            }
             powerUserMode = chatViewModel.salonConfig.isEnabled ? .multi : .single
         }
         .sheet(isPresented: $showingExportSheet) {
@@ -5597,48 +5607,57 @@ struct ActionsView: View {
     // One control does everything: activation + settings access + chat behavior.
     
     private var powerUserSection: some View {
+        // v1.x release: Salon Mode is hidden from the UI. The mode toggle
+        // and the Salon Mode settings sheet entry are gated on Self.salonModeExposedInUI.
+        // The underlying Salon Mode code (SalonModeView, salonConfig, runSalonTurn,
+        // etc.) remains intact per the standing "broken-but-precious" instruction —
+        // flipping the flag back to true restores full Salon Mode access for
+        // future releases. We also force salonConfig.isEnabled = false on appear
+        // (see .onAppear below) to guarantee chat behaviour is single-model
+        // regardless of any stale state from prior installs.
         Section {
-            // Mode toggle
-            VStack(alignment: .leading, spacing: 8) {
-                Text("Power User Mode")
-                    .font(.subheadline)
-                    .fontWeight(.medium)
-                
-                Picker("", selection: Binding(
-                    get: { powerUserMode },
-                    set: { newMode in
-                        powerUserMode = newMode
-                        // CRITICAL: Activate/deactivate Salon Mode based on selection
-                        var config = chatViewModel.salonConfig
-                        config.isEnabled = (newMode == .multi)
-                        chatViewModel.salonConfig = config
-                        print("HALDEBUG-SALON: Mode changed to \(newMode.rawValue), isEnabled = \(config.isEnabled)")
+            if Self.salonModeExposedInUI {
+                // Mode toggle (hidden in v1.x)
+                VStack(alignment: .leading, spacing: 8) {
+                    Text("Power User Mode")
+                        .font(.subheadline)
+                        .fontWeight(.medium)
+
+                    Picker("", selection: Binding(
+                        get: { powerUserMode },
+                        set: { newMode in
+                            powerUserMode = newMode
+                            var config = chatViewModel.salonConfig
+                            config.isEnabled = (newMode == .multi)
+                            chatViewModel.salonConfig = config
+                            print("HALDEBUG-SALON: Mode changed to \(newMode.rawValue), isEnabled = \(config.isEnabled)")
+                        }
+                    )) {
+                        ForEach(PowerUserMode.allCases, id: \.self) { mode in
+                            Text(mode.rawValue).tag(mode)
+                        }
                     }
-                )) {
-                    ForEach(PowerUserMode.allCases, id: \.self) { mode in
-                        Text(mode.rawValue).tag(mode)
-                    }
+                    .pickerStyle(.segmented)
+
+                    Text(powerUserMode == .single ?
+                         "Advanced settings for single model operation" :
+                         "Configure multiple models for collaborative conversations")
+                        .font(.caption)
+                        .foregroundColor(.secondary)
                 }
-                .pickerStyle(.segmented)
-                
-                Text(powerUserMode == .single ?
-                     "Advanced settings for single model operation" :
-                     "Configure multiple models for collaborative conversations")
-                    .font(.caption)
-                    .foregroundColor(.secondary)
             }
-            
-            // Settings button (opens different sheet based on mode)
+
+            // Settings button — in v1.x, always opens Single LLM Settings.
             Button {
-                if powerUserMode == .single {
-                    showingPowerUserSheet = true
-                } else {
+                if Self.salonModeExposedInUI && powerUserMode == .multi {
                     showingSalonModeSheet = true
+                } else {
+                    showingPowerUserSheet = true
                 }
             } label: {
                 HStack {
-                    Image(systemName: powerUserMode == .single ? "wrench.and.screwdriver" : "person.3")
-                    Text(powerUserMode == .single ? "Single LLM Settings" : "Salon Mode Settings")
+                    Image(systemName: (Self.salonModeExposedInUI && powerUserMode == .multi) ? "person.3" : "wrench.and.screwdriver")
+                    Text((Self.salonModeExposedInUI && powerUserMode == .multi) ? "Salon Mode Settings" : "Single LLM Settings")
                     Spacer()
                     Image(systemName: "chevron.right")
                         .font(.caption)
@@ -5647,12 +5666,22 @@ struct ActionsView: View {
             }
             .foregroundColor(.primary)
         } footer: {
-            Text(powerUserMode == .single ?
-                 "Advanced memory settings and data management" :
-                 "Configure multi-model conversation orchestration")
+            Text(Self.salonModeExposedInUI && powerUserMode == .multi ?
+                 "Configure multi-model conversation orchestration" :
+                 "Advanced memory settings and data management")
                 .font(.caption2)
         }
     }
+
+    // MARK: - v1.x Feature Flags
+    //
+    // Salon Mode is feature-complete and its code paths are preserved
+    // (SalonModeView, salonConfig, runSalonTurn, runSalonSeat, etc.) per
+    // the standing "broken-but-precious" rule. For the v1.x App Store
+    // release we don't expose Salon Mode to users — flipping this flag
+    // back to `true` restores the segmented picker, the Salon Mode
+    // settings entry, and the multi-model chat behaviour.
+    private static let salonModeExposedInUI: Bool = false
     
     // MARK: - Helper Function
     
@@ -6433,21 +6462,35 @@ struct ModelLibraryView: View {
     }
     
     // MARK: - Model Filtering
-    
+    //
+    // v1.x release: ship with exactly two user-facing model choices —
+    // Apple Intelligence (AFM) and Gemma 4 E2B. The catalog, downloader,
+    // and API infrastructure stay untouched and continue to see / handle
+    // every model ID. This is a UI-only allowlist applied in the three
+    // computed properties below. To re-expand the model picker in a
+    // future release: edit this set (or remove the filter call entirely).
+    private static let userVisibleModelIDs: Set<String> = [
+        "apple-foundation-models",
+        "mlx-community/gemma-4-e2b-it-4bit"
+    ]
+
     private var builtInModels: [ModelConfiguration] {
         ModelCatalogService.shared.availableModels
+            .filter { Self.userVisibleModelIDs.contains($0.id) }
             .filter { $0.source == .appleFoundation }
             .sorted { $0.displayName < $1.displayName }
     }
-    
+
     private var downloadedMLXModels: [ModelConfiguration] {
         ModelCatalogService.shared.availableModels
+            .filter { Self.userVisibleModelIDs.contains($0.id) }
             .filter { $0.source == .mlx && mlxDownloader.isModelDownloaded($0.id) }
             .sorted { $0.displayName < $1.displayName }
     }
-    
+
     private var availableMLXModels: [ModelConfiguration] {
         ModelCatalogService.shared.availableModels
+            .filter { Self.userVisibleModelIDs.contains($0.id) }
             .filter { $0.source == .mlx && !mlxDownloader.isModelDownloaded($0.id) }
             .sorted { $0.displayName < $1.displayName }
     }
@@ -12743,6 +12786,23 @@ struct ModelConfiguration: Identifiable, Codable, Equatable, Hashable {
         isDownloaded: true,
         localPath: nil
     )
+
+    /// Hardcoded Gemma 4 E2B 4-bit entry for the v1.x release. Always present in
+    /// the catalog from app launch so the user can initiate the one-time
+    /// download even on first launch without an HF catalog fetch having completed.
+    /// On successful HF fetch the fetched record replaces this; on fetch failure
+    /// this constant keeps the model visible in the Model Library.
+    static let gemma4E2B4bit = ModelConfiguration(
+        id: "mlx-community/gemma-4-e2b-it-4bit",
+        displayName: "Gemma 4 E2B",
+        source: .mlx,
+        sizeGB: 3.58,
+        contextWindow: 32_768,
+        license: "gemma",
+        description: "Fully private, on-device. One-time 3.58 GB download (WiFi recommended).",
+        isDownloaded: false,
+        localPath: nil
+    )
 }
 
 // MARK: - Hugging Face API Response Models
@@ -12815,8 +12875,13 @@ struct HFModelConfig: Codable {
 class ModelCatalogService: ObservableObject {
     static let shared = ModelCatalogService()
     
-    // Published state
-    @Published var availableModels: [ModelConfiguration] = []
+    // Published state — pre-populated with the v1.x shipped models so the
+    // Model Library has something to display from app launch, even before
+    // the HF catalog fetch has completed (or if it fails / there's no network).
+    @Published var availableModels: [ModelConfiguration] = [
+        ModelConfiguration.appleFoundation,
+        ModelConfiguration.gemma4E2B4bit
+    ]
     @Published var isLoading: Bool = false
     @Published var errorMessage: String?
     
@@ -12920,6 +12985,11 @@ class ModelCatalogService: ObservableObject {
             
             await MainActor.run {
                 self.availableModels = [appleModel] + mlxModels
+                // v1.x release: guarantee the shipped Gemma entry is present even if
+                // the HF response didn't include it (e.g. transient API change).
+                if !self.availableModels.contains(where: { $0.id == ModelConfiguration.gemma4E2B4bit.id }) {
+                    self.availableModels.append(ModelConfiguration.gemma4E2B4bit)
+                }
                 self.isLoading = false
                 print("HALDEBUG-CATALOG: âœ… Catalog updated with \(self.availableModels.count) total models")
             }
@@ -12929,8 +12999,12 @@ class ModelCatalogService: ObservableObject {
                 self.errorMessage = "Failed to load models: \(error.localizedDescription)"
                 self.isLoading = false
                 
-                // Fallback to Apple Foundation Models only
-                self.availableModels = [ModelConfiguration.appleFoundation]
+                // v1.x release: even on fetch failure, keep both shipped models
+                // visible so the Model Library is usable offline.
+                self.availableModels = [
+                    ModelConfiguration.appleFoundation,
+                    ModelConfiguration.gemma4E2B4bit
+                ]
                 
                 print("HALDEBUG-CATALOG: âŒ Error: \(error.localizedDescription)")
             }
