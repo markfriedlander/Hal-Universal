@@ -6086,7 +6086,7 @@ struct PowerUserView: View {
                 Label("Developer API", systemImage: "terminal")
             } footer: {
                 Text(viewModel.localAPIEnabled
-                    ? "Tap any field to copy. Setup: python3 tests/hal_test.py setup 127.0.0.1 8765 <token>"
+                    ? "Tap any field to copy. Setup: python3 tests/hal_test.py setup 127.0.0.1 \(LocalAPIServer.apiPort) <token>"
                     : "Enables a local HTTP API for automated testing. Off by default.")
                     .font(.caption2)
             }
@@ -14371,11 +14371,19 @@ class HalTestConsole: ObservableObject {
 //   Info:             GET_STATE, CURRENT_MODEL, LIST_MODELS, MODEL_STATUS:<id>
 //
 // Enable: Settings → Power User → Developer API toggle (default OFF).
-// Setup:  python3 tests/hal_test.py setup <ip> 8765 <token>
+// Setup:  python3 tests/hal_test.py setup <ip> 8766 <token>
+// Port:   8766 (see apiPort comment below — per-app port family).
 
 class LocalAPIServer {
 
-    static let apiPort: UInt16 = 8765
+    // Hal's API listener port. Each app in the Mark Friedlander multi-app
+    // family uses its own port so multiple CC instances can each run their
+    // own LocalAPIServer against the simulator (or the same Mac) without
+    // colliding. Known assignments:
+    //   Posey  → 8765
+    //   Hal    → 8766
+    // To extend: pick the next sequential port and document it here.
+    static let apiPort: UInt16 = 8766
 
     private var listener: NWListener?
     private weak var chatViewModel: ChatViewModel?

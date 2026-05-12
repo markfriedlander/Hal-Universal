@@ -3,14 +3,17 @@
 hal_test.py — Hal Universal test runner and control script.
 
 HTTP mode (when tests/.hal_api_config.json exists):
-  Connects directly to LocalAPIServer on port 8765. Fully synchronous and reactive.
+  Connects directly to LocalAPIServer on port 8766. Fully synchronous and reactive.
+  (Hal owns 8766 in the Mark Friedlander app family; Posey owns 8765. Each app
+  has its own port so multiple CC instances can test in parallel without
+  colliding on the simulator or the Mac.)
 
 File mode (fallback, no config):
   Polls output_latest.json via mtime. Slower, for when HTTP is unavailable.
 
 Usage:
   python3 tests/hal_test.py autodiscover               # read ip:port:token from clipboard (app copies on start)
-  python3 tests/hal_test.py setup <ip> 8765 <token>   # one-time manual config
+  python3 tests/hal_test.py setup <ip> 8766 <token>   # one-time manual config
   python3 tests/hal_test.py reset                      # nuclear reset
   python3 tests/hal_test.py new                        # new thread (keep memory)
   python3 tests/hal_test.py turn "Hello"               # single turn

@@ -32,9 +32,13 @@ All builds clean: `generic/platform=iOS`, `iOS Simulator (iPhone 17 Pro)`. App l
 - **`screenWidth = 0` fix end-to-end** — only reproducible on cold launch / scene-state-transition timing, which doesn't occur reliably in simulator. The `screenWidth` property now has a three-tier fallback (any non-background scene → UIScreen.main → hardcoded 390); fix landed at commit `00bf3a7`.
 - **Icon at device scale** — looks correct in asset catalog; final visual check is on physical hardware.
 
-### Simulator API testing limitation (worth knowing)
+### Multi-app port family (resolved May 12)
 
-The Mac has `Posey` (another Mark Friedlander app) listening on port 8765, the same port Hal's LocalAPIServer tries to bind. As a result, Hal in the simulator can't open its API listener (`NWListener` `.failed` rather than `.ready`), so `hal_test.py` can't reach the simulator instance. This is a tooling collision on the Mac, not an issue with Hal. To work around for sim API testing: stop Posey before launching the Hal sim build, or change Hal's `apiPort` constant temporarily.
+Hal's `LocalAPIServer.apiPort` moved from **8765 → 8766** so it coexists with Posey (also using 8765) and any other app in Mark's app family. Verified May 12: Hal sim build binds 8766 while Posey sim build holds 8765 — both apps responsive on their own ports simultaneously. The pattern: pick the next sequential port and document the assignment in `LocalAPIServer.apiPort` comment + this brief.
+
+Known port assignments:
+- **Posey** → 8765
+- **Hal** → 8766
 
 ---
 
@@ -120,7 +124,7 @@ All commands unchanged from yesterday's expansion. Key release-related ones:
 | `SWITCH_MODEL:<id>` | Switch (works for any catalog ID, not just user-visible) |
 | `NUCLEAR_RESET` | Wipe all conversation data (preserves self-knowledge) |
 
-Test runner: `python3 tests/hal_test.py [command]`. Config at `tests/.hal_api_config.json` is currently set to Mark's iPhone (`192.168.12.206:8765`).
+Test runner: `python3 tests/hal_test.py [command]`. Config at `tests/.hal_api_config.json` is currently set to Mark's iPhone (`192.168.12.206:8766`).
 
 ---
 
@@ -135,7 +139,7 @@ Test runner: `python3 tests/hal_test.py [command]`. Config at `tests/.hal_api_co
 ## Open Issues (Priority Order)
 
 1. **Chat send regression on phone** — observed once this session after the salonConfig.isEnabled=false-at-init change. **Reverted in `824b7fb`.** Needs Mark's device to confirm restoration.
-2. **Posey port conflict** — Posey (another Mark Friedlander app) holds port 8765 on the Mac, preventing Hal sim API testing without stopping Posey first. Tooling-only, not a release issue.
+2. ~~Posey port conflict~~ — **Resolved May 12.** Hal moved to port 8766. Both apps coexist on the Mac and on phones.
 3. **Dead code** — `buildPromptHistory`, `buildContextAwarePrompt`, `LLMService.generateResponse`, `MLXWrapper.generate` have zero callers but remain tagged in the source. Safe to delete in v2.0 refactor.
 4. **RAG dedup / per-snippet summarization** — dropped during chat-path migration. Re-add when conversation length warrants it.
 5. **Reflection prompt format** — sometimes produces continuation rather than meta-observation. Already partially addressed (commit `243a02d`). Further polish post-release.
