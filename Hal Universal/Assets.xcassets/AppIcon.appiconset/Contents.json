@@ -1,7 +1,7 @@
 {
   "images" : [
     {
-      "filename" : "hal_icon_1024_appstore_v2.png",
+      "filename" : "hal_icon_v3_light.png",
       "idiom" : "universal",
       "platform" : "ios",
       "size" : "1024x1024"
@@ -13,7 +13,7 @@
           "value" : "dark"
         }
       ],
-      "filename" : "hal_icon_1024_appstore_v2 1.png",
+      "filename" : "hal_icon_v3_light.png",
       "idiom" : "universal",
       "platform" : "ios",
       "size" : "1024x1024"
@@ -25,7 +25,7 @@
           "value" : "tinted"
         }
       ],
-      "filename" : "hal_icon_1024_appstore_v2 2.png",
+      "filename" : "hal_icon_v3_tinted.png",
       "idiom" : "universal",
       "platform" : "ios",
       "size" : "1024x1024"

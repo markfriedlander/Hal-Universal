@@ -1,0 +1,64 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  Hal app icon, v1.x release (May 2026)
+  Source: Mark / Strategic Claude visual spec.
+
+  Layout (native viewBox 680×680, rendered at 1024×1024):
+    • Background: dark near-black with warm tint, #141010 → #040202 radial
+    • Outer glow:  deep red-amber, soft and wide
+    • Outer ring:  silver-grey at r=116, stroke 0.8, opacity 0.08
+    • Inner ring:  silver-grey at r=92,  stroke 1.4, opacity 0.13
+    • Orb:         red-orange flat (not specular), r=80
+    • Pupil:       soft yellow bloom in centre, r=24
+
+  Family alignment: Reflect (dark, single glowing orb) and Pure Phase
+  (dark, centred warm light source) without literal duplication. The red
+  colour and the centred yellow pupil are what make it distinctly Hal.
+
+  iOS handles the rounded-rect mask via the asset catalog — full square
+  fill here, no manual rounding.
+-->
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 680 680" width="1024" height="1024">
+  <defs>
+    <radialGradient id="bg" cx="340" cy="340" r="481" gradientUnits="userSpaceOnUse">
+      <stop offset="0"   stop-color="#141010"/>
+      <stop offset="1"   stop-color="#040202"/>
+    </radialGradient>
+
+    <radialGradient id="outerGlow" cx="340" cy="340" r="340" gradientUnits="userSpaceOnUse">
+      <stop offset="0"   stop-color="#AA2000" stop-opacity="0.32"/>
+      <stop offset="0.60" stop-color="#AA2000" stop-opacity="0.10"/>
+      <stop offset="1"   stop-color="#AA2000" stop-opacity="0"/>
+    </radialGradient>
+
+    <radialGradient id="orbFill" cx="340" cy="340" r="80" gradientUnits="userSpaceOnUse">
+      <stop offset="0"   stop-color="#EE4422"/>
+      <stop offset="0.55" stop-color="#CC1800"/>
+      <stop offset="1"   stop-color="#770800"/>
+    </radialGradient>
+
+    <radialGradient id="pupil" cx="340" cy="340" r="24" gradientUnits="userSpaceOnUse">
+      <stop offset="0"   stop-color="#FFE8A0" stop-opacity="0.85"/>
+      <stop offset="0.50" stop-color="#FFCC66" stop-opacity="0.45"/>
+      <stop offset="1"   stop-color="#FFAA44" stop-opacity="0"/>
+    </radialGradient>
+  </defs>
+
+  <!-- Layer 1: background -->
+  <rect width="680" height="680" fill="url(#bg)"/>
+
+  <!-- Layer 2: outer red-amber glow -->
+  <rect width="680" height="680" fill="url(#outerGlow)"/>
+
+  <!-- Layer 3: outer silver-grey ring (very soft) -->
+  <circle cx="340" cy="340" r="116" fill="none" stroke="#C8C8D0" stroke-width="0.8" opacity="0.08"/>
+
+  <!-- Layer 4: inner silver-grey ring (soft) -->
+  <circle cx="340" cy="340" r="92"  fill="none" stroke="#C8C8D0" stroke-width="1.4" opacity="0.13"/>
+
+  <!-- Layer 5: the orb -->
+  <circle cx="340" cy="340" r="80"  fill="url(#orbFill)"/>
+
+  <!-- Layer 6: pupil yellow bloom -->
+  <circle cx="340" cy="340" r="24"  fill="url(#pupil)"/>
+</svg>
