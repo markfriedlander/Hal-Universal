@@ -1,14 +1,37 @@
 # Hal Universal — Handoff Brief
-**Updated:** May 12, 2026 — Salon Mode revived, RAG perf overhaul, privacy promise restored
+**Updated:** May 12, 2026 (late session) — Curated tier shipped, 5 MLX models verified, real streaming, background-download resilience
 **Branch:** mlx-experiment
 
 ---
 
-## v1.x Status — Salon Mode is back and actually working
+## Late-Session Status (May 12, post-Salon-revival)
 
-The Salon Mode that's been the project's flagship vision for years now works end-to-end with AFM + Gemma running as two seats in the same Hal-turn. Independent mode, Context-Aware mode, and the summarizer/moderator all verified on iPhone 16 Plus. Per-message attribution by model is correct. The maxims about "Hal speaking through different processors" are real on screen, not aspirational.
+Beyond the Salon Mode revival earlier in the session, the late-session push delivered:
 
-This session also fixed a stack of bugs that were either gating release or silently degrading the experience.
+- **Real token streaming** replaces fake-streaming animation (50% wall-clock reduction across all paths).
+- **5 curated MLX models** validated end-to-end on iPhone 16 Plus: Gemma 4 E2B (existing), Phi-4 Mini, Qwen 3.5 2B, Llama 3.2 3B, Dolphin 3.0 (Llama 3.2 3B).
+- **Three-tier Model Library UI**: On Device / Curated / Library (Experimental) — single source of truth via `ModelConfiguration.curatedSeeds`.
+- **First-time hardware-disclosure popup** — sets user expectations about validated hardware before first MLX download or switch.
+- **Background-download mitigations** — `UIApplication.beginBackgroundTask` grace period + persisted in-flight markers + auto-resume on app relaunch. Verified live: Phi-4 download survived an iOS kill+relaunch and continued from partial files.
+- **`@AppStorage("hasSeenHardwareDisclosure")`** + `@AppStorage("inFlightDownloadIDs")` for cross-launch state.
+- **Init-time clamp generalized** — derives allowlist from `curatedSeeds` + AFM so adding a model in one place stays selectable across launches.
+
+### Curated tier voices (validated by single-turn octopus paragraph test)
+
+| Model | Time | Voice signal |
+|---|---|---|
+| Gemma 4 E2B | ~6s (w/ streaming) | philosopher / conceptual |
+| Qwen 3.5 2B | ~17s | versatile generalist |
+| Dolphin 3.0 (Llama 3.2 3B) | ~21s | unhedged — answered "are you conscious" with "ways that **might** be linked to consciousness" |
+| Llama 3.2 3B | ~33s | workhorse baseline |
+| Phi-4 Mini | ~57s | structured / reasoner |
+| AFM | varies | encyclopedic |
+
+The Dolphin response is notable for Maxim #1 work — it's the first model that voluntarily uses "might" instead of flat-refusing the consciousness question.
+
+### Earlier this session
+
+The Salon Mode revival + RAG perf overhaul + privacy fixes from earlier in the day still apply. AFM + Gemma seats speak in the same turn with correct attribution; Context-Aware mode shows seat 2 referencing seat 1; summarizer/moderator integrates both perspectives. Stack of bug fixes that were either gating release or silently degrading the experience also landed.
 
 ### What landed this session (May 12)
 
