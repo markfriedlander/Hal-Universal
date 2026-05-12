@@ -7668,6 +7668,14 @@ struct WidgetTestView: View {
         var footerView: some View {
             VStack(alignment: .trailing, spacing: 2) {
                 if message.isPartial {
+                    // Show the model that's currently generating, alongside the
+                    // spinner and timer, so the user knows which engine is
+                    // producing the response in real time (matches Maxim #2 —
+                    // access to reflection / transparency by default).
+                    // recordedByModel is set on the partial placeholder at
+                    // creation, so the lookup is valid even before generation
+                    // returns.
+                    let activeModelName = ModelCatalogService.shared.getModel(byID: message.recordedByModel)?.displayName ?? message.recordedByModel
                     HStack(spacing: 6) {
                         ProgressView()
                             .scaleEffect(0.8)
@@ -7676,6 +7684,9 @@ struct WidgetTestView: View {
                             .font(.caption2)
                             .foregroundColor(.gray)
                         TimerView(startDate: message.timestamp)
+                        Text("• \(activeModelName)")
+                            .font(.caption2)
+                            .foregroundColor(.gray)
                     }
                     .transition(.opacity)
                     .fixedSize(horizontal: false, vertical: true)
@@ -13343,14 +13354,19 @@ class ModelCatalogService: ObservableObject {
     /// Refreshes the download status for all models in catalog
     func refreshDownloadStates() {
         let downloadManager = MLXModelDownloader.shared
-        
+
         availableModels = availableModels.map { model in
+            // AFM is system-provided, not "downloaded" in the
+            // MLXModelDownloader sense. The downloader will report false
+            // and a nil path for it. Preserve the seed's isDownloaded=true
+            // for AFM so the UI doesn't suggest it needs downloading.
+            guard model.source == .mlx else { return model }
             var updated = model
             updated.isDownloaded = downloadManager.isModelDownloaded(model.id)
             updated.localPath = downloadManager.getModelPath(model.id)
             return updated
         }
-        
+
         print("HALDEBUG-CATALOG: Refreshed download states")
     }
 }

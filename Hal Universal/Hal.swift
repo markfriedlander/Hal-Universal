@@ -7668,6 +7668,14 @@ struct WidgetTestView: View {
         var footerView: some View {
             VStack(alignment: .trailing, spacing: 2) {
                 if message.isPartial {
+                    // Show the model that's currently generating, alongside the
+                    // spinner and timer, so the user knows which engine is
+                    // producing the response in real time (matches Maxim #2 —
+                    // access to reflection / transparency by default).
+                    // recordedByModel is set on the partial placeholder at
+                    // creation, so the lookup is valid even before generation
+                    // returns.
+                    let activeModelName = ModelCatalogService.shared.getModel(byID: message.recordedByModel)?.displayName ?? message.recordedByModel
                     HStack(spacing: 6) {
                         ProgressView()
                             .scaleEffect(0.8)
@@ -7676,6 +7684,9 @@ struct WidgetTestView: View {
                             .font(.caption2)
                             .foregroundColor(.gray)
                         TimerView(startDate: message.timestamp)
+                        Text("• \(activeModelName)")
+                            .font(.caption2)
+                            .foregroundColor(.gray)
                     }
                     .transition(.opacity)
                     .fixedSize(horizontal: false, vertical: true)
