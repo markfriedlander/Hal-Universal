@@ -4213,79 +4213,101 @@ class MLXWrapper: ObservableObject {
     // Unlike generate(prompt:), this lets Gemma (and other chat-template models)
     // see real conversation structure instead of marker-delimited prose-as-user-input.
     func generateChat(messages: [HalChatMessage], temperature: Double = 0.7) async throws -> String {
-        guard isModelLoaded, let container = self.modelContainer else {
-            throw LLMService.LLMError.modelNotLoaded
+        // Drain the streaming variant to keep callers that only want the
+        // final text on a single line.
+        var full = ""
+        for try await chunk in generateChatStream(messages: messages, temperature: temperature) {
+            full = chunk
         }
+        return full
+    }
 
-        halLog("HALDEBUG-MLX-CHAT: Generating from \(messages.count) chat messages (roles: \(messages.map { $0.role.rawValue }.joined(separator: ",")))")
-        let generateStart = Date.timeIntervalSinceReferenceDate
-
-        do {
-            // Convert Hal's role-tagged messages to MLXLMCommon's Chat.Message types.
-            let chatMessages: [Chat.Message] = messages.map { m in
-                switch m.role {
-                case .system:    return .system(m.content)
-                case .user:      return .user(m.content)
-                case .assistant: return .assistant(m.content)
-                }
-            }
-
-            // additionalContext matches Apple's LLMEval reference pattern. Some chat
-            // templates (Qwen3, possibly Gemma 4) consult `enable_thinking` in the
-            // template's Jinja logic; when missing, the template can take a branch
-            // that produces only internal reasoning and no visible output. Empirical
-            // observation: Hal-via-UserInput(chat:) returned empty content for Gemma
-            // until we matched LLMEval's argument shape here.
-            // Seed RNG per LLMEval reference. Without this MLX uses a deterministic
-            // default seed which can produce degenerate sampling sequences.
-            MLX.seed(UInt64(Date.timeIntervalSinceReferenceDate * 1000))
-
-            let userInput = UserInput(
-                chat: chatMessages,
-                additionalContext: ["enable_thinking": false]
-            )
-            let lmInput = try await container.prepare(input: userInput)
-            let promptTokenCount = lmInput.text.tokens.size
-            halLog("HALDEBUG-MLX-CHAT: Input prepared in \(String(format: "%.2f", Date.timeIntervalSinceReferenceDate - generateStart))s; prompt tokens: \(promptTokenCount)")
-
-            // maxTokens raised to 512 now that Gemma generates clean prose (chat-
-            // template fix landed in 71bbd3f). temperature uses Hal's setting.
-            let parameters = GenerateParameters(maxTokens: 512, temperature: Float(temperature))
-            let stream = try await container.generate(input: lmInput, parameters: parameters)
-            let streamStart = Date.timeIntervalSinceReferenceDate
-
-            // Explicit iterator pattern matching LLMEval line-for-line.
-            var iterator = stream.makeAsyncIterator()
-            var fullText = ""
-
-            if let first = await iterator.next() {
-                let ttft = (Date.timeIntervalSinceReferenceDate - streamStart) * 1000
-                halLog("HALDEBUG-MLX-CHAT: First token at \(String(format: "%.0f", ttft))ms")
-                switch first {
-                case .chunk(let text): fullText += text
-                case .info(let info):
-                    halLog("HALDEBUG-MLX-CHAT: Generation complete (first): \(info.generationTokenCount) tokens at \(String(format: "%.1f", info.tokensPerSecond)) tok/s")
-                case .toolCall(_): break
+    /// Streaming variant. Yields the *cumulative* response text after each
+    /// model chunk, so callers can update UI in real time. The final yield
+    /// is the complete trimmed response; stream then finishes. Errors are
+    /// thrown via the stream's failure path.
+    func generateChatStream(messages: [HalChatMessage], temperature: Double = 0.7) -> AsyncThrowingStream<String, Error> {
+        AsyncThrowingStream { continuation in
+            Task {
+                guard isModelLoaded, let container = self.modelContainer else {
+                    halLog("HALDEBUG-MLX-CHAT: Cannot generate - MLX model not loaded")
+                    continuation.finish(throwing: LLMService.LLMError.modelNotLoaded)
+                    return
                 }
 
-                while let next = await iterator.next() {
-                    switch next {
-                    case .chunk(let text): fullText += text
-                    case .info(let info):
-                        halLog("HALDEBUG-MLX-CHAT: Generation complete: \(info.generationTokenCount) tokens at \(String(format: "%.1f", info.tokensPerSecond)) tok/s")
-                    case .toolCall(_): break
+                halLog("HALDEBUG-MLX-CHAT: Generating from \(messages.count) chat messages (roles: \(messages.map { $0.role.rawValue }.joined(separator: ",")))")
+                let generateStart = Date.timeIntervalSinceReferenceDate
+
+                do {
+                    // Convert Hal's role-tagged messages to MLXLMCommon's Chat.Message types.
+                    let chatMessages: [Chat.Message] = messages.map { m in
+                        switch m.role {
+                        case .system:    return .system(m.content)
+                        case .user:      return .user(m.content)
+                        case .assistant: return .assistant(m.content)
+                        }
                     }
-                }
-            } else {
-                halLog("HALDEBUG-MLX-CHAT: Stream produced no items at all (Gemma generated 0 tokens)")
-            }
 
-            MLX.GPU.clearCache()
-            halLog("HALDEBUG-MLX-CHAT: Returning fullText (\(fullText.count) chars): \(fullText.prefix(150))")
-            return fullText.trimmingCharacters(in: CharacterSet.whitespacesAndNewlines)
-        } catch {
-            halLog("HALDEBUG-MLX-CHAT: Error during MLX chat generation: \(error.localizedDescription)")
-            throw LLMService.LLMError.predictionFailed(error)
+                    // additionalContext matches Apple's LLMEval reference pattern.
+                    // Some chat templates (Qwen3, possibly Gemma 4) consult
+                    // enable_thinking in the template's Jinja logic; when missing,
+                    // the template can take a branch that produces only internal
+                    // reasoning and no visible output.
+                    MLX.seed(UInt64(Date.timeIntervalSinceReferenceDate * 1000))
+
+                    let userInput = UserInput(
+                        chat: chatMessages,
+                        additionalContext: ["enable_thinking": false]
+                    )
+                    let lmInput = try await container.prepare(input: userInput)
+                    let promptTokenCount = lmInput.text.tokens.size
+                    halLog("HALDEBUG-MLX-CHAT: Input prepared in \(String(format: "%.2f", Date.timeIntervalSinceReferenceDate - generateStart))s; prompt tokens: \(promptTokenCount)")
+
+                    let parameters = GenerateParameters(maxTokens: 512, temperature: Float(temperature))
+                    let mlxStream = try await container.generate(input: lmInput, parameters: parameters)
+                    let streamStart = Date.timeIntervalSinceReferenceDate
+
+                    var iterator = mlxStream.makeAsyncIterator()
+                    var fullText = ""
+                    var sawFirstToken = false
+
+                    while let event = await iterator.next() {
+                        switch event {
+                        case .chunk(let text):
+                            if !sawFirstToken {
+                                let ttft = (Date.timeIntervalSinceReferenceDate - streamStart) * 1000
+                                halLog("HALDEBUG-MLX-CHAT: First token at \(String(format: "%.0f", ttft))ms")
+                                sawFirstToken = true
+                            }
+                            fullText += text
+                            // Yield the cumulative text so the caller's UI can
+                            // render the partial response as it grows.
+                            continuation.yield(fullText)
+                        case .info(let info):
+                            halLog("HALDEBUG-MLX-CHAT: Generation complete: \(info.generationTokenCount) tokens at \(String(format: "%.1f", info.tokensPerSecond)) tok/s")
+                        case .toolCall(_):
+                            break
+                        }
+                    }
+
+                    if !sawFirstToken {
+                        halLog("HALDEBUG-MLX-CHAT: Stream produced no items at all (model generated 0 tokens)")
+                    }
+
+                    MLX.GPU.clearCache()
+                    let trimmed = fullText.trimmingCharacters(in: CharacterSet.whitespacesAndNewlines)
+                    halLog("HALDEBUG-MLX-CHAT: Returning fullText (\(trimmed.count) chars): \(trimmed.prefix(150))")
+                    // Final yield with the trimmed version so callers settle on
+                    // a clean string. Then finish the stream.
+                    if trimmed != fullText {
+                        continuation.yield(trimmed)
+                    }
+                    continuation.finish()
+                } catch {
+                    halLog("HALDEBUG-MLX-CHAT: Error during MLX chat generation: \(error.localizedDescription)")
+                    continuation.finish(throwing: LLMService.LLMError.predictionFailed(error))
+                }
+            }
         }
     }
 }
@@ -4440,8 +4462,28 @@ class LLMService: ObservableObject {
     // sendMessage/runSingleModelTurn picks the new path. Subsystems like
     // summarization can keep using generateResponse temporarily.
     func generateChatResponse(messages: [HalChatMessage], temperature: Double = 0.7) async throws -> String {
-        halLog("HALDEBUG-RESPONSE: \(currentModel.displayName) (\(currentModel.source)) is responding [chat-path]")
-        halLog("HALDEBUG-LLM: generateChatResponse called - \(messages.count) messages, currentModel: \(currentModel.displayName)")
+        // Drain the streaming variant. Callers that just want the final
+        // string (gate, summarizer, doc summary, reflection, etc.) keep
+        // working without change. UI callers should use the streaming
+        // variant directly so the partial response renders as tokens
+        // arrive instead of after the whole turn completes.
+        var full = ""
+        for try await chunk in generateChatResponseStream(messages: messages, temperature: temperature) {
+            full = chunk
+        }
+        return full
+    }
+
+    /// Streaming variant of `generateChatResponse`. Yields the *cumulative*
+    /// response text after each model chunk. Replaces the previous
+    /// fake-streaming UX (chars/sec animation after generation finished)
+    /// with real token streaming as the model produces output. AFM via
+    /// `session.streamResponse` already produces snapshots whose
+    /// `.content` is the cumulative text; MLX via `MLXWrapper.generateChatStream`
+    /// produces incremental chunks that we accumulate inside the wrapper.
+    func generateChatResponseStream(messages: [HalChatMessage], temperature: Double = 0.7) -> AsyncThrowingStream<String, Error> {
+        halLog("HALDEBUG-RESPONSE: \(currentModel.displayName) (\(currentModel.source)) is responding [chat-path, streaming]")
+        halLog("HALDEBUG-LLM: generateChatResponseStream called - \(messages.count) messages, currentModel: \(currentModel.displayName)")
 
         switch currentModel.source {
         case .appleFoundation:
@@ -4460,25 +4502,34 @@ class LLMService: ObservableObject {
                 halLog("HALDEBUG-LLM-CHAT: AFM session without Instructions")
             }
 
-            do {
-                var accumulatedText = ""
-                let stream = session.streamResponse(options: GenerationOptions(temperature: temperature)) { Prompt(lastUser) }
-                for try await snapshot in stream {
-                    accumulatedText = snapshot.content
+            return AsyncThrowingStream { continuation in
+                Task {
+                    do {
+                        var accumulatedText = ""
+                        let stream = session.streamResponse(options: GenerationOptions(temperature: temperature)) { Prompt(lastUser) }
+                        for try await snapshot in stream {
+                            accumulatedText = snapshot.content
+                            // snapshot.content IS the cumulative text per
+                            // Apple's API contract; just forward it through.
+                            continuation.yield(accumulatedText)
+                        }
+                        halLog("HALDEBUG-LLM-CHAT: AFM response length: \(accumulatedText.count)")
+                        continuation.finish()
+                    } catch {
+                        halLog("HALDEBUG-LLM-CHAT: AFM chat generation error: \(error.localizedDescription)")
+                        continuation.finish(throwing: LLMError.predictionFailed(error))
+                    }
                 }
-                halLog("HALDEBUG-LLM-CHAT: AFM response length: \(accumulatedText.count)")
-                return accumulatedText
-            } catch {
-                halLog("HALDEBUG-LLM-CHAT: AFM chat generation error: \(error.localizedDescription)")
-                throw LLMError.predictionFailed(error)
             }
 
         case .mlx:
             guard mlxWrapper.isModelLoaded else {
                 halLog("HALDEBUG-MLX-CHAT: Cannot generate - MLX model not loaded")
-                throw LLMError.modelNotLoaded
+                return AsyncThrowingStream { continuation in
+                    continuation.finish(throwing: LLMError.modelNotLoaded)
+                }
             }
-            return try await mlxWrapper.generateChat(messages: messages, temperature: temperature)
+            return mlxWrapper.generateChatStream(messages: messages, temperature: temperature)
         }
     }
 
@@ -10510,11 +10561,33 @@ class ChatViewModel: ObservableObject {
                                                                         // a synthetic "prompt" string that approximates what was sent.
                                                                         let prompt = chatMessages.map { "[\($0.role.rawValue)] \($0.content)" }.joined(separator: "\n\n")
 
-                                                                        print("HALDEBUG-MODEL: Sending \(chatMessages.count) chat messages to language model")
+                                                                        halLog("HALDEBUG-MODEL: Sending \(chatMessages.count) chat messages to language model (streaming)")
                                                                         let t0 = Date()
-                                                                        finalText = try await llmService.generateChatResponse(messages: chatMessages, temperature: temperature)
+                                                                        // REAL STREAMING (replaces former fake-streaming animation at
+                                                                        // 100 chars/sec). Updates the partial message's content as
+                                                                        // tokens arrive — the UI sees the response materialise at the
+                                                                        // model's actual generation rate instead of waiting for the
+                                                                        // whole turn to finish, then watching a synthetic typewriter.
+                                                                        // For Gemma 4 E2B (~33 tok/s ≈ 150 chars/s) this is faster
+                                                                        // than the old 100 cps fake stream AND starts immediately on
+                                                                        // first token. Generation timing (modelTime) is captured
+                                                                        // around the whole stream so thinkingDuration stays meaningful.
+                                                                        finalText = ""
+                                                                        do {
+                                                                            let stream = llmService.generateChatResponseStream(messages: chatMessages, temperature: temperature)
+                                                                            for try await chunk in stream {
+                                                                                finalText = chunk
+                                                                                if let i = messages.firstIndex(where: { $0.id == pid }) {
+                                                                                    messages[i].content = chunk
+                                                                                }
+                                                                            }
+                                                                        } catch {
+                                                                            // Rethrow so the existing catch block handles the error state
+                                                                            modelTime = Date().timeIntervalSince(t0)
+                                                                            throw error
+                                                                        }
                                                                         modelTime = Date().timeIntervalSince(t0)
-                                                                        print("HALDEBUG-LLM: ÃƒÆ’Ã‚Â¢Ãƒâ€¦Ã¢â‚¬Å“ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â¦ Non-streaming generation complete. Length: \(finalText.count)")
+                                                                        halLog("HALDEBUG-LLM: Streaming generation complete. Length: \(finalText.count), elapsed: \(String(format: "%.2f", modelTime))s")
 
                                                                         usedCtx = fullRAGContext.isEmpty ? nil : fullRAGContext
                                                                         if let ctx = usedCtx {
@@ -10530,25 +10603,11 @@ class ChatViewModel: ObservableObject {
                                                                             completion: text
                                                                         )
 
-                                                                        // Status Stage 4: Fake streaming (hardcoded for fast display)
-                                                                        let cps: Double = 100.0  // Characters per second
-                                                                        var idx = text.startIndex, acc = ""
-                                                                        while idx < text.endIndex {
-                                                                            let rem = text[idx...]
-                                                                            let n = min(max(4, Int.random(in: 6...18)), rem.count)
-                                                                            let next = text.index(idx, offsetBy: n, limitedBy: text.endIndex) ?? text.endIndex
-                                                                            let chunk = String(text[idx..<next]); idx = next; acc += chunk
-
-                                                                            if let i = messages.firstIndex(where: { $0.id == pid }) {
-                                                                                messages[i].content = acc
-                                                                                // FIXED: Removed NotificationCenter post
-                                                                            }
-
-                                                                            let base = max(0.03, Double(chunk.count)/cps)
-                                                                            try await Task.sleep(nanoseconds: UInt64(base * 1_000_000_000))
-                                                                            if let last = chunk.last, ".!?\n".contains(last) {
-                                                                                try await Task.sleep(nanoseconds: 50_000_000)  // 50ms pause for readability
-                                                                            }
+                                                                        // Final settle: write the trimmed/cleaned text in case the
+                                                                        // last streamed chunk had leading/trailing whitespace or
+                                                                        // repetition that removeRepetitivePatterns stripped.
+                                                                        if let i = messages.firstIndex(where: { $0.id == pid }), messages[i].content != text {
+                                                                            messages[i].content = text
                                                                         }
 
                                                                         let thinking = modelTime
@@ -10891,41 +10950,47 @@ class ChatViewModel: ObservableObject {
                                                                         }
                                                                         try? await Task.sleep(nanoseconds: 300_000_000)
 
-                                                                        print("HALDEBUG-SALON: Sending \(chatMessages.count) context-aware chat messages to model")
+                                                                        halLog("HALDEBUG-SALON: Sending \(chatMessages.count) context-aware chat messages to model (streaming)")
                                                                         let t0 = Date()
-                                                                        finalText = try await llmService.generateChatResponse(messages: chatMessages, temperature: temperature)
+                                                                        // REAL STREAMING (replaces fake-streaming animation). Salon
+                                                                        // seats now render their response as the chosen model
+                                                                        // generates it — the user can watch each seat speak in
+                                                                        // real time. Especially important for context-aware mode
+                                                                        // where seats sequentially contribute different
+                                                                        // perspectives; the visual rhythm matches the underlying
+                                                                        // sequential thinking.
+                                                                        finalText = ""
+                                                                        do {
+                                                                            let stream = llmService.generateChatResponseStream(messages: chatMessages, temperature: temperature)
+                                                                            for try await chunk in stream {
+                                                                                finalText = chunk
+                                                                                if let i = messages.firstIndex(where: { $0.id == pid }) {
+                                                                                    messages[i].content = chunk
+                                                                                }
+                                                                            }
+                                                                        } catch {
+                                                                            modelTime = Date().timeIntervalSince(t0)
+                                                                            throw error
+                                                                        }
                                                                         modelTime = Date().timeIntervalSince(t0)
-                                                                        print("HALDEBUG-SALON: Context-aware generation complete. Length: \(finalText.count)")
-                                                                        
+                                                                        halLog("HALDEBUG-SALON: Context-aware streaming complete. Length: \(finalText.count), elapsed: \(String(format: "%.2f", modelTime))s")
+
                                                                         let text = removeRepetitivePatterns(from: finalText).trimmingCharacters(in: .whitespacesAndNewlines)
-                                                                        
+
                                                                         // Calculate token breakdown
                                                                         let tokenBreakdown = calculateTokenBreakdown(
                                                                             prompt: prompt,
                                                                             userInput: userInput,
                                                                             completion: text
                                                                         )
-                                                                        
-                                                                        // Fake streaming
-                                                                        let cps: Double = 100.0
-                                                                        var idx = text.startIndex, acc = ""
-                                                                        while idx < text.endIndex {
-                                                                            let rem = text[idx...]
-                                                                            let n = min(max(4, Int.random(in: 6...18)), rem.count)
-                                                                            let next = text.index(idx, offsetBy: n, limitedBy: text.endIndex) ?? text.endIndex
-                                                                            let chunk = String(text[idx..<next]); idx = next; acc += chunk
-                                                                            
-                                                                            if let i = messages.firstIndex(where: { $0.id == pid }) {
-                                                                                messages[i].content = acc
-                                                                            }
-                                                                            
-                                                                            let base = max(0.03, Double(chunk.count)/cps)
-                                                                            try await Task.sleep(nanoseconds: UInt64(base * 1_000_000_000))
-                                                                            if let last = chunk.last, ".!?\n".contains(last) {
-                                                                                try await Task.sleep(nanoseconds: 50_000_000)
-                                                                            }
+
+                                                                        // Final settle: write the trimmed/cleaned text in case the
+                                                                        // last streamed chunk had leading/trailing whitespace or
+                                                                        // repetition that removeRepetitivePatterns stripped.
+                                                                        if let i = messages.firstIndex(where: { $0.id == pid }), messages[i].content != text {
+                                                                            messages[i].content = text
                                                                         }
-                                                                        
+
                                                                         let thinking = modelTime
                                                                         
                                                                         await MainActor.run {
