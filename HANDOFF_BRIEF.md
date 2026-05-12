@@ -1,36 +1,51 @@
 # Hal Universal — Handoff Brief
-**Updated:** May 11, 2026 — v1.x release prep
+**Updated:** May 12, 2026 — Salon Mode revived, RAG perf overhaul, privacy promise restored
 **Branch:** mlx-experiment
 
 ---
 
-## v1.x Release Status — Ready for Mark's Hardware Validation
+## v1.x Status — Salon Mode is back and actually working
 
-Per `Docs/CC_V1x_Release_Brief.md` from Strategic Claude, this session prepped a fix-and-stabilize release with Gemma 4 E2B as the local-inference option. Done autonomously on Mac while Mark is out with the phone.
+The Salon Mode that's been the project's flagship vision for years now works end-to-end with AFM + Gemma running as two seats in the same Hal-turn. Independent mode, Context-Aware mode, and the summarizer/moderator all verified on iPhone 16 Plus. Per-message attribution by model is correct. The maxims about "Hal speaking through different processors" are real on screen, not aspirational.
 
-### What landed this session
+This session also fixed a stack of bugs that were either gating release or silently degrading the experience.
+
+### What landed this session (May 12)
 
 | Commit | What |
 |---|---|
-| `da94d28` | Model UI filter (AFM + Gemma 4 E2B only) + Salon Mode hidden behind `salonModeExposedInUI = false` flag |
-| `(icon)` | New app icon per visual spec (red-orange orb, silver rings, yellowish pupil bloom) |
-| `824b7fb` | `selectedModelID` clamp in `ChatViewModel.init` for upgraders with non-allowlisted MLX models; reverted salon force-off at init (caused a sendMessage regression) |
+| `6359bef` | Fix Gemma load (catalog isDownloaded was stale from cold seed), RAG `maxResults` honored (4s saved per turn), RAG gate routes through selected model (privacy + 3.4s saved), doc-summary AFM guard removed (Finding #3), salon upgrade hazard fixed (different approach, no sendMessage regression), AFM duplicate catalog entry fixed, Privacy Manifest added, CLAUDE.md min iOS → 26 |
+| `cca7ebb` | Show generating-model name next to spinner+timer in the partial chat footer (Maxim #2 transparency win) |
+| `72c64d7` | **Salon Mode revival** — seat-switch now actually calls `setupLLM` (was a silent no-op), `keepMlxResident` flag keeps Gemma warm across mixed-source seats, `selectedModelID` saved/restored around the multi-seat turn, salon UI re-exposed, full salon API surface (`SALON_*` commands) added for external testing |
 
-All builds clean: `generic/platform=iOS`, `iOS Simulator (iPhone 17 Pro)`. App launches in simulator without crash. No new asset-catalog warnings.
+### Measured perf improvement on iPhone 16 Plus (memory-needing turn)
 
-### What was verified
+| Phase | Before | After |
+|---|---|---|
+| RAG gate | 4.7s (AFM regardless of mode) | 1.3s (selected model — Gemma is actually faster) |
+| Memory search | 1.2s (no cap) | 0.5s (capped at 10 snippets) |
+| LLM prefill | 7.4s (5945 prompt tokens) | 3.5s (2719 prompt tokens) |
+| LLM generation | 2.1s | 2.0s |
+| **Total turn** | **20.5s** | **12.2s** |
 
-- **Build stability:** Clean compile for both physical-iPhone destination and simulator.
-- **App icon:** Asset catalog accepts all three variants (light, dark, tinted-luminance-map). No actool warnings.
-- **Catalog-display fix (commit `90e8097`):** Verified live on Mark's iPhone earlier in the session — `selectedModelDisplayName` correctly shows `"gemma-4-e2b-it-4bit"` instead of `"Apple Intelligence"`.
-- **Filter:** ModelLibraryView source code shows the allowlist `["apple-foundation-models", "mlx-community/gemma-4-e2b-it-4bit"]` applied at all three sections (built-in, downloaded, available). No other model can be reached through the user-facing UI.
-- **Salon hidden:** `ActionsView.powerUserSection` no longer renders the Single/Multi LLM segmented picker. Only "Single LLM Settings" button is reachable.
+40% faster end-to-end. Simple non-memory turns went from ~14s to ~5s.
 
-### What needs Mark's phone to verify
+### Verified live on iPhone 16 Plus (May 12)
 
-- **Gemma generation on iPhone 16 Plus.** Last session this morning was at 33-37 tok/s. The intermediate test on the phone during this session showed an unrelated sendMessage regression that was caused by an init-time mutation of `salonConfig.isEnabled` — that mutation has been reverted (commit `824b7fb`). The current build should restore the working chat flow.
-- **`screenWidth = 0` fix end-to-end** — only reproducible on cold launch / scene-state-transition timing, which doesn't occur reliably in simulator. The `screenWidth` property now has a three-tier fallback (any non-background scene → UIScreen.main → hardcoded 390); fix landed at commit `00bf3a7`.
-- **Icon at device scale** — looks correct in asset catalog; final visual check is on physical hardware.
+- **Gemma load** is reliable from cold launch and across AFM↔Gemma switching (was silently failing because `setupLLM` trusted the catalog's stale `isDownloaded` flag from the cold seed; now resolves disk reality directly + catalog refreshes at init)
+- **Gemma generation:** 35.1 tok/s (was assumed 33; AFM is ~43 — closer than I'd assumed)
+- **Per-turn perf:** 20.5s → 12.2s on memory-needing turn (40% faster)
+- **RAG gate routes through selected model** — privacy promise restored AND faster in Gemma mode (Gemma prefill ~800 tok/s vs AFM ~138 tok/s for the gate prompt)
+- **Salon Mode independent:** AFM seat 1 + Gemma seat 2 both generate, correctly attributed
+- **Salon Mode context-aware:** Gemma seat 2 references seat 1's AFM response ("as we've discussed")
+- **Salon Mode summarizer:** AFM moderator emits "📋 Summary: …" integrating both seats
+- **Partial-state footer** shows `Processing... [timer] • [model name]` so the user sees which engine is generating in real time
+
+### Diagnostic surface added
+
+- `MLX_STATE` — full snapshot of wrapper state + catalog + disk for the currently selected model
+- `SALON_GET_STATE` / `SALON_SET_ENABLED` / `SALON_SET_SEAT:<1-4>:<modelID|empty>` / `SALON_SET_MODE:<independent|contextAware>` / `SALON_SET_SUMMARIZER:<modelID|empty>`
+- Promoted many `print()` calls in MLX setup/load, RAG gate, tool router, memory search, and salon orchestration to `halLog` so they're queryable via `GET_LOGS` (was previously stdout-only and invisible to the API)
 
 ### Multi-app port family (resolved May 12)
 
