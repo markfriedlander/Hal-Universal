@@ -12945,6 +12945,32 @@ class BackgroundDownloadCoordinator: NSObject, URLSessionDownloadDelegate, Obser
             self.backgroundCompletionHandler = nil
         }
     }
+
+    // MARK: - Cancellation
+
+    /// Cancel all in-flight download tasks for a specific model. Called by
+    /// MLXModelDownloader.startDownload when the user explicitly cancels via
+    /// the UI. Background URLSession cancellation propagates as
+    /// `URLError.cancelled` to didCompleteWithError, where we remove the
+    /// per-task context. We also drop the per-model bookkeeping here so a
+    /// follow-up retry starts clean.
+    func cancelDownload(modelID: String) async {
+        halLog("HALDEBUG-BGDL: cancelDownload requested for \(modelID)")
+        let allTasks = await session.allTasks
+        var cancelled = 0
+        for task in allTasks {
+            if let context = contextLookup(task.taskIdentifier), context.modelID == modelID {
+                task.cancel()
+                cancelled += 1
+            }
+        }
+        halLog("HALDEBUG-BGDL: Cancelled \(cancelled) in-flight task(s) for \(modelID)")
+        await MainActor.run {
+            self.filesPendingByModel.removeValue(forKey: modelID)
+            self.bytesWrittenByModel.removeValue(forKey: modelID)
+            self.bytesExpectedByModel.removeValue(forKey: modelID)
+        }
+    }
 }
 
 // MARK: - MLX Model Downloader (Singleton)
@@ -13381,111 +13407,42 @@ class MLXModelDownloader: ObservableObject {
             }
 
             do {
-                print("HALDEBUG-DOWNLOAD: Starting download for \(modelID) from \(repoID)")
+                halLog("HALDEBUG-DOWNLOAD: Starting download for \(modelID) from \(repoID) via BackgroundDownloadCoordinator")
 
-                // Download model using HubApi. Progress callback used only as fallback
-                // when sizeGB is unknown — otherwise the polling task drives progress.
-                // Match mlx-swift-lm's modelDownloadPatterns (Libraries/MLXLMCommon/ModelFactory.swift):
-                //   ["*.safetensors"] + ["*.json", "*.jinja"]
-                // The "*.jinja" pattern is CRITICAL — modern HF models (Gemma 4, etc.) ship
-                // chat templates in a separate chat_template.jinja file, not in tokenizer_config.json.
-                // Without it, the tokenizer throws TokenizerError.missingChatTemplate and the LLM
-                // input processor falls back to joining message content with "\n\n", producing
-                // degenerate output (echo, repetition) because role markers are lost.
-                let modelURL = try await HubApi.default.snapshot(from: repoID, matching: ["*.safetensors", "*.json", "*.jinja"]) { progress in
-                    guard expectedBytes == 0 else { return }
-                    Task { @MainActor in
-                        if var state = self.downloadStates[modelID] {
-                            state.progress = progress.fractionCompleted
-                            state.message = "Downloading \(Int(progress.fractionCompleted * 100))%..."
-                            self.downloadStates[modelID] = state
-                        }
-                    }
-                }
-                
-                await MainActor.run {
-                    print("HALDEBUG-DOWNLOAD: Download complete for \(modelID)")
-                    print("HALDEBUG-DOWNLOAD: Model URL: \(modelURL)")
-                    
-                    // Determine final path (HubApi returns repo directory, we want models/<modelID>)
-                    let finalURL = modelURL
-                    
-                    // DIAGNOSTIC: Verify the path exists
-                    let pathExists = FileManager.default.fileExists(atPath: finalURL.path)
-                    print("HALDEBUG-DOWNLOAD:    FileManager.fileExists: \(pathExists)")
-                    print("HALDEBUG-DOWNLOAD:    finalURL.path: \(finalURL.path)")
-                    print("HALDEBUG-DOWNLOAD:    finalURL.absoluteString: \(finalURL.absoluteString)")
-                    
-                    if pathExists {
-                        var isDirectory: ObjCBool = false
-                        FileManager.default.fileExists(atPath: finalURL.path, isDirectory: &isDirectory)
-                        print("HALDEBUG-DOWNLOAD:    Is directory: \(isDirectory.boolValue)")
-                        
-                        if isDirectory.boolValue {
-                            do {
-                                let contents = try FileManager.default.contentsOfDirectory(atPath: finalURL.path)
-                                print("HALDEBUG-DOWNLOAD:    Directory contains \(contents.count) files")
-                                for (index, file) in contents.prefix(5).enumerated() {
-                                    print("HALDEBUG-DOWNLOAD:       [\(index + 1)] \(file)")
-                                }
-                                if contents.count > 5 {
-                                    print("HALDEBUG-DOWNLOAD:       ... and \(contents.count - 5) more files")
-                                }
-                            } catch {
-                                print("HALDEBUG-DOWNLOAD:    ❌ Could not list directory: \(error.localizedDescription)")
-                            }
-                        }
-                    } else {
-                        print("HALDEBUG-DOWNLOAD:    ⚠️ WARNING: Path does NOT exist immediately after download!")
-                    }
-                    
-                    // Save model ID to persistent storage
-                    var modelIDs = self.downloadedModelIDs
-                    modelIDs.insert(modelID)
-                    self.downloadedModelIDs = modelIDs
-                    print("HALDEBUG-DOWNLOAD:    Saved model ID to UserDefaults: \(modelID)")
+                // Replaces HubApi.snapshot. The coordinator enqueues a
+                // background URLSession download task per file (matching
+                // the same MLX patterns: *.safetensors, *.json, *.jinja)
+                // and returns once enqueueing is done. The actual downloads
+                // run in iOS-managed background tasks that survive app
+                // suspension and termination — which fixes the "user
+                // pockets the phone mid-download" case from yesterday.
+                try await BackgroundDownloadCoordinator.shared.startDownload(modelID: modelID, repoID: repoID)
 
-                    // Clear the in-flight marker — download fully completed,
-                    // resume-on-launch won't fire for this model again.
-                    self.clearInFlight(modelID)
-                    
-                    // Update state
-                    var state = self.downloadStates[modelID] ?? DownloadState(
-                        isDownloading: false,
-                        progress: 1.0,
-                        message: "Model ready.",
-                        error: nil,
-                        localPath: finalURL
-                    )
+                // If every file was already present on disk (e.g. an interrupted
+                // download we're resuming), the coordinator may have posted the
+                // completion notification before we got here. Check first.
+                let alreadyComplete = await MainActor.run { self.isModelDownloaded(modelID) }
+                if alreadyComplete {
+                    halLog("HALDEBUG-DOWNLOAD: \(modelID) already complete on coordinator start; treating as done")
                     progressPollingTask?.cancel()
-                    state.isDownloading = false
-                    state.progress = 1.0
-                    state.message = "Model ready."
-                    state.localPath = finalURL
-                    self.downloadStates[modelID] = state
-
-                    // Clear current download tracking
-                    self.currentDownloadTask = nil
-                    self.currentDownloadModelID = nil
-                    
-                    // Update cache size
-                    Task {
-                        await self.updateCacheSize()
-                    }
-                    
-                    // Notify observers
-                    NotificationCenter.default.post(
-                        name: .mlxModelDidDownload,
-                        object: nil,
-                        userInfo: ["modelID": modelID]
-                    )
-                    
-                    print("HALDEBUG-DOWNLOAD: ✅ Download completed successfully for \(modelID)")
-                    
-                    // Process next item in queue if any
-                    self.processNextInQueue()
+                    return
                 }
+
+                // Wait for the .mlxModelDidDownload notification matching
+                // this modelID. The coordinator's notifyModelDownloadComplete
+                // posts it AND calls markModelAsDownloadedFromBackground,
+                // which handles ALL the success bookkeeping (DownloadState,
+                // downloadedModelIDs, in-flight marker, currentDownloadTask
+                // clear, queue advance, cache size). So all we do here on
+                // success is cancel the polling task and log.
+                try await self.waitForModelCompletion(modelID: modelID)
+                progressPollingTask?.cancel()
+                halLog("HALDEBUG-DOWNLOAD: ✅ Download notification received for \(modelID); coordinator handled bookkeeping")
             } catch is CancellationError {
+                // User explicit cancel via the UI. Tell the coordinator to
+                // tear down its background URLSession tasks for this model so
+                // they don't continue burning bandwidth after the cancel.
+                await BackgroundDownloadCoordinator.shared.cancelDownload(modelID: modelID)
                 progressPollingTask?.cancel()
                 await MainActor.run {
                     if var state = self.downloadStates[modelID] {
@@ -13500,7 +13457,7 @@ class MLXModelDownloader: ObservableObject {
                     // User explicitly cancelled — don't auto-resume on next launch.
                     self.clearInFlight(modelID)
 
-                    print("HALDEBUG-DOWNLOAD: Download cancelled for \(modelID); in-flight marker cleared")
+                    print("HALDEBUG-DOWNLOAD: Download cancelled for \(modelID); coordinator tasks cancelled; in-flight marker cleared")
 
                     // Process next item in queue if any
                     self.processNextInQueue()
@@ -13652,6 +13609,22 @@ class MLXModelDownloader: ObservableObject {
     func isModelDownloaded(_ modelID: String) -> Bool {
         return downloadedModelIDs.contains(modelID) &&
                FileManager.default.fileExists(atPath: modelPath(for: modelID).path)
+    }
+
+    /// Waits asynchronously for the `.mlxModelDidDownload` notification that
+    /// matches the given `modelID`. Used by startDownload to keep its
+    /// currentDownloadTask alive for the duration of the actual download even
+    /// though `BackgroundDownloadCoordinator.startDownload` returns
+    /// immediately after enqueueing the file tasks. Cancellation propagates
+    /// through Task.checkCancellation.
+    private func waitForModelCompletion(modelID: String) async throws {
+        let notifications = NotificationCenter.default.notifications(named: .mlxModelDidDownload)
+        for await notification in notifications {
+            try Task.checkCancellation()
+            if let id = notification.userInfo?["modelID"] as? String, id == modelID {
+                return
+            }
+        }
     }
 
     /// Called by `BackgroundDownloadCoordinator` once all files for a model
