@@ -4377,7 +4377,40 @@ class LLMService: ObservableObject {
                     var resolvedModel = model
                     resolvedModel.isDownloaded = true
                     resolvedModel.localPath = resolvedPath
+
+                    // SMART MLX→MLX SWAP. If a different MLX model is currently
+                    // loaded (e.g. Salon Mode switching from Gemma seat to
+                    // Dolphin seat), iPhone 16 Plus does not have headroom to
+                    // hold both 4-bit ~3GB models in memory simultaneously
+                    // during the load. The previous behaviour silently relied
+                    // on MLX's load path overwriting the wrapper's container
+                    // reference, hoping iOS would reclaim before the load
+                    // peaks — which it did not, and a 3-seat salon turn
+                    // OOM-killed Hal mid-load last night. Now we explicitly
+                    // drop the previous container + clear the GPU cache +
+                    // give iOS a beat to reclaim memory BEFORE the new load
+                    // begins, trading ~500ms of seat-transition latency for a
+                    // crash-free swap.
+                    let isMLXToMLXSwap = mlxWrapper.isModelLoaded
+                        && (mlxWrapper.currentModelConfig?.id != model.id)
+                    if isMLXToMLXSwap {
+                        let prevID = mlxWrapper.currentModelConfig?.id ?? "?"
+                        halLog("HALDEBUG-MLX: MLX→MLX swap detected (\(prevID) → \(model.id)); unloading previous + clearing GPU cache before load")
+                        mlxWrapper.unloadModel()
+                        MLX.GPU.clearCache()
+                    }
+
                     Task {
+                        // For an MLX→MLX swap, give iOS a brief beat to
+                        // reclaim the just-freed memory before we trigger
+                        // the next load. 500ms is empirical — long enough
+                        // for the OS to actually drop the pages, short
+                        // enough that the user-perceived seat transition
+                        // stays sub-second on top of the load time.
+                        if isMLXToMLXSwap {
+                            try? await Task.sleep(nanoseconds: 500_000_000)
+                            halLog("HALDEBUG-MLX: 500ms memory-reclaim settle complete; starting load for \(model.displayName)")
+                        }
                         await self.mlxWrapper.loadModel(modelConfig: resolvedModel)
                         if let mlxError = self.mlxWrapper.mlxError {
                             await MainActor.run {
@@ -4986,11 +5019,41 @@ struct HistoricalContext {
 }
 
 // MARK: - App Entry Point (for iOS)
+// MARK: - App Delegate (background URLSession dispatch)
+//
+// SwiftUI's @main App lifecycle doesn't directly expose
+// `application:handleEventsForBackgroundURLSession:completionHandler:`,
+// which iOS calls when the system wakes the app to deliver completion
+// events for a background URLSession (used by the model downloader so
+// downloads continue while the app is suspended or terminated).
+// `UIApplicationDelegateAdaptor` bridges UIKit's AppDelegate methods
+// into SwiftUI's App.
+class HalAppDelegate: NSObject, UIApplicationDelegate {
+    func application(_ application: UIApplication,
+                     handleEventsForBackgroundURLSession identifier: String,
+                     completionHandler: @escaping () -> Void) {
+        halLog("HALDEBUG-BGDL: AppDelegate received handleEventsForBackgroundURLSession id=\(identifier)")
+        if identifier == BackgroundDownloadCoordinator.backgroundSessionID {
+            BackgroundDownloadCoordinator.shared.backgroundCompletionHandler = completionHandler
+        } else {
+            completionHandler()
+        }
+    }
+}
+
 @main
 struct Hal10000App: App {
+    @UIApplicationDelegateAdaptor(HalAppDelegate.self) var appDelegate
     @StateObject private var chatViewModel = ChatViewModel()
     @StateObject private var documentImportManager = DocumentImportManager.shared
     @StateObject private var mlxDownloader = MLXModelDownloader.shared // Inject MLXModelDownloader
+
+    init() {
+        // Eagerly construct the background download coordinator so its URLSession
+        // is wired up before iOS dispatches any pending completion events on
+        // app launch (e.g. when iOS wakes us to deliver a finished download).
+        _ = BackgroundDownloadCoordinator.shared
+    }
 
     var body: some Scene {
         WindowGroup {
@@ -6353,7 +6416,14 @@ struct SystemPromptEditorView: View {
 struct SalonModeView: View {
     @EnvironmentObject var chatViewModel: ChatViewModel
     @Environment(\.dismiss) var dismiss
-    
+
+    // Seats 3 and 4 are gated until smart MLX-swap (option 2) is fully
+    // proven on hardware. The data model still supports four seats — flipping
+    // this back to `true` restores the full UI. Keep in sync with the
+    // matching cap in `runSalonTurn` (which limits activeSeats to 2 when
+    // this flag is `false`).
+    static let exposeSeatsThreeAndFour: Bool = false
+
     var body: some View {
         NavigationView {
             Form {
@@ -6374,27 +6444,38 @@ struct SalonModeView: View {
                             Text(model.displayName).tag(model.id as String?)
                         }
                     }
-                    
-                    // Seat 3
-                    Picker("Seat 3 (Third)", selection: $chatViewModel.salonConfig.seat3) {
-                        Text("Empty").tag(nil as String?)
-                        ForEach(chatViewModel.usableModels, id: \.id) { model in
-                            Text(model.displayName).tag(model.id as String?)
+
+                    // Seats 3 and 4 are deliberately hidden in this release.
+                    // 3+ seats with multiple MLX models exceeds iPhone 16 Plus
+                    // memory headroom — iOS OOM-kills the app mid-turn during
+                    // the second MLX-to-MLX model swap. The seats remain in
+                    // the data model (and `runSalonTurn` will still execute
+                    // any persisted values from an upgrader), so we can
+                    // re-expose them once option-2's smart MLX-swap (explicit
+                    // unload + GPU cache clear + memory-reclaim delay) is in
+                    // place. Until then we cap salon at 2 seats — verified
+                    // safe with AFM + Gemma in earlier testing.
+                    if Self.exposeSeatsThreeAndFour {
+                        Picker("Seat 3 (Third)", selection: $chatViewModel.salonConfig.seat3) {
+                            Text("Empty").tag(nil as String?)
+                            ForEach(chatViewModel.usableModels, id: \.id) { model in
+                                Text(model.displayName).tag(model.id as String?)
+                            }
+                        }
+                        Picker("Seat 4 (Fourth)", selection: $chatViewModel.salonConfig.seat4) {
+                            Text("Empty").tag(nil as String?)
+                            ForEach(chatViewModel.usableModels, id: \.id) { model in
+                                Text(model.displayName).tag(model.id as String?)
+                            }
                         }
                     }
-                    
-                    // Seat 4
-                    Picker("Seat 4 (Fourth)", selection: $chatViewModel.salonConfig.seat4) {
-                        Text("Empty").tag(nil as String?)
-                        ForEach(chatViewModel.usableModels, id: \.id) { model in
-                            Text(model.displayName).tag(model.id as String?)
-                        }
-                    }
-                    
+
                 } header: {
                     Label("Active Seats", systemImage: "person.3")
                 } footer: {
-                    Text("Each seat selects a model or Empty. Order is fixed by seat number.")
+                    Text(Self.exposeSeatsThreeAndFour
+                         ? "Each seat selects a model or Empty. Order is fixed by seat number."
+                         : "Two seats let two AI voices speak in turn. More seats will be available once memory management for multi-MLX-model swapping is finished.")
                         .font(.caption)
                 }
                 
@@ -10981,13 +11062,34 @@ class ChatViewModel: ObservableObject {
                                                                 
                                                                 // Salon Mode turn execution
                                                                 private func runSalonTurn(userInput: String) async {
-                                                                    let activeSeats = salonConfig.activeSeats
-                                                                    
+                                                                    // Cap to the first 2 active seats while
+                                                                    // SalonModeView.exposeSeatsThreeAndFour is false.
+                                                                    // An iPhone 16 Plus crashed last night during a
+                                                                    // 3-seat salon (AFM + Gemma + Dolphin) when iOS
+                                                                    // OOM-killed Hal during the second MLX-to-MLX
+                                                                    // model swap. The UI hides seats 3/4, but an
+                                                                    // upgrader with persisted seat3/seat4 values
+                                                                    // would still pass them through here without this
+                                                                    // safety. The cap will be removed once option-2's
+                                                                    // smart MLX-swap (explicit unload + GPU cache
+                                                                    // clear + memory-reclaim delay) is verified at
+                                                                    // 3+ seats.
+                                                                    let fullActiveSeats = salonConfig.activeSeats
+                                                                    let activeSeats: [(position: Int, modelID: String)]
+                                                                    if SalonModeView.exposeSeatsThreeAndFour {
+                                                                        activeSeats = fullActiveSeats
+                                                                    } else {
+                                                                        activeSeats = Array(fullActiveSeats.prefix(2))
+                                                                        if fullActiveSeats.count > 2 {
+                                                                            halLog("HALDEBUG-SALON: Capping salon turn from \(fullActiveSeats.count) active seats to 2 (3+ seats temporarily disabled — see SalonModeView.exposeSeatsThreeAndFour)")
+                                                                        }
+                                                                    }
+
                                                                     guard !activeSeats.isEmpty else {
-                                                                        print("HALDEBUG-SALON: No active seats configured")
+                                                                        halLog("HALDEBUG-SALON: No active seats configured")
                                                                         return
                                                                     }
-                                                                    
+
                                                                     halLog("HALDEBUG-SALON: Starting Salon turn with \(activeSeats.count) active seats; userInput length=\(userInput.count)")
 
                                                                     // SALON FIX: Store user message ONCE before seats execute
@@ -12507,6 +12609,344 @@ struct DocumentImportSummary {
 
 // ==== LEGO START: 29 MLX Model Downloader (Singleton) ====
 
+// MARK: - Background Download Coordinator
+//
+// True iOS-style background downloader for HuggingFace MLX models. Replaces
+// HubApi.snapshot's foreground URLSession with a `URLSessionConfiguration.background`
+// session so model downloads continue while the app is suspended OR terminated.
+// iOS delivers completion events to `HalAppDelegate.application(_:handleEventsForBackgroundURLSession:completionHandler:)`
+// even after the app process has been killed; we reconnect to the in-flight
+// session by re-instantiating the URLSession with the same identifier.
+//
+// Design overview:
+//   - One URLSession with a fixed background identifier (process-wide singleton).
+//   - For each model, we fetch the file list from the HF tree API, filter by
+//     MLX-compatible patterns (*.safetensors, *.json, *.jinja — same set
+//     mlx-swift-lm uses), and enqueue a download task per file.
+//   - Per-task metadata (modelID, target path) is persisted in UserDefaults
+//     so callbacks delivered after a relaunch can route correctly even
+//     though the in-memory map was wiped by termination.
+//   - When all files for a model land, we post `.mlxModelDidDownload` —
+//     same notification the legacy HubApi path used, so downstream
+//     observers (catalog refresh, MLX wrapper loading) keep working unchanged.
+//
+// What this DOESN'T preserve from HubApi:
+//   - LFS pointer resolution beyond what the resolve URL handles
+//   - Authenticated repo access via HF_TOKEN (curated models are all public)
+//   - Symlinked file deduplication across revisions
+//
+// All three are acceptable losses for the curated public-model use case.
+class BackgroundDownloadCoordinator: NSObject, URLSessionDownloadDelegate, ObservableObject {
+    static let shared = BackgroundDownloadCoordinator()
+
+    /// Background URLSession identifier. Must be stable across app launches so
+    /// iOS can reconnect us to in-flight downloads from a previous run.
+    static let backgroundSessionID = "com.MarkFriedlander.Hal-Universal.modelDownload.v1"
+
+    /// Completion handler passed in by `HalAppDelegate`. Invoked once all
+    /// pending background events have been processed so iOS knows it's safe
+    /// to suspend us again.
+    var backgroundCompletionHandler: (() -> Void)?
+
+    // MARK: - Per-Task Persisted Metadata
+    //
+    // URLSession.background tasks survive app termination, but our in-memory
+    // taskIdentifier → context mapping does not. We persist it to disk so
+    // delegate callbacks on the next launch can still route to the right
+    // model. Keyed by URLSessionTask.taskIdentifier (Int as String).
+    struct TaskContext: Codable {
+        let modelID: String     // e.g. "mlx-community/Phi-4-mini-instruct-4bit"
+        let filename: String    // e.g. "model.safetensors"
+        let targetPath: String  // absolute path where the finished file lands
+    }
+
+    private let taskContextDefaultsKey = "bgDownloadTaskContexts.v1"
+
+    private var taskContexts: [String: TaskContext] {
+        get {
+            guard let data = UserDefaults.standard.data(forKey: taskContextDefaultsKey) else { return [:] }
+            return (try? JSONDecoder().decode([String: TaskContext].self, from: data)) ?? [:]
+        }
+        set {
+            if let data = try? JSONEncoder().encode(newValue) {
+                UserDefaults.standard.set(data, forKey: taskContextDefaultsKey)
+            }
+        }
+    }
+
+    private func contextLookup(_ taskID: Int) -> TaskContext? {
+        return taskContexts[String(taskID)]
+    }
+
+    private func saveContext(_ context: TaskContext, for taskID: Int) {
+        var contexts = taskContexts
+        contexts[String(taskID)] = context
+        taskContexts = contexts
+    }
+
+    private func removeContext(for taskID: Int) {
+        var contexts = taskContexts
+        contexts.removeValue(forKey: String(taskID))
+        taskContexts = contexts
+    }
+
+    // MARK: - Lazy URLSession
+    //
+    // Lazy so we don't trigger the background URLSession's reconnection
+    // dance until something actually asks for it. iOS may immediately
+    // start replaying pending delegate callbacks once the session is
+    // created — that's the point of the background mode.
+    private lazy var session: URLSession = {
+        let config = URLSessionConfiguration.background(withIdentifier: Self.backgroundSessionID)
+        config.allowsCellularAccess = true              // user already accepted the hardware disclosure
+        config.sessionSendsLaunchEvents = true          // wake us when complete
+        config.isDiscretionary = false                  // ASAP, not "when convenient"
+        config.shouldUseExtendedBackgroundIdleMode = true
+        // The OperationQueue must be serial to keep delegate ordering deterministic.
+        let queue = OperationQueue()
+        queue.maxConcurrentOperationCount = 1
+        return URLSession(configuration: config, delegate: self, delegateQueue: queue)
+    }()
+
+    private override init() {
+        super.init()
+        halLog("HALDEBUG-BGDL: BackgroundDownloadCoordinator init; will lazily create URLSession id=\(Self.backgroundSessionID)")
+        // Touch the lazy session so iOS immediately replays any pending
+        // events from a previous app instance.
+        _ = session
+    }
+
+    // MARK: - Public API
+
+    /// Kick off a background download for every file in the repo that matches
+    /// the MLX patterns. Returns immediately. Use the `progress(for:)` /
+    /// `isComplete(for:)` accessors to track state. Posts `.mlxModelDidDownload`
+    /// when ALL files for the model have finished landing.
+    ///
+    /// `repoID` is the full HF repo path (e.g. "mlx-community/gemma-4-e2b-it-4bit").
+    /// `modelID` is what MLXModelDownloader uses to identify the model — usually
+    /// identical to `repoID`.
+    func startDownload(modelID: String, repoID: String) async throws {
+        halLog("HALDEBUG-BGDL: startDownload modelID=\(modelID) repoID=\(repoID)")
+
+        // Fetch the file list from the HF tree API.
+        let allFiles = try await fetchRepoFileList(repoID: repoID)
+        let mlxFiles = allFiles.filter { Self.matchesMLXPattern($0) }
+        if mlxFiles.isEmpty {
+            halLog("HALDEBUG-BGDL: No MLX-compatible files found in \(repoID); aborting")
+            throw NSError(domain: "BackgroundDownloadCoordinator", code: 1, userInfo: [
+                NSLocalizedDescriptionKey: "No MLX-compatible files found in repository \(repoID)."
+            ])
+        }
+        halLog("HALDEBUG-BGDL: Found \(mlxFiles.count) MLX files for \(modelID): \(mlxFiles.joined(separator: ", "))")
+
+        // Ensure target directory exists.
+        let modelDir = modelDirectory(for: modelID)
+        try FileManager.default.createDirectory(at: modelDir, withIntermediateDirectories: true)
+
+        // Initialize per-model byte tracking so progress can be computed.
+        bytesExpectedByModel[modelID] = 0
+        bytesWrittenByModel[modelID] = 0
+        filesPendingByModel[modelID] = Set(mlxFiles)
+
+        // Enqueue a download task per file.
+        for filename in mlxFiles {
+            // Files already present at target with non-zero size: skip — the
+            // delegate's didFinishDownloading wouldn't fire for them anyway,
+            // and we want to keep the existing partial-download resilience.
+            let targetURL = modelDir.appendingPathComponent(filename)
+            if let existingSize = try? FileManager.default.attributesOfItem(atPath: targetURL.path)[.size] as? Int64,
+               existingSize > 0 {
+                halLog("HALDEBUG-BGDL: \(filename) already present (\(existingSize) bytes); skipping")
+                var pending = filesPendingByModel[modelID] ?? []
+                pending.remove(filename)
+                filesPendingByModel[modelID] = pending
+                continue
+            }
+
+            guard let url = URL(string: "https://huggingface.co/\(repoID)/resolve/main/\(filename)") else {
+                halLog("HALDEBUG-BGDL: Could not build URL for \(filename); skipping")
+                continue
+            }
+
+            let task = session.downloadTask(with: url)
+            let context = TaskContext(modelID: modelID, filename: filename, targetPath: targetURL.path)
+            saveContext(context, for: task.taskIdentifier)
+            task.resume()
+            halLog("HALDEBUG-BGDL: Enqueued task \(task.taskIdentifier) for \(filename)")
+        }
+
+        // If all files were already present, treat the model as complete now.
+        if (filesPendingByModel[modelID] ?? []).isEmpty {
+            await MainActor.run { self.notifyModelDownloadComplete(modelID: modelID) }
+        }
+    }
+
+    // MARK: - Per-Model Progress Tracking
+
+    @Published var bytesWrittenByModel: [String: Int64] = [:]
+    @Published var bytesExpectedByModel: [String: Int64] = [:]
+    private var filesPendingByModel: [String: Set<String>] = [:]
+
+    func progress(for modelID: String) -> Double {
+        let expected = bytesExpectedByModel[modelID] ?? 0
+        let written = bytesWrittenByModel[modelID] ?? 0
+        guard expected > 0 else { return 0 }
+        return min(1.0, Double(written) / Double(expected))
+    }
+
+    func isComplete(for modelID: String) -> Bool {
+        return (filesPendingByModel[modelID] ?? []).isEmpty && (bytesExpectedByModel[modelID] ?? 0) > 0
+    }
+
+    // MARK: - HuggingFace Tree API
+    //
+    // GET https://huggingface.co/api/models/<repo>/tree/main
+    // Returns a JSON array of {"type": "file"|"directory", "path": "...", "size": Int}
+    private func fetchRepoFileList(repoID: String) async throws -> [String] {
+        guard let url = URL(string: "https://huggingface.co/api/models/\(repoID)/tree/main") else {
+            throw NSError(domain: "BackgroundDownloadCoordinator", code: 2, userInfo: [
+                NSLocalizedDescriptionKey: "Bad repo ID: \(repoID)"
+            ])
+        }
+        var request = URLRequest(url: url)
+        request.timeoutInterval = 15
+        let (data, response) = try await URLSession.shared.data(for: request)
+        guard let http = response as? HTTPURLResponse, http.statusCode == 200 else {
+            let status = (response as? HTTPURLResponse)?.statusCode ?? -1
+            throw NSError(domain: "BackgroundDownloadCoordinator", code: 3, userInfo: [
+                NSLocalizedDescriptionKey: "HF tree API returned status \(status) for \(repoID)"
+            ])
+        }
+        struct TreeEntry: Decodable {
+            let type: String
+            let path: String
+            let size: Int64?
+        }
+        let entries = try JSONDecoder().decode([TreeEntry].self, from: data)
+        return entries.filter { $0.type == "file" }.map { $0.path }
+    }
+
+    // MARK: - Pattern Matching
+    //
+    // Same set mlx-swift-lm's ModelFactory uses: *.safetensors, *.json, *.jinja.
+    // The *.jinja is critical for modern chat-template models (Gemma 4 etc).
+    private static func matchesMLXPattern(_ filename: String) -> Bool {
+        let lower = filename.lowercased()
+        return lower.hasSuffix(".safetensors")
+            || lower.hasSuffix(".json")
+            || lower.hasSuffix(".jinja")
+    }
+
+    private func modelDirectory(for modelID: String) -> URL {
+        let cacheDir = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask)[0]
+        return cacheDir
+            .appendingPathComponent("huggingface", isDirectory: true)
+            .appendingPathComponent("models", isDirectory: true)
+            .appendingPathComponent(modelID, isDirectory: true)
+    }
+
+    // MARK: - Completion Notification
+
+    @MainActor
+    private func notifyModelDownloadComplete(modelID: String) {
+        halLog("HALDEBUG-BGDL: ✅ Model \(modelID) fully downloaded; posting .mlxModelDidDownload")
+        // Mark in MLXModelDownloader's downloaded set so future model-status
+        // queries report it as downloaded.
+        MLXModelDownloader.shared.markModelAsDownloadedFromBackground(modelID: modelID)
+        NotificationCenter.default.post(name: .mlxModelDidDownload, object: nil, userInfo: ["modelID": modelID])
+    }
+
+    // MARK: - URLSessionDownloadDelegate
+
+    func urlSession(_ session: URLSession, downloadTask: URLSessionDownloadTask, didFinishDownloadingTo location: URL) {
+        guard let context = contextLookup(downloadTask.taskIdentifier) else {
+            halLog("HALDEBUG-BGDL: didFinishDownloadingTo received for unknown task \(downloadTask.taskIdentifier); ignoring")
+            return
+        }
+
+        // Move the downloaded temp file to the target path. This must happen
+        // synchronously inside the delegate callback — iOS deletes `location`
+        // as soon as we return.
+        let target = URL(fileURLWithPath: context.targetPath)
+        try? FileManager.default.removeItem(at: target)
+        do {
+            try FileManager.default.moveItem(at: location, to: target)
+            halLog("HALDEBUG-BGDL: Moved \(context.filename) → \(target.path)")
+        } catch {
+            halLog("HALDEBUG-BGDL: ❌ Move failed for \(context.filename): \(error.localizedDescription)")
+        }
+
+        // Update bookkeeping. Note: didCompleteWithError will fire shortly
+        // after this; final cleanup happens there.
+        Task { @MainActor in
+            var pending = self.filesPendingByModel[context.modelID] ?? []
+            pending.remove(context.filename)
+            self.filesPendingByModel[context.modelID] = pending
+            if pending.isEmpty {
+                self.notifyModelDownloadComplete(modelID: context.modelID)
+            }
+        }
+    }
+
+    func urlSession(_ session: URLSession,
+                    downloadTask: URLSessionDownloadTask,
+                    didWriteData bytesWritten: Int64,
+                    totalBytesWritten: Int64,
+                    totalBytesExpectedToWrite: Int64) {
+        guard let context = contextLookup(downloadTask.taskIdentifier) else { return }
+        Task { @MainActor in
+            // Update the per-model totals. Each file contributes its own
+            // expected-bytes count; we accumulate so the model's overall
+            // progress is bytes-summed across all files.
+            //
+            // Because didWriteData fires repeatedly with cumulative totals
+            // *for that single file*, we recompute by subtracting the
+            // previous per-task contribution and adding the new one. We
+            // keep that previous contribution in `bytesWrittenByTask`.
+            let prev = self.bytesWrittenByTask[downloadTask.taskIdentifier] ?? 0
+            let delta = max(0, totalBytesWritten - prev)
+            self.bytesWrittenByTask[downloadTask.taskIdentifier] = totalBytesWritten
+            self.bytesWrittenByModel[context.modelID, default: 0] += delta
+
+            // Same trick for expected. Update if it shrank from -1 (unknown).
+            if totalBytesExpectedToWrite > 0 {
+                let prevExpected = self.bytesExpectedByTask[downloadTask.taskIdentifier] ?? 0
+                let expectedDelta = totalBytesExpectedToWrite - prevExpected
+                if expectedDelta != 0 {
+                    self.bytesExpectedByTask[downloadTask.taskIdentifier] = totalBytesExpectedToWrite
+                    self.bytesExpectedByModel[context.modelID, default: 0] += expectedDelta
+                }
+            }
+        }
+    }
+
+    private var bytesWrittenByTask: [Int: Int64] = [:]
+    private var bytesExpectedByTask: [Int: Int64] = [:]
+
+    func urlSession(_ session: URLSession, task: URLSessionTask, didCompleteWithError error: Error?) {
+        guard let context = contextLookup(task.taskIdentifier) else { return }
+        if let error = error {
+            halLog("HALDEBUG-BGDL: Task \(task.taskIdentifier) (\(context.filename)) failed: \(error.localizedDescription)")
+        } else {
+            halLog("HALDEBUG-BGDL: Task \(task.taskIdentifier) (\(context.filename)) completed")
+        }
+        removeContext(for: task.taskIdentifier)
+        Task { @MainActor in
+            self.bytesWrittenByTask.removeValue(forKey: task.taskIdentifier)
+            self.bytesExpectedByTask.removeValue(forKey: task.taskIdentifier)
+        }
+    }
+
+    func urlSessionDidFinishEvents(forBackgroundURLSession session: URLSession) {
+        halLog("HALDEBUG-BGDL: urlSessionDidFinishEvents — invoking app delegate completion handler")
+        Task { @MainActor in
+            self.backgroundCompletionHandler?()
+            self.backgroundCompletionHandler = nil
+        }
+    }
+}
+
 // MARK: - MLX Model Downloader (Singleton)
 class MLXModelDownloader: ObservableObject {
     static let shared = MLXModelDownloader()
@@ -13212,6 +13652,49 @@ class MLXModelDownloader: ObservableObject {
     func isModelDownloaded(_ modelID: String) -> Bool {
         return downloadedModelIDs.contains(modelID) &&
                FileManager.default.fileExists(atPath: modelPath(for: modelID).path)
+    }
+
+    /// Called by `BackgroundDownloadCoordinator` once all files for a model
+    /// have finished downloading via the background URLSession. We need to
+    /// mirror the bookkeeping that the legacy HubApi-based startDownload
+    /// did at its success site: persist the model ID, update the
+    /// DownloadState, clear the in-flight marker, and refresh the catalog.
+    func markModelAsDownloadedFromBackground(modelID: String) {
+        let finalURL = modelPath(for: modelID)
+        var modelIDs = self.downloadedModelIDs
+        modelIDs.insert(modelID)
+        self.downloadedModelIDs = modelIDs
+
+        var state = self.downloadStates[modelID] ?? DownloadState(
+            isDownloading: false,
+            progress: 1.0,
+            message: "Model ready.",
+            error: nil,
+            localPath: finalURL
+        )
+        state.isDownloading = false
+        state.progress = 1.0
+        state.message = "Model ready."
+        state.localPath = finalURL
+        state.error = nil
+        self.downloadStates[modelID] = state
+
+        // Clear the in-flight marker so the next launch doesn't try to resume.
+        self.clearInFlight(modelID)
+
+        // Clear current task tracking if this was the active one.
+        if self.currentDownloadModelID == modelID {
+            self.currentDownloadModelID = nil
+            self.currentDownloadTask = nil
+        }
+
+        // Refresh cache size to reflect the new download.
+        Task { await self.updateCacheSize() }
+
+        halLog("HALDEBUG-DOWNLOAD: ✅ Background download finalized for \(modelID)")
+
+        // Process the next queued download, if any.
+        self.processNextInQueue()
     }
     
     func getModelPath(_ modelID: String) -> URL? {
@@ -14626,6 +15109,15 @@ class HalTestConsole: ObservableObject {
             vm.resetSettingsToDefaults()
             writeStateJSON(vm: vm)
             return "{\"status\":\"ok\",\"command\":\"RESET_SETTINGS\"}"
+
+        } else if trimmed == "RESET_HARDWARE_DISCLOSURE" {
+            // Debug-only: clears the one-time hardware-disclosure flag so the
+            // popup fires again on the next MLX download or model switch.
+            // Used to validate the popup UX without uninstalling Hal (which
+            // would also wipe the multi-gigabyte downloaded models).
+            UserDefaults.standard.removeObject(forKey: "hasSeenHardwareDisclosure")
+            halLog("HALDEBUG-TESTCONSOLE: Reset hasSeenHardwareDisclosure flag (popup will re-fire on next MLX action)")
+            return "{\"status\":\"ok\",\"command\":\"RESET_HARDWARE_DISCLOSURE\",\"note\":\"flag cleared; next MLX action will re-show the popup\"}"
 
         } else if trimmed == "SALON_GET_STATE" {
             let cfg = vm.salonConfig
