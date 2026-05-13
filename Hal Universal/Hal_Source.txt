@@ -11132,6 +11132,24 @@ class ChatViewModel: ObservableObject {
                                                                     let originalSelectedModelID = selectedModelID
                                                                     halLog("HALDEBUG-SALON: Saving original selectedModelID=\(originalSelectedModelID) for restoration after \(activeSeats.count)-seat turn")
 
+                                                                    // Pre-compute the prior-turns conversation summary ONCE for
+                                                                    // context-aware mode. Without this, each seat re-runs the
+                                                                    // (expensive) TextSummarizer LLM call against the same
+                                                                    // history — that was costing ~20–30s/seat AND was the source
+                                                                    // of the "Exceeded model context window size" error we saw
+                                                                    // after a few salon turns when the history grew past AFM's
+                                                                    // 4K limit. Each seat now appends its current-turn-earlier-
+                                                                    // seats text without another LLM call. Cache is cleared at
+                                                                    // the end of this function (deferred so it survives early
+                                                                    // returns / errors).
+                                                                    if salonConfig.behavioralMode == .contextAware {
+                                                                        halLog("HALDEBUG-SALON: Pre-computing prior-turns summary (one LLM call, reused across all seats)")
+                                                                        let summary = await generateSalonContextSummary(includeCurrentTurnSeats: [])
+                                                                        cachedSalonPriorSummary = summary
+                                                                        halLog("HALDEBUG-SALON: Cached prior-turns summary (\(summary.count) chars)")
+                                                                    }
+                                                                    defer { cachedSalonPriorSummary = nil }
+
                                                                     // Execute each seat sequentially
                                                                     for seat in activeSeats {
                                                                         halLog("HALDEBUG-SALON: Executing seat \(seat.position) with model \(seat.modelID)")
@@ -11379,6 +11397,17 @@ class ChatViewModel: ObservableObject {
                                                                 /// (slim multi-perspective system prompt + conversation summary + current
                                                                 /// user input) but expressed as [HalChatMessage] so it can flow through
                                                                 /// generateChatResponse with chat-template models like Gemma 4.
+                                                                // Per-salon-turn cache of the prior-turns conversation summary so each
+                                                                // seat in context-aware mode doesn't re-generate it via an LLM call.
+                                                                // Set at the top of runSalonTurn (context-aware mode only); cleared at
+                                                                // the end. The "current turn earlier seats" portion is still computed
+                                                                // per-seat and appended without an LLM call (it's short prose).
+                                                                // Previously each seat paid ~20–30s for its own summarize call —
+                                                                // this turns N seats × 1 summary call into 1 summary call total
+                                                                // and fixes the "context-window exceeded" error we saw when the
+                                                                // history grew past AFM's 4K budget after a few salon turns.
+                                                                private var cachedSalonPriorSummary: String? = nil
+
                                                                 private func buildContextAwareChatMessages(userInput: String, seatPosition: Int) async -> [HalChatMessage] {
                                                                     let slimSystemPrompt = """
                                                                     You are Hal, an AI assistant participating in a multi-perspective discussion.
@@ -11392,7 +11421,23 @@ class ChatViewModel: ObservableObject {
                                                                     """
 
                                                                     let currentTurnSeats = getCurrentTurnSeatsResponses(beforeSeat: seatPosition)
-                                                                    let conversationSummary = await generateSalonContextSummary(includeCurrentTurnSeats: currentTurnSeats)
+
+                                                                    // If runSalonTurn pre-computed the prior-turns summary for this
+                                                                    // turn, use it directly and append the current-turn seats as
+                                                                    // plain prose (no LLM call). Otherwise fall back to the
+                                                                    // per-seat regeneration path. This removes ~20-30s/seat in
+                                                                    // context-aware mode and also avoids the AFM 4K context
+                                                                    // overflow we saw when the summary input grew past AFM's
+                                                                    // limit on multi-turn salon conversations.
+                                                                    let conversationSummary: String
+                                                                    if let cachedPrior = cachedSalonPriorSummary {
+                                                                        conversationSummary = appendCurrentTurnSeatsToSummary(
+                                                                            priorSummary: cachedPrior,
+                                                                            currentTurnSeats: currentTurnSeats
+                                                                        )
+                                                                    } else {
+                                                                        conversationSummary = await generateSalonContextSummary(includeCurrentTurnSeats: currentTurnSeats)
+                                                                    }
 
                                                                     let systemMessage: String
                                                                     if conversationSummary.isEmpty {
@@ -11468,6 +11513,26 @@ class ChatViewModel: ObservableObject {
                                                                 }
                                                                 
                                                                 // Generate full conversation summary with LLM (for Salon Mode context-aware)
+                                                                /// Plain-prose append (no LLM) of the current turn's earlier seat
+                                                                /// responses onto a pre-computed prior-turns summary. Used by
+                                                                /// buildContextAwareChatMessages when `cachedSalonPriorSummary` is
+                                                                /// set by runSalonTurn — avoids re-summarising the entire prior
+                                                                /// conversation N times per multi-seat turn.
+                                                                private func appendCurrentTurnSeatsToSummary(priorSummary: String, currentTurnSeats: [String]) -> String {
+                                                                    if currentTurnSeats.isEmpty {
+                                                                        return priorSummary
+                                                                    }
+                                                                    var result = priorSummary
+                                                                    if !priorSummary.isEmpty {
+                                                                        result += "\n\n"
+                                                                    }
+                                                                    result += "--- Current Turn Earlier Responses ---\n\n"
+                                                                    for (index, seatResponse) in currentTurnSeats.enumerated() {
+                                                                        result += "Seat \(index + 1): \(seatResponse)\n\n"
+                                                                    }
+                                                                    return result
+                                                                }
+
                                                                 private func generateSalonContextSummary(includeCurrentTurnSeats: [String]) async -> String {
                                                                     // Collect all messages up to current moment (excluding partial messages)
                                                                     let allPriorMessages = messages.filter { !$0.isPartial }
