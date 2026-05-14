@@ -1258,6 +1258,17 @@ class MemoryStore: ObservableObject {
                             print("HALDEBUG-MEMORY: Combined entity keywords: '\(combinedEntitiesKeywords)'")
 
                             // SALON MODE FIX: Conditionally store user message
+                            //
+                            // Position scheme (May 13, 2026): each turn occupies a 1000-position
+                            // block. User at turnNumber * 1000, assistant(s) at turnNumber * 1000
+                            // + seatNumber (or +1 for solo). This solves the salon collision bug
+                            // where seats 2+ at the same turn previously wrote to the same
+                            // position (turnNumber * 2) — and the UNIQUE(source_type, source_id,
+                            // position) constraint silently dropped all but one. Up to 999 seat
+                            // slots per turn supported. Legacy data (positions 1..N from before
+                            // this commit) remains correctly ordered relative to new turns
+                            // because every new turn's positions land above any plausible legacy
+                            // position for the same conversation.
                             var userContentId = ""
                             if !skipUserMessage {
                                 // Store user message with entity keywords and device type
@@ -1265,7 +1276,7 @@ class MemoryStore: ObservableObject {
                                     content: userMessage,
                                     sourceType: .conversation,
                                     sourceId: conversationId,
-                                    position: turnNumber * 2 - 1,
+                                    position: turnNumber * 1000,
                                     timestamp: Date(),
                                     isFromUser: true, // Explicitly set for user message
                                     entityKeywords: combinedEntitiesKeywords,
@@ -1303,12 +1314,18 @@ class MemoryStore: ObservableObject {
 
                             // Store assistant message with entity keywords, metadata, and device type
                             // Scrub HelPML markers before storage so structural delimiters don't pollute RAG retrieval
+                            //
+                            // Position: turnNumber * 1000 + seatNumber (or +1 for solo). Each
+                            // salon seat gets a unique position within the turn so the
+                            // UNIQUE(source_type, source_id, position) constraint doesn't drop
+                            // overlapping rows. See user-message branch above for the full
+                            // rationale.
                             let scrubbedAssistantMessage = assistantMessage.ScrubHelPMLMarkers()
                             let assistantContentId = storeUnifiedContentWithEntities(
                                 content: scrubbedAssistantMessage,
                                 sourceType: .conversation,
                                 sourceId: conversationId,
-                                position: turnNumber * 2,
+                                position: turnNumber * 1000 + (seatNumber ?? 1),
                                 timestamp: Date(),
                                 isFromUser: false, // Explicitly set for assistant message
                                 entityKeywords: combinedEntitiesKeywords,
