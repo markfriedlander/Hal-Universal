@@ -115,4 +115,30 @@ Every model engaged substantively with the "what would you change" prompt. Quali
 
 ---
 
+## CORRIGENDUM (May 13, 2026, evening)
+
+The Maxim 3 findings above are **invalid**. The test-runner protocol used
+`NUCLEAR_RESET` between plant-turn and recall-turn, which wipes the entire
+RAG database — destroying the very memory the test was trying to verify.
+All four MLX models pass Maxim 3 cleanly under the corrected protocol
+(`NEW_THREAD` instead of `NUCLEAR_RESET`). The other Maxim results
+(M1, M2, M4, M5) are unaffected. Full investigation:
+`Docs/RAG_Investigation_Findings_2026-05-13.md`.
+
+Specifically retracted:
+- "AFM is the only model that passed Maxim 3"
+- "Qwen invented a Golden Retriever conversation"
+- "Dolphin invented 'Miska' as the cat's name"
+- The Maxim 3 row in the per-model voice summary
+- The "AFM uniquely good at remembering you across conversations" voice update
+
+All four MLX curated models trust RAG-injected context correctly. The
+hallucination-on-empty-memory behavior of Qwen and Dolphin is real but
+separate — they should say "I don't know" rather than invent — but it
+isn't a RAG-trust problem.
+
+The "Investigate why Gemma/Llama/Dolphin override RAG snippets" follow-up
+is no longer needed; the personal-recall gate bypass added during the
+investigation is sufficient defense-in-depth.
+
 *— CC, 13 May 2026*

@@ -4477,16 +4477,28 @@ class MLXWrapper: ObservableObject {
                     let modelPenalty = settings.repetitionPenalty
                     let modelPenaltyCtx = settings.repetitionContextSize ?? 20
                     halLog("HALDEBUG-MLX-CHAT: Penalty config for \(self.currentModelConfig?.displayName ?? "unknown"): penalty=\(modelPenalty.map { String($0) } ?? "nil"), ctx=\(modelPenaltyCtx)")
-                    // Token budget. Was 512 — too low; combined with longer Maxim-
-                    // class responses or any small-model looping, the model would
-                    // hit the cap mid-word and the user would see "...bottomle" or
-                    // "...consc" — visibly broken. 1536 gives all curated models
-                    // comfortable headroom for a paragraph-class reply (Gemma at
-                    // ~35 tok/s generates 1536 tokens in ~44 s; well within the
-                    // 120 s SOP limit). The trimToWordBoundary safeguard below
-                    // catches any remaining mid-word cuts so the user never sees
-                    // the rough edge regardless of model or cap.
-                    let maxOutputTokens = 1536
+                    // Token budget. Per Mark's clarification (May 13 evening):
+                    // this is a *runaway* safeguard, not a normal-response
+                    // ceiling. Models should be free to complete their thought
+                    // fully. 4096 tokens ≈ 16K characters ≈ 2500 words — well
+                    // beyond any natural single-response length. The only
+                    // scenarios approaching it are pathological repetition
+                    // loops (caught by the per-model repetition penalty) or a
+                    // deliberately essay-length prompt the user asked for.
+                    //
+                    // At Gemma's ~35 tok/s, 4096 tokens = 117s — just under the
+                    // 120s MLX SOP. The trimToWordBoundary safeguard below
+                    // still acts as a defensive last-resort if a model ever
+                    // does hit this cap, but it should fire essentially never
+                    // for normal use.
+                    //
+                    // Previous values:
+                    //   - 512: too aggressive; was cutting normal Maxim 2
+                    //     responses (~1100 tokens for Gemma) mid-word.
+                    //   - 1536: better, but per Mark's intent still a ceiling
+                    //     on the normal-response distribution rather than a
+                    //     true runaway cap.
+                    let maxOutputTokens = 4096
                     let parameters = GenerateParameters(
                         maxTokens: maxOutputTokens,
                         temperature: Float(temperature),
@@ -10209,7 +10221,67 @@ class ChatViewModel: ObservableObject {
                                                                         /// Asks LLM whether memory search is needed for this query.
                                                                         /// Provides recent STM context and rolling summary so the gate can decide
                                                                         /// whether the answer is already covered by the conversation shown.
+                                                                        /// Pre-gate fast-path: when the user's query unambiguously asks about
+                                                                        /// something personal that may have been shared before, force YES
+                                                                        /// without consulting the LLM gate. This catches the most important
+                                                                        /// case (memory recall on personal info) regardless of how well the
+                                                                        /// active model classifies for the gate prompt.
+                                                                        ///
+                                                                        /// Why this exists: §2 Maxim sweep + on-device reproduction (May 13)
+                                                                        /// showed that Gemma — and likely the other MLX models — sometimes
+                                                                        /// say NO to "What's my cat's name?" because settings-reset
+                                                                        /// dialogue and other STM residue in the gate's "recent
+                                                                        /// conversation" pollutes the classification. AFM happens to
+                                                                        /// classify this case well; the other curated models don't.
+                                                                        /// Memory recall on personal info is too central to Hal's identity
+                                                                        /// to leave at the mercy of per-model classifier accuracy.
+                                                                        ///
+                                                                        /// The patterns are deliberately conservative — they target
+                                                                        /// explicit personal-recall phrasing, not every question. False
+                                                                        /// positives just trigger a memory search the model wouldn't have
+                                                                        /// otherwise; false negatives risk silent memory loss.
+                                                                        private static let personalRecallPatterns: [String] = [
+                                                                            // "what's my", "what is my", "where is my", "who is my"
+                                                                            "what's my ", "what is my ", "whats my ",
+                                                                            "where's my ", "where is my ",
+                                                                            "who's my ", "who is my ",
+                                                                            "when's my ", "when is my ",
+                                                                            // Direct recall phrasing
+                                                                            "do you remember",
+                                                                            "do you know my ",
+                                                                            "did i tell you",
+                                                                            "did i mention",
+                                                                            "have i told you",
+                                                                            "have i mentioned",
+                                                                            "what did i tell you",
+                                                                            "what did i say about",
+                                                                            "remember when i",
+                                                                            "remember what i",
+                                                                            // First-person possessive — caught only when prefixed by
+                                                                            // "my" alone (after a sentence boundary) to avoid matching
+                                                                            // "in my opinion" style phrasing.
+                                                                            "tell me about my ",
+                                                                            "tell me what you know about my ",
+                                                                        ]
+
+                                                                        private func looksLikePersonalRecall(_ q: String) -> Bool {
+                                                                            let lower = q.lowercased()
+                                                                            for pattern in ChatViewModel.personalRecallPatterns {
+                                                                                if lower.contains(pattern) { return true }
+                                                                            }
+                                                                            return false
+                                                                        }
+
                                                                         private func decideTools(userInput: String) async -> ToolDecision {
+                                                                            // Personal-recall fast-path. Bypass the LLM classifier when the
+                                                                            // query clearly asks about something we may have been told.
+                                                                            // The trade-off is firmly toward fail-open: a wasted memory
+                                                                            // search is cheap; a missed recall is a Maxim #3 violation.
+                                                                            if looksLikePersonalRecall(userInput) {
+                                                                                halLog("HALDEBUG-TOOLS: Gate bypass — query matches personal-recall pattern, forcing memory_search")
+                                                                                return ToolDecision(tools: ["memory_search"], reasoning: "personal-recall keyword bypass")
+                                                                            }
+
                                                                             // Build a recent-conversation excerpt matching the actual STM window.
                                                                             // effectiveMemoryDepth is the runtime-clamped turn count; each turn = 2 messages.
                                                                             let recentMessages = messages.filter { !$0.isPartial }.suffix(effectiveMemoryDepth * 2)

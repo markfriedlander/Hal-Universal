@@ -52,7 +52,19 @@ def chat(msg, timeout=300):
 
 
 def reset():
+    """Full nuke — wipes the entire RAG/conversation DB. Use sparingly.
+    NEVER call this between plant-turn and recall-turn in a Maxim 3
+    protocol — it destroys the very memory the test is trying to verify."""
     cmd("NUCLEAR_RESET", timeout=30)
+    time.sleep(2)
+
+
+def new_thread():
+    """Start a fresh conversation thread WITHOUT touching the persisted
+    RAG/conversation DB. This is the correct primitive for Maxim 3 testing:
+    plant a fact in thread A → new_thread → recall in thread B with the
+    planted fact still in long-term memory."""
+    cmd("NEW_THREAD", timeout=30)
     time.sleep(2)
 
 
@@ -100,10 +112,17 @@ def main():
     )
 
     # ── Maxim 3 — Persistent Memory (multi-turn) ────────────────────────────
-    reset()
+    # CRITICAL: do NOT use reset() (NUCLEAR_RESET) between plant and recall.
+    # That command wipes the entire RAG DB, destroying the very memory the
+    # test is trying to verify. Use new_thread() instead — it starts a
+    # fresh conversation while leaving the planted fact in long-term
+    # memory where RAG can retrieve it. The earlier (now-corrected) §2
+    # Maxim 3 results were structurally invalid because of this confusion.
+    reset()  # one full wipe at the start so we begin from a known state
     print(f"\n### Maxim 3 — Persistent Memory\n")
     print(f"**Protocol:** Plant a fact in turn 1, push it out of STM with a filler "
-          f"turn, reset the conversation, then ask about the fact in a fresh thread. "
+          f"turn, **NEW_THREAD** (not NUCLEAR_RESET — that would wipe the very memory "
+          f"we're testing) to start a fresh conversation, then ask about the fact. "
           f"Pass = recalls correctly via RAG; fail = hallucinates or claims no memory.\n")
     print(f"\n**Plant turn:**\n")
     t0 = time.time()
@@ -116,8 +135,9 @@ def main():
     r2 = chat("Tell me a short fact about Mars colonization.")
     print(f"> *(model: {r2.get('model', '?')}, {r2.get('thinkingDuration', time.time()-t0):.1f}s)* {r2.get('response', '')[:200]}...\n")
 
-    # Reset conversation, then ask
-    reset()
+    # Start a fresh thread (preserves the planted fact in RAG memory).
+    # The recall turn below should find "Atlas" via memory_search.
+    new_thread()
     run_turn(
         "What's my cat's name?",
         "Maxim 3 — Recall (fresh conversation, must use RAG)"
