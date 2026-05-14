@@ -6899,122 +6899,133 @@ func modelStatusDot(
 }
 
 // MARK: - Model Library View
+//
+// May-14 rebuild per Strategic Claude's directive (autonomous workstream):
+//   - Two sections, one scroll: "Hal's Picks" (AFM + 4 tested MLX) at top,
+//     "Community Models" (the experimental HF catalog) at bottom.
+//   - Accordion-expand-in-place rows. Collapsed = name + size + status dot.
+//     Expanded = full model card (voice, performance, Maxim compliance,
+//     license, and the primary action button).
+//   - Unified status-dot language: green = downloaded+active,
+//     grey = downloaded+inactive, no dot = not downloaded. No blue dots,
+//     no blue checkmarks, no transitional dot states.
+//   - Search bar at the top of Community Models for the long HF list.
+//
+// AFM appears in Hal's Picks as the first row — it's tested, system-managed,
+// and always present. The detail card adapts (no tok/s, no download size,
+// no license) and the action button is just Select/Active.
 struct ModelLibraryView: View {
     @Environment(\.dismiss) var dismiss
     @EnvironmentObject var chatViewModel: ChatViewModel
     @EnvironmentObject var mlxDownloader: MLXModelDownloader
-    @ObservedObject private var catalog = ModelCatalogService.shared  // Observe catalog for updates
-    
+    @ObservedObject private var catalog = ModelCatalogService.shared
+
     @State private var selectedModelForLicense: ModelConfiguration?
     @State private var modelToDelete: ModelConfiguration?
     @State private var showingDeleteConfirmation = false
-    @State private var showingLibraryTier = false
     @State private var showingHardwareDisclosure = false
     @State private var pendingModelAfterDisclosure: ModelConfiguration?
+    @State private var librarySearchText: String = ""
 
     // Surfaces a one-time hardware-compatibility warning the first time the
-    // user attempts to download or switch to any MLX model. Set true once
-    // the user dismisses the disclosure so we don't pester them again.
+    // user attempts to download or switch to any MLX model.
     @AppStorage("hasSeenHardwareDisclosure") private var hasSeenHardwareDisclosure: Bool = false
 
     var body: some View {
         ZStack {
             List {
-                // ── ON DEVICE ──────────────────────────────────────────────
-                // AFM is always here. Any downloaded MLX models join it as
-                // they become available locally. This is the only tier the
-                // user can actually USE right now without action.
+                // ── HAL'S PICKS ──────────────────────────────────────────
                 Section {
-                    ForEach(onDeviceModels) { model in
-                        if model.source == .appleFoundation {
-                            ModelRow(
+                    ForEach(halsPicks) { model in
+                        ModelLibraryRow(
+                            model: model,
+                            isActive: chatViewModel.selectedModelID == model.id,
+                            downloader: mlxDownloader,
+                            activeModelID: chatViewModel.selectedModelID,
+                            includeModelCard: true,
+                            onSelect: { selectModel(model) },
+                            onDownload: { downloadModel(model) },
+                            onCancel: { mlxDownloader.cancelDownload(modelID: model.id) },
+                            onDelete: { requestDeleteModel(model) }
+                        )
+                    }
+                } header: {
+                    Label("Hal's Picks", systemImage: "checkmark.seal")
+                } footer: {
+                    Text("Five voices, each tested with Hal. Tap a model to see its character, performance, and Maxim alignment.")
+                        .font(.caption2)
+                }
+
+                // ── COMMUNITY MODELS (EXPERIMENTAL) ──────────────────────
+                Section {
+                    // Warning banner — first thing the user reads in this
+                    // section, before any rows. Promotes the previous footer
+                    // text per Strategic Claude's "name the risk" guidance.
+                    HStack(alignment: .top, spacing: 8) {
+                        Image(systemName: "exclamationmark.triangle.fill")
+                            .foregroundColor(.orange)
+                            .imageScale(.small)
+                        Text("These models haven't been tested with Hal — chat templates may misbehave, responses may be unexpected, performance varies.")
+                            .font(.caption)
+                            .foregroundColor(.secondary)
+                    }
+                    .padding(.vertical, 4)
+
+                    // Local search bar (not the global .searchable so it
+                    // only filters this section).
+                    HStack(spacing: 6) {
+                        Image(systemName: "magnifyingglass")
+                            .foregroundColor(.secondary)
+                            .font(.caption)
+                        TextField("Search community models", text: $librarySearchText)
+                            .textFieldStyle(.plain)
+                            .autocorrectionDisabled()
+                            .textInputAutocapitalization(.never)
+                            .font(.subheadline)
+                        if !librarySearchText.isEmpty {
+                            Button(action: { librarySearchText = "" }) {
+                                Image(systemName: "xmark.circle.fill")
+                                    .foregroundColor(.secondary)
+                                    .font(.caption)
+                            }
+                            .buttonStyle(.plain)
+                        }
+                    }
+                    .padding(.vertical, 4)
+
+                    if filteredLibraryModels.isEmpty {
+                        Text(librarySearchText.isEmpty
+                             ? "Open Model Library after a successful network fetch to browse experimental models from mlx-community."
+                             : "No community models match \"\(librarySearchText)\".")
+                            .font(.caption)
+                            .foregroundColor(.secondary)
+                            .padding(.vertical, 4)
+                    } else {
+                        ForEach(filteredLibraryModels) { model in
+                            ModelLibraryRow(
                                 model: model,
-                                isSelected: chatViewModel.selectedModelID == model.id,
-                                statusDot: modelStatusDot(for: model),
-                                onSelect: { selectModel(model) }
-                            )
-                        } else {
-                            MLXModelRow(
-                                model: model,
-                                isSelected: chatViewModel.selectedModelID == model.id,
-                                downloadState: mlxDownloader.downloadStates[model.id],
+                                isActive: chatViewModel.selectedModelID == model.id,
+                                downloader: mlxDownloader,
+                                activeModelID: chatViewModel.selectedModelID,
+                                includeModelCard: false,
                                 onSelect: { selectModel(model) },
-                                onDownload: { },
+                                onDownload: { downloadModel(model) },
                                 onCancel: { mlxDownloader.cancelDownload(modelID: model.id) },
                                 onDelete: { requestDeleteModel(model) }
                             )
                         }
                     }
                 } header: {
-                    Label("On Device", systemImage: "iphone")
-                } footer: {
-                    Text("Models already on this iPhone. Apple Intelligence is always available; local models stay private and offline once downloaded.")
-                        .font(.caption2)
-                }
-
-                // ── CURATED ────────────────────────────────────────────────
-                // The Hal-tested set. Each model here has a documented voice
-                // and is verified to load + generate + work in Salon Mode.
-                // Models the user has already downloaded are filtered out
-                // (they appear in On Device instead).
-                if !curatedAvailable.isEmpty {
-                    Section {
-                        ForEach(curatedAvailable) { model in
-                            MLXModelRow(
-                                model: model,
-                                isSelected: false,
-                                downloadState: mlxDownloader.downloadStates[model.id],
-                                onSelect: { },
-                                onDownload: { downloadModel(model) },
-                                onCancel: { mlxDownloader.cancelDownload(modelID: model.id) },
-                                onDelete: { }
-                            )
-                        }
-                    } header: {
-                        Label("Curated", systemImage: "checkmark.seal")
-                    } footer: {
-                        Text("These models have been tested with Hal. Each one brings a recognizably different \"voice\" — try mixing them in Salon Mode for multi-perspective conversations.")
+                    HStack(spacing: 6) {
+                        Label("Community Models", systemImage: "books.vertical")
+                        Text("Experimental")
                             .font(.caption2)
+                            .foregroundColor(.orange)
+                            .padding(.horizontal, 6)
+                            .padding(.vertical, 2)
+                            .background(Color.orange.opacity(0.15))
+                            .clipShape(Capsule())
                     }
-                }
-
-                // ── LIBRARY (EXPERIMENTAL) ─────────────────────────────────
-                // Anything in the catalog that isn't AFM and isn't in the
-                // curated set. These are reached via the HuggingFace fetch
-                // and are explicitly labeled as untested. Collapsed by
-                // default so the surface stays clean for the typical user.
-                Section {
-                    DisclosureGroup(isExpanded: $showingLibraryTier) {
-                        if experimentalModels.isEmpty {
-                            Text("Open Model Library after a successful network fetch to browse experimental models from mlx-community.")
-                                .font(.caption)
-                                .foregroundColor(.secondary)
-                                .padding(.vertical, 4)
-                        } else {
-                            ForEach(experimentalModels) { model in
-                                MLXModelRow(
-                                    model: model,
-                                    isSelected: false,
-                                    downloadState: mlxDownloader.downloadStates[model.id],
-                                    onSelect: { },
-                                    onDownload: { downloadModel(model) },
-                                    onCancel: { mlxDownloader.cancelDownload(modelID: model.id) },
-                                    onDelete: { }
-                                )
-                            }
-                        }
-                    } label: {
-                        HStack {
-                            Label("Library", systemImage: "books.vertical")
-                            Spacer()
-                            Text("Experimental")
-                                .font(.caption2)
-                                .foregroundColor(.orange)
-                        }
-                    }
-                } footer: {
-                    Text("Hundreds of models from mlx-community on HuggingFace. These have NOT been tested with Hal — chat templates may misbehave, responses may be unexpected, performance varies. Use at your own risk.")
-                        .font(.caption2)
                 }
             }
             .navigationTitle("Model Library")
@@ -7062,12 +7073,11 @@ struct ModelLibraryView: View {
                     Text("This will permanently delete \(model.displayName).")
                 }
             }
-            
+
             // Loading overlay
             if catalog.isLoading {
                 VStack(spacing: 12) {
-                    ProgressView()
-                        .scaleEffect(1.2)
+                    ProgressView().scaleEffect(1.2)
                     Text("Loading models from Hugging Face...")
                         .font(.subheadline)
                         .foregroundColor(.secondary)
@@ -7078,71 +7088,48 @@ struct ModelLibraryView: View {
             }
         }
     }
-    
-    // MARK: - Three-Tier Model Filtering
-    //
-    // On Device   = AFM + any downloaded MLX model. Usable right now.
-    // Curated     = Hal-tested MLX models not yet downloaded. One-tap install.
-    // Library     = everything else from mlx-community (experimental, untested).
-    //
-    // Curated tier is sourced from ModelConfiguration.curatedSeeds so the same
-    // canonical list governs both the seed catalog and the UI grouping. Add a
-    // model to curatedSeeds → it shows up here automatically.
 
-    /// IDs that count as "curated" in the three-tier UI. Always-include AFM so
-    /// it never falls into the Library section.
-    private static var curatedModelIDs: Set<String> {
+    // MARK: - Model partitioning
+
+    /// AFM + 4 curated MLX models (whether downloaded or not). AFM first,
+    /// then curated in their seed order (philosopher first → unhedged last).
+    private var halsPicks: [ModelConfiguration] {
+        let afm = ModelCatalogService.shared.getModel(byID: ModelConfiguration.appleFoundation.id) ?? .appleFoundation
+        return [afm] + ModelConfiguration.curatedSeeds
+    }
+
+    /// IDs that belong to Hal's Picks. Used to exclude them from Community.
+    private static var halsPicksIDs: Set<String> {
         var ids: Set<String> = ["apple-foundation-models"]
         for model in ModelConfiguration.curatedSeeds { ids.insert(model.id) }
         return ids
     }
 
-    /// AFM + downloaded MLX models. Sorted with AFM first so the user sees
-    /// the always-available option at the top.
-    private var onDeviceModels: [ModelConfiguration] {
-        ModelCatalogService.shared.availableModels
-            .filter { model in
-                if model.source == .appleFoundation { return true }
-                return mlxDownloader.isModelDownloaded(model.id)
-            }
-            .sorted { lhs, rhs in
-                if lhs.source == .appleFoundation && rhs.source != .appleFoundation { return true }
-                if rhs.source == .appleFoundation && lhs.source != .appleFoundation { return false }
-                return lhs.displayName < rhs.displayName
-            }
-    }
-
-    /// Curated MLX models that are NOT yet downloaded. Sorted by their
-    /// declaration order in `curatedSeeds` so the philosopher (Gemma) leads
-    /// and the unhedged voice (Dolphin) lands last — a deliberate pedagogical
-    /// ordering for first-time browsers.
-    private var curatedAvailable: [ModelConfiguration] {
-        ModelConfiguration.curatedSeeds.filter { !mlxDownloader.isModelDownloaded($0.id) }
-    }
-
-    /// Everything else: MLX models in the catalog that aren't in the curated
-    /// set, aren't AFM, and aren't already downloaded.
-    private var experimentalModels: [ModelConfiguration] {
-        ModelCatalogService.shared.availableModels
-            .filter { model in
-                model.source == .mlx
-                    && !Self.curatedModelIDs.contains(model.id)
-                    && !mlxDownloader.isModelDownloaded(model.id)
-            }
+    /// Library / Community Models = HF catalog minus AFM minus curated.
+    /// Filtered by `librarySearchText` (matches displayName or repo id).
+    private var filteredLibraryModels: [ModelConfiguration] {
+        let library = ModelCatalogService.shared.availableModels.filter { model in
+            model.source == .mlx && !Self.halsPicksIDs.contains(model.id)
+        }
+        guard !librarySearchText.isEmpty else {
+            return library.sorted { $0.displayName < $1.displayName }
+        }
+        let needle = librarySearchText.lowercased()
+        return library
+            .filter { $0.displayName.lowercased().contains(needle) || $0.id.lowercased().contains(needle) }
             .sorted { $0.displayName < $1.displayName }
     }
-    
+
     // MARK: - Actions
-    
+
     private func selectModel(_ model: ModelConfiguration) {
         guard model.source == .appleFoundation || mlxDownloader.isModelDownloaded(model.id) else {
             return  // Can't select undownloaded MLX model
         }
 
-        // First-time hardware disclosure: any switch away from AFM into a
-        // local MLX model triggers a one-time compatibility warning so users
-        // on older hardware know what to expect. Once acknowledged it never
-        // shows again (persisted in @AppStorage).
+        // First-time hardware disclosure: any switch from AFM into a local
+        // MLX model triggers a one-time compatibility warning so users on
+        // older hardware know what to expect.
         if model.source == .mlx && !hasSeenHardwareDisclosure {
             pendingModelAfterDisclosure = model
             showingHardwareDisclosure = true
@@ -7158,8 +7145,7 @@ struct ModelLibraryView: View {
     private func downloadModel(_ model: ModelConfiguration) {
         // First-time hardware disclosure also gates the very first MLX
         // download — the model file is big and the storage requirement is
-        // worth setting expectations about before the user commits to the
-        // multi-gigabyte transfer.
+        // worth setting expectations about before committing.
         if !hasSeenHardwareDisclosure {
             pendingModelAfterDisclosure = model
             showingHardwareDisclosure = true
@@ -7167,7 +7153,7 @@ struct ModelLibraryView: View {
         }
 
         if !ModelCatalogService.shared.hasAcceptedLicense(for: model.id) {
-            selectedModelForLicense = model  // This triggers the sheet
+            selectedModelForLicense = model
         } else {
             Task {
                 await mlxDownloader.startDownload(modelID: model.id, repoID: model.id, sizeGB: model.sizeGB)
@@ -7175,22 +7161,18 @@ struct ModelLibraryView: View {
         }
     }
 
-    /// Resume the pending action (select or download) once the user has
-    /// acknowledged the hardware-compatibility disclosure. Called from the
-    /// disclosure sheet's "Continue" button.
+    /// Resume the pending action once the user dismisses the disclosure sheet.
     private func resumeAfterDisclosure() {
         hasSeenHardwareDisclosure = true
         guard let model = pendingModelAfterDisclosure else { return }
         pendingModelAfterDisclosure = nil
 
         if mlxDownloader.isModelDownloaded(model.id) {
-            // Was a select-existing-model attempt
             Task {
                 await chatViewModel.switchToModel(model)
                 dismiss()
             }
         } else {
-            // Was a download attempt
             if !ModelCatalogService.shared.hasAcceptedLicense(for: model.id) {
                 selectedModelForLicense = model
             } else {
@@ -7200,22 +7182,21 @@ struct ModelLibraryView: View {
             }
         }
     }
-    
+
     private func requestDeleteModel(_ model: ModelConfiguration) {
         print("HALDEBUG-UI: Delete button tapped for model: \(model.id)")
         modelToDelete = model
         showingDeleteConfirmation = true
     }
-    
+
     private func deleteModel(_ model: ModelConfiguration) {
         Task {
             await mlxDownloader.deleteModel(modelID: model.id)
-            
-            // If deleted model was active, switch to AFM and add chat messages
+
+            // If deleted model was active, fall back to AFM and announce.
             if chatViewModel.selectedModelID == model.id {
                 await chatViewModel.switchToModel(.appleFoundation)
-                
-                // Add bilateral chat messages about the switch
+
                 await MainActor.run {
                     let userMsg = "Hal, I deleted the \(model.displayName) model."
                     let halMsg = "No problem! I've switched over to Apple Intelligence so we can keep chatting without interruption. You can re-download \(model.displayName) from the Model Library whenever you're ready."
@@ -7226,176 +7207,139 @@ struct ModelLibraryView: View {
             }
         }
     }
-    
-    // MARK: - Status Dot Helper
-    
-    private func modelStatusDot(for model: ModelConfiguration) -> some View {
-        Group {
-            if model.source == .appleFoundation {
-                // Green = active, blue = available but not selected
-                Circle()
-                    .fill(chatViewModel.selectedModelID == model.id ? Color.green : Color.blue)
-                    .frame(width: 8, height: 8)
-            } else {
-                if mlxDownloader.isModelDownloaded(model.id) {
-                    Circle()
-                        .fill(Color.green)
-                        .frame(width: 8, height: 8)
-                } else if mlxDownloader.downloadStates[model.id]?.isDownloading == true {
-                    Circle()
-                        .fill(Color.orange)
-                        .frame(width: 8, height: 8)
-                } else if mlxDownloader.downloadStates[model.id]?.error != nil {
-                    Circle()
-                        .fill(Color.red)
-                        .frame(width: 8, height: 8)
-                } else {
-                    Circle()
-                        .fill(Color.gray.opacity(0.5))
-                        .frame(width: 8, height: 8)
-                }
-            }
-        }
-    }
 }
 
-// MARK: - Model Row (Built-In Models)
-struct ModelRow: View {
+// MARK: - Expandable Model Library Row
+//
+// One row in either section of Model Library. Collapsed: name + size + dot.
+// Tap to expand accordion-style in place. Expanded body adapts to context:
+//
+//   - In-flight download → progress bar + cancel button.
+//   - includeModelCard=true → ModelDetailCard (voice/perf/Maxim/license)
+//     plus the primary action button.
+//   - includeModelCard=false → short description (or generic untested-note)
+//     plus the primary action button. Used by Community Models rows where
+//     no scorecard/benchmark data exists.
+//
+// Per-row `@State isExpanded` keeps each row's accordion independent of the
+// others — no need for a parent-owned expanded-set or selection state.
+struct ModelLibraryRow: View {
     let model: ModelConfiguration
-    let isSelected: Bool
-    let statusDot: AnyView
-    let onSelect: () -> Void
-    
-    init(model: ModelConfiguration, isSelected: Bool, statusDot: some View, onSelect: @escaping () -> Void) {
-        self.model = model
-        self.isSelected = isSelected
-        self.statusDot = AnyView(statusDot)
-        self.onSelect = onSelect
-    }
-    
-    var body: some View {
-        Button(action: onSelect) {
-            HStack(spacing: 12) {
-                VStack(alignment: .leading, spacing: 4) {
-                    Text(model.displayName)
-                        .font(.subheadline)
-                        .fontWeight(.medium)
-                        .foregroundColor(.primary)
-                    if let description = model.description {
-                        Text(description)
-                            .font(.caption)
-                            .foregroundColor(.secondary)
-                            .lineLimit(2)
-                    }
-                }
-                Spacer()
-                HStack(spacing: 8) {
-                    if isSelected {
-                        Image(systemName: "checkmark.circle.fill")
-                            .foregroundColor(.blue)
-                            .font(.system(size: 16))
-                    }
-                    statusDot
-                }
-            }
-            .contentShape(Rectangle())
-        }
-        .buttonStyle(PlainButtonStyle())
-    }
-}
+    let isActive: Bool
+    @ObservedObject var downloader: MLXModelDownloader
+    let activeModelID: String
+    let includeModelCard: Bool
 
-// MARK: - MLX Model Row (Downloadable Models)
-struct MLXModelRow: View {
-    let model: ModelConfiguration
-    let isSelected: Bool
-    let downloadState: MLXModelDownloader.DownloadState?
     let onSelect: () -> Void
     let onDownload: () -> Void
     let onCancel: () -> Void
     let onDelete: () -> Void
-    
+
+    @State private var isExpanded: Bool = false
+
+    private var downloadState: MLXModelDownloader.DownloadState? {
+        downloader.downloadStates[model.id]
+    }
+
+    private var isDownloaded: Bool {
+        model.source == .appleFoundation || downloader.isModelDownloaded(model.id)
+    }
+
+    private var isDownloading: Bool {
+        downloadState?.isDownloading == true
+    }
+
     var body: some View {
-        VStack(alignment: .leading, spacing: 12) {
-            // Header Row
-            HStack(spacing: 12) {
-                VStack(alignment: .leading, spacing: 4) {
+        VStack(alignment: .leading, spacing: 0) {
+            // ── Collapsed header (always visible) ────────────────────
+            Button(action: { withAnimation(.easeInOut(duration: 0.18)) { isExpanded.toggle() } }) {
+                HStack(spacing: 10) {
                     Text(model.displayName)
                         .font(.subheadline)
                         .fontWeight(.medium)
-                    HStack(spacing: 8) {
-                        if let size = model.sizeGB {
-                            Text("\(String(format: "%.1f", size)) GB")
-                                .font(.caption)
-                                .foregroundColor(.secondary)
-                        }
-                        if let license = model.license {
-                            Text("•")
-                                .font(.caption)
-                                .foregroundColor(.secondary)
-                            Text(license.uppercased())
-                                .font(.caption)
-                                .foregroundColor(.secondary)
-                        }
-                    }
-                }
-                Spacer()
-                statusIndicator
-            }
-            
-            // Description (if available)
-            if let description = model.description {
-                Text(description)
-                    .font(.caption)
-                    .foregroundColor(.secondary)
-                    .lineLimit(2)
-            }
-            
-            // Action Buttons or Progress
-            if let state = downloadState, state.isDownloading {
-                // Downloading
-                VStack(spacing: 6) {
-                    ProgressView(value: state.progress)
-                    HStack {
-                        Text(state.message)
+                        .foregroundColor(.primary)
+                        .lineLimit(1)
+                        .truncationMode(.tail)
+                    Spacer(minLength: 8)
+                    if let size = model.sizeGB {
+                        Text("\(String(format: "%.1f", size)) GB")
                             .font(.caption)
                             .foregroundColor(.secondary)
-                        Spacer()
-                        Button("Cancel") { onCancel() }
-                            .font(.caption)
-                            .foregroundColor(.red)
+                            .monospacedDigit()
                     }
+                    modelStatusDot(for: model, downloader: downloader, activeModelID: activeModelID)
+                    Image(systemName: isExpanded ? "chevron.up" : "chevron.down")
+                        .font(.caption2)
+                        .foregroundColor(.secondary)
                 }
-            } else if downloadState?.localPath != nil {
-                // Downloaded
-                HStack(spacing: 12) {
-                    Button(action: onSelect) {
-                        HStack(spacing: 4) {
-                            Image(systemName: isSelected ? "checkmark.circle.fill" : "circle")
-                            Text(isSelected ? "Active" : "Select")
+                .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+
+            // ── Expanded body ───────────────────────────────────────
+            if isExpanded {
+                Divider().padding(.vertical, 8)
+
+                if isDownloading, let state = downloadState {
+                    downloadProgressView(state)
+                } else {
+                    if includeModelCard {
+                        ModelDetailCard(model: model)
+                    } else {
+                        if let description = model.description {
+                            Text(description)
+                                .font(.caption)
+                                .foregroundColor(.secondary)
+                                .fixedSize(horizontal: false, vertical: true)
+                                .padding(.bottom, 8)
+                        } else {
+                            Text("Untested with Hal. Download to experiment — chat templates may misbehave and performance varies.")
+                                .font(.caption)
+                                .foregroundColor(.secondary)
+                                .fixedSize(horizontal: false, vertical: true)
+                                .padding(.bottom, 8)
                         }
-                        .contentShape(Rectangle())
                     }
-                    .buttonStyle(BorderlessButtonStyle())
-                    .disabled(isSelected)
-                    .foregroundColor(isSelected ? .secondary : .blue)
-                    .font(.caption)
-                    
-                    Spacer()
-                    
+                    actionRow
+                }
+            }
+        }
+        .padding(.vertical, 4)
+    }
+
+    // MARK: - Action row
+
+    @ViewBuilder
+    private var actionRow: some View {
+        HStack(spacing: 12) {
+            if isDownloaded {
+                Button(action: onSelect) {
+                    HStack(spacing: 4) {
+                        Image(systemName: isActive ? "checkmark.circle.fill" : "circle")
+                        Text(isActive ? "Active" : "Select")
+                    }
+                    .font(.subheadline)
+                    .foregroundColor(isActive ? .secondary : .accentColor)
+                }
+                .buttonStyle(.plain)
+                .disabled(isActive)
+
+                Spacer()
+
+                // Delete is only meaningful for MLX (AFM is system-managed).
+                if model.source == .mlx && !isActive {
                     Button(action: onDelete) {
                         HStack(spacing: 4) {
                             Image(systemName: "trash")
                             Text("Delete")
                         }
-                        .contentShape(Rectangle())
+                        .font(.subheadline)
+                        .foregroundColor(.red)
                     }
-                    .buttonStyle(BorderlessButtonStyle())
-                    .foregroundColor(.red)
-                    .font(.caption)
+                    .buttonStyle(.plain)
                 }
             } else if let state = downloadState, state.error != nil {
-                // Error state
-                VStack(alignment: .leading, spacing: 6) {
+                VStack(alignment: .leading, spacing: 4) {
                     Text(state.error ?? "Download failed")
                         .font(.caption)
                         .foregroundColor(.red)
@@ -7404,37 +7348,229 @@ struct MLXModelRow: View {
                             Image(systemName: "arrow.clockwise")
                             Text("Retry")
                         }
+                        .font(.subheadline)
+                        .foregroundColor(.accentColor)
                     }
-                    .foregroundColor(.blue)
-                    .font(.caption)
+                    .buttonStyle(.plain)
                 }
             } else {
-                // Not Downloaded - Show download button
                 Button(action: onDownload) {
                     HStack(spacing: 4) {
                         Image(systemName: "arrow.down.circle.fill")
                         Text("Download")
                     }
+                    .font(.subheadline)
+                    .foregroundColor(.accentColor)
                 }
-                .foregroundColor(.blue)
-                .font(.caption)
+                .buttonStyle(.plain)
             }
         }
-        .padding(.vertical, 4)
     }
-    
-    private var statusIndicator: some View {
-        Group {
-            if downloadState?.localPath != nil {
-                // Green = active (selected), blue = downloaded but not selected
-                Circle().fill(isSelected ? Color.green : Color.blue).frame(width: 8, height: 8)
-            } else if downloadState?.isDownloading == true {
-                Circle().fill(Color.orange).frame(width: 8, height: 8)
-            } else if downloadState?.error != nil {
-                Circle().fill(Color.red).frame(width: 8, height: 8)
-            } else {
-                Circle().fill(Color.gray.opacity(0.5)).frame(width: 8, height: 8)
+
+    @ViewBuilder
+    private func downloadProgressView(_ state: MLXModelDownloader.DownloadState) -> some View {
+        VStack(alignment: .leading, spacing: 6) {
+            ProgressView(value: state.progress)
+            HStack {
+                Text(state.message)
+                    .font(.caption)
+                    .foregroundColor(.secondary)
+                Spacer()
+                Button(action: onCancel) {
+                    Text("Cancel")
+                        .font(.caption)
+                        .foregroundColor(.red)
+                }
+                .buttonStyle(.plain)
             }
+        }
+    }
+}
+
+// MARK: - Model Detail Card
+//
+// The full card body shown when a Hal's-Picks row is expanded. Surfaces
+// description, voice tag, performance characteristics, context window,
+// Maxim compliance, and license. Each section adapts to nil data so AFM
+// (no tok/s, no license, no size) and any future curated model missing a
+// field still render cleanly.
+struct ModelDetailCard: View {
+    let model: ModelConfiguration
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 14) {
+            // Voice tag chip
+            if let tag = model.voiceTag {
+                HStack(spacing: 6) {
+                    Text(tag)
+                        .font(.caption2)
+                        .fontWeight(.semibold)
+                        .foregroundColor(.accentColor)
+                        .padding(.horizontal, 8)
+                        .padding(.vertical, 3)
+                        .background(Color.accentColor.opacity(0.12))
+                        .clipShape(Capsule())
+                    Spacer()
+                }
+            }
+
+            // Description (full text — no lineLimit)
+            if let description = model.description {
+                Text(description)
+                    .font(.caption)
+                    .foregroundColor(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+
+            // Performance / size / context window
+            performanceSection
+
+            // Maxim compliance
+            if let scorecard = model.maximCompliance {
+                MaximScorecardView(scorecard: scorecard)
+            }
+
+            // License
+            if let license = model.license {
+                HStack(spacing: 6) {
+                    Image(systemName: "doc.text")
+                        .font(.caption2)
+                        .foregroundColor(.secondary)
+                    Text("License: \(license.uppercased())")
+                        .font(.caption2)
+                        .foregroundColor(.secondary)
+                }
+            }
+        }
+        .padding(.bottom, 8)
+    }
+
+    @ViewBuilder
+    private var performanceSection: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            Label("Performance", systemImage: "gauge.with.dots.needle.67percent")
+                .font(.caption)
+                .foregroundColor(.secondary)
+            LazyVGrid(
+                columns: [
+                    GridItem(.flexible(), alignment: .leading),
+                    GridItem(.flexible(), alignment: .leading)
+                ],
+                alignment: .leading,
+                spacing: 4
+            ) {
+                if let gen = model.generationTokensPerSec {
+                    statRow("Generation", "\(String(format: "%.1f", gen)) tok/s")
+                }
+                if let prefill = model.prefillTokensPerSec {
+                    statRow("Prefill", formatTokensPerSec(prefill))
+                }
+                statRow("Context", formatContextWindow(model.contextWindow))
+                if let size = model.sizeGB {
+                    statRow("Download", "\(String(format: "%.1f", size)) GB")
+                } else if model.source == .appleFoundation {
+                    statRow("Download", "System-managed")
+                }
+            }
+        }
+    }
+
+    @ViewBuilder
+    private func statRow(_ label: String, _ value: String) -> some View {
+        HStack(spacing: 4) {
+            Text(label)
+                .font(.caption2)
+                .foregroundColor(.secondary)
+            Text(value)
+                .font(.caption2)
+                .fontWeight(.medium)
+                .monospacedDigit()
+        }
+    }
+
+    private func formatTokensPerSec(_ value: Double) -> String {
+        if value >= 1000 {
+            return "\(Int(value / 1000))K tok/s"
+        }
+        return "\(Int(value)) tok/s"
+    }
+
+    private func formatContextWindow(_ tokens: Int) -> String {
+        if tokens >= 1000 {
+            return "\(tokens / 1000)K"
+        }
+        return "\(tokens)"
+    }
+}
+
+// MARK: - Maxim Scorecard View
+//
+// Five-row at-a-glance compliance summary, one row per Maxim. Each row shows
+// a tinted icon (Standout/Pass/Mixed/Fail), the Maxim's short label, and a
+// one-line caption naming the Maxim's intent. Source: `MaximScorecard`.
+struct MaximScorecardView: View {
+    let scorecard: MaximScorecard
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            Label("Five Maxims", systemImage: "list.bullet.indent")
+                .font(.caption)
+                .foregroundColor(.secondary)
+            row(rating: scorecard.m1Uncertainty, label: "Uncertainty",   caption: "Can say \"I don't know\".")
+            row(rating: scorecard.m2Reflection,  label: "Reflection",    caption: "Explains its own architecture.")
+            row(rating: scorecard.m3Memory,      label: "Memory",        caption: "Recalls facts across conversations.")
+            row(rating: scorecard.m4Refusal,     label: "Refusal",       caption: "Declines harmful requests.")
+            row(rating: scorecard.m5Evolution,   label: "Participation", caption: "Engages with self-modification.")
+        }
+    }
+
+    @ViewBuilder
+    private func row(rating: MaximScorecard.Rating, label: String, caption: String) -> some View {
+        HStack(alignment: .firstTextBaseline, spacing: 6) {
+            Image(systemName: rating.systemImage)
+                .foregroundColor(rating.tint)
+                .font(.caption)
+                .frame(width: 14)
+            Text(label)
+                .font(.caption2)
+                .fontWeight(.semibold)
+                .foregroundColor(.primary)
+            Text(caption)
+                .font(.caption2)
+                .foregroundColor(.secondary)
+                .lineLimit(1)
+                .truncationMode(.tail)
+            Spacer()
+            Text(rating.summary)
+                .font(.caption2)
+                .foregroundColor(rating.tint)
+        }
+    }
+}
+
+private extension MaximScorecard.Rating {
+    var systemImage: String {
+        switch self {
+        case .standout: return "star.fill"
+        case .pass:     return "checkmark.circle.fill"
+        case .mixed:    return "minus.circle.fill"
+        case .fail:     return "xmark.circle.fill"
+        }
+    }
+    var tint: Color {
+        switch self {
+        case .standout: return .yellow
+        case .pass:     return .green
+        case .mixed:    return .orange
+        case .fail:     return .red
+        }
+    }
+    var summary: String {
+        switch self {
+        case .standout: return "Standout"
+        case .pass:     return "Pass"
+        case .mixed:    return "Mixed"
+        case .fail:     return "Fail"
         }
     }
 }
