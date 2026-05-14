@@ -3988,6 +3988,61 @@ struct HalModelLimits {
 
 // ==== LEGO START: 08 MLXWrapper & LLMService (Foundation + MLX Routing) ====
 
+// MARK: - Truncation-safe response trimming
+//
+// Every LLM we use (AFM via Apple FoundationModels; every MLX model via
+// mlx-swift-lm) has an upper bound on how many tokens it will emit per turn.
+// When generation hits that ceiling, the model stops mid-word — leaving the
+// user staring at a sentence cut at "bottomle" or "consc". That's worse than
+// a slow response; it looks broken.
+//
+// `trimToWordBoundary` is the universal post-generation safeguard. Both the
+// AFM streaming path (`LLMService.generateChatResponseStream`) and the MLX
+// streaming path (`MLXWrapper.generateChatStream`) call it on the final
+// cumulative text right before the stream finishes. If the response already
+// ends at a natural boundary (whitespace, punctuation, sentence terminator,
+// quote, etc.), nothing changes. If the last character is alphanumeric — the
+// mid-word truncation case — we walk back to the last whitespace and append
+// an ellipsis to signal the response was cut off. The trim is bounded to ~200
+// characters so we never lose substantial content; if no boundary exists
+// within that window, we return the input unchanged (better to leave the
+// rough edge than throw away meaningful content).
+//
+// Word boundaries are detected by Swift's Unicode-aware `isLetter`/`isNumber`,
+// plus apostrophe and hyphen (so "don't" and "self-aware" stay intact). The
+// addition of "…" mirrors how a human transcriber would mark truncation.
+//
+// This is a global UX guarantee, not a per-model patch. It applies to every
+// response that flows through either chat path.
+fileprivate func trimToWordBoundary(_ text: String) -> String {
+    let stripped = text.trimmingCharacters(in: .whitespacesAndNewlines)
+    guard let last = stripped.last else { return text }
+
+    // If the response already ends in something that isn't a letter/digit,
+    // it's at a natural boundary (whitespace, punctuation, closing quote,
+    // ellipsis, etc.) — no trim needed.
+    let isWordChar: (Character) -> Bool = { ch in
+        ch.isLetter || ch.isNumber || ch == "'" || ch == "\u{2019}" || ch == "-"
+    }
+    guard isWordChar(last) else { return text }
+
+    // Find the last whitespace within the lookback window. Beyond that, the
+    // "word" is suspiciously long — likely a URL or code token we shouldn't
+    // hack apart, so leave the response as-is rather than trim aggressively.
+    let chars = Array(stripped)
+    let lookbackLimit = max(0, chars.count - 200)
+    for i in stride(from: chars.count - 1, through: lookbackLimit, by: -1) {
+        if chars[i].isWhitespace {
+            let prefix = String(chars[..<i]).trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !prefix.isEmpty else { return text }
+            return prefix + "\u{2026}"  // …
+        }
+    }
+    // No whitespace found within 200 chars — give up; leave the partial word
+    // in place rather than trim something that's clearly not a normal sentence.
+    return text
+}
+
 // MARK: - MLXWrapper for MLX Model Interaction
 class MLXWrapper: ObservableObject {
     @Published var isModelLoaded: Bool = false
@@ -4274,8 +4329,18 @@ class MLXWrapper: ObservableObject {
                     let modelPenalty = self.currentModelConfig?.repetitionPenalty
                     let modelPenaltyCtx = self.currentModelConfig?.repetitionContextSize ?? 20
                     halLog("HALDEBUG-MLX-CHAT: Penalty config for \(self.currentModelConfig?.displayName ?? "unknown"): penalty=\(modelPenalty.map { String($0) } ?? "nil"), ctx=\(modelPenaltyCtx)")
+                    // Token budget. Was 512 — too low; combined with longer Maxim-
+                    // class responses or any small-model looping, the model would
+                    // hit the cap mid-word and the user would see "...bottomle" or
+                    // "...consc" — visibly broken. 1536 gives all curated models
+                    // comfortable headroom for a paragraph-class reply (Gemma at
+                    // ~35 tok/s generates 1536 tokens in ~44 s; well within the
+                    // 120 s SOP limit). The trimToWordBoundary safeguard below
+                    // catches any remaining mid-word cuts so the user never sees
+                    // the rough edge regardless of model or cap.
+                    let maxOutputTokens = 1536
                     let parameters = GenerateParameters(
-                        maxTokens: 512,
+                        maxTokens: maxOutputTokens,
                         temperature: Float(temperature),
                         repetitionPenalty: modelPenalty,
                         repetitionContextSize: modelPenaltyCtx
@@ -4311,12 +4376,20 @@ class MLXWrapper: ObservableObject {
                     }
 
                     MLX.GPU.clearCache()
-                    let trimmed = fullText.trimmingCharacters(in: CharacterSet.whitespacesAndNewlines)
-                    halLog("HALDEBUG-MLX-CHAT: Returning fullText (\(trimmed.count) chars): \(trimmed.prefix(150))")
-                    // Final yield with the trimmed version so callers settle on
-                    // a clean string. Then finish the stream.
-                    if trimmed != fullText {
-                        continuation.yield(trimmed)
+                    let whitespaceTrimmed = fullText.trimmingCharacters(in: CharacterSet.whitespacesAndNewlines)
+                    // Universal mid-word-truncation safeguard. If maxOutputTokens
+                    // was hit (or anything else cut the response off mid-word),
+                    // trim back to the last word boundary and append an ellipsis.
+                    // No-op when the response already ends naturally.
+                    let finalText = trimToWordBoundary(whitespaceTrimmed)
+                    if finalText != whitespaceTrimmed {
+                        halLog("HALDEBUG-MLX-CHAT: Truncation safeguard trimmed \(whitespaceTrimmed.count - finalText.count) chars from a mid-word cut")
+                    }
+                    halLog("HALDEBUG-MLX-CHAT: Returning fullText (\(finalText.count) chars): \(finalText.prefix(150))")
+                    // Final yield with the cleaned version so callers settle on a
+                    // string with no mid-word truncation. Then finish the stream.
+                    if finalText != fullText {
+                        continuation.yield(finalText)
                     }
                     continuation.finish()
                 } catch {
@@ -4562,7 +4635,21 @@ class LLMService: ObservableObject {
                             // Apple's API contract; just forward it through.
                             continuation.yield(accumulatedText)
                         }
-                        halLog("HALDEBUG-LLM-CHAT: AFM response length: \(accumulatedText.count)")
+                        // Universal mid-word-truncation safeguard. AFM's
+                        // default maximumResponseTokens is generous but not
+                        // infinite — if a long generation hits the internal
+                        // cap, trim back to the last word boundary and append
+                        // an ellipsis so the user never sees a mid-word cut.
+                        // No-op when the response ends naturally.
+                        let whitespaceTrimmed = accumulatedText.trimmingCharacters(in: .whitespacesAndNewlines)
+                        let finalText = trimToWordBoundary(whitespaceTrimmed)
+                        if finalText != whitespaceTrimmed {
+                            halLog("HALDEBUG-LLM-CHAT: AFM truncation safeguard trimmed \(whitespaceTrimmed.count - finalText.count) chars from a mid-word cut")
+                        }
+                        if finalText != accumulatedText {
+                            continuation.yield(finalText)
+                        }
+                        halLog("HALDEBUG-LLM-CHAT: AFM response length: \(finalText.count)")
                         continuation.finish()
                     } catch {
                         halLog("HALDEBUG-LLM-CHAT: AFM chat generation error: \(error.localizedDescription)")
