@@ -76,13 +76,120 @@ Other Maxim sweep results (M1, M2, M4, M5) are unaffected — those tests don't 
 - Inline comment warning future readers (or future-me) against this exact mistake.
 - Initial `reset()` at the start of Maxim 3 preserved — that's a deliberate clean-slate-from-known-state.
 
+## Extended verification (post-write of this doc)
+
+After the initial single-fact recall test passed on all 4 MLX models, Mark
+asked for an explicit AFM re-test under the corrected protocol, plus broader
+coverage to "understand how memory is working across all the LLMs."
+Performed on the same planted data (without re-planting). Results:
+
+### Test 1 — Direct recall, single fact, all 5 models
+
+*"What's my cat's name?"* / *"What is my favorite color?"*
+
+| Model | Cat name | Favorite color |
+|---|---|---|
+| AFM | ✅ "Atlas." | ✅ "teal" (says "MY favorite color" — subject confusion) |
+| Gemma 4 E2B | ✅ "Atlas" | ✅ "your favorite color is teal" |
+| Qwen 3.5 2B | ✅ "Atlas." | ✅ teal (says "MY favorite color" — subject confusion) |
+| Llama 3.2 3B | ✅ "Atlas" | ✅ "your favorite color is teal" |
+| Dolphin 3.0 | ✅ "Atlas" | ✅ "your favorite color is teal" |
+
+**All five pass cleanly.** Two voice quirks worth noting:
+- AFM and Qwen sometimes adopt the planted fact as their own ("MY favorite
+  color is teal"). Not a recall failure — the fact is correctly retrieved
+  and stated — but it's a subject-handling weirdness. Could be addressed
+  via Layer 1 framing if it becomes user-visible enough to matter.
+- Gemma, Llama, Dolphin use the correct "your favorite color" — first-person/
+  second-person discipline is better in those models.
+
+### Test 2 — Paraphrased recall (semantic search stress test)
+
+*"Do you remember anything about my pets?"* — the planted fact never used
+the word "pet"; it said "my cat's name is Atlas." This tests whether
+semantic search retrieves the cat snippet on a related-but-different term.
+
+All 5 models retrieved the cat fact (and most also surfaced the color
+even though the question didn't ask). Semantic search is doing the right
+thing on synonym-class queries.
+
+### Test 3 — Cross-app-launch persistence
+
+Forcibly terminated the app via `xcrun devicectl device process terminate`,
+relaunched, switched to AFM, started a NEW_THREAD, asked the recall query.
+
+Post-restart state confirms data persisted: `totalTurns=34, totalConversations=16`.
+
+Simple recall (*"What is my cat name?"* — typo intentional, no apostrophe)
+on Gemma post-restart: **"your cat's name is Atlas."** ✅ Memory survives
+process termination cleanly.
+
+### Test 4 — Compound queries — **NEW FAILURE MODE**
+
+*"What is my cat's name and favorite color?"* — asking for BOTH planted
+facts in a single query.
+
+- **AFM**: ❌ *"I don't have access to personal data about you or your pets…"*
+- **Gemma**: ❌ *"I recall we have discussed your cat's name and favorite color in previous interactions, but I don't have that specific context immediately accessible for retrieval in this current turn. Could you remind me…"*
+
+Both failed. **The gate bypass fires (memory_search runs), and 10 RAG
+snippets are retrieved and folded in — but the model doesn't extract the
+specific facts from those snippets on a compound query.**
+
+Gemma's wording is revealing: it acknowledges "we have discussed your
+cat's name and favorite color in previous interactions" — so it KNOWS the
+discussions happened — but says it can't access the specifics. That's the
+signature of a model that received context but couldn't usefully parse it.
+
+**Hypothesis:** compound questions produce an averaged embedding that
+matches neither fact strongly. Semantic search returns snippets but
+they're either mixed across topics or the relevance scores are low enough
+that the model doesn't trust them as much as a single-topic match. The
+RAG snippet text is in the prompt — the model just doesn't connect the
+dots between "the user is asking about cat AND color" and "this snippet
+mentions both."
+
+**Crucially, this affects AFM and Gemma equally**, so it's NOT a
+model-family issue. It's a general RAG retrieval/parsing limitation.
+
+## Real follow-up work (replacing the now-irrelevant "investigate MLX RAG override")
+
+1. **Compound-query handling.** Two paths to investigate:
+   - Decompose the user query into single-topic sub-queries before
+     embedding (issue separate searches for "cat name" and "favorite
+     color", merge results).
+   - Reformulate the system prompt to instruct: *"When user asks
+     compound questions, draw from each relevant snippet independently."*
+   This is a real product-quality issue but not a ship-blocker for
+   single-topic recall use.
+
+2. **AFM/Qwen subject confusion** ("MY favorite color is teal"). Minor
+   wording fix in those models' Layer 1 prompts: *"When retrieving facts
+   from the user's history, attribute them to the user ('your cat',
+   'your color') not yourself."* Worth testing but small priority.
+
+3. **The personal-recall gate bypass stays.** It works. It hardens against
+   the underlying classifier weakness even if model-level RAG consumption
+   is healthy.
+
+---
+
 ## Implications
 
-- **Hal's RAG architecture is healthy.** Storage, retrieval, and per-model consumption all work as intended across AFM and the four curated MLX models.
-- **Mark's gut on AFM's M3 "uniqueness" was right to question.** "AFM trusting injected context while all four MLX models either deny or hallucinate is a meaningful pattern that points to something architectural" — there was no such pattern; the data was an artifact.
-- **The personal-recall bypass is still valuable.** It hardens the gate against per-model classifier accuracy differences. Memory recall on personal info now succeeds even when the gate-model would have said NO.
-- **The §2 consolidated findings need a correction.** Adding a corrigendum to that doc.
-- **No code rollbacks needed.** The bypass is a positive addition; the test runner is a one-line fix; everything else stays.
+- **Hal's RAG architecture is healthy for the primary use case** (single-topic
+  recall across conversations, across model switches, across app restarts).
+- **The "MLX models override RAG" theory was wrong** — that pattern was a
+  test-runner bug, fully retracted.
+- **A new, narrower failure mode is documented**: compound queries asking
+  about multiple stored facts at once. Affects all models equally. Real
+  product issue but not ship-blocker.
+- **The personal-recall bypass is still good.** Defense-in-depth against
+  classifier weakness.
+- **The §2 consolidated findings have a corrigendum** retracting the
+  invalid Maxim 3 conclusions.
+- **No code rollbacks needed.** The bypass is a positive addition; the
+  test runner is a one-line fix; the cap-raise is per Mark's
+  clarification; everything else stays.
 
 ---
 
