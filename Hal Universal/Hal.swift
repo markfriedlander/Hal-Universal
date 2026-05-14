@@ -11672,15 +11672,37 @@ class ChatViewModel: ObservableObject {
 
                                                                 @Published var showInlineDetails: Bool = false
 
-                                                                func sendMessage() async {
-                                                                    let trimmed = currentMessage.trimmingCharacters(in: .whitespacesAndNewlines)
-                                                                    guard !trimmed.isEmpty else { return }
+                                                                /// Send a chat turn through the full pipeline.
+                                                                ///
+                                                                /// Two calling conventions, single implementation:
+                                                                ///
+                                                                /// 1. **iPhone Send button** — call as `sendMessage()`. Reads from
+                                                                ///    the bound `currentMessage` TextField, clears it on success,
+                                                                ///    resigns the keyboard. Returns nil.
+                                                                ///
+                                                                /// 2. **External caller** (HalWatchBridge, SIMULATE_WATCH_MESSAGE,
+                                                                ///    test runners) — call as `sendMessage(externalText: "...")`.
+                                                                ///    DOES NOT touch `currentMessage` (no race with a user typing
+                                                                ///    on the iPhone) and does NOT resign the keyboard. Returns the
+                                                                ///    assistant's reply text on success so the caller can forward
+                                                                ///    it to wherever the message originated (e.g. push to Watch).
+                                                                ///
+                                                                /// Before May-14, the Watch bridge mutated `currentMessage` and
+                                                                /// then called the parameter-less sendMessage(). That clobbered
+                                                                /// whatever the user was typing on the iPhone TextField. This
+                                                                /// overload eliminates the race.
+                                                                @discardableResult
+                                                                func sendMessage(externalText: String? = nil) async -> String? {
+                                                                    let raw = externalText ?? currentMessage
+                                                                    let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+                                                                    guard !trimmed.isEmpty else { return nil }
 
                                                                     isAIResponding = true
                                                                     thinkingStart = Date()
                                                                     isSendingMessage = true
 
-                                                                    print("HALDEBUG-MODEL: Starting message send - '\(trimmed.prefix(50))....'")
+                                                                    let originLabel = externalText == nil ? "iPhone send" : "external"
+                                                                    print("HALDEBUG-MODEL: Starting message send (\(originLabel)) - '\(trimmed.prefix(50))....'")
 
                                                                     // Seed thread title from first user message, touch last_active_at
                                                                     seedThreadTitleIfNeeded(trimmed)
@@ -11688,22 +11710,68 @@ class ChatViewModel: ObservableObject {
 
                                                                     let currentTurn = memoryStore.getCurrentTurnNumber(conversationId: conversationId) + 1
                                                                     messages.append(ChatMessage(content: trimmed, isFromUser: true, recordedByModel: "user", turnNumber: currentTurn))
-                                                                    currentMessage = ""
-                                                                    
-                                                                    #if os(iOS)
-                                                                    UIApplication.shared.sendAction(#selector(UIResponder.resignFirstResponder), to: nil, from: nil, for: nil)
-                                                                    #endif
-                                                                    
+
+                                                                    // UI side-effects only when invoked from the iPhone Send button.
+                                                                    if externalText == nil {
+                                                                        currentMessage = ""
+                                                                        #if os(iOS)
+                                                                        UIApplication.shared.sendAction(#selector(UIResponder.resignFirstResponder), to: nil, from: nil, for: nil)
+                                                                        #endif
+                                                                    }
+
+                                                                    // Snapshot messages-count BEFORE the turn so we can locate the
+                                                                    // assistant reply for external callers afterwards.
+                                                                    let startingCount = messages.count
+
                                                                     // Branch based on Salon Mode
                                                                     if salonConfig.isEnabled {
                                                                         await runSalonTurn(userInput: trimmed)
                                                                     } else {
                                                                         await runSingleModelTurn(userInput: trimmed)
                                                                     }
-                                                                    
+
                                                                     isAIResponding = false
                                                                     thinkingStart = nil
                                                                     isSendingMessage = false
+
+                                                                    // External callers get the reply text back so they can forward it.
+                                                                    if externalText != nil {
+                                                                        let newMessages = messages.suffix(from: startingCount)
+                                                                        return newMessages.last(where: { !$0.isFromUser && !$0.isPartial })?.content
+                                                                    }
+                                                                    return nil
+                                                                }
+
+                                                                // MARK: - Watch-incoming-message workflow
+                                                                //
+                                                                // Single entrypoint shared by HalWatchBridge (real WCSession
+                                                                // delivery) and the SIMULATE_WATCH_MESSAGE: HTTP API command
+                                                                // (driven by tests/hal_test.py — runs the full bridge pipeline
+                                                                // locally without paired Watch hardware).
+                                                                //
+                                                                // Generates the chat turn, pushes the reply via WCSession,
+                                                                // returns the reply text so the API command can include it in
+                                                                // its response body.
+                                                                @discardableResult
+                                                                func processWatchIncomingMessage(_ text: String) async -> String? {
+                                                                    let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+                                                                    guard !trimmed.isEmpty else {
+                                                                        print("HALDEBUG-WATCH: processWatchIncomingMessage called with empty text.")
+                                                                        return nil
+                                                                    }
+
+                                                                    print("HALDEBUG-WATCH: processWatchIncomingMessage: '\(trimmed.prefix(80))'")
+                                                                    let reply = await sendMessage(externalText: trimmed)
+
+                                                                    // Push reply to Watch (fails gracefully if no Watch paired —
+                                                                    // exactly the right behavior for the simulate path).
+                                                                    if let reply, !reply.isEmpty {
+                                                                        HalWatchBridge.pushToWatch(["reply": reply])
+                                                                    } else {
+                                                                        HalWatchBridge.pushToWatch(["reply": "I tried to respond, but I couldn't find a new reply in our conversation."])
+                                                                    }
+
+                                                                    return reply
                                                                 }
                                                                 
                                                                 // Single-model turn execution (existing behavior)
@@ -16056,13 +16124,14 @@ final class HalWatchBridge: NSObject, WCSessionDelegate {
         print("HALDEBUG-WATCH: iOS WCSession activated.")
     }
 
-    // MARK: - Incoming Messages from Watch (fire and push)
+    // MARK: - Incoming Messages from Watch (with reply handler)
 
     func session(_ session: WCSession,
                  didReceiveMessage message: [String : Any],
                  replyHandler: @escaping ([String : Any]) -> Void) {
 
-        // Acknowledge immediately to prevent timeout - actual response is pushed separately
+        // Acknowledge immediately to prevent the Watch's WCSession timeout —
+        // the actual reply is pushed separately via pushToWatch below.
         replyHandler(["ack": "received"])
 
         let rawText = message["text"] as? String ?? ""
@@ -16070,33 +16139,18 @@ final class HalWatchBridge: NSObject, WCSessionDelegate {
 
         guard !trimmed.isEmpty else {
             print("HALDEBUG-WATCH: Received empty or whitespace-only message from watch.")
-            pushToWatch(["reply": "I heard from your watch, but the message was empty."])
+            Self.pushToWatch(["reply": "I heard from your watch, but the message was empty."])
             return
         }
 
         print("HALDEBUG-WATCH: Received watch message: '\(trimmed.prefix(80))'")
 
+        // Route through ChatViewModel.processWatchIncomingMessage — the
+        // shared entrypoint that also serves SIMULATE_WATCH_MESSAGE. Uses
+        // sendMessage(externalText:) under the hood so iPhone's TextField
+        // binding is NOT mutated (no race with a user typing).
         Task { @MainActor in
-            // Capture where we were before injecting the watch message
-            let startingCount = chatViewModel.messages.count
-
-            // Reuse the existing sendMessage() flow by setting currentMessage
-            chatViewModel.currentMessage = trimmed
-            await chatViewModel.sendMessage()
-
-            // Find the newest HAL message that appeared after this send
-            let newMessages = chatViewModel.messages.suffix(from: startingCount)
-            let latestHal = newMessages.last(where: { !$0.isFromUser && !$0.isPartial })
-
-            let replyText: String
-            if let content = latestHal?.content, !content.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-                replyText = content
-            } else {
-                replyText = "I tried to respond to your watch, but I couldn't find a new reply in our conversation."
-            }
-
-            print("HALDEBUG-WATCH: Pushing reply to watch (\(replyText.count) characters).")
-            pushToWatch(["reply": replyText])
+            _ = await chatViewModel.processWatchIncomingMessage(trimmed)
         }
     }
 
@@ -16116,23 +16170,17 @@ final class HalWatchBridge: NSObject, WCSessionDelegate {
         print("HALDEBUG-WATCH: Received watch message (no reply expected): '\(trimmed.prefix(80))'")
 
         Task { @MainActor in
-            let startingCount = chatViewModel.messages.count
-            chatViewModel.currentMessage = trimmed
-            await chatViewModel.sendMessage()
-
-            let newMessages = chatViewModel.messages.suffix(from: startingCount)
-            let latestHal = newMessages.last(where: { !$0.isFromUser && !$0.isPartial })
-
-            if let content = latestHal?.content, !content.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-                print("HALDEBUG-WATCH: Pushing reply to watch (\(content.count) characters).")
-                pushToWatch(["reply": content])
-            }
+            _ = await chatViewModel.processWatchIncomingMessage(trimmed)
         }
     }
 
     // MARK: - Push message to Watch
-
-    private func pushToWatch(_ payload: [String: Any]) {
+    //
+    // Static so the bridge instance isn't required to push — callers like
+    // ChatViewModel.processWatchIncomingMessage (driven by SIMULATE_WATCH_MESSAGE)
+    // can push without needing a reference to the bridge. WCSession.default
+    // is a class-level singleton so encapsulation here was incidental.
+    static func pushToWatch(_ payload: [String: Any]) {
         guard WCSession.default.isReachable else {
             print("HALDEBUG-WATCH: Watch not reachable for push.")
             return
@@ -16478,6 +16526,30 @@ class HalTestConsole: ObservableObject {
         } else if trimmed.hasPrefix("DELETE_MODEL:") {
             let modelID = String(trimmed.dropFirst("DELETE_MODEL:".count)).trimmingCharacters(in: .whitespaces)
             return await deleteModel(modelID)
+
+        } else if trimmed.hasPrefix("SIMULATE_WATCH_MESSAGE:") {
+            // Drive the Watch round-trip locally without paired hardware.
+            // Routes through the exact same ChatViewModel entrypoint
+            // (`processWatchIncomingMessage`) that HalWatchBridge uses for
+            // real WCSession deliveries. The reply is pushed to the Watch
+            // (a no-op if no Watch is reachable, with a HALDEBUG-WATCH log
+            // line) AND returned to the API caller in the response body so
+            // tests can verify the round-trip without a real Watch.
+            //
+            // Strategic Claude's May-14 directive: "This should behave
+            // exactly as if the Watch sent that text via WCSession — the
+            // iPhone receives it, routes it through ChatViewModel, generates
+            // a response, and sends the reply back through the WCSession path."
+            let payload = String(trimmed.dropFirst("SIMULATE_WATCH_MESSAGE:".count))
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !payload.isEmpty else {
+                return "{\"status\":\"error\",\"command\":\"SIMULATE_WATCH_MESSAGE\",\"error\":\"empty payload\"}"
+            }
+            let reply = await vm.processWatchIncomingMessage(payload)
+            let watchReachable = WCSession.default.isReachable
+            let replyEscaped = jsonStringEscape(reply ?? "")
+            let payloadEscaped = jsonStringEscape(payload)
+            return "{\"status\":\"ok\",\"command\":\"SIMULATE_WATCH_MESSAGE\",\"sent\":\"\(payloadEscaped)\",\"reply\":\"\(replyEscaped)\",\"watchReachable\":\(watchReachable)}"
 
         } else if trimmed == "NEW_THREAD" {
             vm.startNewConversation()

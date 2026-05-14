@@ -49,6 +49,9 @@ Document management:
   python3 tests/hal_test.py import_document <path>     # import a file into RAG
   python3 tests/hal_test.py delete_document <source_id># remove document from RAG
 
+Watch round-trip (without paired hardware):
+  python3 tests/hal_test.py simulate_watch "Hello"     # exercise the full WCSession path; response returned in API body
+
 Scripted file format:
   # comment lines are ignored
   > This is a user turn sent to Hal
@@ -565,6 +568,21 @@ def main():
                 print(f"\nFull response:\n{result['response']}")
         else:
             file_send_turn(message)
+
+    elif subcommand == "simulate_watch":
+        # Run the full Watch round-trip locally — exercises the same
+        # ChatViewModel.processWatchIncomingMessage entrypoint that real
+        # WCSession deliveries use. Returns the assistant reply in the
+        # API response, and pushes to the Watch via WCSession (no-op if
+        # no Watch is paired/reachable, but the chat pipeline still ran).
+        if len(args) < 2:
+            print("Usage: hal_test.py simulate_watch <message>")
+            sys.exit(1)
+        message = " ".join(args[1:])
+        if config:
+            send_command(f"SIMULATE_WATCH_MESSAGE:{message}", config)
+        else:
+            file_send_command(f"SIMULATE_WATCH_MESSAGE:{message}")
 
     elif subcommand == "cmd":
         if len(args) < 2:
