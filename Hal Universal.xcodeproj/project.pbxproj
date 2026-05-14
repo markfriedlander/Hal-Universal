@@ -9,6 +9,9 @@
 /* Begin PBXBuildFile section */
 		850EFD642EEB507700A8AA7D /* Hal Universal Watch.app in Embed Watch Content */ = {isa = PBXBuildFile; fileRef = 850EFD5A2EEB507500A8AA7D /* Hal Universal Watch.app */; settings = {ATTRIBUTES = (RemoveHeadersOnCopy, ); }; };
 		850EFD6A2EEB551500A8AA7D /* WatchConnectivity.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 850EFD692EEB551500A8AA7D /* WatchConnectivity.framework */; };
+		8522367E2FB68EA600A88135 /* WidgetKit.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 8522367D2FB68EA600A88135 /* WidgetKit.framework */; };
+		852236802FB68EA600A88135 /* SwiftUI.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 8522367F2FB68EA600A88135 /* SwiftUI.framework */; };
+		8522368B2FB68EAA00A88135 /* HalWatchComplicationExtension.appex in Embed Foundation Extensions */ = {isa = PBXBuildFile; fileRef = 8522367C2FB68EA600A88135 /* HalWatchComplicationExtension.appex */; settings = {ATTRIBUTES = (RemoveHeadersOnCopy, ); }; };
 		855E38602EA94A620029C420 /* FoundationModels.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 855E385F2EA94A620029C420 /* FoundationModels.framework */; };
 		855E38622EA94A730029C420 /* NaturalLanguage.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 855E38612EA94A730029C420 /* NaturalLanguage.framework */; };
 		855E38642EA94AF40029C420 /* libsqlite3.tbd in Frameworks */ = {isa = PBXBuildFile; fileRef = 855E38632EA94AE60029C420 /* libsqlite3.tbd */; };
@@ -33,6 +36,13 @@
 			remoteGlobalIDString = 850EFD592EEB507500A8AA7D;
 			remoteInfo = "Hal Universal Watch Watch App";
 		};
+		852236892FB68EAA00A88135 /* PBXContainerItemProxy */ = {
+			isa = PBXContainerItemProxy;
+			containerPortal = 85B3C5752EA943560060BCEC /* Project object */;
+			proxyType = 1;
+			remoteGlobalIDString = 8522367B2FB68EA600A88135;
+			remoteInfo = HalWatchComplicationExtension;
+		};
 /* End PBXContainerItemProxy section */
 
 /* Begin PBXCopyFilesBuildPhase section */
@@ -47,11 +57,25 @@
 			name = "Embed Watch Content";
 			runOnlyForDeploymentPostprocessing = 0;
 		};
+		8522368C2FB68EAA00A88135 /* Embed Foundation Extensions */ = {
+			isa = PBXCopyFilesBuildPhase;
+			buildActionMask = 2147483647;
+			dstPath = "";
+			dstSubfolderSpec = 13;
+			files = (
+				8522368B2FB68EAA00A88135 /* HalWatchComplicationExtension.appex in Embed Foundation Extensions */,
+			);
+			name = "Embed Foundation Extensions";
+			runOnlyForDeploymentPostprocessing = 0;
+		};
 /* End PBXCopyFilesBuildPhase section */
 
 /* Begin PBXFileReference section */
 		850EFD5A2EEB507500A8AA7D /* Hal Universal Watch.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = "Hal Universal Watch.app"; sourceTree = BUILT_PRODUCTS_DIR; };
 		850EFD692EEB551500A8AA7D /* WatchConnectivity.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = WatchConnectivity.framework; path = Platforms/WatchOS.platform/Developer/SDKs/WatchOS26.1.sdk/System/Library/Frameworks/WatchConnectivity.framework; sourceTree = DEVELOPER_DIR; };
+		8522367C2FB68EA600A88135 /* HalWatchComplicationExtension.appex */ = {isa = PBXFileReference; explicitFileType = "wrapper.app-extension"; includeInIndex = 0; path = HalWatchComplicationExtension.appex; sourceTree = BUILT_PRODUCTS_DIR; };
+		8522367D2FB68EA600A88135 /* WidgetKit.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = WidgetKit.framework; path = System/Library/Frameworks/WidgetKit.framework; sourceTree = SDKROOT; };
+		8522367F2FB68EA600A88135 /* SwiftUI.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = SwiftUI.framework; path = System/Library/Frameworks/SwiftUI.framework; sourceTree = SDKROOT; };
 		855E385F2EA94A620029C420 /* FoundationModels.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = FoundationModels.framework; path = System/Library/Frameworks/FoundationModels.framework; sourceTree = SDKROOT; };
 		855E38612EA94A730029C420 /* NaturalLanguage.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = NaturalLanguage.framework; path = System/Library/Frameworks/NaturalLanguage.framework; sourceTree = SDKROOT; };
 		855E38632EA94AE60029C420 /* libsqlite3.tbd */ = {isa = PBXFileReference; lastKnownFileType = "sourcecode.text-based-dylib-definition"; name = libsqlite3.tbd; path = usr/lib/libsqlite3.tbd; sourceTree = SDKROOT; };
@@ -60,10 +84,28 @@
 		85C74A1A2EC6EC4500C52EF5 /* README.md */ = {isa = PBXFileReference; lastKnownFileType = net.daringfireball.markdown; path = README.md; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
+/* Begin PBXFileSystemSynchronizedBuildFileExceptionSet section */
+		8522368F2FB68EAA00A88135 /* Exceptions for "HalWatchComplication" folder in "HalWatchComplicationExtension" target */ = {
+			isa = PBXFileSystemSynchronizedBuildFileExceptionSet;
+			membershipExceptions = (
+				Info.plist,
+			);
+			target = 8522367B2FB68EA600A88135 /* HalWatchComplicationExtension */;
+		};
+/* End PBXFileSystemSynchronizedBuildFileExceptionSet section */
+
 /* Begin PBXFileSystemSynchronizedRootGroup section */
 		850EFD5B2EEB507500A8AA7D /* Hal Universal Watch */ = {
 			isa = PBXFileSystemSynchronizedRootGroup;
 			path = "Hal Universal Watch";
+			sourceTree = "<group>";
+		};
+		852236812FB68EA600A88135 /* HalWatchComplication */ = {
+			isa = PBXFileSystemSynchronizedRootGroup;
+			exceptions = (
+				8522368F2FB68EAA00A88135 /* Exceptions for "HalWatchComplication" folder in "HalWatchComplicationExtension" target */,
+			);
+			path = HalWatchComplication;
 			sourceTree = "<group>";
 		};
 		85B3C57F2EA943560060BCEC /* Hal Universal */ = {
@@ -79,6 +121,15 @@
 			buildActionMask = 2147483647;
 			files = (
 				850EFD6A2EEB551500A8AA7D /* WatchConnectivity.framework in Frameworks */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		852236792FB68EA600A88135 /* Frameworks */ = {
+			isa = PBXFrameworksBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				852236802FB68EA600A88135 /* SwiftUI.framework in Frameworks */,
+				8522367E2FB68EA600A88135 /* WidgetKit.framework in Frameworks */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -113,6 +164,8 @@
 				855E38632EA94AE60029C420 /* libsqlite3.tbd */,
 				855E38612EA94A730029C420 /* NaturalLanguage.framework */,
 				855E385F2EA94A620029C420 /* FoundationModels.framework */,
+				8522367D2FB68EA600A88135 /* WidgetKit.framework */,
+				8522367F2FB68EA600A88135 /* SwiftUI.framework */,
 			);
 			name = Frameworks;
 			sourceTree = "<group>";
@@ -123,6 +176,7 @@
 				85C74A1A2EC6EC4500C52EF5 /* README.md */,
 				85B3C57F2EA943560060BCEC /* Hal Universal */,
 				850EFD5B2EEB507500A8AA7D /* Hal Universal Watch */,
+				852236812FB68EA600A88135 /* HalWatchComplication */,
 				855E385E2EA94A620029C420 /* Frameworks */,
 				85B3C57E2EA943560060BCEC /* Products */,
 			);
@@ -133,6 +187,7 @@
 			children = (
 				85B3C57D2EA943560060BCEC /* Hal Universal.app */,
 				850EFD5A2EEB507500A8AA7D /* Hal Universal Watch.app */,
+				8522367C2FB68EA600A88135 /* HalWatchComplicationExtension.appex */,
 			);
 			name = Products;
 			sourceTree = "<group>";
@@ -147,10 +202,12 @@
 				850EFD562EEB507500A8AA7D /* Sources */,
 				850EFD572EEB507500A8AA7D /* Frameworks */,
 				850EFD582EEB507500A8AA7D /* Resources */,
+				8522368C2FB68EAA00A88135 /* Embed Foundation Extensions */,
 			);
 			buildRules = (
 			);
 			dependencies = (
+				8522368A2FB68EAA00A88135 /* PBXTargetDependency */,
 			);
 			fileSystemSynchronizedGroups = (
 				850EFD5B2EEB507500A8AA7D /* Hal Universal Watch */,
@@ -161,6 +218,28 @@
 			productName = "Hal Universal Watch Watch App";
 			productReference = 850EFD5A2EEB507500A8AA7D /* Hal Universal Watch.app */;
 			productType = "com.apple.product-type.application";
+		};
+		8522367B2FB68EA600A88135 /* HalWatchComplicationExtension */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = 852236902FB68EAA00A88135 /* Build configuration list for PBXNativeTarget "HalWatchComplicationExtension" */;
+			buildPhases = (
+				852236782FB68EA600A88135 /* Sources */,
+				852236792FB68EA600A88135 /* Frameworks */,
+				8522367A2FB68EA600A88135 /* Resources */,
+			);
+			buildRules = (
+			);
+			dependencies = (
+			);
+			fileSystemSynchronizedGroups = (
+				852236812FB68EA600A88135 /* HalWatchComplication */,
+			);
+			name = HalWatchComplicationExtension;
+			packageProductDependencies = (
+			);
+			productName = HalWatchComplicationExtension;
+			productReference = 8522367C2FB68EA600A88135 /* HalWatchComplicationExtension.appex */;
+			productType = "com.apple.product-type.app-extension";
 		};
 		85B3C57C2EA943560060BCEC /* Hal Universal */ = {
 			isa = PBXNativeTarget;
@@ -202,11 +281,14 @@
 			isa = PBXProject;
 			attributes = {
 				BuildIndependentTargetsInParallel = 1;
-				LastSwiftUpdateCheck = 2610;
+				LastSwiftUpdateCheck = 2650;
 				LastUpgradeCheck = 2610;
 				TargetAttributes = {
 					850EFD592EEB507500A8AA7D = {
 						CreatedOnToolsVersion = 26.1.1;
+					};
+					8522367B2FB68EA600A88135 = {
+						CreatedOnToolsVersion = 26.5;
 					};
 					85B3C57C2EA943560060BCEC = {
 						CreatedOnToolsVersion = 26.0.1;
@@ -235,12 +317,20 @@
 			targets = (
 				85B3C57C2EA943560060BCEC /* Hal Universal */,
 				850EFD592EEB507500A8AA7D /* Hal Universal Watch */,
+				8522367B2FB68EA600A88135 /* HalWatchComplicationExtension */,
 			);
 		};
 /* End PBXProject section */
 
 /* Begin PBXResourcesBuildPhase section */
 		850EFD582EEB507500A8AA7D /* Resources */ = {
+			isa = PBXResourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		8522367A2FB68EA600A88135 /* Resources */ = {
 			isa = PBXResourcesBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
@@ -265,6 +355,13 @@
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
+		852236782FB68EA600A88135 /* Sources */ = {
+			isa = PBXSourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
 		85B3C5792EA943560060BCEC /* Sources */ = {
 			isa = PBXSourcesBuildPhase;
 			buildActionMask = 2147483647;
@@ -279,6 +376,11 @@
 			isa = PBXTargetDependency;
 			target = 850EFD592EEB507500A8AA7D /* Hal Universal Watch */;
 			targetProxy = 850EFD622EEB507700A8AA7D /* PBXContainerItemProxy */;
+		};
+		8522368A2FB68EAA00A88135 /* PBXTargetDependency */ = {
+			isa = PBXTargetDependency;
+			target = 8522367B2FB68EA600A88135 /* HalWatchComplicationExtension */;
+			targetProxy = 852236892FB68EAA00A88135 /* PBXContainerItemProxy */;
 		};
 /* End PBXTargetDependency section */
 
@@ -346,6 +448,72 @@
 				SWIFT_VERSION = 5.0;
 				TARGETED_DEVICE_FAMILY = 4;
 				WATCHOS_DEPLOYMENT_TARGET = 26.0;
+			};
+			name = Release;
+		};
+		8522368D2FB68EAA00A88135 /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME = AccentColor;
+				ASSETCATALOG_COMPILER_WIDGET_BACKGROUND_COLOR_NAME = WidgetBackground;
+				CODE_SIGN_STYLE = Automatic;
+				CURRENT_PROJECT_VERSION = 1;
+				DEVELOPMENT_TEAM = FBUNBDS7R7;
+				GENERATE_INFOPLIST_FILE = YES;
+				INFOPLIST_FILE = HalWatchComplication/Info.plist;
+				INFOPLIST_KEY_CFBundleDisplayName = HalWatchComplication;
+				INFOPLIST_KEY_NSHumanReadableCopyright = "";
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/Frameworks",
+					"@executable_path/../../Frameworks",
+					"@executable_path/../../../../Frameworks",
+				);
+				MARKETING_VERSION = 1.0;
+				PRODUCT_BUNDLE_IDENTIFIER = "com.MarkFriedlander.Hal-Universal.watchkitapp.HalWatchComplication";
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SDKROOT = watchos;
+				SKIP_INSTALL = YES;
+				STRING_CATALOG_GENERATE_SYMBOLS = YES;
+				SWIFT_APPROACHABLE_CONCURRENCY = YES;
+				SWIFT_EMIT_LOC_STRINGS = YES;
+				SWIFT_UPCOMING_FEATURE_MEMBER_IMPORT_VISIBILITY = YES;
+				SWIFT_VERSION = 5.0;
+				TARGETED_DEVICE_FAMILY = 4;
+				WATCHOS_DEPLOYMENT_TARGET = 26.5;
+			};
+			name = Debug;
+		};
+		8522368E2FB68EAA00A88135 /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME = AccentColor;
+				ASSETCATALOG_COMPILER_WIDGET_BACKGROUND_COLOR_NAME = WidgetBackground;
+				CODE_SIGN_STYLE = Automatic;
+				CURRENT_PROJECT_VERSION = 1;
+				DEVELOPMENT_TEAM = FBUNBDS7R7;
+				GENERATE_INFOPLIST_FILE = YES;
+				INFOPLIST_FILE = HalWatchComplication/Info.plist;
+				INFOPLIST_KEY_CFBundleDisplayName = HalWatchComplication;
+				INFOPLIST_KEY_NSHumanReadableCopyright = "";
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/Frameworks",
+					"@executable_path/../../Frameworks",
+					"@executable_path/../../../../Frameworks",
+				);
+				MARKETING_VERSION = 1.0;
+				PRODUCT_BUNDLE_IDENTIFIER = "com.MarkFriedlander.Hal-Universal.watchkitapp.HalWatchComplication";
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SDKROOT = watchos;
+				SKIP_INSTALL = YES;
+				STRING_CATALOG_GENERATE_SYMBOLS = YES;
+				SWIFT_APPROACHABLE_CONCURRENCY = YES;
+				SWIFT_EMIT_LOC_STRINGS = YES;
+				SWIFT_UPCOMING_FEATURE_MEMBER_IMPORT_VISIBILITY = YES;
+				SWIFT_VERSION = 5.0;
+				TARGETED_DEVICE_FAMILY = 4;
+				WATCHOS_DEPLOYMENT_TARGET = 26.5;
 			};
 			name = Release;
 		};
@@ -547,6 +715,15 @@
 			buildConfigurations = (
 				850EFD662EEB507700A8AA7D /* Debug */,
 				850EFD672EEB507700A8AA7D /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Release;
+		};
+		852236902FB68EAA00A88135 /* Build configuration list for PBXNativeTarget "HalWatchComplicationExtension" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				8522368D2FB68EAA00A88135 /* Debug */,
+				8522368E2FB68EAA00A88135 /* Release */,
 			);
 			defaultConfigurationIsVisible = 0;
 			defaultConfigurationName = Release;
