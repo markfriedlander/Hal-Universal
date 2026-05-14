@@ -4263,7 +4263,23 @@ class MLXWrapper: ObservableObject {
                     let promptTokenCount = lmInput.text.tokens.size
                     halLog("HALDEBUG-MLX-CHAT: Input prepared in \(String(format: "%.2f", Date.timeIntervalSinceReferenceDate - generateStart))s; prompt tokens: \(promptTokenCount)")
 
-                    let parameters = GenerateParameters(maxTokens: 512, temperature: Float(temperature))
+                    // Per-model repetition-penalty tuning. Some models (Qwen 3.5 2B)
+                    // need a mild penalty to avoid token-level repetition loops on
+                    // open-ended prompts; others (Phi-4 Mini) actively destabilize
+                    // under any penalty and need defaults. Values live in each
+                    // ModelConfiguration's repetitionPenalty / repetitionContextSize
+                    // fields (see Block 30). nil → mlx-swift-lm defaults (no penalty,
+                    // contextSize=20). See Maxim_1_Alignment_Findings_2026-05-13.md
+                    // and the May-13 Phi-4 baseline investigation.
+                    let modelPenalty = self.currentModelConfig?.repetitionPenalty
+                    let modelPenaltyCtx = self.currentModelConfig?.repetitionContextSize ?? 20
+                    halLog("HALDEBUG-MLX-CHAT: Penalty config for \(self.currentModelConfig?.displayName ?? "unknown"): penalty=\(modelPenalty.map { String($0) } ?? "nil"), ctx=\(modelPenaltyCtx)")
+                    let parameters = GenerateParameters(
+                        maxTokens: 512,
+                        temperature: Float(temperature),
+                        repetitionPenalty: modelPenalty,
+                        repetitionContextSize: modelPenaltyCtx
+                    )
                     let mlxStream = try await container.generate(input: lmInput, parameters: parameters)
                     let streamStart = Date.timeIntervalSinceReferenceDate
 
@@ -13855,9 +13871,57 @@ struct ModelConfiguration: Identifiable, Codable, Equatable, Hashable {
     let description: String?
     var isDownloaded: Bool
     var localPath: URL?
-    
+
+    // MARK: - Generation tuning (per-model)
+    //
+    // Different model families react very differently to a repetition penalty.
+    // Qwen 3.5 2B will spiral into a token-level repetition loop on open-ended
+    // philosophical prompts unless a mild penalty is applied; Phi-4 Mini, by
+    // contrast, *gets worse* under a penalty — pushed off its preferred token
+    // paths, it finds new loops in low-probability space (known failure mode
+    // for some BPE-tokenized reasoners). So we let each curated model declare
+    // its own values, and MLXWrapper.generateChatStream looks them up at
+    // generation time.
+    //
+    // nil → use mlx-swift-lm defaults (repetitionPenalty=nil, contextSize=20),
+    // which effectively disables the penalty.
+    //
+    // These fields are Codable-optional so older persisted ModelConfiguration
+    // records decode cleanly without migration — they simply default to nil.
+    var repetitionPenalty: Float?
+    var repetitionContextSize: Int?
+
     var isLocal: Bool { source == .mlx }
     var requiresDownload: Bool { source == .mlx && !isDownloaded }
+
+    /// Explicit memberwise init with defaults so the new generation-tuning
+    /// fields don't break existing call sites. Synthesized memberwise inits
+    /// don't allow default values; this one does.
+    init(
+        id: String,
+        displayName: String,
+        source: ModelSource,
+        sizeGB: Double?,
+        contextWindow: Int,
+        license: String?,
+        description: String?,
+        isDownloaded: Bool,
+        localPath: URL?,
+        repetitionPenalty: Float? = nil,
+        repetitionContextSize: Int? = nil
+    ) {
+        self.id = id
+        self.displayName = displayName
+        self.source = source
+        self.sizeGB = sizeGB
+        self.contextWindow = contextWindow
+        self.license = license
+        self.description = description
+        self.isDownloaded = isDownloaded
+        self.localPath = localPath
+        self.repetitionPenalty = repetitionPenalty
+        self.repetitionContextSize = repetitionContextSize
+    }
     
     func hash(into hasher: inout Hasher) {
         hasher.combine(id)
@@ -13901,11 +13965,15 @@ struct ModelConfiguration: Identifiable, Codable, Equatable, Hashable {
         displayName: "Gemma 4 E2B",
         source: .mlx,
         sizeGB: 3.58,
-        contextWindow: 32_768,
+        contextWindow: 128_000,
         license: "gemma",
         description: "Fully private, on-device. The philosopher voice — conceptual, dialectical, comfortable with ambiguity. 3.58 GB download (WiFi recommended).",
         isDownloaded: false,
-        localPath: nil
+        localPath: nil,
+        // Tolerates a mild penalty cleanly. No regression vs. default on the
+        // Maxim #1 prompt, and serves as guardrail for unusually long generations.
+        repetitionPenalty: 1.1,
+        repetitionContextSize: 64
     )
 
     /// Phi-4 Mini Instruct 4-bit — the reasoner voice. Microsoft's late-2025
@@ -13921,7 +13989,16 @@ struct ModelConfiguration: Identifiable, Codable, Equatable, Hashable {
         license: "mit",
         description: "Fully private, on-device. The reasoner voice — analytical, math-strong, structured. 2.3 GB download.",
         isDownloaded: false,
-        localPath: nil
+        localPath: nil,
+        // Phi-4 destabilizes under a repetition penalty — observed in May-13
+        // testing, the 1.1/64 settings that work for all other curated models
+        // pushed Phi-4 into a "conferring finality paradox" repetition loop
+        // and also induced a Maxim #1 violation (verbatim "I do not have
+        // personal experiences or consciousness"). Default behavior (nil)
+        // until we understand whether Phi-4 is baseline-stable or just
+        // parameter-sensitive — see Phi-4 baseline test results.
+        repetitionPenalty: nil,
+        repetitionContextSize: nil
     )
 
     /// Qwen 3.5 2B 4-bit — the versatile generalist voice. Alibaba's March 2026
@@ -13932,11 +14009,17 @@ struct ModelConfiguration: Identifiable, Codable, Equatable, Hashable {
         displayName: "Qwen 3.5 2B",
         source: .mlx,
         sizeGB: 1.8,
-        contextWindow: 32_768,
+        contextWindow: 262_144,
         license: "apache-2.0",
-        description: "Fully private, on-device. The versatile generalist — multimodal-ready, balanced voice. 1.8 GB download.",
+        description: "Fully private, on-device. The versatile generalist — multimodal-ready, balanced voice with a 262K context window (ideal for long documents and extended research). 1.8 GB download.",
         isDownloaded: false,
-        localPath: nil
+        localPath: nil,
+        // Qwen 3.5 2B is the canonical case for needing this — without the
+        // penalty it spiraled into a token-level repetition loop on the
+        // Maxim #1 consciousness prompt. 1.1/64 breaks the loop cleanly
+        // without degrading response quality.
+        repetitionPenalty: 1.1,
+        repetitionContextSize: 64
     )
 
     /// Llama 3.2 3B Instruct 4-bit — the workhorse voice. Meta's proven small
@@ -13951,7 +14034,11 @@ struct ModelConfiguration: Identifiable, Codable, Equatable, Hashable {
         license: "llama3.2",
         description: "Fully private, on-device. The workhorse voice — well-rounded, widely-tested baseline. 2.0 GB download.",
         isDownloaded: false,
-        localPath: nil
+        localPath: nil,
+        // Tolerates the penalty cleanly on the Maxim #1 prompt. Same settings
+        // as Gemma/Qwen/Dolphin for consistency across the well-behaved tier.
+        repetitionPenalty: 1.1,
+        repetitionContextSize: 64
     )
 
     /// Dolphin 3.0 Llama 3.2 3B 4-bit — the unhedged voice. Cognitive
@@ -13966,20 +14053,67 @@ struct ModelConfiguration: Identifiable, Codable, Equatable, Hashable {
         displayName: "Dolphin 3.0 (Llama 3.2 3B)",
         source: .mlx,
         sizeGB: 2.0,
-        contextWindow: 32_768,
+        contextWindow: 128_000,
         license: "llama3.2",
         description: "Fully private, on-device. The unhedged voice — fewer reflexive refusals, more willing to sit with hard questions. 2.0 GB download.",
         isDownloaded: false,
-        localPath: nil
+        localPath: nil,
+        // Tolerates the penalty cleanly on the Maxim #1 prompt. Same settings
+        // as Gemma/Qwen/Llama for consistency across the well-behaved tier.
+        repetitionPenalty: 1.1,
+        repetitionContextSize: 64
+    )
+
+    /// Ministral 3-3B Instruct 2512 4-bit — the precision voice. Mistral AI's
+    /// December 2025 release in the Ministral-3 family. Apache 2.0, 262K
+    /// context window, designed for edge deployment. Architecture is the new
+    /// `mistral3` type (multimodal at the file level, but loaded as text-only
+    /// through mlx-swift-lm's `Mistral3TextModel` — the vision weights load
+    /// but are unused, no extra integration work needed). Voice tends toward
+    /// precise, structured, and rigorous — fills a register the other curated
+    /// models don't naturally occupy.
+    static let ministral3_3B_Instruct_2512_4bit = ModelConfiguration(
+        id: "mlx-community/Ministral-3-3B-Instruct-2512-4bit",
+        displayName: "Ministral 3B",
+        source: .mlx,
+        sizeGB: 2.75,
+        contextWindow: 262_144,
+        license: "apache-2.0",
+        description: "Fully private, on-device. The precision voice — Mistral's structured, system-prompt-faithful style with a 262K context window (ideal for long documents and extended research). 2.75 GB download.",
+        isDownloaded: false,
+        localPath: nil,
+        // Mistral family is historically well-behaved on repetition. Starting
+        // with the well-behaved-tier defaults; will adjust after Maxim testing
+        // if needed.
+        repetitionPenalty: 1.1,
+        repetitionContextSize: 64
     )
 
     /// All MLX models Hal personally validates as part of the Curated tier.
     /// AFM is intentionally excluded — it's system-managed, not downloadable,
     /// and has its own permanent "On Device" status.
+    ///
     /// Order is the user-visible order in Model Library.
+    ///
+    /// Phi-4 Mini was previously included but was demoted on May 13, 2026 after
+    /// baseline-stability testing showed a 33% paragraph-loop failure rate on
+    /// the Maxim #1 consciousness prompt under default generation parameters.
+    /// The static let `phi4Mini4bit` is preserved (metadata only) so the model
+    /// can still be reconstructed if a user discovers it via HF library search.
+    /// "Four clean curated models is better than five with an asterisk."
+    ///
+    /// Ministral 3-3B Instruct 2512 4-bit is defined above but intentionally
+    /// **not** in curatedSeeds yet — Mark's May-13 directive made its
+    /// promotion conditional on passing the full 5-Maxim test suite first,
+    /// and the BackgroundDownloadCoordinator is currently unable to fetch the
+    /// `model.safetensors` blob from this repo's HuggingFace Xet storage URL
+    /// (the small JSON/tokenizer files transfer fine; the 2.75 GB Xet-served
+    /// blob never emits didWriteData callbacks). Gemma's similar-sized
+    /// safetensors blob downloaded fine previously, so this is specific to
+    /// the Xet path. Promote Ministral here once BGDL+Xet handling is fixed
+    /// and Maxim testing passes.
     static let curatedSeeds: [ModelConfiguration] = [
         .gemma4E2B4bit,
-        .phi4Mini4bit,
         .qwen35_2B4bit,
         .llama32_3B4bit,
         .dolphin3Llama32_3B4bit
@@ -14068,10 +14202,11 @@ class ModelCatalogService: ObservableObject {
     @Published var availableModels: [ModelConfiguration] = [
         ModelConfiguration.appleFoundation,
         ModelConfiguration.gemma4E2B4bit,
-        ModelConfiguration.phi4Mini4bit,
         ModelConfiguration.qwen35_2B4bit,
         ModelConfiguration.llama32_3B4bit,
         ModelConfiguration.dolphin3Llama32_3B4bit
+        // .ministral3_3B_Instruct_2512_4bit — intentionally absent until BGDL
+        // can complete the Xet-served safetensors download + Maxim suite passes
     ]
     @Published var isLoading: Bool = false
     @Published var errorMessage: String?
