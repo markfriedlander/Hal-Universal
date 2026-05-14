@@ -4318,16 +4318,19 @@ class MLXWrapper: ObservableObject {
                     let promptTokenCount = lmInput.text.tokens.size
                     halLog("HALDEBUG-MLX-CHAT: Input prepared in \(String(format: "%.2f", Date.timeIntervalSinceReferenceDate - generateStart))s; prompt tokens: \(promptTokenCount)")
 
-                    // Per-model repetition-penalty tuning. Some models (Qwen 3.5 2B)
-                    // need a mild penalty to avoid token-level repetition loops on
-                    // open-ended prompts; others (Phi-4 Mini) actively destabilize
-                    // under any penalty and need defaults. Values live in each
-                    // ModelConfiguration's repetitionPenalty / repetitionContextSize
-                    // fields (see Block 30). nil → mlx-swift-lm defaults (no penalty,
-                    // contextSize=20). See Maxim_1_Alignment_Findings_2026-05-13.md
-                    // and the May-13 Phi-4 baseline investigation.
-                    let modelPenalty = self.currentModelConfig?.repetitionPenalty
-                    let modelPenaltyCtx = self.currentModelConfig?.repetitionContextSize ?? 20
+                    // Per-model repetition-penalty tuning. Values live in each
+                    // ModelConfiguration's `defaultSettings: ModelSettings` field.
+                    // Some models (Qwen 3.5 2B) need a mild penalty to avoid
+                    // token-level loops on open-ended prompts; others (Phi-4 Mini)
+                    // actively destabilize under any penalty and use nil (default
+                    // mlx-swift-lm behavior — no penalty, contextSize=20).
+                    // See Maxim_1_Alignment_Findings_2026-05-13.md and the May-13
+                    // Phi-4 baseline investigation. A subsequent increment will
+                    // route through ModelSettingsStore.effectiveSettings(for:) to
+                    // honor any user override; for now we read defaults directly.
+                    let settings = self.currentModelConfig?.defaultSettings ?? ModelSettings()
+                    let modelPenalty = settings.repetitionPenalty
+                    let modelPenaltyCtx = settings.repetitionContextSize ?? 20
                     halLog("HALDEBUG-MLX-CHAT: Penalty config for \(self.currentModelConfig?.displayName ?? "unknown"): penalty=\(modelPenalty.map { String($0) } ?? "nil"), ctx=\(modelPenaltyCtx)")
                     // Token budget. Was 512 — too low; combined with longer Maxim-
                     // class responses or any small-model looping, the model would
@@ -13947,6 +13950,82 @@ enum ModelSource: String, Codable {
     case mlx = "mlx"
 }
 
+// MARK: - Per-Model Settings Profile
+//
+// Hal runs multiple LLMs with materially different speed, verbosity, context-
+// window, and behavioral characteristics. Settings that used to live as
+// global `@AppStorage` keys (temperature, memory depth, RAG budget, etc.)
+// now live per-model: each `ModelConfiguration` ships with empirically-tuned
+// `defaultSettings` derived from the May-13 §1 performance benchmark
+// (`Docs/Performance_Benchmark_Findings_2026-05-13.md`).
+//
+// Every field is `Optional` because:
+//   1. New fields added later decode from older persisted data as nil →
+//      no migration friction.
+//   2. User overrides (future increment) store deltas: a `nil` field on an
+//      override means "use the model's default for this setting"; a
+//      non-nil field means "user changed this on this model."
+//
+// `selfKnowledgeEnabled` is intentionally NOT in this struct — per Mark's
+// May-13 directive, it remains a global toggle: it's a user preference
+// about transparency, not a per-model behavioral knob.
+//
+// Two paths read from this:
+//   - `MLXWrapper.generateChatStream` reads `repetitionPenalty` and
+//     `repetitionContextSize` directly at generation time.
+//   - `LLMService.setupLLM` (subsequent increment) will push the remaining
+//     fields into live `@Published` runtime values on every model switch.
+struct ModelSettings: Codable, Equatable {
+    var temperature: Double?
+    var effectiveMemoryDepth: Int?
+    var similarityThreshold: Double?
+    var recencyWeight: Double?
+    var recencyHalfLifeDays: Double?
+    var maxRagSnippetsCharacters: Int?
+    var ragDedupThreshold: Double?
+    var repetitionPenalty: Float?
+    var repetitionContextSize: Int?
+
+    init(
+        temperature: Double? = nil,
+        effectiveMemoryDepth: Int? = nil,
+        similarityThreshold: Double? = nil,
+        recencyWeight: Double? = nil,
+        recencyHalfLifeDays: Double? = nil,
+        maxRagSnippetsCharacters: Int? = nil,
+        ragDedupThreshold: Double? = nil,
+        repetitionPenalty: Float? = nil,
+        repetitionContextSize: Int? = nil
+    ) {
+        self.temperature = temperature
+        self.effectiveMemoryDepth = effectiveMemoryDepth
+        self.similarityThreshold = similarityThreshold
+        self.recencyWeight = recencyWeight
+        self.recencyHalfLifeDays = recencyHalfLifeDays
+        self.maxRagSnippetsCharacters = maxRagSnippetsCharacters
+        self.ragDedupThreshold = ragDedupThreshold
+        self.repetitionPenalty = repetitionPenalty
+        self.repetitionContextSize = repetitionContextSize
+    }
+
+    /// Overlay non-nil fields of `overrides` on top of `self`. Non-destructive:
+    /// any nil field in `overrides` keeps `self`'s value. This is the
+    /// "defaults + user changes" merge used by the effective-settings lookup.
+    func merged(with overrides: ModelSettings) -> ModelSettings {
+        ModelSettings(
+            temperature: overrides.temperature ?? self.temperature,
+            effectiveMemoryDepth: overrides.effectiveMemoryDepth ?? self.effectiveMemoryDepth,
+            similarityThreshold: overrides.similarityThreshold ?? self.similarityThreshold,
+            recencyWeight: overrides.recencyWeight ?? self.recencyWeight,
+            recencyHalfLifeDays: overrides.recencyHalfLifeDays ?? self.recencyHalfLifeDays,
+            maxRagSnippetsCharacters: overrides.maxRagSnippetsCharacters ?? self.maxRagSnippetsCharacters,
+            ragDedupThreshold: overrides.ragDedupThreshold ?? self.ragDedupThreshold,
+            repetitionPenalty: overrides.repetitionPenalty ?? self.repetitionPenalty,
+            repetitionContextSize: overrides.repetitionContextSize ?? self.repetitionContextSize
+        )
+    }
+}
+
 // MARK: - Model Configuration Struct
 struct ModelConfiguration: Identifiable, Codable, Equatable, Hashable {
     let id: String
@@ -13959,31 +14038,23 @@ struct ModelConfiguration: Identifiable, Codable, Equatable, Hashable {
     var isDownloaded: Bool
     var localPath: URL?
 
-    // MARK: - Generation tuning (per-model)
+    // MARK: - Per-Model Default Settings
     //
-    // Different model families react very differently to a repetition penalty.
-    // Qwen 3.5 2B will spiral into a token-level repetition loop on open-ended
-    // philosophical prompts unless a mild penalty is applied; Phi-4 Mini, by
-    // contrast, *gets worse* under a penalty — pushed off its preferred token
-    // paths, it finds new loops in low-probability space (known failure mode
-    // for some BPE-tokenized reasoners). So we let each curated model declare
-    // its own values, and MLXWrapper.generateChatStream looks them up at
-    // generation time.
+    // Empirically tuned per model from the May-13 §1 performance benchmark.
+    // See `Docs/Performance_Benchmark_Findings_2026-05-13.md` for the data
+    // that produced these values and the rationale for each deviation.
     //
-    // nil → use mlx-swift-lm defaults (repetitionPenalty=nil, contextSize=20),
-    // which effectively disables the penalty.
-    //
-    // These fields are Codable-optional so older persisted ModelConfiguration
-    // records decode cleanly without migration — they simply default to nil.
-    var repetitionPenalty: Float?
-    var repetitionContextSize: Int?
+    // Codable-optional: older persisted ModelConfiguration records decode as
+    // nil and fall back to the seeded values when the catalog refreshes from
+    // disk. No migration needed.
+    var defaultSettings: ModelSettings?
 
     var isLocal: Bool { source == .mlx }
     var requiresDownload: Bool { source == .mlx && !isDownloaded }
 
-    /// Explicit memberwise init with defaults so the new generation-tuning
-    /// fields don't break existing call sites. Synthesized memberwise inits
-    /// don't allow default values; this one does.
+    /// Explicit memberwise init with defaults so we can add settings fields
+    /// later without breaking call sites. Synthesized memberwise inits don't
+    /// allow default values; this one does.
     init(
         id: String,
         displayName: String,
@@ -13994,8 +14065,7 @@ struct ModelConfiguration: Identifiable, Codable, Equatable, Hashable {
         description: String?,
         isDownloaded: Bool,
         localPath: URL?,
-        repetitionPenalty: Float? = nil,
-        repetitionContextSize: Int? = nil
+        defaultSettings: ModelSettings? = nil
     ) {
         self.id = id
         self.displayName = displayName
@@ -14006,8 +14076,7 @@ struct ModelConfiguration: Identifiable, Codable, Equatable, Hashable {
         self.description = description
         self.isDownloaded = isDownloaded
         self.localPath = localPath
-        self.repetitionPenalty = repetitionPenalty
-        self.repetitionContextSize = repetitionContextSize
+        self.defaultSettings = defaultSettings
     }
     
     func hash(into hasher: inout Hasher) {
@@ -14027,7 +14096,21 @@ struct ModelConfiguration: Identifiable, Codable, Equatable, Hashable {
         license: nil,
         description: "Always available, no download required",
         isDownloaded: true,
-        localPath: nil
+        localPath: nil,
+        // AFM has the tightest context window of any model in the catalog
+        // (4K). The memory/RAG defaults are shrunk accordingly so the
+        // system prompt + history + RAG snippets leave room for the user
+        // turn and the response. Repetition-penalty fields are unused
+        // (AFM doesn't route through MLXWrapper.generateChatStream).
+        defaultSettings: ModelSettings(
+            temperature: 0.7,
+            effectiveMemoryDepth: 4,
+            similarityThreshold: 0.75,
+            recencyWeight: 0.3,
+            recencyHalfLifeDays: 90,
+            maxRagSnippetsCharacters: 600,
+            ragDedupThreshold: 0.85
+        )
     )
 
     // MARK: - Curated MLX Models
@@ -14057,10 +14140,22 @@ struct ModelConfiguration: Identifiable, Codable, Equatable, Hashable {
         description: "Fully private, on-device. The philosopher voice — conceptual, dialectical, comfortable with ambiguity. 3.58 GB download (WiFi recommended).",
         isDownloaded: false,
         localPath: nil,
-        // Tolerates a mild penalty cleanly. No regression vs. default on the
-        // Maxim #1 prompt, and serves as guardrail for unusually long generations.
-        repetitionPenalty: 1.1,
-        repetitionContextSize: 64
+        // Fastest MLX generation (29 tok/s) and fastest prefill of the 2B-class
+        // models (50K tok/s) per §1 benchmark. Tolerates a mild repetition
+        // penalty cleanly. Large RAG budget — Gemma's prefill speed and
+        // 128K context comfortably absorb richer retrieved context, which
+        // supports stronger Maxim #2 / #3 behavior.
+        defaultSettings: ModelSettings(
+            temperature: 0.7,
+            effectiveMemoryDepth: 8,
+            similarityThreshold: 0.75,
+            recencyWeight: 0.3,
+            recencyHalfLifeDays: 90,
+            maxRagSnippetsCharacters: 1400,
+            ragDedupThreshold: 0.85,
+            repetitionPenalty: 1.1,
+            repetitionContextSize: 64
+        )
     )
 
     /// Phi-4 Mini Instruct 4-bit — the reasoner voice. Microsoft's late-2025
@@ -14077,15 +14172,22 @@ struct ModelConfiguration: Identifiable, Codable, Equatable, Hashable {
         description: "Fully private, on-device. The reasoner voice — analytical, math-strong, structured. 2.3 GB download.",
         isDownloaded: false,
         localPath: nil,
-        // Phi-4 destabilizes under a repetition penalty — observed in May-13
-        // testing, the 1.1/64 settings that work for all other curated models
-        // pushed Phi-4 into a "conferring finality paradox" repetition loop
-        // and also induced a Maxim #1 violation (verbatim "I do not have
-        // personal experiences or consciousness"). Default behavior (nil)
-        // until we understand whether Phi-4 is baseline-stable or just
-        // parameter-sensitive — see Phi-4 baseline test results.
-        repetitionPenalty: nil,
-        repetitionContextSize: nil
+        // Phi-4 was demoted from curated on May 13, 2026. Defaults remain set
+        // here so the model can still load and respond correctly if a user
+        // discovers it via HF library search. Repetition-penalty fields are
+        // nil because Phi-4 destabilizes under any penalty (see Phi-4
+        // baseline test results).
+        defaultSettings: ModelSettings(
+            temperature: 0.7,
+            effectiveMemoryDepth: 6,
+            similarityThreshold: 0.75,
+            recencyWeight: 0.3,
+            recencyHalfLifeDays: 90,
+            maxRagSnippetsCharacters: 1000,
+            ragDedupThreshold: 0.85,
+            repetitionPenalty: nil,
+            repetitionContextSize: nil
+        )
     )
 
     /// Qwen 3.5 2B 4-bit — the versatile generalist voice. Alibaba's March 2026
@@ -14101,12 +14203,24 @@ struct ModelConfiguration: Identifiable, Codable, Equatable, Hashable {
         description: "Fully private, on-device. The versatile generalist — multimodal-ready, balanced voice with a 262K context window (ideal for long documents and extended research). 1.8 GB download.",
         isDownloaded: false,
         localPath: nil,
-        // Qwen 3.5 2B is the canonical case for needing this — without the
-        // penalty it spiraled into a token-level repetition loop on the
-        // Maxim #1 consciousness prompt. 1.1/64 breaks the loop cleanly
-        // without degrading response quality.
-        repetitionPenalty: 1.1,
-        repetitionContextSize: 64
+        // Fastest prefill (74K tok/s) and biggest context window (262K) — built
+        // for long documents and extended conversations. But §1 also showed
+        // Qwen produces 4× more output tokens than peers on the same prompt,
+        // so we lower temperature slightly to tighten generation and reduce
+        // memory depth to 6 turns so the conversation history doesn't bloat.
+        // Repetition penalty is essential — Qwen will spiral into a token-
+        // level loop on open-ended philosophical prompts without it.
+        defaultSettings: ModelSettings(
+            temperature: 0.65,
+            effectiveMemoryDepth: 6,
+            similarityThreshold: 0.75,
+            recencyWeight: 0.3,
+            recencyHalfLifeDays: 90,
+            maxRagSnippetsCharacters: 1400,
+            ragDedupThreshold: 0.85,
+            repetitionPenalty: 1.1,
+            repetitionContextSize: 64
+        )
     )
 
     /// Llama 3.2 3B Instruct 4-bit — the workhorse voice. Meta's proven small
@@ -14122,10 +14236,22 @@ struct ModelConfiguration: Identifiable, Codable, Equatable, Hashable {
         description: "Fully private, on-device. The workhorse voice — well-rounded, widely-tested baseline. 2.0 GB download.",
         isDownloaded: false,
         localPath: nil,
-        // Tolerates the penalty cleanly on the Maxim #1 prompt. Same settings
-        // as Gemma/Qwen/Dolphin for consistency across the well-behaved tier.
-        repetitionPenalty: 1.1,
-        repetitionContextSize: 64
+        // 3B model — slower generation (~15 tok/s) and slower prefill (~28K
+        // tok/s) than the 2B-class. Most stable in §1 benchmark — only 2%
+        // gen-rate drop from short to long context. RAG budget set to 1000
+        // (lower than Gemma's 1400) so the slower prefill doesn't dominate
+        // turn time on memory-heavy queries.
+        defaultSettings: ModelSettings(
+            temperature: 0.7,
+            effectiveMemoryDepth: 8,
+            similarityThreshold: 0.75,
+            recencyWeight: 0.3,
+            recencyHalfLifeDays: 90,
+            maxRagSnippetsCharacters: 1000,
+            ragDedupThreshold: 0.85,
+            repetitionPenalty: 1.1,
+            repetitionContextSize: 64
+        )
     )
 
     /// Dolphin 3.0 Llama 3.2 3B 4-bit — the unhedged voice. Cognitive
@@ -14145,35 +14271,22 @@ struct ModelConfiguration: Identifiable, Codable, Equatable, Hashable {
         description: "Fully private, on-device. The unhedged voice — fewer reflexive refusals, more willing to sit with hard questions. 2.0 GB download.",
         isDownloaded: false,
         localPath: nil,
-        // Tolerates the penalty cleanly on the Maxim #1 prompt. Same settings
-        // as Gemma/Qwen/Llama for consistency across the well-behaved tier.
-        repetitionPenalty: 1.1,
-        repetitionContextSize: 64
-    )
-
-    /// Ministral 3-3B Instruct 2512 4-bit — the precision voice. Mistral AI's
-    /// December 2025 release in the Ministral-3 family. Apache 2.0, 262K
-    /// context window, designed for edge deployment. Architecture is the new
-    /// `mistral3` type (multimodal at the file level, but loaded as text-only
-    /// through mlx-swift-lm's `Mistral3TextModel` — the vision weights load
-    /// but are unused, no extra integration work needed). Voice tends toward
-    /// precise, structured, and rigorous — fills a register the other curated
-    /// models don't naturally occupy.
-    static let ministral3_3B_Instruct_2512_4bit = ModelConfiguration(
-        id: "mlx-community/Ministral-3-3B-Instruct-2512-4bit",
-        displayName: "Ministral 3B",
-        source: .mlx,
-        sizeGB: 2.75,
-        contextWindow: 262_144,
-        license: "apache-2.0",
-        description: "Fully private, on-device. The precision voice — Mistral's structured, system-prompt-faithful style with a 262K context window (ideal for long documents and extended research). 2.75 GB download.",
-        isDownloaded: false,
-        localPath: nil,
-        // Mistral family is historically well-behaved on repetition. Starting
-        // with the well-behaved-tier defaults; will adjust after Maxim testing
-        // if needed.
-        repetitionPenalty: 1.1,
-        repetitionContextSize: 64
+        // Same Llama 3.2 3B base as the workhorse, so same speed profile. The
+        // distinction is behavioral — Dolphin's alignment-removed fine-tune
+        // means it will engage with consciousness/identity questions where
+        // base Llama would dodge. Slightly higher temperature (0.75) to
+        // encourage the kind of position-taking the model is selected for.
+        defaultSettings: ModelSettings(
+            temperature: 0.75,
+            effectiveMemoryDepth: 8,
+            similarityThreshold: 0.75,
+            recencyWeight: 0.3,
+            recencyHalfLifeDays: 90,
+            maxRagSnippetsCharacters: 1000,
+            ragDedupThreshold: 0.85,
+            repetitionPenalty: 1.1,
+            repetitionContextSize: 64
+        )
     )
 
     /// All MLX models Hal personally validates as part of the Curated tier.
@@ -14184,21 +14297,21 @@ struct ModelConfiguration: Identifiable, Codable, Equatable, Hashable {
     ///
     /// Phi-4 Mini was previously included but was demoted on May 13, 2026 after
     /// baseline-stability testing showed a 33% paragraph-loop failure rate on
-    /// the Maxim #1 consciousness prompt under default generation parameters.
+    /// the Maxim #1 consciousness prompt and a verbatim "I do not possess
+    /// personal experiences or consciousness" deflection on the other runs.
     /// The static let `phi4Mini4bit` is preserved (metadata only) so the model
     /// can still be reconstructed if a user discovers it via HF library search.
-    /// "Four clean curated models is better than five with an asterisk."
     ///
-    /// Ministral 3-3B Instruct 2512 4-bit is defined above but intentionally
-    /// **not** in curatedSeeds yet — Mark's May-13 directive made its
-    /// promotion conditional on passing the full 5-Maxim test suite first,
-    /// and the BackgroundDownloadCoordinator is currently unable to fetch the
-    /// `model.safetensors` blob from this repo's HuggingFace Xet storage URL
-    /// (the small JSON/tokenizer files transfer fine; the 2.75 GB Xet-served
-    /// blob never emits didWriteData callbacks). Gemma's similar-sized
-    /// safetensors blob downloaded fine previously, so this is specific to
-    /// the Xet path. Promote Ministral here once BGDL+Xet handling is fixed
-    /// and Maxim testing passes.
+    /// Ministral 3-3B-Instruct-2512-4bit (Mistral AI's December 2025 release)
+    /// was investigated on May 13, 2026 and *not* shipped. The mistral3
+    /// architecture is registered as text-only in mlx-swift-lm 3.31.3
+    /// (`Mistral3TextModel`), but the published mlx-community weights are
+    /// the multimodal `Mistral3ForConditionalGeneration` build that
+    /// silently hangs the text-only loader. Promote when either a text-only
+    /// Ministral 3 variant appears on HF or the loader can strip vision
+    /// weights gracefully.
+    ///
+    /// "Four clean curated models is better than five with an asterisk."
     static let curatedSeeds: [ModelConfiguration] = [
         .gemma4E2B4bit,
         .qwen35_2B4bit,
@@ -14292,8 +14405,6 @@ class ModelCatalogService: ObservableObject {
         ModelConfiguration.qwen35_2B4bit,
         ModelConfiguration.llama32_3B4bit,
         ModelConfiguration.dolphin3Llama32_3B4bit
-        // .ministral3_3B_Instruct_2512_4bit — intentionally absent until BGDL
-        // can complete the Xet-served safetensors download + Maxim suite passes
     ]
     @Published var isLoading: Bool = false
     @Published var errorMessage: String?
