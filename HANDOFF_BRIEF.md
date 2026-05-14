@@ -1,6 +1,10 @@
 # Hal Universal — Handoff Brief
-**Updated:** May 12, 2026 (late session) — Curated tier shipped, 5 MLX models verified, real streaming, background-download resilience
+**Updated:** May 13, 2026 (pre-compaction) — Maxim #1 empirical data + Strategic Claude brief landed; next phase scoped
 **Branch:** mlx-experiment
+
+> **For post-compaction CC:** read `Docs/CC_Recovery_2026-05-13.md` first. It points to everything else including Strategic Claude's brief defining the next 13-section work plan, and Mark's operational answers to my pre-compaction questions.
+
+> **Top of list, before anything else:** the Qwen 3.5 2B repetition-loop bug. Visual evidence (screenshot) shows it cannot ship. Fix probably involves `repetitionPenalty` in `GenerateParameters` or shorter `max_tokens`. Test against the consciousness prompt; check all curated MLX models for the same susceptibility. See recovery doc §1.
 
 ---
 
