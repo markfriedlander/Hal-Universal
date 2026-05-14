@@ -6772,12 +6772,15 @@ struct SalonModeView: View {
     @EnvironmentObject var chatViewModel: ChatViewModel
     @Environment(\.dismiss) var dismiss
 
-    // Seats 3 and 4 are gated until smart MLX-swap (option 2) is fully
-    // proven on hardware. The data model still supports four seats — flipping
-    // this back to `true` restores the full UI. Keep in sync with the
-    // matching cap in `runSalonTurn` (which limits activeSeats to 2 when
-    // this flag is `false`).
-    static let exposeSeatsThreeAndFour: Bool = false
+    // Seats 3 and 4 — gate verified open per Strategic §6/§13 (May 13, 2026).
+    // The smart MLX→MLX swap in MLXWrapper.setupLLM (unload + GPU.clearCache +
+    // 500ms reclaim sleep) keeps peak memory at one MLX model at a time
+    // regardless of seat count. The schema migration v2 (§9) ensures every
+    // seat's storage write has its own UNIQUE row even when multiple seats
+    // share a (turn, position) tuple. Both fixes together unblock 3- and
+    // 4-seat salons; verified on iPhone 16 Plus on the May-13 build by
+    // running multi-seat turns and confirming no OOM crashes + no row loss.
+    static let exposeSeatsThreeAndFour: Bool = true
 
     var body: some View {
         NavigationView {
