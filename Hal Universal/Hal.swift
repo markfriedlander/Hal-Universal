@@ -8463,8 +8463,29 @@ struct WidgetTestView: View {
                     let turnText = "Turn \(actualTurnNumber)"
                     let durationText = message.thinkingDuration.map { String(format: "Inference %.1f sec", $0) }
                     let modelName = !message.isFromUser ? (ModelCatalogService.shared.getModel(byID: message.recordedByModel)?.displayName ?? message.recordedByModel) : nil
-                    let footerString = ([formattedDate, turnText, durationText, modelName].compactMap { $0 }).joined(separator: ", ")
-                    
+                    // Salon footer fields (Strategic §6/§13 follow-up):
+                    //   Seat: "Seat N of M" when the message came from a salon
+                    //         seat (seatNumber non-nil). M is the active seat
+                    //         count at the *current* salonConfig — close-enough
+                    //         for almost every real conversation (users rarely
+                    //         reconfigure mid-thread); a true historical M
+                    //         would require schema work.
+                    //   Host: "Host" when the message is the moderator/Host
+                    //         summary. Detected by the "📋 Summary:" prefix
+                    //         that runModeratorSummary applies — unambiguous
+                    //         and survives even if recordedByModel coincides
+                    //         with a regular seat's model.
+                    let seatText: String? = {
+                        guard let seat = message.seatNumber else { return nil }
+                        let totalSeats = chatViewModel.salonConfig.activeSeats.count
+                        if totalSeats > 0 {
+                            return "Seat \(seat) of \(totalSeats)"
+                        }
+                        return "Seat \(seat)"
+                    }()
+                    let hostText: String? = (!message.isFromUser && message.content.hasPrefix("\u{1F4CB} Summary:")) ? "Host" : nil
+                    let footerString = ([formattedDate, turnText, durationText, modelName, seatText, hostText].compactMap { $0 }).joined(separator: ", ")
+
                     HStack {
                         Text(footerString)
                             .font(.caption2)
@@ -8480,7 +8501,22 @@ struct WidgetTestView: View {
 
         private func buildDetailsShareText() -> String {
             var lines: [String] = []
-            lines.append("Assistant response (turn \(actualTurnNumber)):")
+            // Header line: turn number + model + (salon) seat / host attribution.
+            // Mirrors the in-app footer so exported transcripts carry the same
+            // attribution the user saw in the conversation view.
+            var headerFields: [String] = ["turn \(actualTurnNumber)"]
+            let modelName = ModelCatalogService.shared.getModel(byID: message.recordedByModel)?.displayName ?? message.recordedByModel
+            if !message.isFromUser, !modelName.isEmpty {
+                headerFields.append("model: \(modelName)")
+            }
+            if let seat = message.seatNumber {
+                let totalSeats = chatViewModel.salonConfig.activeSeats.count
+                headerFields.append(totalSeats > 0 ? "seat \(seat) of \(totalSeats)" : "seat \(seat)")
+            }
+            if !message.isFromUser, message.content.hasPrefix("\u{1F4CB} Summary:") {
+                headerFields.append("role: Host")
+            }
+            lines.append("Assistant response (\(headerFields.joined(separator: ", "))):")
             lines.append(message.content)
             lines.append("")
             if let prompt = message.fullPromptUsed, !prompt.isEmpty {
