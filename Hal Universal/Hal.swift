@@ -7466,7 +7466,7 @@ struct ModelDetailCard: View {
 
     @ViewBuilder
     private var performanceSection: some View {
-        VStack(alignment: .leading, spacing: 4) {
+        VStack(alignment: .leading, spacing: 6) {
             Label("Performance", systemImage: "gauge.with.dots.needle.67percent")
                 .font(.caption)
                 .foregroundColor(.secondary)
@@ -7476,32 +7476,36 @@ struct ModelDetailCard: View {
                     GridItem(.flexible(), alignment: .leading)
                 ],
                 alignment: .leading,
-                spacing: 4
+                spacing: 10
             ) {
                 if let gen = model.generationTokensPerSec {
-                    statRow("Generation", "\(String(format: "%.1f", gen)) tok/s")
+                    statCell("Generation", "\(String(format: "%.1f", gen)) tok/s")
                 }
                 if let prefill = model.prefillTokensPerSec {
-                    statRow("Prefill", formatTokensPerSec(prefill))
+                    statCell("Prefill", formatTokensPerSec(prefill))
                 }
-                statRow("Context", formatContextWindow(model.contextWindow))
+                statCell("Context", formatContextWindow(model.contextWindow))
                 if let size = model.sizeGB {
-                    statRow("Download", "\(String(format: "%.1f", size)) GB")
+                    statCell("Download", "\(String(format: "%.1f", size)) GB")
                 } else if model.source == .appleFoundation {
-                    statRow("Download", "System-managed")
+                    statCell("Download", "System-managed")
                 }
             }
         }
     }
 
+    /// Stacked label-above-value cell. Each cell gets its full half-column
+    /// width so "Generation" / "Prefill" / "Download" don't have to compete
+    /// horizontally with their numeric values (the inline `[label] [value]`
+    /// layout caused "Genera-tion" to wrap when the column was tight).
     @ViewBuilder
-    private func statRow(_ label: String, _ value: String) -> some View {
-        HStack(spacing: 4) {
+    private func statCell(_ label: String, _ value: String) -> some View {
+        VStack(alignment: .leading, spacing: 1) {
             Text(label)
                 .font(.caption2)
                 .foregroundColor(.secondary)
             Text(value)
-                .font(.caption2)
+                .font(.caption)
                 .fontWeight(.medium)
                 .monospacedDigit()
         }
@@ -7543,26 +7547,35 @@ struct MaximScorecardView: View {
         }
     }
 
+    /// Two-line row: icon spans both lines on the left; label + rating word
+    /// on the top line; caption (full text, may wrap) on the second line.
+    /// Earlier inline layout squeezed the caption between label and rating
+    /// and clipped it with an ellipsis on every Maxim — this layout gives
+    /// the caption the row's full width.
     @ViewBuilder
     private func row(rating: MaximScorecard.Rating, label: String, caption: String) -> some View {
-        HStack(alignment: .firstTextBaseline, spacing: 6) {
+        HStack(alignment: .top, spacing: 8) {
             Image(systemName: rating.systemImage)
                 .foregroundColor(rating.tint)
                 .font(.caption)
                 .frame(width: 14)
-            Text(label)
-                .font(.caption2)
-                .fontWeight(.semibold)
-                .foregroundColor(.primary)
-            Text(caption)
-                .font(.caption2)
-                .foregroundColor(.secondary)
-                .lineLimit(1)
-                .truncationMode(.tail)
-            Spacer()
-            Text(rating.summary)
-                .font(.caption2)
-                .foregroundColor(rating.tint)
+                .padding(.top, 1)  // optical alignment with first text line
+            VStack(alignment: .leading, spacing: 1) {
+                HStack(alignment: .firstTextBaseline) {
+                    Text(label)
+                        .font(.caption2)
+                        .fontWeight(.semibold)
+                        .foregroundColor(.primary)
+                    Spacer()
+                    Text(rating.summary)
+                        .font(.caption2)
+                        .foregroundColor(rating.tint)
+                }
+                Text(caption)
+                    .font(.caption2)
+                    .foregroundColor(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
         }
     }
 }
