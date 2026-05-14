@@ -10358,43 +10358,207 @@ class ChatViewModel: ObservableObject {
                                                                         }
                                                                         
                                                                         /// Executes the selected tools based on decision
+                                                                        /// Compound-query decomposition (May 13, 2026, post-RAG-investigation).
+                                                                        ///
+                                                                        /// "What's my cat's name AND favorite color?" — asking for two
+                                                                        /// stored facts in one query — embeds to a vector that's the
+                                                                        /// average of both topics. Semantic search returns snippets
+                                                                        /// that match neither strongly, and the model fails to extract
+                                                                        /// the specific facts. Verified on device: failed on AFM and
+                                                                        /// Gemma equally, so it's not a model-family issue — it's a
+                                                                        /// general retrieval limitation.
+                                                                        ///
+                                                                        /// Fix: detect compound queries, split into atomic sub-queries,
+                                                                        /// run independent searches, merge snippets. Each sub-query
+                                                                        /// embeds cleanly; each search returns snippets relevant to
+                                                                        /// that topic; merge dedupes content and keeps the strongest
+                                                                        /// matches.
+                                                                        ///
+                                                                        /// Returns nil for non-compound queries (caller uses single
+                                                                        /// search path). Returns the split sub-queries when compound
+                                                                        /// patterns are detected.
+                                                                        ///
+                                                                        /// Detection is conservative (rule-based, pattern-match) — a
+                                                                        /// false positive just costs one extra search; a false
+                                                                        /// negative leaves us in the old broken state. Per Mark's
+                                                                        /// "rule-based for obvious cases" suggestion.
+                                                                        private func decomposeCompoundQuery(_ input: String) -> [String]? {
+                                                                            let trimmed = input.trimmingCharacters(in: .whitespacesAndNewlines)
+                                                                            guard !trimmed.isEmpty else { return nil }
+                                                                            let lower = trimmed.lowercased()
+
+                                                                            // Multiple sentences ending in '?' — strong compound signal.
+                                                                            // e.g. "What's my cat's name? What about my color?"
+                                                                            let questionMarks = trimmed.filter { $0 == "?" }.count
+                                                                            if questionMarks > 1 {
+                                                                                let parts = trimmed
+                                                                                    .components(separatedBy: "?")
+                                                                                    .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+                                                                                    .filter { !$0.isEmpty }
+                                                                                if parts.count > 1 {
+                                                                                    halLog("HALDEBUG-RAG: Compound detected (multi-? marks) → \(parts.count) sub-queries")
+                                                                                    return parts.map { $0 + "?" }
+                                                                                }
+                                                                            }
+
+                                                                            // " and " joining two topics within a single question — only
+                                                                            // treat as compound when at least one side carries a
+                                                                            // personal-recall signal ("my ...") to avoid splitting
+                                                                            // legitimate single-topic phrases like
+                                                                            // "Britain and France" or "rock and roll".
+                                                                            if lower.contains(" and ") && lower.contains("my ") {
+                                                                                let parts = trimmed
+                                                                                    .components(separatedBy: " and ")
+                                                                                    .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+                                                                                    .filter { !$0.isEmpty }
+                                                                                // Only split if both segments are non-trivial and at
+                                                                                // least one mentions "my" (the recall-trigger).
+                                                                                if parts.count == 2,
+                                                                                   parts.allSatisfy({ $0.count >= 3 }),
+                                                                                   parts.contains(where: { $0.lowercased().contains("my ") })
+                                                                                {
+                                                                                    halLog("HALDEBUG-RAG: Compound detected (' and ' with personal recall) → \(parts.count) sub-queries")
+                                                                                    return parts
+                                                                                }
+                                                                            }
+
+                                                                            // Comma-separated topics in a question. Conservative: only
+                                                                            // treat as compound when the question contains a
+                                                                            // first-person pronoun ("my", "I") and at least two
+                                                                            // commas (suggesting a list).
+                                                                            let commaCount = trimmed.filter { $0 == "," }.count
+                                                                            if commaCount >= 2 && (lower.contains("my ") || lower.contains(" i ")) {
+                                                                                let parts = trimmed
+                                                                                    .components(separatedBy: ",")
+                                                                                    .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+                                                                                    .filter { $0.count >= 3 }
+                                                                                if parts.count >= 3 {
+                                                                                    halLog("HALDEBUG-RAG: Compound detected (comma-separated list) → \(parts.count) sub-queries")
+                                                                                    return parts
+                                                                                }
+                                                                            }
+
+                                                                            return nil
+                                                                        }
+
+                                                                        /// Merge snippets from multiple searches, deduping by content
+                                                                        /// (keep the highest-relevance copy when a snippet appears
+                                                                        /// in multiple sub-query results), then sort by relevance.
+                                                                        /// Caller applies token-budget capping afterwards.
+                                                                        private func mergeSearchSnippets(_ groups: [[UnifiedSearchResult]]) -> [UnifiedSearchResult] {
+                                                                            var byContent: [String: UnifiedSearchResult] = [:]
+                                                                            for group in groups {
+                                                                                for result in group {
+                                                                                    let key = result.content
+                                                                                    if let existing = byContent[key] {
+                                                                                        // Keep the higher-relevance copy
+                                                                                        if result.relevance > existing.relevance {
+                                                                                            byContent[key] = result
+                                                                                        }
+                                                                                    } else {
+                                                                                        byContent[key] = result
+                                                                                    }
+                                                                                }
+                                                                            }
+                                                                            return byContent.values.sorted { $0.relevance > $1.relevance }
+                                                                        }
+
                                                                         private func executeTools(decision: ToolDecision, userInput: String, excludeTurns: [Int], tokenBudget: Int) async -> ToolResults {
                                                                             var memoryResults: [UnifiedSearchResult]? = nil
                                                                             var usedTools: [String] = []
-                                                                            
+
                                                                             // Execute memory_search if requested
                                                                             if decision.tools.contains("memory_search") {
                                                                                 let searchStart = Date()
-                                                                                halLog("HALDEBUG-TOOLS: memory_search START (budget=\(tokenBudget) tokens, excludeTurns=\(excludeTurns.count))")
-                                                                                let searchContext = memoryStore.searchUnifiedContent(
-                                                                                    for: userInput,
-                                                                                    currentConversationId: conversationId,
-                                                                                    excludeTurns: excludeTurns,
-                                                                                    maxResults: 10,
-                                                                                    tokenBudget: tokenBudget
-                                                                                )
 
-                                                                                // Convert RAGSnippets to UnifiedSearchResults (architectural boundary)
-                                                                                let allSnippets = searchContext.conversationSnippets + searchContext.documentSnippets
-                                                                                memoryResults = allSnippets.map { ragSnippet in
-                                                                                    UnifiedSearchResult(
-                                                                                        content: ragSnippet.content,
-                                                                                        relevance: ragSnippet.relevanceScore,
-                                                                                        source: ragSnippet.sourceType.rawValue,
-                                                                                        isEntityMatch: ragSnippet.isEntityMatch,
-                                                                                        filePath: ragSnippet.sourceType == .document ? ragSnippet.sourceName : nil
+                                                                                // Compound-query decomposition. When the user asks
+                                                                                // for multiple stored facts in one query, run a
+                                                                                // separate search per sub-topic and merge — the
+                                                                                // single-embedding average otherwise dilutes match
+                                                                                // strength on every topic. Verified failure mode
+                                                                                // on the May-13 cross-restart test.
+                                                                                let subQueries: [String] = decomposeCompoundQuery(userInput) ?? [userInput]
+
+                                                                                if subQueries.count == 1 {
+                                                                                    // Original single-search path. No behavior change.
+                                                                                    halLog("HALDEBUG-TOOLS: memory_search START (budget=\(tokenBudget) tokens, excludeTurns=\(excludeTurns.count))")
+                                                                                    let searchContext = memoryStore.searchUnifiedContent(
+                                                                                        for: userInput,
+                                                                                        currentConversationId: conversationId,
+                                                                                        excludeTurns: excludeTurns,
+                                                                                        maxResults: 10,
+                                                                                        tokenBudget: tokenBudget
                                                                                     )
+                                                                                    let allSnippets = searchContext.conversationSnippets + searchContext.documentSnippets
+                                                                                    memoryResults = allSnippets.map { ragSnippet in
+                                                                                        UnifiedSearchResult(
+                                                                                            content: ragSnippet.content,
+                                                                                            relevance: ragSnippet.relevanceScore,
+                                                                                            source: ragSnippet.sourceType.rawValue,
+                                                                                            isEntityMatch: ragSnippet.isEntityMatch,
+                                                                                            filePath: ragSnippet.sourceType == .document ? ragSnippet.sourceName : nil
+                                                                                        )
+                                                                                    }
+                                                                                    let searchMs = Int(Date().timeIntervalSince(searchStart) * 1000)
+                                                                                    halLog("HALDEBUG-TOOLS: memory_search END in \(searchMs)ms — \(memoryResults?.count ?? 0) results (\(searchContext.conversationSnippets.count) conv + \(searchContext.documentSnippets.count) doc)")
+                                                                                } else {
+                                                                                    // Multi-search path. Each sub-query gets the
+                                                                                    // full token budget for its own search; the
+                                                                                    // merged set is then re-capped to the original
+                                                                                    // budget so prompt prefill stays bounded.
+                                                                                    halLog("HALDEBUG-TOOLS: memory_search START (compound, \(subQueries.count) sub-queries, budget=\(tokenBudget) tokens each, excludeTurns=\(excludeTurns.count))")
+                                                                                    var perQueryGroups: [[UnifiedSearchResult]] = []
+                                                                                    var totalConv = 0
+                                                                                    var totalDoc = 0
+                                                                                    for (i, sub) in subQueries.enumerated() {
+                                                                                        halLog("HALDEBUG-TOOLS: sub-query [\(i+1)/\(subQueries.count)]: \(sub.prefix(80))")
+                                                                                        let ctx = memoryStore.searchUnifiedContent(
+                                                                                            for: sub,
+                                                                                            currentConversationId: conversationId,
+                                                                                            excludeTurns: excludeTurns,
+                                                                                            maxResults: 5,   // smaller per-sub-query cap
+                                                                                            tokenBudget: tokenBudget
+                                                                                        )
+                                                                                        totalConv += ctx.conversationSnippets.count
+                                                                                        totalDoc += ctx.documentSnippets.count
+                                                                                        let group = (ctx.conversationSnippets + ctx.documentSnippets).map { ragSnippet in
+                                                                                            UnifiedSearchResult(
+                                                                                                content: ragSnippet.content,
+                                                                                                relevance: ragSnippet.relevanceScore,
+                                                                                                source: ragSnippet.sourceType.rawValue,
+                                                                                                isEntityMatch: ragSnippet.isEntityMatch,
+                                                                                                filePath: ragSnippet.sourceType == .document ? ragSnippet.sourceName : nil
+                                                                                            )
+                                                                                        }
+                                                                                        perQueryGroups.append(group)
+                                                                                    }
+                                                                                    let merged = mergeSearchSnippets(perQueryGroups)
+
+                                                                                    // Re-apply the original token budget on the
+                                                                                    // merged set (cap by relevance order, then
+                                                                                    // re-check budget). This keeps the prompt
+                                                                                    // prefill bounded even if all sub-queries
+                                                                                    // returned snippets at full budget each.
+                                                                                    var capped: [UnifiedSearchResult] = []
+                                                                                    var totalTokens = 0
+                                                                                    for r in merged {
+                                                                                        let t = TokenEstimator.estimateTokens(from: r.content)
+                                                                                        if totalTokens + t > tokenBudget { break }
+                                                                                        capped.append(r)
+                                                                                        totalTokens += t
+                                                                                        if capped.count >= 10 { break }
+                                                                                    }
+                                                                                    memoryResults = capped
+                                                                                    let searchMs = Int(Date().timeIntervalSince(searchStart) * 1000)
+                                                                                    halLog("HALDEBUG-TOOLS: memory_search END (compound) in \(searchMs)ms — \(memoryResults?.count ?? 0) merged results from \(perQueryGroups.reduce(0) { $0 + $1.count }) raw across \(subQueries.count) sub-queries (\(totalConv) conv + \(totalDoc) doc raw, \(totalTokens) tokens after merge+cap)")
                                                                                 }
                                                                                 usedTools.append("memory_search")
-
-                                                                                let searchMs = Int(Date().timeIntervalSince(searchStart) * 1000)
-                                                                                halLog("HALDEBUG-TOOLS: memory_search END in \(searchMs)ms — \(memoryResults?.count ?? 0) results (\(searchContext.conversationSnippets.count) conv + \(searchContext.documentSnippets.count) doc)")
                                                                             } else {
                                                                                 halLog("HALDEBUG-TOOLS: Skipping memory_search (gate decision)")
                                                                             }
-                                                                            
+
                                                                             // Future tools (Wikipedia, DuckDuckGo) would be added here
-                                                                            
+
                                                                             return ToolResults(memorySearchResults: memoryResults, toolsUsed: usedTools)
                                                                         }
                                                                         
