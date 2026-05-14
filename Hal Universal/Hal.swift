@@ -630,6 +630,16 @@ class MemoryStore: ObservableObject {
                                         """
 
                                         // ENHANCED SCHEMA: Add entity_keywords, turn_number, deliberation_round, seat_number columns
+                                        //
+                                        // UNIQUE constraint includes seat_number and
+                                        // deliberation_round (schema v2). This makes salon
+                                        // multi-seat / multi-round turns naturally non-
+                                        // colliding: SQLite treats NULL values in UNIQUE
+                                        // columns as distinct, so non-salon rows still
+                                        // collide on (source_type, source_id, position)
+                                        // as intended. See migrateUnifiedContentUniqueConstraintToV2
+                                        // for the migration that brings legacy databases up
+                                        // to this schema.
                                         let unifiedContentSQL = """
                                         CREATE TABLE IF NOT EXISTS unified_content (
                                             id TEXT PRIMARY KEY,
@@ -648,7 +658,7 @@ class MemoryStore: ObservableObject {
                                             deliberation_round INTEGER NULL,
                                             seat_number INTEGER,
                                             created_at INTEGER DEFAULT (strftime('%s', 'now')),
-                                            UNIQUE(source_type, source_id, position)
+                                            UNIQUE(source_type, source_id, position, seat_number, deliberation_round)
                                         );
                                         """
 
@@ -780,17 +790,141 @@ class MemoryStore: ObservableObject {
                                             }
                                         }
                                         
+                                        // Schema migration v2: broaden unified_content UNIQUE
+                                        // constraint to include seat_number and
+                                        // deliberation_round so salon multi-seat / multi-round
+                                        // turns don't collide on (source_type, source_id,
+                                        // position). See Strategic §9.
+                                        migrateUnifiedContentUniqueConstraintToV2()
+
                                         // Enable data protection (encryption)
                                         enableDataProtection()
-                                        
+
                                         // Load statistics
                                         loadUnifiedStats()
-                                        
+
                                         // Initialize self-knowledge with core values on first launch
                                         initializeCoreIdentity()
-                                        
+
                                         // Enable source code access (Maxim #2)
                                         enableSourceCodeAccess()
+                                    }
+
+                                    // MARK: - Schema Migration v2 (UNIQUE-constraint widening)
+                                    //
+                                    // Strategic §9: the original `unified_content` schema had
+                                    // `UNIQUE(source_type, source_id, position)`. Salon mode
+                                    // writes multiple assistant rows per turn (one per seat,
+                                    // possibly several per seat across deliberation rounds),
+                                    // all at position `turnNumber * 2`. Under the original
+                                    // constraint, only one of those rows could persist —
+                                    // SQLite silently rejected the others — manifesting as
+                                    // "seat 1 not stored after app kill" and similar latent
+                                    // bugs.
+                                    //
+                                    // The fix is to widen the UNIQUE constraint to include
+                                    // `seat_number` and `deliberation_round`. SQLite treats
+                                    // NULL values in UNIQUE columns as distinct, so non-salon
+                                    // rows (seat_number IS NULL, deliberation_round = 1) still
+                                    // collide on (source_type, source_id, position) as
+                                    // intended — preventing accidental duplicate stores of a
+                                    // single-seat turn.
+                                    //
+                                    // SQLite doesn't support ALTER TABLE … DROP CONSTRAINT, so
+                                    // the migration uses the canonical "shadow table + swap"
+                                    // pattern: create a new table with the right schema, copy
+                                    // every row, drop the original, rename the new one.
+                                    // PRAGMA user_version is bumped on success so we never
+                                    // run this twice.
+                                    private func migrateUnifiedContentUniqueConstraintToV2() {
+                                        guard ensureHealthyConnection() else { return }
+
+                                        // Read current schema version
+                                        var currentVersion: Int32 = 0
+                                        var versionStmt: OpaquePointer?
+                                        if sqlite3_prepare_v2(db, "PRAGMA user_version;", -1, &versionStmt, nil) == SQLITE_OK {
+                                            if sqlite3_step(versionStmt) == SQLITE_ROW {
+                                                currentVersion = sqlite3_column_int(versionStmt, 0)
+                                            }
+                                        }
+                                        sqlite3_finalize(versionStmt)
+
+                                        guard currentVersion < 2 else {
+                                            print("HALDEBUG-MIGRATION: unified_content schema already at v\(currentVersion); no v2 migration needed")
+                                            return
+                                        }
+
+                                        print("HALDEBUG-MIGRATION: Schema v\(currentVersion) → v2: widening unified_content UNIQUE to (source_type, source_id, position, seat_number, deliberation_round)")
+
+                                        // Single multi-statement script. SQLite executes each
+                                        // statement in order; if any fails, the explicit
+                                        // ROLLBACK in the catch branch restores the prior
+                                        // state. The UNIQUE constraint name is intentionally
+                                        // not given — SQLite auto-names anonymous constraints,
+                                        // which is fine for our purposes.
+                                        let migrationSQL = """
+                                        BEGIN IMMEDIATE TRANSACTION;
+
+                                        CREATE TABLE unified_content_v2 (
+                                            id TEXT PRIMARY KEY,
+                                            content TEXT NOT NULL,
+                                            embedding BLOB,
+                                            timestamp INTEGER NOT NULL,
+                                            source_type TEXT NOT NULL,
+                                            source_id TEXT NOT NULL,
+                                            position INTEGER NOT NULL,
+                                            is_from_user INTEGER,
+                                            entity_keywords TEXT,
+                                            recorded_by_model TEXT,
+                                            metadata_json TEXT,
+                                            device_type TEXT,
+                                            turn_number INTEGER NULL,
+                                            deliberation_round INTEGER NULL,
+                                            seat_number INTEGER,
+                                            created_at INTEGER DEFAULT (strftime('%s', 'now')),
+                                            UNIQUE(source_type, source_id, position, seat_number, deliberation_round)
+                                        );
+
+                                        INSERT INTO unified_content_v2 (
+                                            id, content, embedding, timestamp, source_type, source_id,
+                                            position, is_from_user, entity_keywords, recorded_by_model,
+                                            metadata_json, device_type, turn_number, deliberation_round,
+                                            seat_number, created_at
+                                        )
+                                        SELECT
+                                            id, content, embedding, timestamp, source_type, source_id,
+                                            position, is_from_user, entity_keywords, recorded_by_model,
+                                            metadata_json, device_type, turn_number, deliberation_round,
+                                            seat_number, created_at
+                                        FROM unified_content;
+
+                                        DROP TABLE unified_content;
+
+                                        ALTER TABLE unified_content_v2 RENAME TO unified_content;
+
+                                        COMMIT;
+                                        """
+
+                                        var errPtr: UnsafeMutablePointer<CChar>?
+                                        let result = sqlite3_exec(db, migrationSQL, nil, nil, &errPtr)
+
+                                        if result == SQLITE_OK {
+                                            // PRAGMA user_version is NOT transactional in
+                                            // SQLite; it lives in the database header. Bump
+                                            // it AFTER the data migration commits.
+                                            sqlite3_exec(db, "PRAGMA user_version = 2;", nil, nil, nil)
+                                            print("HALDEBUG-MIGRATION: ✓ unified_content migrated to v2 (UNIQUE now includes seat_number + deliberation_round)")
+                                        } else {
+                                            let errorMessage = errPtr.map { String(cString: $0) } ?? "unknown error"
+                                            print("HALDEBUG-MIGRATION: ❌ v2 migration failed (code \(result)): \(errorMessage)")
+                                            // Best-effort rollback in case the transaction is
+                                            // still open (sqlite3_exec usually rolls back on
+                                            // failure, but be explicit).
+                                            sqlite3_exec(db, "ROLLBACK;", nil, nil, nil)
+                                        }
+                                        if errPtr != nil {
+                                            sqlite3_free(errPtr)
+                                        }
                                     }
 
                                     // ENCRYPTION: Enable Apple Data Protection on database file
@@ -1259,16 +1393,12 @@ class MemoryStore: ObservableObject {
 
                             // SALON MODE FIX: Conditionally store user message
                             //
-                            // Position scheme (May 13, 2026): each turn occupies a 1000-position
-                            // block. User at turnNumber * 1000, assistant(s) at turnNumber * 1000
-                            // + seatNumber (or +1 for solo). This solves the salon collision bug
-                            // where seats 2+ at the same turn previously wrote to the same
-                            // position (turnNumber * 2) — and the UNIQUE(source_type, source_id,
-                            // position) constraint silently dropped all but one. Up to 999 seat
-                            // slots per turn supported. Legacy data (positions 1..N from before
-                            // this commit) remains correctly ordered relative to new turns
-                            // because every new turn's positions land above any plausible legacy
-                            // position for the same conversation.
+                            // Position is just turnNumber * 2 - 1 (user) / turnNumber * 2
+                            // (assistant). Salon multi-seat uniqueness is enforced by the
+                            // unified_content UNIQUE constraint, which includes seat_number
+                            // and deliberation_round (see schema migration v2 in
+                            // createUnifiedSchema). No artificial multiplier needed in the
+                            // position formula.
                             var userContentId = ""
                             if !skipUserMessage {
                                 // Store user message with entity keywords and device type
@@ -1276,7 +1406,7 @@ class MemoryStore: ObservableObject {
                                     content: userMessage,
                                     sourceType: .conversation,
                                     sourceId: conversationId,
-                                    position: turnNumber * 1000,
+                                    position: turnNumber * 2 - 1,
                                     timestamp: Date(),
                                     isFromUser: true, // Explicitly set for user message
                                     entityKeywords: combinedEntitiesKeywords,
@@ -1315,17 +1445,15 @@ class MemoryStore: ObservableObject {
                             // Store assistant message with entity keywords, metadata, and device type
                             // Scrub HelPML markers before storage so structural delimiters don't pollute RAG retrieval
                             //
-                            // Position: turnNumber * 1000 + seatNumber (or +1 for solo). Each
-                            // salon seat gets a unique position within the turn so the
-                            // UNIQUE(source_type, source_id, position) constraint doesn't drop
-                            // overlapping rows. See user-message branch above for the full
-                            // rationale.
+                            // Position is just turnNumber * 2. Salon multi-seat uniqueness is
+                            // handled by the schema's UNIQUE constraint, which now includes
+                            // seat_number and deliberation_round (schema v2).
                             let scrubbedAssistantMessage = assistantMessage.ScrubHelPMLMarkers()
                             let assistantContentId = storeUnifiedContentWithEntities(
                                 content: scrubbedAssistantMessage,
                                 sourceType: .conversation,
                                 sourceId: conversationId,
-                                position: turnNumber * 1000 + (seatNumber ?? 1),
+                                position: turnNumber * 2,
                                 timestamp: Date(),
                                 isFromUser: false, // Explicitly set for assistant message
                                 entityKeywords: combinedEntitiesKeywords,
@@ -15604,6 +15732,18 @@ class HalTestConsole: ObservableObject {
             vm.systemPrompt = promptText
             writeStateJSON(vm: vm)
             return "{\"status\":\"ok\",\"command\":\"SET_SYSTEM_PROMPT_STORED\"}"
+
+        } else if trimmed == "RESET_MODEL_SETTINGS" {
+            // Per-model settings reset (Layer 3 of per-model profiles).
+            // Clears the ACTIVE model's user overrides and re-applies its
+            // empirical defaults through the live VM properties so the
+            // @AppStorage-bound state reflects the change immediately.
+            // Other models' overrides are untouched.
+            await MainActor.run {
+                vm.resetSettingsToModelDefaults()
+            }
+            writeStateJSON(vm: vm)
+            return "{\"status\":\"ok\",\"command\":\"RESET_MODEL_SETTINGS\",\"modelID\":\"\(jsonStringEscape(vm.selectedModelID))\"}"
 
         } else if trimmed.hasPrefix("SET_MEMORY_DEPTH:") {
             let depthStr = String(trimmed.dropFirst("SET_MEMORY_DEPTH:".count)).trimmingCharacters(in: .whitespaces)
