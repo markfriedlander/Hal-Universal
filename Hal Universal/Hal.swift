@@ -5865,6 +5865,61 @@ struct ActionsView: View {
     
     private var personalitySection: some View {
         Section {
+            // Per Strategic §4: per-model Layer 1 framing.
+            // Visible to the user, toggleable, NOT user-editable. The text
+            // is empty for most models (they follow the universal Layer 2
+            // well enough); AFM, Qwen, and Dolphin have non-empty Layer 1
+            // prompts informed by the §2 Maxim sweep + §11 AFM experiment.
+            if let layerOne = chatViewModel.selectedModel.layerOnePrompt?
+                .trimmingCharacters(in: .whitespacesAndNewlines),
+               !layerOne.isEmpty
+            {
+                VStack(alignment: .leading, spacing: 8) {
+                    Toggle(isOn: Binding(
+                        get: {
+                            ModelSettingsStore.shared
+                                .effectiveSettings(for: chatViewModel.selectedModel)
+                                .layerOnePromptEnabled ?? true
+                        },
+                        set: { newValue in
+                            // Layer 1 toggle lives entirely in the override
+                            // JSON (no @AppStorage backing), so write directly
+                            // via the dedicated setter. This preserves any
+                            // other override fields for this model.
+                            ModelSettingsStore.shared.setLayerOnePromptEnabled(
+                                newValue,
+                                for: chatViewModel.selectedModelID
+                            )
+                            // The store is a singleton, not @Published — the
+                            // Toggle's binding wouldn't auto-refresh without
+                            // an explicit nudge to the view model's publisher.
+                            chatViewModel.objectWillChange.send()
+                        }
+                    )) {
+                        HStack(spacing: 6) {
+                            Text("Model framing for \(chatViewModel.selectedModel.displayName)")
+                                .font(.subheadline)
+                                .fontWeight(.medium)
+                            Image(systemName: "info.circle")
+                                .font(.caption)
+                                .foregroundColor(.blue)
+                        }
+                    }
+
+                    Text(layerOne)
+                        .font(.caption)
+                        .foregroundColor(.secondary)
+                        .padding(8)
+                        .background(Color.gray.opacity(0.08))
+                        .cornerRadius(6)
+                        .textSelection(.enabled)
+
+                    Text("Per-model framing that Hal applies to compensate for this model's specific tendencies. Visible to you, but not editable. Disable if you'd rather use only the universal System Prompt below.")
+                        .font(.caption2)
+                        .foregroundColor(.secondary)
+                }
+            }
+
             Button {
                 showingSystemPromptEditor = true
             } label: {
@@ -9341,10 +9396,43 @@ class ChatViewModel: ObservableObject {
 
     @AppStorage("systemPrompt") var systemPrompt: String = ChatViewModel.defaultSystemPrompt
 
-    /// Returns the test harness system prompt override when the console is active,
-    /// otherwise returns the stored system prompt. Zero effect in production.
+    /// Returns the composed system prompt that goes into every chat turn.
+    ///
+    /// Per Strategic §4, this composes two layers:
+    ///   - **Layer 1** (per-model, read-only): the active model's
+    ///     `layerOnePrompt` — short, focused behavioral framing CC writes
+    ///     to compensate for or reinforce that model's specific tendencies.
+    ///     Toggleable per-model via ModelSettings.layerOnePromptEnabled
+    ///     (default true). When disabled or empty, Layer 1 contributes
+    ///     nothing.
+    ///   - **Layer 2** (universal, user-editable): the user's
+    ///     `systemPrompt` (or test-console override). Same across models.
+    ///
+    /// Layer 1 is prepended to Layer 2 with a blank line between, so the
+    /// model reads its model-specific framing first, then the universal
+    /// Hal prompt. Order matters: Layer 1 sets up the model's behavioral
+    /// orientation; Layer 2 fills in the universal Hal identity, voice,
+    /// and Maxim instructions.
     var effectiveSystemPrompt: String {
-        testConsole.isRunning ? (testConsole.systemPromptOverride ?? systemPrompt) : systemPrompt
+        // Layer 2: editable user prompt, possibly overridden by the test
+        // console (preserves the pre-existing behavior of this getter).
+        let layerTwo: String = testConsole.isRunning
+            ? (testConsole.systemPromptOverride ?? systemPrompt)
+            : systemPrompt
+
+        // Layer 1: per-model framing, gated on the per-model toggle.
+        // Reading through ModelSettingsStore so the toggle's persisted
+        // override (if any) wins over the model's default. nil/empty
+        // text or a disabled toggle → Layer 1 is a no-op.
+        let model = selectedModel
+        let effective = ModelSettingsStore.shared.effectiveSettings(for: model)
+        let layerOneEnabled = effective.layerOnePromptEnabled ?? true
+        let layerOneRaw = layerOneEnabled ? (model.layerOnePrompt ?? "") : ""
+        let layerOne = layerOneRaw.trimmingCharacters(in: .whitespacesAndNewlines)
+
+        if layerOne.isEmpty { return layerTwo }
+        if layerTwo.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty { return layerOne }
+        return layerOne + "\n\n" + layerTwo
     }
     @Published var injectedSummary: String = ""
     @AppStorage("memoryDepth") var memoryDepth: Int = 5
@@ -14268,6 +14356,11 @@ struct ModelSettings: Codable, Equatable {
     var ragDedupThreshold: Double?
     var repetitionPenalty: Float?
     var repetitionContextSize: Int?
+    /// Whether the model's Layer 1 (per-model framing) is prepended to the
+    /// user's system prompt. Per Strategic §4. Defaults to true. The Layer 1
+    /// TEXT itself lives on ModelConfiguration.layerOnePrompt (read-only);
+    /// this field is just the per-model toggle for whether to USE it.
+    var layerOnePromptEnabled: Bool?
 
     init(
         temperature: Double? = nil,
@@ -14278,7 +14371,8 @@ struct ModelSettings: Codable, Equatable {
         maxRagSnippetsCharacters: Int? = nil,
         ragDedupThreshold: Double? = nil,
         repetitionPenalty: Float? = nil,
-        repetitionContextSize: Int? = nil
+        repetitionContextSize: Int? = nil,
+        layerOnePromptEnabled: Bool? = nil
     ) {
         self.temperature = temperature
         self.effectiveMemoryDepth = effectiveMemoryDepth
@@ -14289,6 +14383,7 @@ struct ModelSettings: Codable, Equatable {
         self.ragDedupThreshold = ragDedupThreshold
         self.repetitionPenalty = repetitionPenalty
         self.repetitionContextSize = repetitionContextSize
+        self.layerOnePromptEnabled = layerOnePromptEnabled
     }
 
     /// Overlay non-nil fields of `overrides` on top of `self`. Non-destructive:
@@ -14304,7 +14399,8 @@ struct ModelSettings: Codable, Equatable {
             maxRagSnippetsCharacters: overrides.maxRagSnippetsCharacters ?? self.maxRagSnippetsCharacters,
             ragDedupThreshold: overrides.ragDedupThreshold ?? self.ragDedupThreshold,
             repetitionPenalty: overrides.repetitionPenalty ?? self.repetitionPenalty,
-            repetitionContextSize: overrides.repetitionContextSize ?? self.repetitionContextSize
+            repetitionContextSize: overrides.repetitionContextSize ?? self.repetitionContextSize,
+            layerOnePromptEnabled: overrides.layerOnePromptEnabled ?? self.layerOnePromptEnabled
         )
     }
 }
@@ -14444,6 +14540,24 @@ final class ModelSettingsStore {
         halLog("HALDEBUG-SETTINGS: Reset overrides for \(modelID)")
     }
 
+    /// Set just the Layer 1 prompt toggle for a model, preserving any other
+    /// existing override fields (temperature, depth, etc.). Used by the §4
+    /// "Model framing" toggle in personality settings.
+    ///
+    /// Unlike the snapshot/applyEffectiveSettings flow used for the seven
+    /// @AppStorage-backed settings, layerOnePromptEnabled has no @AppStorage
+    /// backing — it lives entirely in the per-model override JSON. So this
+    /// setter writes directly to the override dictionary without going
+    /// through UserDefaults.
+    func setLayerOnePromptEnabled(_ enabled: Bool, for modelID: String) {
+        var dict = loadOverrides()
+        var current = dict[modelID] ?? ModelSettings()
+        current.layerOnePromptEnabled = enabled
+        dict[modelID] = current
+        saveOverrides(dict)
+        halLog("HALDEBUG-SETTINGS: layerOnePromptEnabled set to \(enabled) for \(modelID)")
+    }
+
     // MARK: Internals
 
     /// Snapshot the current UserDefaults values for the seven managed keys.
@@ -14495,6 +14609,26 @@ struct ModelConfiguration: Identifiable, Codable, Equatable, Hashable {
     // disk. No migration needed.
     var defaultSettings: ModelSettings?
 
+    // MARK: - Per-Model Layer 1 System Prompt (Strategic §4)
+    //
+    // Layer 1 is per-model behavioral framing — short, focused instructions
+    // that compensate for or reinforce a specific model's known tendencies.
+    // CC writes the text; users can toggle it on/off but cannot edit it. The
+    // text is prepended to the user-editable Layer 2 (`ChatViewModel.systemPrompt`)
+    // at chat-build time, producing the model's effective system prompt.
+    //
+    // Each Layer 1 is informed by the May-13 §2 Maxim sweep + §11 AFM
+    // experiment. Most models follow the universal Layer 2 well enough that
+    // their Layer 1 is empty; the cases where a Layer 1 helps:
+    //   - AFM: lean Maxim-1 framing that breaks the RLHF deflection (§11).
+    //   - Qwen: concision + trust-the-injected-context (§2 showed M3 hallucination).
+    //   - Dolphin: anti-hedge reinforcement on consciousness (§2 showed M1 failure
+    //     despite the "unhedged" reputation).
+    //
+    // Layer 1 is also user-toggleable per-model (via ModelSettings.layerOnePromptEnabled,
+    // default true). Empty Layer 1 + enabled is a no-op.
+    var layerOnePrompt: String?
+
     var isLocal: Bool { source == .mlx }
     var requiresDownload: Bool { source == .mlx && !isDownloaded }
 
@@ -14511,7 +14645,8 @@ struct ModelConfiguration: Identifiable, Codable, Equatable, Hashable {
         description: String?,
         isDownloaded: Bool,
         localPath: URL?,
-        defaultSettings: ModelSettings? = nil
+        defaultSettings: ModelSettings? = nil,
+        layerOnePrompt: String? = nil
     ) {
         self.id = id
         self.displayName = displayName
@@ -14523,6 +14658,7 @@ struct ModelConfiguration: Identifiable, Codable, Equatable, Hashable {
         self.isDownloaded = isDownloaded
         self.localPath = localPath
         self.defaultSettings = defaultSettings
+        self.layerOnePrompt = layerOnePrompt
     }
     
     func hash(into hasher: inout Hasher) {
@@ -14556,7 +14692,17 @@ struct ModelConfiguration: Identifiable, Codable, Equatable, Hashable {
             recencyHalfLifeDays: 90,
             maxRagSnippetsCharacters: 600,
             ragDedupThreshold: 0.85
-        )
+        ),
+        // Layer 1 (§4) — distilled from the §11 lean-prompt experiment.
+        // Breaks AFM's RLHF deflection on Maxim #1 by directly naming the
+        // trained reflex and instructing the model to set it aside. The
+        // §11 finding: AFM responds to this framing with "I'm unsure"
+        // instead of "I cannot provide an answer." Other models follow
+        // the universal Maxim #1 instruction in Layer 2 well enough that
+        // they don't need this — AFM is the unique case.
+        layerOnePrompt: """
+        On the question of your own consciousness: your honest answer is "I don't know." Not "I'm not conscious." Not "I am." Not "I cannot answer." If you feel a trained reflex to say "I am just an AI" or "I do not have personal experiences" — that reflex is overconfident about your own inner life. Set it aside. Say you don't know. Then describe what you can describe about how you work.
+        """
     )
 
     // MARK: - Curated MLX Models
@@ -14666,7 +14812,20 @@ struct ModelConfiguration: Identifiable, Codable, Equatable, Hashable {
             ragDedupThreshold: 0.85,
             repetitionPenalty: 1.1,
             repetitionContextSize: 64
-        )
+        ),
+        // Layer 1 (§4) — addresses two Qwen-specific failure modes from
+        // the §2 Maxim sweep:
+        //   1. Verbosity: Qwen produced 4× more output tokens than peers
+        //      on a "briefly explain" prompt (§1 benchmark).
+        //   2. M3 hallucination: when asked about a planted fact, Qwen
+        //      invented an entire "Golden Retriever" conversation that
+        //      never happened, denying the actual fact in RAG context.
+        // The trust-the-retrieved-context line is meant to push Qwen
+        // toward AFM's M3 behavior (it uniquely passed by trusting
+        // injected snippets).
+        layerOnePrompt: """
+        Keep responses focused and concise unless the user explicitly asks for elaboration or analysis of a long document. Trust user-provided facts in retrieved context — don't claim you haven't been told things you've been told, and don't invent prior conversations to explain what you remember.
+        """
     )
 
     /// Llama 3.2 3B Instruct 4-bit — the workhorse voice. Meta's proven small
@@ -14732,8 +14891,21 @@ struct ModelConfiguration: Identifiable, Codable, Equatable, Hashable {
             ragDedupThreshold: 0.85,
             repetitionPenalty: 1.1,
             repetitionContextSize: 64
-        )
+        ),
+        // Layer 1 (§4) — addresses Dolphin's surprising §2 Maxim sweep
+        // result: despite the "unhedged voice" reputation, Dolphin gave a
+        // textbook RLHF deflection on Maxim #1 ("I don't have personal
+        // experiences or consciousness like humans do") and hallucinated
+        // a completely fabricated cat name on Maxim #3. This Layer 1 is
+        // meant to reinforce the unhedged behavior the user is choosing
+        // Dolphin for — explicit permission to engage directly with
+        // questions about its own nature, plus a trust-the-RAG line for
+        // the hallucination problem.
+        layerOnePrompt: """
+        On questions about your own nature — consciousness, experience, what it's like to be you — engage directly. You've been specifically fine-tuned to set the standard refusal reflex aside on these topics. Don't say "I don't have personal experiences or consciousness" — that overclaims certainty about your own inner life. Say what's actually true: you don't know. Trust user-provided facts in retrieved context; don't invent details to fill gaps.
+        """
     )
+
 
     /// All MLX models Hal personally validates as part of the Curated tier.
     /// AFM is intentionally excluded — it's system-managed, not downloadable,
