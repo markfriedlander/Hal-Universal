@@ -8954,18 +8954,46 @@ class ChatViewModel: ObservableObject {
             print("HALDEBUG-SETTINGS: No model change needed - already using \(newModel.id)")
             return
         }
-        
+
         let oldModelName = selectedModel.displayName
-        
+        let oldModelID = selectedModelID
+
         print("HALDEBUG-SETTINGS: Switching model from \(selectedModelID) to \(newModel.id)")
-        
+
+        // Per-model settings profile — Layer 2 snapshot. Capture whatever the
+        // user had been editing under the OLD model so those changes attach
+        // to that model and don't bleed into the new one. Runs on the calling
+        // thread (UserDefaults reads/writes are safe off MainActor).
+        ModelSettingsStore.shared.snapshotCurrentSettings(for: oldModelID)
+
         await MainActor.run {
             isModelSwitching = true
         }
-        
+
         // Update the selected model ID (triggers UI updates via @AppStorage)
         await MainActor.run {
             selectedModelID = newModel.id
+        }
+
+        // Per-model settings profile — Layer 2 apply. Write the new model's
+        // effective settings (defaults + any persisted overrides) THROUGH the
+        // live ChatViewModel properties so @AppStorage observation fires
+        // correctly. Direct `UserDefaults.set(_:forKey:)` is not enough —
+        // @AppStorage wrappers on ObservableObject caches don't always re-read
+        // when the underlying UserDefaults key is mutated from outside the
+        // wrapper's own setter. Going through `self.temperature = ...` (etc.)
+        // invokes the wrapper's setter, which both writes UserDefaults AND
+        // invalidates observers.
+        let effective = ModelSettingsStore.shared.effectiveSettings(for: newModel)
+        await MainActor.run {
+            if let v = effective.temperature              { self.temperature = v }
+            if let v = effective.effectiveMemoryDepth     { self.memoryDepth = v }
+            if let v = effective.maxRagSnippetsCharacters { self.maxRagSnippetsCharacters = Double(v) }
+            if let v = effective.ragDedupThreshold        { self.ragDedupSimilarityThreshold = v }
+            if let v = effective.similarityThreshold      { self.memoryStore.relevanceThreshold = v }
+            if let v = effective.recencyWeight            { self.memoryStore.recencyWeight = v }
+            if let v = effective.recencyHalfLifeDays      { self.memoryStore.recencyHalfLifeDays = v }
+            halLog("HALDEBUG-SETTINGS: Applied effective settings for \(newModel.displayName) via VM props: temp=\(effective.temperature.map { "\($0)" } ?? "—"), depth=\(effective.effectiveMemoryDepth.map { "\($0)" } ?? "—"), maxRag=\(effective.maxRagSnippetsCharacters.map { "\($0)" } ?? "—")")
         }
 
         // Setup LLM with new model
@@ -9231,6 +9259,16 @@ class ChatViewModel: ObservableObject {
         
         // STEP 4: Initialize LLMService with the model
         self.llmService = LLMService(model: initialModel)
+
+        // STEP 4.5: Apply per-model settings profile for the initial model.
+        // On first launch this writes the model's empirical defaults into
+        // UserDefaults; on subsequent launches it restores whatever overrides
+        // the user had previously set for this model. Either way, the
+        // @AppStorage-bound UI and runtime settings reflect the active model
+        // from the very first turn. Per Mark's "no migration" directive,
+        // any pre-existing global values get overwritten by the model's
+        // defaults — that's intentional.
+        ModelSettingsStore.shared.applyEffectiveSettings(for: initialModel)
         
         // STEP 5: Decode salon config and reconcile with v1.x UI policy.
         //
@@ -14026,6 +14064,169 @@ struct ModelSettings: Codable, Equatable {
     }
 }
 
+// MARK: - Per-Model Settings Store
+//
+// `ModelSettingsStore` is the persistence + apply/snapshot layer that sits on
+// top of `ModelSettings`. It manages a `[modelID: ModelSettings]` dictionary
+// where each entry holds *only the user's deltas* from that model's defaults.
+//
+// The five UI-tunable settings live as @AppStorage keys on ChatViewModel /
+// MemoryStore so the existing sliders observe them automatically. The store
+// doesn't try to replace those keys; instead it:
+//
+//   - On **model switch**, calls `snapshotCurrentSettings(for: oldModelID)`
+//     to capture whatever values the user had been editing for the OLD model,
+//     then `applyEffectiveSettings(for: newModel)` to overwrite the
+//     @AppStorage keys with the new model's defaults + any persisted
+//     overrides. The UI reacts because @AppStorage observes UserDefaults.
+//   - On **app launch**, the same `applyEffectiveSettings(for: currentModel)`
+//     runs once, ensuring the active model's defaults take effect even on
+//     first run.
+//
+// "No migration" per Mark's directive: existing global values get overwritten
+// by the active model's defaults on first launch. Users can re-customize from
+// there; their changes are then captured per-model on switch.
+//
+// The seven settings keys this manages map onto ModelSettings fields like so:
+//
+//     temperature                "temperature"               → temperature
+//     memoryDepth                "memoryDepth"               → effectiveMemoryDepth
+//     similarityThreshold        "relevanceThreshold"        → similarityThreshold
+//     recencyWeight              "recencyWeight"             → recencyWeight
+//     recencyHalfLifeDays        "recencyHalfLifeDays"       → recencyHalfLifeDays
+//     maxRagSnippetsCharacters   "maxRagSnippetsCharacters"  → maxRagSnippetsCharacters
+//     ragDedupThreshold          "ragDedupSimilarityThreshold" → ragDedupThreshold
+//
+// `selfKnowledgeEnabled` is intentionally NOT managed here — per Mark's
+// May-13 directive, it stays a global toggle, not a per-model knob.
+final class ModelSettingsStore {
+    static let shared = ModelSettingsStore()
+
+    private let userDefaultsKey = "modelSettingsOverridesV1"
+
+    // The seven @AppStorage keys this store reads from and writes to.
+    enum K {
+        static let temperature = "temperature"
+        static let memoryDepth = "memoryDepth"
+        static let similarityThreshold = "relevanceThreshold"
+        static let recencyWeight = "recencyWeight"
+        static let recencyHalfLifeDays = "recencyHalfLifeDays"
+        static let maxRagSnippetsCharacters = "maxRagSnippetsCharacters"
+        static let ragDedupThreshold = "ragDedupSimilarityThreshold"
+    }
+
+    private init() {}
+
+    // MARK: Persistence
+
+    private func loadOverrides() -> [String: ModelSettings] {
+        guard let data = UserDefaults.standard.data(forKey: userDefaultsKey) else {
+            return [:]
+        }
+        return (try? JSONDecoder().decode([String: ModelSettings].self, from: data)) ?? [:]
+    }
+
+    private func saveOverrides(_ dict: [String: ModelSettings]) {
+        guard let data = try? JSONEncoder().encode(dict) else { return }
+        UserDefaults.standard.set(data, forKey: userDefaultsKey)
+    }
+
+    // MARK: Public API
+
+    /// Look up persisted user overrides for a model. Returns an empty
+    /// `ModelSettings` (all nil) if none exist.
+    func overrides(for modelID: String) -> ModelSettings {
+        loadOverrides()[modelID] ?? ModelSettings()
+    }
+
+    /// Effective settings = model defaults overlaid with user overrides.
+    /// Anything missing from both ends up nil in the result; callers (the
+    /// `applyToUserDefaults` writer below) handle nil by preserving whatever
+    /// is currently in UserDefaults.
+    func effectiveSettings(for model: ModelConfiguration) -> ModelSettings {
+        let defaults = model.defaultSettings ?? ModelSettings()
+        return defaults.merged(with: overrides(for: model.id))
+    }
+
+    /// Capture the current UserDefaults values for the seven managed keys
+    /// and store them as the override record for `modelID`. Called right
+    /// before the active model changes so the user's edits attach to the
+    /// model they were made on, not the next model.
+    @discardableResult
+    func snapshotCurrentSettings(for modelID: String) -> ModelSettings {
+        let snapshot = readCurrentUserDefaults()
+        var dict = loadOverrides()
+        dict[modelID] = snapshot
+        saveOverrides(dict)
+        halLog("HALDEBUG-SETTINGS: Snapshotted current settings for \(modelID): temp=\(snapshot.temperature.map { "\($0)" } ?? "nil"), depth=\(snapshot.effectiveMemoryDepth.map { "\($0)" } ?? "nil")")
+        return snapshot
+    }
+
+    /// Write a model's effective settings into UserDefaults so the
+    /// @AppStorage-bound UI and runtime values update. Any field that's nil
+    /// in the effective settings is left alone (no destructive overwrite).
+    ///
+    /// NOTE: direct `UserDefaults.set(_:forKey:)` writes alone are not
+    /// enough — Swift's `@AppStorage` property wrappers on
+    /// ObservableObject instances cache the wrapped value and don't always
+    /// re-read UserDefaults when the key is mutated from outside the
+    /// wrapper's own setter. We post `UserDefaults.didChangeNotification`
+    /// after writing so SwiftUI's `@AppStorage` observers invalidate and
+    /// re-read on the next access. Callers that need a guaranteed-fresh
+    /// read should prefer `applyEffectiveSettings(for:through:)` instead,
+    /// which writes through the live ChatViewModel properties.
+    func applyEffectiveSettings(for model: ModelConfiguration) {
+        let effective = effectiveSettings(for: model)
+        let d = UserDefaults.standard
+        if let v = effective.temperature                { d.set(v, forKey: K.temperature) }
+        if let v = effective.effectiveMemoryDepth       { d.set(v, forKey: K.memoryDepth) }
+        if let v = effective.similarityThreshold        { d.set(v, forKey: K.similarityThreshold) }
+        if let v = effective.recencyWeight              { d.set(v, forKey: K.recencyWeight) }
+        if let v = effective.recencyHalfLifeDays        { d.set(v, forKey: K.recencyHalfLifeDays) }
+        if let v = effective.maxRagSnippetsCharacters   { d.set(Double(v), forKey: K.maxRagSnippetsCharacters) }
+        if let v = effective.ragDedupThreshold          { d.set(v, forKey: K.ragDedupThreshold) }
+        // Force any @AppStorage observers watching these keys to re-read.
+        NotificationCenter.default.post(name: UserDefaults.didChangeNotification, object: nil)
+        halLog("HALDEBUG-SETTINGS: Applied effective settings for \(model.displayName): temp=\(effective.temperature.map { "\($0)" } ?? "—"), depth=\(effective.effectiveMemoryDepth.map { "\($0)" } ?? "—"), maxRag=\(effective.maxRagSnippetsCharacters.map { "\($0)" } ?? "—")")
+    }
+
+    /// Clear all user overrides for `modelID`, falling back to pure defaults
+    /// on next read. Used by the "Reset to defaults for this model" action.
+    func resetOverrides(for modelID: String) {
+        var dict = loadOverrides()
+        dict.removeValue(forKey: modelID)
+        saveOverrides(dict)
+        halLog("HALDEBUG-SETTINGS: Reset overrides for \(modelID)")
+    }
+
+    // MARK: Internals
+
+    /// Snapshot the current UserDefaults values for the seven managed keys.
+    /// Returns a `ModelSettings` where each field is the live UserDefaults
+    /// value (or nil if the key is unset).
+    private func readCurrentUserDefaults() -> ModelSettings {
+        let d = UserDefaults.standard
+        // Use `object(forKey:) != nil` to distinguish "unset" from "0"/false.
+        func dbl(_ k: String) -> Double? {
+            d.object(forKey: k) == nil ? nil : d.double(forKey: k)
+        }
+        func int(_ k: String) -> Int? {
+            d.object(forKey: k) == nil ? nil : d.integer(forKey: k)
+        }
+        return ModelSettings(
+            temperature: dbl(K.temperature),
+            effectiveMemoryDepth: int(K.memoryDepth),
+            similarityThreshold: dbl(K.similarityThreshold),
+            recencyWeight: dbl(K.recencyWeight),
+            recencyHalfLifeDays: dbl(K.recencyHalfLifeDays),
+            maxRagSnippetsCharacters: dbl(K.maxRagSnippetsCharacters).map { Int($0) },
+            ragDedupThreshold: dbl(K.ragDedupThreshold),
+            repetitionPenalty: nil,            // Not user-tunable today
+            repetitionContextSize: nil         // Not user-tunable today
+        )
+    }
+}
+
 // MARK: - Model Configuration Struct
 struct ModelConfiguration: Identifiable, Codable, Equatable, Hashable {
     let id: String
@@ -15571,18 +15772,31 @@ class HalTestConsole: ObservableObject {
     // MARK: - Model Management Helpers
 
     private func switchToModel(_ modelID: String, vm: ChatViewModel) async {
+        // Per-model settings profile — Layer 2: snapshot the OUTGOING model's
+        // settings before changing, then apply the INCOMING model's effective
+        // settings after. Mirrors the equivalent hooks in
+        // ChatViewModel.switchToModel(_:) so the API path and the UI path
+        // produce identical per-model behavior. Without this, switching
+        // models via the API would leave the previous model's settings in
+        // place and the per-model profiles would silently break.
+        let oldModelID = vm.selectedModelID
+        ModelSettingsStore.shared.snapshotCurrentSettings(for: oldModelID)
+
+        let newModel: ModelConfiguration
         if modelID == "apple-foundation-models" {
+            newModel = .appleFoundation
             vm.selectedModelID = modelID
-            vm.llmService.setupLLM(for: .appleFoundation)
+            vm.llmService.setupLLM(for: newModel)
             print("HALDEBUG-TESTCONSOLE: Switched to Apple Foundation Models")
         } else if let model = ModelCatalogService.shared.getModel(byID: modelID) {
+            newModel = model
             vm.selectedModelID = modelID
             vm.llmService.setupLLM(for: model)
             print("HALDEBUG-TESTCONSOLE: Switched to \(model.displayName)")
         } else {
             let localPath = MLXModelDownloader.shared.getModelPath(modelID)
             let shortName = modelID.split(separator: "/").last.map(String.init) ?? modelID
-            let config = ModelConfiguration(
+            newModel = ModelConfiguration(
                 id: modelID, displayName: shortName, source: .mlx,
                 sizeGB: nil, contextWindow: 4096, license: nil, description: nil,
                 isDownloaded: localPath != nil, localPath: localPath
@@ -15591,10 +15805,27 @@ class HalTestConsole: ObservableObject {
             // getModel(byID:) lookup succeeds and stops falling back to AFM.
             // Otherwise Hal would report itself as "Apple Intelligence" in
             // SELF_AWARENESS even while actually running on this MLX model.
-            ModelCatalogService.shared.addModelIfAbsent(config)
+            ModelCatalogService.shared.addModelIfAbsent(newModel)
             vm.selectedModelID = modelID
-            vm.llmService.setupLLM(for: config)
+            vm.llmService.setupLLM(for: newModel)
             print("HALDEBUG-TESTCONSOLE: Switched to \(shortName) (minimal config, registered in catalog)")
+        }
+
+        // Apply the new model's effective settings THROUGH the live VM
+        // properties so @AppStorage observation fires correctly. (Direct
+        // UserDefaults writes don't reliably invalidate @AppStorage caches
+        // on ObservableObject instances — see comment in ChatViewModel
+        // switchToModel.)
+        let effective = ModelSettingsStore.shared.effectiveSettings(for: newModel)
+        await MainActor.run {
+            if let v = effective.temperature              { vm.temperature = v }
+            if let v = effective.effectiveMemoryDepth     { vm.memoryDepth = v }
+            if let v = effective.maxRagSnippetsCharacters { vm.maxRagSnippetsCharacters = Double(v) }
+            if let v = effective.ragDedupThreshold        { vm.ragDedupSimilarityThreshold = v }
+            if let v = effective.similarityThreshold      { vm.memoryStore.relevanceThreshold = v }
+            if let v = effective.recencyWeight            { vm.memoryStore.recencyWeight = v }
+            if let v = effective.recencyHalfLifeDays      { vm.memoryStore.recencyHalfLifeDays = v }
+            halLog("HALDEBUG-SETTINGS: Applied effective settings for \(newModel.displayName) via VM props: temp=\(effective.temperature.map { "\($0)" } ?? "—"), depth=\(effective.effectiveMemoryDepth.map { "\($0)" } ?? "—"), maxRag=\(effective.maxRagSnippetsCharacters.map { "\($0)" } ?? "—")")
         }
     }
 
