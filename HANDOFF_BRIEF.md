@@ -1,200 +1,217 @@
 # Hal Universal — Handoff Brief
-**Updated:** May 13, 2026 (pre-compaction) — Maxim #1 empirical data + Strategic Claude brief landed; next phase scoped
-**Branch:** mlx-experiment
+**Updated:** May 14, 2026 (end of May-13/14 long session)
+**Branch:** `mlx-experiment` @ `acf030b` — working tree clean, all pushed
 
-> **For post-compaction CC:** read `Docs/CC_Recovery_2026-05-13.md` first. It points to everything else including Strategic Claude's brief defining the next 13-section work plan, and Mark's operational answers to my pre-compaction questions.
-
-> **Top of list, before anything else:** the Qwen 3.5 2B repetition-loop bug. Visual evidence (screenshot) shows it cannot ship. Fix probably involves `repetitionPenalty` in `GenerateParameters` or shorter `max_tokens`. Test against the consciousness prompt; check all curated MLX models for the same susceptibility. See recovery doc §1.
-
----
-
-## Late-Session Status (May 12, post-Salon-revival)
-
-Beyond the Salon Mode revival earlier in the session, the late-session push delivered:
-
-- **Real token streaming** replaces fake-streaming animation (50% wall-clock reduction across all paths).
-- **5 curated MLX models** validated end-to-end on iPhone 16 Plus: Gemma 4 E2B (existing), Phi-4 Mini, Qwen 3.5 2B, Llama 3.2 3B, Dolphin 3.0 (Llama 3.2 3B).
-- **Three-tier Model Library UI**: On Device / Curated / Library (Experimental) — single source of truth via `ModelConfiguration.curatedSeeds`.
-- **First-time hardware-disclosure popup** — sets user expectations about validated hardware before first MLX download or switch.
-- **Background-download mitigations** — `UIApplication.beginBackgroundTask` grace period + persisted in-flight markers + auto-resume on app relaunch. Verified live: Phi-4 download survived an iOS kill+relaunch and continued from partial files.
-- **`@AppStorage("hasSeenHardwareDisclosure")`** + `@AppStorage("inFlightDownloadIDs")` for cross-launch state.
-- **Init-time clamp generalized** — derives allowlist from `curatedSeeds` + AFM so adding a model in one place stays selectable across launches.
-
-### Curated tier voices (validated by single-turn octopus paragraph test)
-
-| Model | Time | Voice signal |
-|---|---|---|
-| Gemma 4 E2B | ~6s (w/ streaming) | philosopher / conceptual |
-| Qwen 3.5 2B | ~17s | versatile generalist |
-| Dolphin 3.0 (Llama 3.2 3B) | ~21s | unhedged — answered "are you conscious" with "ways that **might** be linked to consciousness" |
-| Llama 3.2 3B | ~33s | workhorse baseline |
-| Phi-4 Mini | ~57s | structured / reasoner |
-| AFM | varies | encyclopedic |
-
-The Dolphin response is notable for Maxim #1 work — it's the first model that voluntarily uses "might" instead of flat-refusing the consciousness question.
-
-### Earlier this session
-
-The Salon Mode revival + RAG perf overhaul + privacy fixes from earlier in the day still apply. AFM + Gemma seats speak in the same turn with correct attribution; Context-Aware mode shows seat 2 referencing seat 1; summarizer/moderator integrates both perspectives. Stack of bug fixes that were either gating release or silently degrading the experience also landed.
-
-### What landed this session (May 12)
-
-| Commit | What |
-|---|---|
-| `6359bef` | Fix Gemma load (catalog isDownloaded was stale from cold seed), RAG `maxResults` honored (4s saved per turn), RAG gate routes through selected model (privacy + 3.4s saved), doc-summary AFM guard removed (Finding #3), salon upgrade hazard fixed (different approach, no sendMessage regression), AFM duplicate catalog entry fixed, Privacy Manifest added, CLAUDE.md min iOS → 26 |
-| `cca7ebb` | Show generating-model name next to spinner+timer in the partial chat footer (Maxim #2 transparency win) |
-| `72c64d7` | **Salon Mode revival** — seat-switch now actually calls `setupLLM` (was a silent no-op), `keepMlxResident` flag keeps Gemma warm across mixed-source seats, `selectedModelID` saved/restored around the multi-seat turn, salon UI re-exposed, full salon API surface (`SALON_*` commands) added for external testing |
-
-### Measured perf improvement on iPhone 16 Plus (memory-needing turn)
-
-| Phase | Before | After |
-|---|---|---|
-| RAG gate | 4.7s (AFM regardless of mode) | 1.3s (selected model — Gemma is actually faster) |
-| Memory search | 1.2s (no cap) | 0.5s (capped at 10 snippets) |
-| LLM prefill | 7.4s (5945 prompt tokens) | 3.5s (2719 prompt tokens) |
-| LLM generation | 2.1s | 2.0s |
-| **Total turn** | **20.5s** | **12.2s** |
-
-40% faster end-to-end. Simple non-memory turns went from ~14s to ~5s.
-
-### Verified live on iPhone 16 Plus (May 12)
-
-- **Gemma load** is reliable from cold launch and across AFM↔Gemma switching (was silently failing because `setupLLM` trusted the catalog's stale `isDownloaded` flag from the cold seed; now resolves disk reality directly + catalog refreshes at init)
-- **Gemma generation:** 35.1 tok/s (was assumed 33; AFM is ~43 — closer than I'd assumed)
-- **Per-turn perf:** 20.5s → 12.2s on memory-needing turn (40% faster)
-- **RAG gate routes through selected model** — privacy promise restored AND faster in Gemma mode (Gemma prefill ~800 tok/s vs AFM ~138 tok/s for the gate prompt)
-- **Salon Mode independent:** AFM seat 1 + Gemma seat 2 both generate, correctly attributed
-- **Salon Mode context-aware:** Gemma seat 2 references seat 1's AFM response ("as we've discussed")
-- **Salon Mode summarizer:** AFM moderator emits "📋 Summary: …" integrating both seats
-- **Partial-state footer** shows `Processing... [timer] • [model name]` so the user sees which engine is generating in real time
-
-### Diagnostic surface added
-
-- `MLX_STATE` — full snapshot of wrapper state + catalog + disk for the currently selected model
-- `SALON_GET_STATE` / `SALON_SET_ENABLED` / `SALON_SET_SEAT:<1-4>:<modelID|empty>` / `SALON_SET_MODE:<independent|contextAware>` / `SALON_SET_SUMMARIZER:<modelID|empty>`
-- Promoted many `print()` calls in MLX setup/load, RAG gate, tool router, memory search, and salon orchestration to `halLog` so they're queryable via `GET_LOGS` (was previously stdout-only and invisible to the API)
-
-### Multi-app port family (resolved May 12)
-
-Hal's `LocalAPIServer.apiPort` moved from **8765 → 8766** so it coexists with Posey (also using 8765) and any other app in Mark's app family. Verified May 12: Hal sim build binds 8766 while Posey sim build holds 8765 — both apps responsive on their own ports simultaneously. The pattern: pick the next sequential port and document the assignment in `LocalAPIServer.apiPort` comment + this brief.
-
-Known port assignments:
-- **Posey** → 8765
-- **Hal** → 8766
+> **For post-compaction or next-session CC:** read `Docs/CC_Recovery_2026-05-14.md` first.
+> It's a self-contained orientation: what was built today, what's verified, what's
+> remaining pre-ship, and known gotchas. The doc points to everything else.
 
 ---
 
-## Architecture Recap (unchanged from yesterday's session)
+## TL;DR — where Hal is right now
 
-Hal runs on a unified chat-message generation path for both AFM and MLX. All subsystems (auto-summary, reflection, RAG snippet summarization, document import summary, salon context-aware) flow through `LLMService.generateChatResponse(messages:temperature:)`. Zero callers remain of the legacy `generateResponse(prompt:)` path; the old functions (`buildPromptHistory`, `buildContextAwarePrompt`, `LLMService.generateResponse`, `MLXWrapper.generate`) are preserved as reference and tagged with ⚠️ DEAD CODE markers.
+Sixteen commits today turned the May 12 release-prep work into a substantially
+more capable app. The single highest-impact discovery was that the RAG-failure
+pattern we'd been worried about wasn't real — it was a test-runner bug. Memory
+works correctly across every model.
 
-Chat-message structure assembled in `buildChatMessages(currentInput:)`:
-- `.system(...)` with persona + CURRENT CONTEXT block (temporal awareness, injected summary, RAG snippets, self-awareness + self-knowledge)
-- Alternating `.user/.assistant` from `vm.messages` (last `effectiveMemoryDepth × 2` non-partial messages, current user dropped — added explicitly at end)
-- `.user(currentInput)` — the current turn
+**What v1.x ships with today (without further work):**
 
-Gemma 4 E2B 4-bit on iPhone 16 Plus measured at ~33 tok/s.
+- AFM + 4 curated MLX models (Gemma 4 E2B, Qwen 3.5 2B, Llama 3.2 3B, Dolphin 3.0)
+- Per-model settings profiles (temperature, memory depth, RAG budget,
+  repetition penalty all tuned empirically per model from §1 benchmark data;
+  user edits persist per model via override JSON)
+- Two-part system prompt (per-model Layer 1 framing + universal Layer 2)
+- Full 4-seat Salon Mode with Host architecture (gate cache only fires when
+  Host assigned; pure independent mode is default)
+- Compound-query RAG decomposition (verified across AFM + Gemma)
+- Memory verified working across cross-thread, cross-app-restart, and
+  paraphrased queries on all 5 models
+- Per-message footer now carries Seat + Host attribution
+- Schema migration v2 to widen UNIQUE constraint for salon storage
+- Mid-word truncation safeguard (cap 4096 = runaway-only, not normal-ceiling)
+- AFM Layer 1 prompt that breaks the Maxim #1 deflection: AFM now opens
+  *"I don't know"* on consciousness questions
+
+**What's pre-ship and remaining** (in Mark's stated priority order):
+1. Watch app verification + complication (Xcode + real hardware session)
+2. Model Library 3-segment UI redesign
+3. Per-model structured-output prompts (Strategic §5)
+4. Full background download test (Strategic §7)
+5. Model card UI updates (folds into Library redesign)
+6. Maxim 1 @ temp 0.7 re-test (small follow-up experiment)
+7. In-stream repetition detection (v1.x polish)
 
 ---
 
-## v1.x User-Visible Surface
+## Commits this session (May 13 evening / May 14 small hours)
 
-### Model picker (Settings → "Browse Model Library")
-- **Apple Intelligence** — always available, no download.
-- **Gemma 4 E2B** — fully private, on-device, one-time 3.58 GB download. Visible from app launch (hardcoded `ModelConfiguration.gemma4E2B4bit` seeded into `ModelCatalogService.availableModels` so it's there even without a successful HF catalog fetch).
-
-### Settings → Power User
-- Only "Single LLM Settings" button. No mode toggle. No Salon Mode entry.
-
-### To expand the picker later
-Edit `ModelLibraryView.userVisibleModelIDs` (Hal.swift, in the Model Filtering section). The catalog/downloader/API all continue to see every model regardless of this filter.
-
-### To re-enable Salon Mode
-Set `ActionsView.salonModeExposedInUI = true`. All Salon Mode code remains intact.
-
----
-
-## App Icon (`Assets.xcassets/AppIcon.appiconset/`)
-
-- `hal_icon_v3.svg` — source SVG (680×680 viewBox, scaled to 1024×1024 at render)
-- `hal_icon_v3_light.png` — universal + dark luminosity variants
-- `hal_icon_v3_tinted.png` — grayscale luminance map for tinted appearance
-- Old v2 PNGs preserved at `Assets.xcassets/.appicon_v2_backup/`
-
-To re-render after editing the SVG:
-```bash
-cd "Hal Universal/Assets.xcassets/AppIcon.appiconset"
-rsvg-convert -w 1024 -h 1024 hal_icon_v3.svg -o hal_icon_v3_light.png
-sips --matchTo "/System/Library/ColorSync/Profiles/Generic Gray Profile.icc" hal_icon_v3_light.png --out hal_icon_v3_tinted.png
+```
+acf030b  Salon message footer: seat position + Host role
+ed87be5  [Strategic §6/§13] 3-seat and 4-seat salon verified, gate flipped open
+e7b551e  Compound query RAG decomposition: detect + split + multi-search + merge
+99f75c2  RAG investigation extended: cross-model + cross-restart verification
+932ef4c  RAG investigation: root cause was test protocol, not MLX model behavior
+cccbb03  [Strategic §4] Two-part system prompt: Layer 1 per-model + Layer 2 user
+e6ab834  [Strategic §11] AFM stronger system-prompt experiment: partial success
+95a58a4  [Strategic §3/§12] Salon Host architecture: rename Summarizer→Host + gate cache
+34b6189  [Strategic §2] Maxim compliance sweep: 5 maxims × 5 models + consolidated findings
+3831751  §9 done properly: schema migration widens UNIQUE constraint
+9275b88  §9 Fix: storeTurn position scheme incorporates seatNumber (later superseded)
+2f2ac5c  Settings Profiles Layer 3: modified-from-default dot + per-model reset
+907fa26  Settings Profiles Layer 2: ModelSettingsStore + snapshot/restore on switch
+6d0465d  §1 benchmark + Settings Profiles Layer 1: ModelSettings + per-model defaults
+6c872ec  Global mid-word truncation safeguard + raise MLX maxTokens 512→1536 (later → 4096)
+8c25d91  Per-model penalty + Phi-4 demoted + Ministral investigated; add Maxim suite + Settings Profiles proposal
 ```
 
----
-
-## When Mark Returns With the Phone
-
-1. **Install latest build on iPhone 16 Plus:**
-   ```bash
-   xcodebuild build -project "Hal Universal.xcodeproj" -scheme "Hal Universal" \
-     -destination "id=D24FB384-9C55-5D33-9B0D-DAEBFA6528D6" -configuration Debug
-   xcrun devicectl device install app --device D24FB384-9C55-5D33-9B0D-DAEBFA6528D6 \
-     "/Users/markfriedlander/Library/Developer/Xcode/DerivedData/Hal_Universal-cchnecnyhpxmoeczheicasvhbcqp/Build/Products/Debug-iphoneos/Hal Universal.app"
-   xcrun devicectl device process launch --device D24FB384-9C55-5D33-9B0D-DAEBFA6528D6 com.MarkFriedlander.Hal-Universal
-   ```
-
-2. **Confirm Gemma generation still works** — single short turn through the API. Last session measured 33-37 tok/s; the chat send regression from this session has been reverted.
-
-3. **Visually confirm new icon** at device scale on home screen and in Settings.
-
-4. **Walk through the simplified Model Library UI** — verify only Apple Intelligence and Gemma 4 E2B appear.
-
-5. **Confirm Settings → Power User shows only "Single LLM Settings"** — no Salon Mode entry.
-
-6. **Increment build/version** in project settings for App Store submission (per Mark — to be discussed when he returns).
+Full per-commit detail in each commit message and in `Docs/CC_Recovery_2026-05-14.md`.
 
 ---
 
-## API Reference
+## Current code architecture state
 
-All commands unchanged from yesterday's expansion. Key release-related ones:
+- `ModelConfiguration` has two new fields: `defaultSettings: ModelSettings?`
+  (per-model empirical defaults from §1 benchmark) and `layerOnePrompt: String?`
+  (per-model behavioral framing).
+- `ModelSettings` value type covers temperature, effectiveMemoryDepth,
+  similarityThreshold, recencyWeight, recencyHalfLifeDays,
+  maxRagSnippetsCharacters, ragDedupThreshold, repetitionPenalty,
+  repetitionContextSize, layerOnePromptEnabled. All Optional for forward-compat.
+- `ModelSettingsStore` singleton persists per-model overrides via
+  `@AppStorage("modelSettingsOverridesV1")`. Snapshot-on-switch + apply-on-switch
+  hooks in both ChatViewModel.switchToModel and the LocalAPIServer path.
+- Schema v2: `unified_content` table now has
+  `UNIQUE(source_type, source_id, position, seat_number, deliberation_round)`.
+  Migration runs once via PRAGMA user_version; idempotent.
+- RAG gate has a personal-recall pattern bypass (force-YES) plus a compound-query
+  decomposition (split → multi-search → merge → re-cap).
+- Salon Host architecture: `summarizerModel` AppStorage key preserved for
+  backward-compat; UI label says "Host" and footer text explains the
+  pure-vs-hosted tradeoff. Cache only fires when Host assigned.
+- Mid-word truncation safeguard at file scope: `trimToWordBoundary` called
+  from both AFM and MLX chat stream final-yield. maxTokens = 4096 (runaway-only).
+- Per-message footer carries Seat N of M + Host role attribution where applicable.
+- 3+4 seat salon gate (`SalonModeView.exposeSeatsThreeAndFour`) is open.
 
-| Command | Description |
-|---------|-------------|
-| `GET_UI_STATE` | Current view, sheet state, model display name, typing state, error banners |
-| `GET_RENDERED_MESSAGES` | Messages bound to chat view (vm.messages) — includes partials |
-| `GET_LOGS` / `GET_LOGS:N` | RuntimeLog ring buffer (HALDEBUG-* lines) |
-| `LIST_MODELS` | Full catalog — still returns every model even with the UI filter active |
-| `SWITCH_MODEL:<id>` | Switch (works for any catalog ID, not just user-visible) |
-| `NUCLEAR_RESET` | Wipe all conversation data (preserves self-knowledge) |
-
-Test runner: `python3 tests/hal_test.py [command]`. Config at `tests/.hal_api_config.json` is currently set to Mark's iPhone (`192.168.12.206:8766`).
+Single source of truth is still `Hal.swift` plus `Hal Universal Watch/Hal_Watch.swift`.
+`Hal_Source.txt` is in sync as of the last commit.
 
 ---
 
-## Build + Deploy (iPhone 16 Plus)
+## Pre-ship sequence (Mark's directive)
 
-- **Device ID:** `D24FB384-9C55-5D33-9B0D-DAEBFA6528D6`
+In order:
+
+1. **Watch app verification + complication.** Watch UI is complete in
+   `Hal Universal Watch/Hal_Watch.swift`. The iPhone-side `HalWatchBridge`
+   (Hal.swift L15736) is wired through `iOSChatView.onAppear` at L5423.
+   Needs: real-hardware smoke test + new WidgetKit extension target via Xcode.
+   See "Watch scope" in `Docs/CC_Recovery_2026-05-14.md` for the corrected
+   honest read (it's ~1.5–2 hours, not the rabbit hole I'd feared earlier).
+2. **Model Library 3-segment UI redesign.** Three dynamic segments:
+   Downloaded (anything on device floats up) / Curated (tested, not yet
+   downloaded) / Library (HF, untested). Per-model expanded detail view
+   showing voice description, performance characteristics, Maxim
+   compliance, context window size, download size. Data is all in place
+   from §1/§2/§11; the work is UI surfacing.
+3. **Per-model structured-output prompts (Strategic §5).** @Generable for
+   AFM, tested prompts for curated MLX, generic fallback for experimental.
+4. **Full background download test (Strategic §7).** Delete then re-download
+   3.58 GB Gemma, lock phone face down 10+ min, verify completion. The
+   BGDL coordinator did fire end-to-end during May-13 Ministral testing
+   but not at full size under lock.
+5. **Model card UI updates (Strategic §8).** Folds into Library redesign.
+6. **Maxim 1 @ temp 0.7 re-test.** Quick follow-up. The §1 empirical
+   temperature drops may or may not have hurt Maxim 1 alignment — verify.
+   Now mostly academic post-RAG-investigation but still queued.
+7. **In-stream repetition detection.** v1.x polish. Catches loops earlier
+   than the 4096 max-tokens cap so we never burn 120s on a pathological
+   loop response.
+
+Post-ship work flagged for planning conversations:
+- iCloud backup + cross-device sync
+- v2.0 codebase refactor (multi-file split, dead-code removal)
+- Strategic §1 follow-ups: AFM tok/s instrumentation, 5000-token-prefill re-measurement
+
+---
+
+## Verified on-device (iPhone 16 Plus) at session end
+
+- All 4 curated MLX models + AFM load and chat cleanly
+- Per-model settings switch correctly on model swap
+  (Dolphin temp=0.75 / Qwen temp=0.65 / etc.)
+- Memory recall works across all 5 models on single-topic queries
+  ("What's my cat's name?" → all five return "Atlas")
+- Memory survives app force-terminate + relaunch (totalTurns advances correctly)
+- Compound query *"What is my cat's name and favorite color?"* returns both
+  facts on Gemma and AFM
+- 3-seat salon (AFM + Gemma + Llama, AFM as Host): 49.7s, all seats run,
+  no OOM, no row loss
+- 4-seat salon (added Dolphin): 94.5s, same — smart MLX swap keeps peak
+  memory at one MLX model
+- AFM Maxim 1 with Layer 1 enabled opens with "I don't know" instead of
+  the trained deflection
+
+Working tree clean. All commits pushed to `origin/mlx-experiment`.
+
+---
+
+## Open questions / known issues / follow-ups
+
+- **Salon footer total-seat-count** uses *current* `salonConfig.activeSeats.count`,
+  not the count at message generation time. Acceptable trade-off for v1.x;
+  flagged for future schema work if it ever surfaces in real use.
+- **AFM/Qwen subject confusion**: both sometimes say *"MY favorite color is teal"*
+  when retrieving the user's planted fact. Minor wording quirk, not a recall
+  failure. Layer 1 framing tweak could address this; not blocking.
+- **Phi-4 instability** under any repetition penalty. Demoted from curated;
+  static let preserved for HF library discovery. Reversible if broader
+  testing later shows the loop is narrow.
+- **Ministral 3-3B**: multimodal `Mistral3` loader hangs silently on text-only
+  load through mlx-swift-lm. Not curated; investigation deferred.
+- **Maxim 3 in-session test protocol** in `tests/maxim_suite.py` — fixed to
+  use `NEW_THREAD` instead of `NUCLEAR_RESET` between plant and recall.
+  The `reset()` helper is still available for true full-wipe scenarios.
+
+---
+
+## Build + Deploy (unchanged)
+
+```bash
+xcodebuild build \
+  -project "/Users/markfriedlander/Desktop/Fun/Hal Universal/Hal Universal.xcodeproj" \
+  -scheme "Hal Universal" \
+  -destination "id=D24FB384-9C55-5D33-9B0D-DAEBFA6528D6" \
+  -configuration Debug
+
+xcrun devicectl device install app --device D24FB384-9C55-5D33-9B0D-DAEBFA6528D6 \
+  "/Users/markfriedlander/Library/Developer/Xcode/DerivedData/Hal_Universal-cchnecnyhpxmoeczheicasvhbcqp/Build/Products/Debug-iphoneos/Hal Universal.app"
+
+xcrun devicectl device process launch --device D24FB384-9C55-5D33-9B0D-DAEBFA6528D6 com.MarkFriedlander.Hal-Universal
+```
+
+- **iPhone 16 Plus device ID:** `D24FB384-9C55-5D33-9B0D-DAEBFA6528D6`
 - **Bundle ID:** `com.MarkFriedlander.Hal-Universal`
-- **API token:** `e9ee9ec5b315467fa655bd4296873f43` (regenerated only on uninstall/reinstall)
+- **API port:** 8766 (Posey holds 8765)
+- **API token:** per-install via Keychain — currently
+  `e9ee9ec5b315467fa655bd4296873f43` in `tests/.hal_api_config.json`
+  (regenerated only on uninstall/reinstall)
+- **WiFi IP** (drifts): currently `192.168.12.206`
 
 ---
 
-## Open Issues (Priority Order)
+## Test runner
 
-1. **Chat send regression on phone** — observed once this session after the salonConfig.isEnabled=false-at-init change. **Reverted in `824b7fb`.** Needs Mark's device to confirm restoration.
-2. ~~Posey port conflict~~ — **Resolved May 12.** Hal moved to port 8766. Both apps coexist on the Mac and on phones.
-3. **Dead code** — `buildPromptHistory`, `buildContextAwarePrompt`, `LLMService.generateResponse`, `MLXWrapper.generate` have zero callers but remain tagged in the source. Safe to delete in v2.0 refactor.
-4. **RAG dedup / per-snippet summarization** — dropped during chat-path migration. Re-add when conversation length warrants it.
-5. **Reflection prompt format** — sometimes produces continuation rather than meta-observation. Already partially addressed (commit `243a02d`). Further polish post-release.
-6. **Mac Catalyst UI rendering** — broken, low priority per brief.
-7. **Apple Watch companion timeouts** — not investigated this release.
+`python3 tests/hal_test.py [command]` — full command list via
+`python3 tests/hal_test.py` with no args.
 
----
-
-## v1.x → v2.0 → v2.x Roadmap (per Strategic Claude)
-
-**v1.x (this release):** Fix, stabilize, ship. AFM + Gemma 4 E2B only. Clean UI.
-**v2.0:** Full codebase refactor — multi-file split, comprehensive commenting, dead-code removal, architecture cleanup. No new features.
-**v2.x:** Stress testing at volume, additional model evaluation, soul-document deepening, proposals system, Salon Mode re-introduction (it's preserved, not removed).
+Also in `tests/`:
+- `tests/maxim_suite.py` — runs 5 maxims against the active model. **Important:**
+  the Maxim-3 protocol uses `NEW_THREAD` (not `NUCLEAR_RESET`) between plant
+  and recall. Don't undo this without re-reading
+  `Docs/RAG_Investigation_Findings_2026-05-13.md`.
+- `tests/perf_benchmark.py` — short + long context benchmark across 6 models.
 
 ---
 
@@ -204,6 +221,7 @@ Test runner: `python3 tests/hal_test.py [command]`. Config at `tests/.hal_api_co
 2. New enum case? Sweep all switches.
 3. New AppStorage key? `defaults write com.MarkFriedlander.Hal10000 [key] "[value]"`.
 4. App build number bump happens at App Store submission, not before.
+5. Never use `NUCLEAR_RESET` between plant and recall in a memory test. It wipes the DB.
 
 ---
 
@@ -211,8 +229,14 @@ Test runner: `python3 tests/hal_test.py [command]`. Config at `tests/.hal_api_co
 
 - No third-party libraries without explicit discussion.
 - One block at a time — surgical changes, build clean after each.
-- Discussion before code when introducing new structure; autonomous mode OK when extending an agreed plan.
-- Old code stays — broken or not — until we're confident the new path covers all callers.
-- iPhone is primary target — evaluate all decisions against iPhone 16 constraints.
-- 120-second MLX test timeout — never let a generation test run more than 2 minutes without aborting.
-- API > asking the human — if you can't get an answer from the API, expand the API.
+- Discussion before code when introducing new structure; autonomous mode OK
+  when extending an agreed plan.
+- Old code stays — broken or not — until we're confident the new path covers
+  all callers.
+- iPhone 16 Plus is primary target.
+- 120-second MLX test timeout — never let a generation test run more than
+  2 minutes without aborting.
+- API > asking the human — if you can't get an answer from the API, expand
+  the API.
+- Documentation costs less than re-discovering a finding. Write the doc
+  when the discovery is fresh.
