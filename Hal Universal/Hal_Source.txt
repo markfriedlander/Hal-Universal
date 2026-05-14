@@ -6032,23 +6032,42 @@ struct ActionsView: View {
     
     private var modelSection: some View {
         Section {
+            // Salon-aware active summary (May-14, Strategic Claude directive):
+            //   - Single-model: "Active Model • [Name]" with unified status dot
+            //   - Salon Mode: "Salon Mode • N voices" with a person.2 indicator
+            // The Browse Model Library link below is unchanged in either mode.
             HStack {
-                Text("Active Model")
-                    .font(.subheadline)
-                    .fontWeight(.medium)
-                Spacer()
-                HStack(spacing: 6) {
-                    modelStatusDot(
-                        for: chatViewModel.selectedModel,
-                        downloader: mlxDownloader,
-                        activeModelID: chatViewModel.selectedModelID
-                    )
-                    Text(chatViewModel.selectedModel.displayName)
+                if chatViewModel.salonConfig.isEnabled {
+                    Text("Salon Mode")
                         .font(.subheadline)
-                        .foregroundColor(.secondary)
+                        .fontWeight(.medium)
+                    Spacer()
+                    HStack(spacing: 6) {
+                        Image(systemName: "person.2.fill")
+                            .foregroundColor(.accentColor)
+                            .imageScale(.small)
+                        Text("\(chatViewModel.salonConfig.activeSeats.count) voices")
+                            .font(.subheadline)
+                            .foregroundColor(.secondary)
+                    }
+                } else {
+                    Text("Active Model")
+                        .font(.subheadline)
+                        .fontWeight(.medium)
+                    Spacer()
+                    HStack(spacing: 6) {
+                        modelStatusDot(
+                            for: chatViewModel.selectedModel,
+                            downloader: mlxDownloader,
+                            activeModelID: chatViewModel.selectedModelID
+                        )
+                        Text(chatViewModel.selectedModel.displayName)
+                            .font(.subheadline)
+                            .foregroundColor(.secondary)
+                    }
                 }
             }
-            
+
             NavigationLink(destination: ModelLibraryView()
                 .environmentObject(chatViewModel)
                 .environmentObject(mlxDownloader)) {
