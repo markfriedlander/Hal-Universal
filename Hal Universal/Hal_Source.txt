@@ -5766,18 +5766,25 @@ struct ActionsView: View {
             }
             
             VStack(alignment: .leading, spacing: 8) {
-                HStack {
+                HStack(spacing: 6) {
                     Text("Temperature")
                         .font(.subheadline)
                         .fontWeight(.medium)
+                    // Modified-from-model-default indicator (Layer 3).
+                    if abs(chatViewModel.temperature - (chatViewModel.selectedModel.defaultSettings?.temperature ?? 0.7)) > 0.001 {
+                        Circle()
+                            .fill(Color.orange)
+                            .frame(width: 6, height: 6)
+                            .accessibilityLabel("Modified from model default")
+                    }
                     Spacer()
                     Text(String(format: "%.2f", chatViewModel.temperature))
                         .foregroundColor(.secondary)
                         .monospacedDigit()
                 }
-                
+
                 Slider(value: $chatViewModel.temperature, in: 0.0...1.0, step: 0.05)
-                
+
                 Text("Higher = more creative, Lower = more focused")
                     .font(.caption)
                     .foregroundColor(.secondary)
@@ -6079,7 +6086,8 @@ struct PowerUserView: View {
                         } else {
                             sliderStartValues.removeValue(forKey: "memoryDepth")
                         }
-                    }
+                    },
+                    isModified: chatViewModel.memoryDepth != (chatViewModel.selectedModel.defaultSettings?.effectiveMemoryDepth ?? 5)
                 )
                 
                 Divider()
@@ -6101,7 +6109,8 @@ struct PowerUserView: View {
                         } else {
                             sliderStartValues.removeValue(forKey: "threshold")
                         }
-                    }
+                    },
+                    isModified: abs(chatViewModel.memoryStore.relevanceThreshold - (chatViewModel.selectedModel.defaultSettings?.similarityThreshold ?? 0.75)) > 0.001
                 )
                 
                 LabeledSliderControl(
@@ -6119,7 +6128,8 @@ struct PowerUserView: View {
                         } else {
                             sliderStartValues.removeValue(forKey: "recency")
                         }
-                    }
+                    },
+                    isModified: abs(chatViewModel.memoryStore.recencyWeight - (chatViewModel.selectedModel.defaultSettings?.recencyWeight ?? 0.3)) > 0.001
                 )
                 
                 LabeledSliderControl(
@@ -6137,7 +6147,8 @@ struct PowerUserView: View {
                         } else {
                             sliderStartValues.removeValue(forKey: "halflife")
                         }
-                    }
+                    },
+                    isModified: abs(chatViewModel.memoryStore.recencyHalfLifeDays - (chatViewModel.selectedModel.defaultSettings?.recencyHalfLifeDays ?? 90.0)) > 0.5
                 )
                 
                 LabeledStepperControl(
@@ -6152,7 +6163,8 @@ struct PowerUserView: View {
                     range: 200...Double(chatViewModel.maxRAGCharsForModel),
                     step: 100,
                     valueFormatter: { "\(Int($0)) chars" },
-                    helperText: "Model limit: \(chatViewModel.maxRAGCharsForModel) chars (\(chatViewModel.selectedModel.displayName))"
+                    helperText: "Model limit: \(chatViewModel.maxRAGCharsForModel) chars (\(chatViewModel.selectedModel.displayName))",
+                    isModified: Int(chatViewModel.maxRagSnippetsCharacters) != (chatViewModel.selectedModel.defaultSettings?.maxRagSnippetsCharacters ?? 800)
                 )
                 
                 Divider()
@@ -6204,21 +6216,46 @@ struct PowerUserView: View {
     
     private var settingsResetSection: some View {
         Section {
-            VStack(alignment: .leading, spacing: 12) {
+            VStack(alignment: .leading, spacing: 16) {
+                // Per-model reset (Layer 3 of per-model settings profiles).
+                // Restores just the active model's settings to its empirical
+                // defaults, leaving other models' overrides untouched.
+                Button(action: {
+                    chatViewModel.resetSettingsToModelDefaults()
+                }) {
+                    HStack {
+                        Image(systemName: "arrow.uturn.backward.circle.fill")
+                            .foregroundColor(.blue)
+                        Text("Reset settings for \(chatViewModel.selectedModel.displayName)")
+                            .foregroundColor(.primary)
+                            .multilineTextAlignment(.leading)
+                        Spacer()
+                    }
+                    .padding(.vertical, 4)
+                }
+
+                Text("Restore the active model's settings (temperature, memory depth, RAG budget, etc.) to its tuned defaults. Other models' settings are untouched.")
+                    .font(.caption)
+                    .foregroundColor(.secondary)
+
+                Divider()
+
+                // Global "nuke everything" reset (existing behavior).
                 Button(action: {
                     showResetSettingsAlert = true
                 }) {
                     HStack {
                         Image(systemName: "arrow.counterclockwise.circle.fill")
                             .foregroundColor(.orange)
-                        Text("Reset Settings to Defaults")
+                        Text("Reset All Settings to Factory Defaults")
                             .foregroundColor(.primary)
+                            .multilineTextAlignment(.leading)
                         Spacer()
                     }
                     .padding(.vertical, 4)
                 }
-                
-                Text("Restore all tunable parameters to their factory defaults. This does not affect your conversation history, documents, or Hal's learned self-knowledge - only the settings that control how those systems behave.")
+
+                Text("Restore every tunable parameter — across every model — to factory defaults. This does not affect conversation history, documents, or Hal's learned self-knowledge.")
                     .font(.caption)
                     .foregroundColor(.secondary)
             }
@@ -7432,6 +7469,11 @@ struct SectionHeaderText: View {
 // MARK: - Labeled Slider Control
 /// Reusable slider with label, current value display, min/max labels, and optional helper text
 /// Eliminates the repetitive VStack(HStack(Text+Spacer+Text) + Slider + Text) pattern
+///
+/// `isModified`: when true, a small orange dot is rendered next to the label
+/// to signal the current value differs from the active model's default.
+/// Used by per-model settings profiles (Layer 3) — callers compute the
+/// comparison against `selectedModel.defaultSettings?.<field>`.
 struct LabeledSliderControl: View {
     let label: String
     let value: Binding<Double>
@@ -7442,19 +7484,26 @@ struct LabeledSliderControl: View {
     let maxLabel: String
     let helperText: String?
     let onEditingChanged: ((Bool) -> Void)?
-    
+    var isModified: Bool = false
+
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
-            // Label + Value Display
-            HStack {
+            // Label + Value Display (with optional modified-from-default dot)
+            HStack(spacing: 6) {
                 Text(label)
                     .font(.subheadline)
+                if isModified {
+                    Circle()
+                        .fill(Color.orange)
+                        .frame(width: 6, height: 6)
+                        .accessibilityLabel("Modified from model default")
+                }
                 Spacer()
                 Text(valueFormatter(value.wrappedValue))
                     .font(.subheadline)
                     .foregroundColor(.secondary)
             }
-            
+
             // Slider with min/max labels
             Slider(
                 value: value,
@@ -7465,7 +7514,7 @@ struct LabeledSliderControl: View {
                 maximumValueLabel: { Text(maxLabel).font(.caption2) },
                 onEditingChanged: onEditingChanged ?? { _ in }
             )
-            
+
             // Helper text (if provided)
             if let helperText = helperText {
                 Text(helperText)
@@ -7486,13 +7535,20 @@ struct LabeledStepperControl: View {
     let step: Double
     let valueFormatter: (Double) -> String
     let helperText: String?
-    
+    var isModified: Bool = false
+
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
-            // Label + Value Display
-            HStack {
+            // Label + Value Display (with optional modified-from-default dot)
+            HStack(spacing: 6) {
                 Text(label)
                     .font(.subheadline)
+                if isModified {
+                    Circle()
+                        .fill(Color.orange)
+                        .frame(width: 6, height: 6)
+                        .accessibilityLabel("Modified from model default")
+                }
                 Spacer()
                 Text(valueFormatter(value.wrappedValue))
                     .font(.subheadline)
@@ -9530,6 +9586,24 @@ class ChatViewModel: ObservableObject {
         pendingSettingsChanges.removeAll()
     }
     
+    /// Resets the per-model settings profile for the CURRENT model — clears
+    /// any user overrides and re-applies the model's empirical defaults
+    /// through the live property setters so the UI updates immediately.
+    /// Other models' overrides are untouched.
+    func resetSettingsToModelDefaults() {
+        let model = selectedModel
+        print("HALDEBUG-SETTINGS: Resetting per-model settings for \(model.displayName) (\(model.id))")
+        ModelSettingsStore.shared.resetOverrides(for: model.id)
+        let effective = ModelSettingsStore.shared.effectiveSettings(for: model)
+        if let v = effective.temperature              { self.temperature = v }
+        if let v = effective.effectiveMemoryDepth     { self.memoryDepth = v }
+        if let v = effective.maxRagSnippetsCharacters { self.maxRagSnippetsCharacters = Double(v) }
+        if let v = effective.ragDedupThreshold        { self.ragDedupSimilarityThreshold = v }
+        if let v = effective.similarityThreshold      { self.memoryStore.relevanceThreshold = v }
+        if let v = effective.recencyWeight            { self.memoryStore.recencyWeight = v }
+        if let v = effective.recencyHalfLifeDays      { self.memoryStore.recencyHalfLifeDays = v }
+    }
+
     /// Resets all user-configurable settings to factory defaults
     func resetSettingsToDefaults() {
         print("HALDEBUG-SETTINGS: Resetting all settings to defaults")
