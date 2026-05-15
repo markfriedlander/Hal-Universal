@@ -5774,6 +5774,7 @@ struct ActionsView: View {
                 personalitySection
                 importExportSection
                 modelSection
+                watchSection
                 powerUserSection
             }
             .navigationTitle("Settings")
@@ -6126,7 +6127,33 @@ struct ActionsView: View {
                 .font(.caption2)
         }
     }
-    
+
+    // MARK: - Apple Watch Section
+    //
+    // Dedicated home for the Watch-related disclosure (and a natural place
+    // for future Watch-specific toggles — default model for Watch turns,
+    // haptic intensity, etc.). For v1.x this is just the educational
+    // disclosure Mark requested on May-14: response time depends on which
+    // model is active.
+    private var watchSection: some View {
+        Section {
+            VStack(alignment: .leading, spacing: 6) {
+                Text("Response time on your Watch depends on which model Hal is using. Faster models respond in seconds; larger or backgrounded models may take up to a minute.")
+                    .font(.caption)
+                    .foregroundColor(.secondary)
+                Text("Hal will buzz your wrist when the reply is ready. You can lower your wrist after dictating — Hal keeps working.")
+                    .font(.caption)
+                    .foregroundColor(.secondary)
+            }
+            .padding(.vertical, 2)
+        } header: {
+            Label("Apple Watch", systemImage: "applewatch")
+        } footer: {
+            Text("Tap the eye on your Watch, dictate, send. The active model handles the reply with a wrist-sized formatting hint.")
+                .font(.caption2)
+        }
+    }
+
     // MARK: - Power User Section
     
     // SELF-AWARENESS NOTE (for Hal reading this code):
@@ -16399,17 +16426,36 @@ final class HalWatchBridge: NSObject, WCSessionDelegate {
 
     // MARK: - Push message to Watch
     //
-    // Static so the bridge instance isn't required to push — callers like
-    // ChatViewModel.processWatchIncomingMessage (driven by SIMULATE_WATCH_MESSAGE)
-    // can push without needing a reference to the bridge. WCSession.default
-    // is a class-level singleton so encapsulation here was incidental.
+    // Two-tier delivery (May-14):
+    //   1. If the Watch is reachable (app foregrounded), use sendMessage —
+    //      it's instant, lowest-latency, and the Watch's didReceiveMessage
+    //      delegate fires the moment we send.
+    //   2. If the Watch is NOT reachable (screen dimmed, watchface showing,
+    //      app backgrounded), fall back to transferUserInfo — iOS queues
+    //      the payload and delivers it via didReceiveUserInfo whenever the
+    //      Watch app next gets runtime. This is the path that fixes Mark's
+    //      May-14 experience: iPhone took 7 minutes to generate, by which
+    //      time the Watch screen had dimmed, and sendMessage dropped the
+    //      reply silently. transferUserInfo guarantees it lands.
+    //
+    // Static so any caller (HalWatchBridge instance methods,
+    // ChatViewModel.processWatchIncomingMessage, the SIMULATE_WATCH_MESSAGE
+    // API) can push without holding a bridge reference. WCSession.default
+    // is a class-level singleton so this encapsulation was incidental.
     static func pushToWatch(_ payload: [String: Any]) {
-        guard WCSession.default.isReachable else {
-            print("HALDEBUG-WATCH: Watch not reachable for push.")
-            return
-        }
-        WCSession.default.sendMessage(payload, replyHandler: nil) { error in
-            print("HALDEBUG-WATCH: Push error: \(error.localizedDescription)")
+        let session = WCSession.default
+        if session.isReachable {
+            session.sendMessage(payload, replyHandler: nil) { error in
+                // Reachable said yes but delivery failed — queue it as a
+                // fallback. Better to deliver twice than drop the reply.
+                halLog("HALDEBUG-WATCH: sendMessage failed (\(error.localizedDescription)); queuing via transferUserInfo.")
+                session.transferUserInfo(payload)
+            }
+            halLog("HALDEBUG-WATCH: push via sendMessage (reachable=true).")
+        } else {
+            // Watch app not foregrounded. Queue for guaranteed delivery.
+            session.transferUserInfo(payload)
+            halLog("HALDEBUG-WATCH: Watch not reachable — queued via transferUserInfo (will deliver when Watch app foregrounds).")
         }
     }
 

@@ -11,6 +11,7 @@ import SwiftUI
 import WatchConnectivity
 import AVFoundation
 import Combine
+import WatchKit  // WKInterfaceDevice for haptic feedback on reply arrival
 
 // ==== LEGO END: 01 - Imports & Constants ====
 
@@ -89,16 +90,43 @@ class WatchConnectivityManager: NSObject, ObservableObject, WCSessionDelegate {
     // -------------------------------------------------------------
     // MARK: - Receive Messages from iPhone
     // -------------------------------------------------------------
+    //
+    // Two delivery paths (matched on the iPhone side in HalWatchBridge.pushToWatch):
+    //
+    //   - didReceiveMessage  -> realtime sendMessage, fires immediately
+    //                            when the Watch app is foregrounded and
+    //                            reachable.
+    //   - didReceiveUserInfo -> queued transferUserInfo, fires whenever the
+    //                            Watch app next has runtime -- even if the
+    //                            user let their wrist drop during generation.
+    //
+    // Both route through `deliverReply` so behavior is identical: update
+    // lastReceivedMessage and buzz the wrist so the user notices even if
+    // their screen had auto-dimmed.
+
     func session(_ session: WCSession,
                  didReceiveMessage message: [String : Any]) {
+        deliverReply(from: message, path: "sendMessage")
+    }
 
+    func session(_ session: WCSession,
+                 didReceiveUserInfo userInfo: [String : Any] = [:]) {
+        deliverReply(from: userInfo, path: "transferUserInfo")
+    }
+
+    private func deliverReply(from payload: [String: Any], path: String) {
         DispatchQueue.main.async {
-            if let reply = message["reply"] as? String {
-                self.lastReceivedMessage = reply
-                print("[WatchConnectivity] RECEIVED â† \(reply)")
-            } else {
-                print("[WatchConnectivity] Received message without 'reply' field")
+            guard let reply = payload["reply"] as? String, !reply.isEmpty else {
+                print("[WatchConnectivity] Received \(path) payload without 'reply' field")
+                return
             }
+            self.lastReceivedMessage = reply
+            print("[WatchConnectivity] RECEIVED via \(path): \(reply.prefix(80))")
+            // Haptic so the user notices even if their wrist had dropped or
+            // the screen had auto-dimmed during a slow generation. The Watch
+            // app doesn't time out client-side, but the screen does -- and a
+            // buzz is the only reliable signal that the reply arrived.
+            WKInterfaceDevice.current().play(.notification)
         }
     }
 
@@ -277,16 +305,21 @@ struct WatchSendingOverlay: View {
         VStack {
             Spacer()
 
-            VStack(spacing: 12) {
+            VStack(spacing: 10) {
                 ProgressView()
                     .progressViewStyle(CircularProgressViewStyle(tint: .white))
                     .scaleEffect(1.2)
 
-                Text("Hal is thinking...")
+                Text("Hal is thinking…")
                     .font(.footnote)
-                    .foregroundColor(.white.opacity(0.8))
+                    .foregroundColor(.white.opacity(0.9))
+                Text("You can lower your wrist — Hal will buzz when ready.")
+                    .font(.caption2)
+                    .foregroundColor(.white.opacity(0.7))
+                    .multilineTextAlignment(.center)
+                    .padding(.horizontal, 4)
             }
-            .padding()
+            .padding(12)
             .background(Color.black.opacity(0.6))
             .clipShape(RoundedRectangle(cornerRadius: 12))
 
