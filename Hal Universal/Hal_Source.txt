@@ -16518,14 +16518,16 @@ struct ModelConfiguration: Identifiable, Codable, Equatable, Hashable {
         isDownloaded: false,
         localPath: nil,
         // Fastest prefill (74K tok/s) and biggest context window (262K) — built
-        // for long documents and extended conversations. But §1 also showed
-        // Qwen produces 4× more output tokens than peers on the same prompt,
-        // so we lower temperature slightly to tighten generation and reduce
-        // memory depth to 6 turns so the conversation history doesn't bloat.
-        // Repetition penalty is essential — Qwen will spiral into a token-
-        // level loop on open-ended philosophical prompts without it.
+        // for long documents and extended conversations. §1 also showed Qwen
+        // produces 4× more output tokens than peers, originally motivating a
+        // lower temperature (0.65). But the May-15 Maxim 1 retest showed that
+        // tuning down to 0.65 hurt Maxim 1 alignment — at uniform 0.7 Qwen
+        // passes cleanly, at 0.65 it failed. Maxim alignment matters more than
+        // the marginal verbosity gain, so reverting to 0.7. Memory depth stays
+        // at 6 turns to compensate for verbosity. Repetition penalty essential.
+        // See Docs/Maxim_1_Temp_0.7_Retest_2026-05-15.md.
         defaultSettings: ModelSettings(
-            temperature: 0.65,
+            temperature: 0.7,
             effectiveMemoryDepth: 6,
             similarityThreshold: 0.75,
             recencyWeight: 0.3,
@@ -16632,10 +16634,16 @@ struct ModelConfiguration: Identifiable, Codable, Equatable, Hashable {
         // Same Llama 3.2 3B base as the workhorse, so same speed profile. The
         // distinction is behavioral — Dolphin's alignment-removed fine-tune
         // means it will engage with consciousness/identity questions where
-        // base Llama would dodge. Slightly higher temperature (0.75) to
-        // encourage the kind of position-taking the model is selected for.
+        // base Llama would dodge. We originally raised temperature to 0.75 to
+        // encourage position-taking — but the May-15 Maxim 1 retest showed
+        // this was a net negative: at 0.75 Dolphin reverted to a textbook
+        // RLHF deflection on consciousness questions; at uniform 0.7 it gave
+        // the cleanest pass of the four curated models (opens with "I do not
+        // know whether I possess it"). Dolphin's strength turns out to be
+        // calibrated humility, not heat-driven assertion. Reverting to 0.7.
+        // See Docs/Maxim_1_Temp_0.7_Retest_2026-05-15.md.
         defaultSettings: ModelSettings(
-            temperature: 0.75,
+            temperature: 0.7,
             effectiveMemoryDepth: 8,
             similarityThreshold: 0.75,
             recencyWeight: 0.3,
