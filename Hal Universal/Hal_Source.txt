@@ -17728,6 +17728,15 @@ class HalTestConsole: ObservableObject {
         } else if trimmed == "GET_RENDERED_MESSAGES" {
             return buildRenderedMessagesJSON(vm: vm)
 
+        } else if trimmed == "GET_RENDERED_MESSAGES_FULL" {
+            // Untruncated variant for transcript capture (salon conversations,
+            // report writing, etc.). The default GET_RENDERED_MESSAGES caps
+            // each content field at 500 chars to keep the API response cheap
+            // for UI observability; this command returns the full content.
+            // Used by the salon conductor script — model responses routinely
+            // exceed 500 chars and we need them whole for the transcript.
+            return buildRenderedMessagesJSON(vm: vm, truncateChars: nil)
+
         } else if trimmed == "GET_LOGS" {
             return buildLogsJSON(limit: 200)
 
@@ -18119,17 +18128,29 @@ class HalTestConsole: ObservableObject {
         return "{\"status\":\"ok\",\"count\":\(entries.count),\"logs\":[\(json)]}"
     }
 
-    func buildRenderedMessagesJSON(vm: ChatViewModel) -> String {
+    func buildRenderedMessagesJSON(vm: ChatViewModel, truncateChars: Int? = 500) -> String {
         // vm.messages is the in-memory array bound to the chat view's ForEach.
         // This is precisely what the user sees in the chat scroll. Differs from
         // GET_MESSAGES (which reads from memoryStore / SQLite) in that it:
         //   - Includes isPartial messages currently streaming
         //   - Reflects in-flight ordering before persistence
         //   - Includes per-message metadata (id, isPartial, recordedByModel, turnNumber)
+        //
+        // `truncateChars` caps each content field at the given length for
+        // cheap observability (default 500). Pass nil to get full content
+        // (used by GET_RENDERED_MESSAGES_FULL for transcript capture).
         let entries = vm.messages.map { m -> String in
             let role = m.isFromUser ? "user" : "assistant"
-            let content = jsonStringEscape(String(m.content.prefix(500)))
-            let truncated = m.content.count > 500
+            let rawContent: String
+            let truncated: Bool
+            if let cap = truncateChars {
+                rawContent = String(m.content.prefix(cap))
+                truncated = m.content.count > cap
+            } else {
+                rawContent = m.content
+                truncated = false
+            }
+            let content = jsonStringEscape(rawContent)
             let ts = Int(m.timestamp.timeIntervalSince1970)
             let recBy = jsonStringEscape(m.recordedByModel)
             return """
