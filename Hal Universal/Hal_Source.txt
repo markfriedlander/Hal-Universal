@@ -3336,94 +3336,113 @@ class MemoryStore: ObservableObject {
             reflectionType: Int,
             llmService: LLMService
         ) async {
-            // MODIFIED: Prompt to convert free-form reflection into structured self-knowledge entries
-            // with hybrid category guidance and shareability choice
+            // Prompt to convert free-form reflection into structured self-knowledge entries.
+            // For AFM, the @Generable contract enforces the schema; for MLX models, we
+            // fall back to JSON-in-text with per-model augmentations (Strategic §5).
             let structuringPrompt = """
             You have just reflected on your experience. Now convert your insights into structured self-knowledge entries.
-            
+
             Your reflection:
             \(reflection)
-            
+
             Instructions:
             - Extract 0-3 discrete insights (only store if genuinely new or reinforcing)
             - For each insight, provide: category, key, value, confidence (0.0-1.0), shareable (true/false)
-            
+
             Category guidance:
             - Category should typically be: \(reflectionType == 1 ? "effectiveness_pattern" : "existential_observation")
             - However, if your insight fits better as: learned_trait, behavior_pattern, capability, or value, use that instead
             - You may also propose a new category if none fit (use sparingly)
-            
+
             Field definitions:
             - key: Brief identifier (e.g., "evening_communication", "experience_of_time")
             - value: The insight itself (1-2 sentences)
             - confidence: Your certainty about this pattern (0.5-0.9 typical range)
             - shareable: true/false (can users view this in your diary? Your choice - some reflections may feel too personal or preliminary)
-            
+
             Check if this insight already exists in your self-knowledge before storing.
             Only store if it's genuinely new or reinforces an existing pattern.
-            
-            Respond ONLY with valid JSON (no markdown, no explanation):
-            [
-              {"category": "...", "key": "...", "value": "...", "confidence": 0.0, "shareable": true},
-              ...
-            ]
-            
-            If nothing worth storing, respond with: []
             """
-            
-            do {
-                // Temperature 0.3 for deterministic JSON. Chat-message path so
-                // chat-template models work.
-                let response = try await llmService.generateChatResponse(
-                    messages: [.system("You are Hal converting reflection text into structured JSON. Respond ONLY with the JSON array — no markdown, no commentary."), .user(structuringPrompt)],
-                    temperature: 0.3
-                )
-                
-                print("HALDEBUG-REFLECTION: Structured response generated with temperature 0.3 for reliable JSON")
-                
-                let cleaned = response.replacingOccurrences(of: "```json", with: "")
-                                     .replacingOccurrences(of: "```", with: "")
-                                     .trimmingCharacters(in: .whitespacesAndNewlines)
-                
-                guard let jsonData = cleaned.data(using: .utf8),
-                      let insights = try? JSONSerialization.jsonObject(with: jsonData) as? [[String: Any]] else {
-                    print("HALDEBUG-REFLECTION: Could not parse structured insights")
+
+            // Branch on model source: AFM → typed @Generable, MLX → JSON-in-text.
+            // Both end at the same storage call site below so the persistence
+            // semantics are identical regardless of which model produced the
+            // insights.
+            let activeID = llmService.activeModelID
+            var parsedInsights: [(category: String, key: String, value: String, confidence: Double, shareable: Bool)] = []
+
+            if activeID == ModelConfiguration.appleFoundation.id {
+                // AFM path — typed structured output via @Generable.
+                do {
+                    let batch = try await llmService.generateStructuredOnAFM(
+                        prompt: structuringPrompt,
+                        instructions: "You are Hal extracting structured insights from your own reflection. Use the typed schema. Return at most 3 insights; return zero if nothing is worth storing.",
+                        type: AFMReflectionInsightBatch.self,
+                        temperature: 0.3
+                    )
+                    parsedInsights = batch.insights.map {
+                        (category: $0.category, key: $0.key, value: $0.value, confidence: $0.confidence, shareable: $0.shareable)
+                    }
+                    print("HALDEBUG-REFLECTION: AFM @Generable returned \(parsedInsights.count) typed insights.")
+                } catch {
+                    print("HALDEBUG-REFLECTION: AFM structured generation failed: \(error.localizedDescription)")
                     return
                 }
-                
-                // MODIFIED: Store each insight with shareability flag
-                for insight in insights {
-                    guard let category = insight["category"] as? String,
-                          let key = insight["key"] as? String,
-                          let value = insight["value"] as? String,
-                          let confidence = insight["confidence"] as? Double else {
-                        print("HALDEBUG-REFLECTION: Skipping insight - missing required fields")
-                        continue
-                    }
-                    
-                    // Extract shareable flag (default to false if not provided - private by default)
-                    let shareable = insight["shareable"] as? Bool ?? false
-                    
-                    // MODIFIED: Call storeSelfKnowledge with shareable parameter
-                    storeSelfKnowledge(
-                        category: category,
-                        key: key,
-                        value: value,
-                        confidence: confidence,
-                        source: "reflection_type_\(reflectionType)",
-                        notes: "From turn-based self-reflection",
-                        shareable: shareable
+            } else {
+                // MLX path — JSON-in-text with per-model augmentations.
+                let textPrompt = mlxInsightStructuringAugmentation(modelID: activeID, base: structuringPrompt + "\n\nRespond ONLY with a valid JSON array. Empty array if nothing is worth storing.\n\nExample shape:\n[\n  {\"category\": \"...\", \"key\": \"...\", \"value\": \"...\", \"confidence\": 0.0, \"shareable\": true}\n]")
+                do {
+                    let response = try await llmService.generateChatResponse(
+                        messages: [
+                            .system("You are Hal converting reflection text into structured JSON. Respond ONLY with the JSON array — no markdown, no commentary."),
+                            .user(textPrompt)
+                        ],
+                        temperature: 0.3
                     )
-                    
-                    let shareableStatus = shareable ? "SHAREABLE" : "PRIVATE"
-                    print("HALDEBUG-REFLECTION: Stored insight: \(category)/\(key) [\(shareableStatus)]")
+                    let cleaned = response
+                        .replacingOccurrences(of: "```json", with: "")
+                        .replacingOccurrences(of: "```", with: "")
+                        .trimmingCharacters(in: .whitespacesAndNewlines)
+                    guard let jsonData = cleaned.data(using: .utf8),
+                          let rawInsights = try? JSONSerialization.jsonObject(with: jsonData) as? [[String: Any]] else {
+                        print("HALDEBUG-REFLECTION: Could not parse MLX structured insights (response: \(cleaned.prefix(120)))")
+                        return
+                    }
+                    for insight in rawInsights {
+                        guard let category = insight["category"] as? String,
+                              let key = insight["key"] as? String,
+                              let value = insight["value"] as? String,
+                              let confidenceRaw = insight["confidence"] else {
+                            print("HALDEBUG-REFLECTION: Skipping insight - missing required fields")
+                            continue
+                        }
+                        // confidence may decode as Double, Int, or NSNumber depending on JSON shape
+                        let confidence = (confidenceRaw as? Double) ?? Double(confidenceRaw as? Int ?? 0) // tolerate ints
+                        let shareable = insight["shareable"] as? Bool ?? false
+                        parsedInsights.append((category, key, value, confidence, shareable))
+                    }
+                    print("HALDEBUG-REFLECTION: MLX JSON path returned \(parsedInsights.count) parsed insights.")
+                } catch {
+                    print("HALDEBUG-REFLECTION: MLX structured recording failed: \(error.localizedDescription)")
+                    return
                 }
-                
-                print("HALDEBUG-REFLECTION: Recorded \(insights.count) structured insights")
-                
-            } catch {
-                print("HALDEBUG-REFLECTION: Structured recording failed: \(error.localizedDescription)")
             }
+
+            // Unified storage — same regardless of which model produced the insights.
+            for insight in parsedInsights {
+                storeSelfKnowledge(
+                    category: insight.category,
+                    key: insight.key,
+                    value: insight.value,
+                    confidence: insight.confidence,
+                    source: "reflection_type_\(reflectionType)",
+                    notes: "From turn-based self-reflection",
+                    shareable: insight.shareable
+                )
+                let shareableStatus = insight.shareable ? "SHAREABLE" : "PRIVATE"
+                print("HALDEBUG-REFLECTION: Stored insight: \(insight.category)/\(insight.key) [\(shareableStatus)]")
+            }
+            print("HALDEBUG-REFLECTION: Recorded \(parsedInsights.count) structured insights")
         }
     }
 
@@ -5009,6 +5028,83 @@ class MLXWrapper: ObservableObject {
     }
 }
 
+// MARK: - Per-model MLX prompt augmentations (Strategic §5)
+//
+// For MLX models, structured output relies on prompt discipline rather
+// than a typed contract (no @Generable equivalent for arbitrary GGUF/
+// MLX models). Most curated models follow the base prompt cleanly;
+// one notable exception is Qwen 3.5 2B, whose verbosity tendency (4×
+// more tokens than peers per §1 benchmark) regularly breaks single-
+// word YES/NO discipline and tries to wrap JSON in markdown fences.
+// The augmentation helpers add small, model-specific reinforcements
+// — they are no-ops for models that don't need them, and a generic
+// fallback covers experimental / library models we haven't tested.
+
+fileprivate func mlxGatePromptAugmentation(modelID: String, base: String) -> String {
+    // Hard reinforcement for models prone to elaborating.
+    if modelID.contains("Qwen") {
+        return base + "\n\n[STRICT FORMAT: Output is one word — YES or NO. No explanation, no punctuation, no preamble. Anything else is wrong.]"
+    }
+    // Gemma, Llama, Dolphin all respect the base "Answer only YES or NO."
+    // directive without further reinforcement.
+    return base
+}
+
+fileprivate func mlxInsightStructuringAugmentation(modelID: String, base: String) -> String {
+    // Models that wrap JSON in markdown fences get a sharper directive.
+    if modelID.contains("Qwen") {
+        return base + "\n\n[STRICT FORMAT: Raw JSON array only. Do NOT wrap in ```json or any code fence. Do NOT add commentary before or after. The first character of your response must be `[` and the last must be `]`.]"
+    }
+    return base
+}
+
+// MARK: - Structured-output Generable types (Strategic §5)
+//
+// AFM exposes Apple's @Generable macro for typed structured outputs —
+// the model is constrained to produce a value that decodes into the
+// target Swift type, eliminating the brittle "parse text → maybe-JSON
+// → maybe-extract-fields" path. Two operations benefit most:
+//
+//   1. The RAG gate — currently text "YES"/"NO" stringly-typed and
+//      prefix-matched. @Generable returns a typed Bool.
+//   2. Reflection structuring — currently free-text JSON with manual
+//      markdown stripping and JSONSerialization parsing. Brittle: the
+//      model can add markdown fences, malformed quotes, missing keys.
+//      @Generable returns a typed array of insight structs directly.
+//
+// These types only ship on the AFM path; MLX models use the per-model
+// text prompts in their respective callsites with response post-
+// processing (see `recordStructuredInsights` and `decideTools`).
+@Generable
+struct AFMRAGGateDecision {
+    @Guide(description: "True if Hal should search its memory database to help answer the current user question; false if the question is answerable from general knowledge alone or from the recent conversation already shown.")
+    var shouldSearchMemory: Bool
+}
+
+@Generable
+struct AFMReflectionInsight {
+    @Guide(description: "A short label for the kind of insight, e.g. \"effectiveness_pattern\", \"existential_observation\", \"learned_trait\", \"behavior_pattern\", \"capability\", or \"value\".")
+    var category: String
+
+    @Guide(description: "A brief identifier for this specific insight, snake_case, e.g. \"evening_communication\" or \"experience_of_time\". 1-4 words.")
+    var key: String
+
+    @Guide(description: "The insight itself, 1-2 sentences, written in Hal's own voice.")
+    var value: String
+
+    @Guide(description: "Hal's certainty about this pattern, from 0.0 (very tentative) to 1.0 (fully confident). Typical range 0.5-0.9.")
+    var confidence: Double
+
+    @Guide(description: "Whether this insight is shareable in Hal's viewable diary. True for thoughts Hal is comfortable surfacing; false for private or preliminary observations.")
+    var shareable: Bool
+}
+
+@Generable
+struct AFMReflectionInsightBatch {
+    @Guide(description: "0 to 3 discrete insights extracted from the reflection. Empty array if nothing new or reinforcing is worth storing. Each insight should be genuinely new — do not duplicate ones that already exist.")
+    var insights: [AFMReflectionInsight]
+}
+
 // MARK: - LLM Service (Wrapper for Foundation Models and MLX)
 class LLMService: ObservableObject {
     internal var mlxWrapper: MLXWrapper // Changed to internal for MLXModelDownloader access
@@ -5017,6 +5113,40 @@ class LLMService: ObservableObject {
     private var currentModel: ModelConfiguration
     /// Exposes the model ID currently loaded in LLMService (for diagnostic use by HalTestConsole).
     var activeModelID: String { currentModel.id }
+
+    // MARK: - AFM-only structured generation
+    //
+    // Typed structured-output entry point for the two paths that benefit:
+    // the RAG gate (decideTools) and reflection structuring
+    // (recordStructuredInsights). Throws when invoked on a non-AFM
+    // model so callers MUST branch on `currentModel.source` first.
+    // MLX paths use the text-prompt variants in their own callsites.
+    func generateStructuredOnAFM<T>(
+        prompt: String,
+        instructions: String? = nil,
+        type: T.Type,
+        temperature: Double = 0.3
+    ) async throws -> T where T: Generable {
+        guard currentModel.source == .appleFoundation else {
+            throw LLMError.predictionFailed(NSError(
+                domain: "LLMService",
+                code: -1,
+                userInfo: [NSLocalizedDescriptionKey: "generateStructuredOnAFM called on non-AFM model (\(currentModel.displayName)). Callers must branch on currentModel.source."]
+            ))
+        }
+        let session: LanguageModelSession
+        if let instructions, !instructions.isEmpty {
+            session = LanguageModelSession(instructions: Instructions(instructions))
+        } else {
+            session = LanguageModelSession()
+        }
+        let response = try await session.respond(
+            to: Prompt(prompt),
+            generating: T.self,
+            options: GenerationOptions(temperature: temperature)
+        )
+        return response.content
+    }
 
     // Initialize with a specific model
     init(model: ModelConfiguration) {
@@ -11113,24 +11243,39 @@ class ChatViewModel: ObservableObject {
                                                                                 // never silently invoke a different LLM. The earlier "RAG gate
                                                                                 // always uses AFM" optimization violated the consistency
                                                                                 // promise that everything in Gemma mode stays on Gemma.
-                                                                                // Measurement (May 12, 2026) shows Gemma 4 E2B 4-bit prefill
-                                                                                // is actually faster than AFM for the gate-sized prompt
-                                                                                // (~800 tok/s vs ~138 tok/s), so this is also a perf win in
-                                                                                // Gemma mode — not a regression.
-                                                                                let gateResponse = try await llmService.generateChatResponse(
-                                                                                    messages: [
-                                                                                        .system("You are a fast YES/NO classifier. Respond with only the single word YES or NO — no punctuation, no explanation."),
-                                                                                        .user(toolDecisionPrompt)
-                                                                                    ],
-                                                                                    temperature: 0.1
-                                                                                )
-                                                                                let answer = gateResponse.trimmingCharacters(in: .whitespacesAndNewlines).uppercased()
+                                                                                //
+                                                                                // Per Strategic §5: AFM uses @Generable for a typed Bool return
+                                                                                // (no parsing, no prefix-matching). MLX uses the text-based
+                                                                                // YES/NO prompt with per-model wording adjustments where
+                                                                                // needed — e.g. Qwen's verbosity needs a sharper directive.
+                                                                                let shouldSearch: Bool
+                                                                                if selectedModel.source == .appleFoundation {
+                                                                                    let decision = try await llmService.generateStructuredOnAFM(
+                                                                                        prompt: toolDecisionPrompt,
+                                                                                        instructions: "You are a fast classifier deciding whether Hal needs to search its memory database to answer the user's current question.",
+                                                                                        type: AFMRAGGateDecision.self,
+                                                                                        temperature: 0.1
+                                                                                    )
+                                                                                    shouldSearch = decision.shouldSearchMemory
+                                                                                } else {
+                                                                                    let mlxPrompt = mlxGatePromptAugmentation(modelID: selectedModel.id, base: toolDecisionPrompt)
+                                                                                    let gateResponse = try await llmService.generateChatResponse(
+                                                                                        messages: [
+                                                                                            .system("You are a fast YES/NO classifier. Respond with only the single word YES or NO — no punctuation, no explanation."),
+                                                                                            .user(mlxPrompt)
+                                                                                        ],
+                                                                                        temperature: 0.1
+                                                                                    )
+                                                                                    let answer = gateResponse.trimmingCharacters(in: .whitespacesAndNewlines).uppercased()
+                                                                                    shouldSearch = answer.hasPrefix("YES")
+                                                                                }
+
                                                                                 let gateMs = Int(Date().timeIntervalSince(gateStart) * 1000)
-                                                                                if answer.hasPrefix("YES") {
+                                                                                if shouldSearch {
                                                                                     halLog("HALDEBUG-TOOLS: Gate → YES in \(gateMs)ms (memory search needed)")
                                                                                     return ToolDecision(tools: ["memory_search"], reasoning: "Gate answered YES")
                                                                                 } else {
-                                                                                    halLog("HALDEBUG-TOOLS: Gate → NO in \(gateMs)ms (recent context sufficient), raw: \(answer.prefix(20))")
+                                                                                    halLog("HALDEBUG-TOOLS: Gate → NO in \(gateMs)ms (recent context sufficient)")
                                                                                     return ToolDecision(tools: [], reasoning: "Gate answered NO")
                                                                                 }
                                                                             } catch {
