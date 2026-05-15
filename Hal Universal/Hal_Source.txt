@@ -17846,6 +17846,20 @@ class HalTestConsole: ObservableObject {
             print("HALDEBUG-TESTCONSOLE: NUCLEAR_RESET — \(threads) threads, \(messages) messages deleted")
             return "{\"status\":\"ok\",\"command\":\"NUCLEAR_RESET\",\"threadsDeleted\":\(threads),\"factsDeleted\":\(facts),\"messagesDeleted\":\(messages),\"newConversationId\":\"\(vm.conversationId)\"}"
 
+        } else if trimmed == "RESET_SELF_KNOWLEDGE" {
+            // Targeted reset: wipes every self_knowledge row (reflections
+            // + structured traits) without touching conversations, threads,
+            // or unified_content / RAG memory. Used to clear testing-
+            // artifact data before a clean restart of the self-knowledge
+            // accumulation cycle. Per Mark's May-15 directive before the
+            // salon conversation: "the current entries are testing
+            // artifacts — repetitive, shallow, generated under broken
+            // conditions. They're junk data and they'll pollute everything
+            // that follows. Start clean."
+            let deleted = vm.memoryStore.resetSelfKnowledgeAndReflections()
+            print("HALDEBUG-TESTCONSOLE: RESET_SELF_KNOWLEDGE — \(deleted) rows deleted (reflections + traits)")
+            return "{\"status\":\"ok\",\"command\":\"RESET_SELF_KNOWLEDGE\",\"rowsDeleted\":\(deleted)}"
+
         } else if trimmed == "GET_STATE" {
             writeStateJSON(vm: vm)
             if let data = try? Data(contentsOf: stateFile),
