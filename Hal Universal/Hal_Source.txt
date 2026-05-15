@@ -4564,9 +4564,25 @@ fileprivate func detectRepetitionLoop(in text: String) -> Bool {
     return false
 }
 
+/// Six in-voice closing phrases picked at random when the repetition
+/// detector trims a stuck stream. Replaces the bare ellipsis so the
+/// user sees what's actually happening rather than a silent cut-off —
+/// transparency over opacity. Each phrase starts with U+2026 so the
+/// truncation marker is preserved, then continues in Hal's voice.
+fileprivate let repetitionStopPhrases: [String] = [
+    "\u{2026} I notice I'm repeating myself. Pausing here.",
+    "\u{2026} I'm catching myself in a loop. Let me stop.",
+    "\u{2026} I think I'm circling. Stopping for now.",
+    "\u{2026} I seem to be looping. Stopping to think.",
+    "\u{2026} I'm repeating myself \u{2014} better to stop than continue.",
+    "\u{2026} I'm going in circles. Let me pause here.",
+]
+
 /// Trim the repetitive tail off a text where `detectRepetitionLoop`
 /// returned true. Tries to strip back to the last point before the
-/// loop began, then ends with an ellipsis to signal a stopped response.
+/// loop began, preserving one complete instance of the repeating
+/// content, then appends a randomized in-voice closing phrase from
+/// `repetitionStopPhrases`.
 fileprivate func trimTrailingRepetition(in text: String) -> String {
     // Strip paragraph-level repetition first.
     var working = text
@@ -4578,16 +4594,31 @@ fileprivate func trimTrailingRepetition(in text: String) -> String {
         let last  = working[second..<endIndex]
         let prior = working[first..<second]
         if last == prior {
-            // Found repetition. Keep stripping while the tail matches.
-            working = String(working[..<second])
-            while working.count >= chunkSize {
-                let s = working.index(working.endIndex, offsetBy: -chunkSize)
-                if working[s..<working.endIndex] == last {
-                    working = String(working[..<s])
+            // Found repetition. Count how many consecutive identical
+            // chunks of this size exist at the end, then strip all but
+            // one — mirroring the token-level matchCount-1 logic below.
+            // The previous version stripped while-the-tail-matched which
+            // ate into the FIRST instance when chunkSize misaligned with
+            // the natural block boundary (e.g. a 42-char repeating block
+            // detected at chunkSize 40 → the leading 2 chars of every
+            // block survived, but the FINAL VALUE of the first instance
+            // got chopped off). See Docs/Evolutionary_Salon_Report_2026-05-15.md
+            // section 5 for the trace that surfaced this bug.
+            var matchCount = 2  // last + prior already known to match
+            var cursor = working.count - chunkSize * 2
+            while cursor >= chunkSize {
+                let s = working.index(working.startIndex, offsetBy: cursor - chunkSize)
+                let e = working.index(working.startIndex, offsetBy: cursor)
+                if working[s..<e] == last {
+                    matchCount += 1
+                    cursor -= chunkSize
                 } else {
                     break
                 }
             }
+            // Preserve one full instance — strip (matchCount - 1) chunks.
+            let cutCount = (matchCount - 1) * chunkSize
+            working = String(working.dropLast(cutCount))
             break  // done — paragraph repetition is handled
         }
     }
@@ -4621,11 +4652,17 @@ fileprivate func trimTrailingRepetition(in text: String) -> String {
         }
     }
 
-    // Normalize trailing whitespace and append ellipsis if we actually
-    // stripped something visible.
+    // Normalize trailing whitespace and append a randomized in-voice
+    // closing phrase if we actually stripped something visible. Picks
+    // one of six phrases at random so users see WHY the response ended
+    // mid-thought, not a silent cut-off. Each phrase carries the U+2026
+    // truncation marker internally.
     let cleaned = working.trimmingCharacters(in: .whitespacesAndNewlines)
     if cleaned.count < text.trimmingCharacters(in: .whitespacesAndNewlines).count {
-        return cleaned + "\u{2026}"
+        let phrase = repetitionStopPhrases.randomElement() ?? "\u{2026}"
+        // Single space separator so the phrase reads as a continuation
+        // rather than running together with the preserved instance.
+        return cleaned + " " + phrase
     }
     return cleaned
 }
