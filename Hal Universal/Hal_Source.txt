@@ -6563,32 +6563,35 @@ struct ActionsView: View {
 
             // Per Strategic §4: per-model Layer 1 framing.
             //
-            // May-15 refactor — the inline display (toggle + greyed text
-            // block + caption) was replaced with a System-Prompt-style
-            // navigation row that opens a detail sheet (see
-            // ModelFramingDetailView). Same data, same semantics —
-            // visible-but-not-editable text, user-toggleable apply switch,
-            // model-specific. The row only appears for models that have
-            // a non-empty Layer 1 prompt.
-            if let layerOne = chatViewModel.selectedModel.layerOnePrompt?
-                .trimmingCharacters(in: .whitespacesAndNewlines),
-               !layerOne.isEmpty
-            {
-                Button {
-                    showingModelFramingDetail = true
-                } label: {
-                    HStack {
-                        Text("Model framing for \(chatViewModel.selectedModel.displayName)")
-                        Spacer()
-                        Image(systemName: "chevron.right")
-                            .font(.caption)
-                            .foregroundColor(.secondary)
-                    }
+            // May-15 refactor — the inline display was replaced with a
+            // System-Prompt-style navigation row that opens a detail
+            // sheet (see ModelFramingDetailView). Same data, same
+            // semantics — visible-but-not-editable text, user-toggleable
+            // apply switch, model-specific.
+            //
+            // May-16 fix — the row is now ALWAYS shown, including for
+            // models like Gemma and Llama whose layerOnePrompt is
+            // intentionally empty (they follow the universal Layer 2
+            // without needing per-model framing). Previously the row was
+            // gated on `!layerOne.isEmpty`, which made it invisible for
+            // those models — Mark couldn't find it on Gemma. The detail
+            // sheet explains the empty case inline ("No model-specific
+            // framing for X — this model follows only the universal
+            // System Prompt"). Discoverability > short-term cleanliness.
+            Button {
+                showingModelFramingDetail = true
+            } label: {
+                HStack {
+                    Text("Model framing for \(chatViewModel.selectedModel.displayName)")
+                    Spacer()
+                    Image(systemName: "chevron.right")
+                        .font(.caption)
+                        .foregroundColor(.secondary)
                 }
-                .foregroundColor(.primary)
-                .disabled(isSalonActive)
-                .opacity(isSalonActive ? 0.45 : 1.0)
             }
+            .foregroundColor(.primary)
+            .disabled(isSalonActive)
+            .opacity(isSalonActive ? 0.45 : 1.0)
 
             Button {
                 showingSystemPromptEditor = true
@@ -7526,19 +7529,29 @@ struct ModelFramingDetailView: View {
             Form {
                 Section {
                     Toggle("Apply this framing", isOn: framingEnabled)
+                        .disabled(layerOneText.isEmpty)
                 } footer: {
-                    Text("When enabled, the framing below is prepended to Hal's system prompt for \(chatViewModel.selectedModel.displayName) only. Disable to use only the universal System Prompt.")
-                        .font(.caption2)
+                    if layerOneText.isEmpty {
+                        Text("\(chatViewModel.selectedModel.displayName) has no model-specific framing. It runs only against the universal System Prompt. The toggle has no effect for this model.")
+                            .font(.caption2)
+                    } else {
+                        Text("When enabled, the framing below is prepended to Hal's system prompt for \(chatViewModel.selectedModel.displayName) only. Disable to use only the universal System Prompt.")
+                            .font(.caption2)
+                    }
                 }
 
                 Section {
-                    Text(layerOneText.isEmpty
-                        ? "(No model-specific framing for \(chatViewModel.selectedModel.displayName).)"
-                        : layerOneText)
-                        .font(.system(.callout, design: .monospaced))
-                        .textSelection(.enabled)
-                        .foregroundColor(layerOneText.isEmpty ? .secondary : .primary)
-                        .padding(.vertical, 4)
+                    if layerOneText.isEmpty {
+                        Text("(No model-specific framing for \(chatViewModel.selectedModel.displayName) — this model follows the universal Maxim guidance well enough that no per-model correction was needed.)")
+                            .font(.callout)
+                            .foregroundColor(.secondary)
+                            .padding(.vertical, 4)
+                    } else {
+                        Text(layerOneText)
+                            .font(.system(.callout, design: .monospaced))
+                            .textSelection(.enabled)
+                            .padding(.vertical, 4)
+                    }
                 } header: {
                     Text("Framing text")
                 } footer: {
