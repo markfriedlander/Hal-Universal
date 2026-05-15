@@ -5774,7 +5774,17 @@ struct ActionsView: View {
                 personalitySection
                 importExportSection
                 modelSection
-                watchSection
+                // watchSection — frozen May-14, 2026. Apple Watch feature is
+                // not user-visible in v1.x. The underlying code remains intact
+                // (AppDelegate bridge, processWatchIncomingMessage, the
+                // Hal Universal Watch + HalWatchComplicationExtension build
+                // targets) so it can be reactivated by un-commenting this
+                // line. Decision rationale: the iOS WatchConnectivity
+                // platform does not reliably support cold-launch of the
+                // iPhone companion app, which makes the Watch use case
+                // (talk to Hal when the iPhone isn't in hand) inconsistent
+                // in a way that violates Mark's "never silently fail"
+                // principle.
                 powerUserSection
             }
             .navigationTitle("Settings")
