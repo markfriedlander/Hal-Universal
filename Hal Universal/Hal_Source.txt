@@ -6365,6 +6365,7 @@ struct ActionsView: View {
     @State private var showingSalonModeSheet = false
     @State private var powerUserMode: PowerUserMode = .single
     @State private var showingSystemPromptEditor = false
+    @State private var showingModelFramingDetail = false
     @State private var showingSelfReflectionViewer = false
     @State private var initialSettingsSnapshot: [String: Any] = [:]
     @State private var skipComparisonOnDismiss = false
@@ -6424,6 +6425,10 @@ struct ActionsView: View {
         }
         .sheet(isPresented: $showingSystemPromptEditor) {
             SystemPromptEditorView()
+                .environmentObject(chatViewModel)
+        }
+        .sheet(isPresented: $showingModelFramingDetail) {
+            ModelFramingDetailView()
                 .environmentObject(chatViewModel)
         }
         .onAppear {
@@ -6528,61 +6533,61 @@ struct ActionsView: View {
     // These settings are front-and-center because they're what users adjust most frequently when
     // experimenting with different tasks (creative writing vs technical analysis) or different models.
     
+    /// True while the user has Salon Mode enabled. Per-model controls
+    /// (Model Framing, Temperature, RAG settings, memory depth, etc.)
+    /// are visible but disabled in this state — the active "model" is
+    /// a multi-seat ensemble, not a single configuration. Global toggles
+    /// (Self-Knowledge, the universal System Prompt) stay editable
+    /// because they apply regardless of how many voices are speaking.
+    /// (Mark's May-15 directive.)
+    private var isSalonActive: Bool {
+        chatViewModel.salonConfig.isEnabled
+    }
+
     private var personalitySection: some View {
         Section {
+            // Salon-mode banner — placed at the top of the personality
+            // section so the user sees the lockout reason BEFORE the
+            // disabled controls. Only renders when salon is active.
+            if isSalonActive {
+                HStack(alignment: .top, spacing: 6) {
+                    Image(systemName: "person.3.fill")
+                        .foregroundColor(.orange)
+                        .imageScale(.small)
+                    Text("Individual model settings are locked during Salon conversations. Exit Salon Mode to adjust.")
+                        .font(.caption)
+                        .foregroundColor(.secondary)
+                }
+                .padding(.vertical, 4)
+            }
+
             // Per Strategic §4: per-model Layer 1 framing.
-            // Visible to the user, toggleable, NOT user-editable. The text
-            // is empty for most models (they follow the universal Layer 2
-            // well enough); AFM, Qwen, and Dolphin have non-empty Layer 1
-            // prompts informed by the §2 Maxim sweep + §11 AFM experiment.
+            //
+            // May-15 refactor — the inline display (toggle + greyed text
+            // block + caption) was replaced with a System-Prompt-style
+            // navigation row that opens a detail sheet (see
+            // ModelFramingDetailView). Same data, same semantics —
+            // visible-but-not-editable text, user-toggleable apply switch,
+            // model-specific. The row only appears for models that have
+            // a non-empty Layer 1 prompt.
             if let layerOne = chatViewModel.selectedModel.layerOnePrompt?
                 .trimmingCharacters(in: .whitespacesAndNewlines),
                !layerOne.isEmpty
             {
-                VStack(alignment: .leading, spacing: 8) {
-                    Toggle(isOn: Binding(
-                        get: {
-                            ModelSettingsStore.shared
-                                .effectiveSettings(for: chatViewModel.selectedModel)
-                                .layerOnePromptEnabled ?? true
-                        },
-                        set: { newValue in
-                            // Layer 1 toggle lives entirely in the override
-                            // JSON (no @AppStorage backing), so write directly
-                            // via the dedicated setter. This preserves any
-                            // other override fields for this model.
-                            ModelSettingsStore.shared.setLayerOnePromptEnabled(
-                                newValue,
-                                for: chatViewModel.selectedModelID
-                            )
-                            // The store is a singleton, not @Published — the
-                            // Toggle's binding wouldn't auto-refresh without
-                            // an explicit nudge to the view model's publisher.
-                            chatViewModel.objectWillChange.send()
-                        }
-                    )) {
-                        HStack(spacing: 6) {
-                            Text("Model framing for \(chatViewModel.selectedModel.displayName)")
-                                .font(.subheadline)
-                                .fontWeight(.medium)
-                            Image(systemName: "info.circle")
-                                .font(.caption)
-                                .foregroundColor(.blue)
-                        }
+                Button {
+                    showingModelFramingDetail = true
+                } label: {
+                    HStack {
+                        Text("Model framing for \(chatViewModel.selectedModel.displayName)")
+                        Spacer()
+                        Image(systemName: "chevron.right")
+                            .font(.caption)
+                            .foregroundColor(.secondary)
                     }
-
-                    Text(layerOne)
-                        .font(.caption)
-                        .foregroundColor(.secondary)
-                        .padding(8)
-                        .background(Color.gray.opacity(0.08))
-                        .cornerRadius(6)
-                        .textSelection(.enabled)
-
-                    Text("Per-model framing that Hal applies to compensate for this model's specific tendencies. Visible to you, but not editable. Disable if you'd rather use only the universal System Prompt below.")
-                        .font(.caption2)
-                        .foregroundColor(.secondary)
                 }
+                .foregroundColor(.primary)
+                .disabled(isSalonActive)
+                .opacity(isSalonActive ? 0.45 : 1.0)
             }
 
             Button {
@@ -6654,6 +6659,8 @@ struct ActionsView: View {
                     .font(.caption)
                     .foregroundColor(.secondary)
             }
+            .disabled(isSalonActive)
+            .opacity(isSalonActive ? 0.45 : 1.0)
         } header: {
             Label("Personality", systemImage: "theatermasks")
         } footer: {
@@ -6892,11 +6899,20 @@ struct PowerUserView: View {
     @Environment(\.dismiss) var dismiss
     @EnvironmentObject var chatViewModel: ChatViewModel
     @EnvironmentObject var mlxDownloader: MLXModelDownloader
-    
+
     @State private var showingNuclearResetConfirmationAlert = false
     @State private var showingClearCacheAlert = false
     @State private var showResetSettingsAlert = false
     @State private var sliderStartValues: [String: Double] = [:]
+
+    /// Per Mark's May-15 directive — per-model controls (memory depth,
+    /// RAG thresholds, etc.) are visible but disabled while Salon Mode
+    /// is active, because the "active model" is then an ensemble rather
+    /// than a single configuration. Global controls (self-knowledge
+    /// half-life, identity floor) stay editable.
+    private var isSalonActive: Bool {
+        chatViewModel.salonConfig.isEnabled
+    }
     
     var body: some View {
         NavigationView {
@@ -6954,8 +6970,20 @@ struct PowerUserView: View {
     private var memorySection: some View {
         Section {
             VStack(alignment: .leading, spacing: 16) {
+                if isSalonActive {
+                    HStack(alignment: .top, spacing: 6) {
+                        Image(systemName: "person.3.fill")
+                            .foregroundColor(.orange)
+                            .imageScale(.small)
+                        Text("Per-model memory settings are locked during Salon conversations. Exit Salon Mode to adjust.")
+                            .font(.caption)
+                            .foregroundColor(.secondary)
+                    }
+                }
+
+                Group {
                 SectionHeaderText(text: "SHORT-TERM MEMORY")
-                
+
                 LabeledSliderControl(
                     label: "Memory Depth",
                     value: Binding(
@@ -7054,9 +7082,12 @@ struct PowerUserView: View {
                     helperText: "Model limit: \(chatViewModel.maxRAGCharsForModel) chars (\(chatViewModel.selectedModel.displayName))",
                     isModified: Int(chatViewModel.maxRagSnippetsCharacters) != (chatViewModel.selectedModel.defaultSettings?.maxRagSnippetsCharacters ?? 800)
                 )
-                
+                }  // end per-model Group
+                .disabled(isSalonActive)
+                .opacity(isSalonActive ? 0.45 : 1.0)
+
                 Divider()
-                
+
                 SectionHeaderText(text: "SELF-KNOWLEDGE")
                 
                 LabeledSliderControl(
@@ -7439,7 +7470,95 @@ struct SystemPromptEditorView: View {
 
 
 // ==== LEGO END: 10.3 SystemPromptEditorView ====
-    
+
+
+// ==== LEGO START: 10.3.5 ModelFramingDetailView ====
+//
+// Per-model "Layer 1" framing prompt detail screen. Replaces the earlier
+// inline display (toggle + greyed-text block) that lived directly in the
+// personality section, with a System-Prompt-style row that navigates to
+// this detail view.
+//
+// What it shows:
+//   - The active model's display name in the title bar
+//   - The Layer 1 prompt text (read-only, monospaced for clarity that
+//     it's prompt content, NOT user-editable as Mark directed)
+//   - The "Apply this framing" toggle
+//   - Explanation of what Layer 1 is and why it exists
+//
+// What it does NOT do:
+//   - Allow editing the prompt text. Mark's directive: "Text visible
+//     but not editable." Layer 1 is CC-authored to compensate for
+//     specific per-model tendencies; user edits would defeat the
+//     calibration. The toggle is the user's lever.
+//
+// When the active model has no Layer 1 prompt (empty string), the
+// settings page doesn't surface this row at all. The detail view
+// therefore can safely assume non-empty text in its body.
+struct ModelFramingDetailView: View {
+    @Environment(\.dismiss) var dismiss
+    @EnvironmentObject var chatViewModel: ChatViewModel
+
+    private var layerOneText: String {
+        chatViewModel.selectedModel.layerOnePrompt?
+            .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+    }
+
+    private var framingEnabled: Binding<Bool> {
+        Binding(
+            get: {
+                ModelSettingsStore.shared
+                    .effectiveSettings(for: chatViewModel.selectedModel)
+                    .layerOnePromptEnabled ?? true
+            },
+            set: { newValue in
+                ModelSettingsStore.shared.setLayerOnePromptEnabled(
+                    newValue,
+                    for: chatViewModel.selectedModelID
+                )
+                chatViewModel.objectWillChange.send()
+            }
+        )
+    }
+
+    var body: some View {
+        NavigationView {
+            Form {
+                Section {
+                    Toggle("Apply this framing", isOn: framingEnabled)
+                } footer: {
+                    Text("When enabled, the framing below is prepended to Hal's system prompt for \(chatViewModel.selectedModel.displayName) only. Disable to use only the universal System Prompt.")
+                        .font(.caption2)
+                }
+
+                Section {
+                    Text(layerOneText.isEmpty
+                        ? "(No model-specific framing for \(chatViewModel.selectedModel.displayName).)"
+                        : layerOneText)
+                        .font(.system(.callout, design: .monospaced))
+                        .textSelection(.enabled)
+                        .foregroundColor(layerOneText.isEmpty ? .secondary : .primary)
+                        .padding(.vertical, 4)
+                } header: {
+                    Text("Framing text")
+                } footer: {
+                    Text("Per-model framing that Hal applies to compensate for this model's specific tendencies. CC-authored from on-device testing and informed by the Maxim sweep. Visible to you but not editable — user edits would defeat the calibration.")
+                        .font(.caption2)
+                }
+            }
+            .navigationTitle("Model Framing")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .confirmationAction) {
+                    Button("Done") { dismiss() }
+                }
+            }
+        }
+    }
+}
+
+// ==== LEGO END: 10.3.5 ModelFramingDetailView ====
+
 
 
 // ==== LEGO START: 10.4 SalonModeView (Multi-LLM Configuration) ====
