@@ -6145,10 +6145,26 @@ struct iOSChatView: View {
                             userHasScrolled = false
                             if let latestUser = chatViewModel.messages.last(where: { $0.isFromUser }) {
                                 pinnedExchangeID = latestUser.id
-                                halLog("HALDEBUG-SCROLL: Anchor engaged on user message \(latestUser.id.uuidString.prefix(8)) (\(latestUser.content.count) chars)")
+                                // Long-user-message heuristic (per Mark 5/16):
+                                // when the user's message is taller than ~half
+                                // the visible area, anchor to .bottom of the
+                                // user message so the END of their question
+                                // sits at the top of the visible area and
+                                // Hal's response begins right below — visible
+                                // without scrolling. For shorter messages,
+                                // anchor to .top so the user can re-read their
+                                // question + see the response in the same view.
+                                //
+                                // Character count is a rough proxy for height.
+                                // ~400 chars at default font on iPhone 16 Plus
+                                // is roughly half the visible chat area.
+                                // Tunable based on hand-test feedback.
+                                let useBottomAnchor = latestUser.content.count > 400
+                                let anchor: UnitPoint = useBottomAnchor ? .bottom : .top
+                                halLog("HALDEBUG-SCROLL: Anchor engaged on user message \(latestUser.id.uuidString.prefix(8)) (\(latestUser.content.count) chars, anchor: \(useBottomAnchor ? "bottom" : "top"))")
                                 DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
                                     withAnimation(.easeOut(duration: 0.3)) {
-                                        proxy.scrollTo(latestUser.id, anchor: .top)
+                                        proxy.scrollTo(latestUser.id, anchor: anchor)
                                     }
                                 }
                             }
