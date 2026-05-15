@@ -12058,7 +12058,8 @@ class ChatViewModel: ObservableObject {
                                                                         // Subsequent steps will fold in: conversation history as turn pairs,
                                                                         // temporal context, summary, RAG snippets, self-knowledge. See
                                                                         // HANDOFF_BRIEF "prompt format" section for rationale.
-                                                                        func buildChatMessages(currentInput: String) async -> [HalChatMessage] {
+                                                                        func buildChatMessages(currentInput: String,
+                                                                                               historyOverride: [ChatMessage]? = nil) async -> [HalChatMessage] {
                                                                             halLog("HALDEBUG-CHAT: Building chat messages for input: '\(currentInput.prefix(60))…'")
 
                                                                             var msgs: [HalChatMessage] = []
@@ -12175,7 +12176,14 @@ class ChatViewModel: ObservableObject {
                                                                             //
                                                                             // Depth: effectiveMemoryDepth turns × 2 messages-per-turn.
                                                                             let historyDepth = effectiveMemoryDepth * 2
-                                                                            let nonPartial = messages.filter { !$0.isPartial }
+                                                                            // History source: if `historyOverride` is provided (used by
+                                                                            // Salon Mode's independent path — each seat must see the
+                                                                            // conversation as it was BEFORE any seat ran this turn, not
+                                                                            // the live `messages` array which already contains earlier
+                                                                            // seats' responses), use it. Otherwise fall back to the live
+                                                                            // array. See Docs/Two_Bug_Diagnosis_2026-05-15.md.
+                                                                            let historySource = historyOverride ?? messages
+                                                                            let nonPartial = historySource.filter { !$0.isPartial }
                                                                             let trailingIsCurrentTurn: Bool = {
                                                                                 guard let last = nonPartial.last else { return false }
                                                                                 return last.isFromUser && last.content == currentInput
@@ -12917,7 +12925,10 @@ class ChatViewModel: ObservableObject {
                                                                         }
                                                                         try? await Task.sleep(nanoseconds: 200_000_000)
 
-                                                                        let chatMessages = await buildChatMessages(currentInput: userInput)
+                                                                        let chatMessages = await buildChatMessages(
+                                                                            currentInput: userInput,
+                                                                            historyOverride: historyMessagesOverride
+                                                                        )
                                                                         // For diagnostics & legacy fields (fullPromptUsed, tokenBreakdown), keep
                                                                         // a synthetic "prompt" string that approximates what was sent.
                                                                         let prompt = chatMessages.map { "[\($0.role.rawValue)] \($0.content)" }.joined(separator: "\n\n")
