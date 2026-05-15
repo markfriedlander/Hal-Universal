@@ -4739,8 +4739,36 @@ class MLXWrapper: ObservableObject {
 
     // NEW: Function to unload the MLX model and free memory
     func unloadModel() {
-        print("HALDEBUG-MLX: Unloading MLX model...")
-        
+        // Diagnostic memory snapshot — entry. Helps us see whether
+        // jetsam pressure is creeping up across salon swaps. Use
+        // halLog (not print) so the lines surface in the API log
+        // buffer for post-hoc inspection.
+        let memBefore = MLX.Memory.snapshot()
+        let mb = { (b: Int) -> String in String(format: "%.1f MB", Double(b) / (1024.0 * 1024.0)) }
+        halLog("HALDEBUG-MEMORY: unloadModel ENTRY active=\(mb(memBefore.activeMemory)) cache=\(mb(memBefore.cacheMemory)) peak=\(mb(memBefore.peakMemory))")
+
+        halLog("HALDEBUG-MLX: Unloading MLX model...")
+
+        // GPU SYNC BARRIER. Before tearing down this model's state,
+        // wait for all in-flight Metal command buffers from its
+        // generation to complete. Without this, a fast salon model
+        // swap can race with the previous model's still-pending
+        // buffers; their completion handlers then fire against
+        // backing memory that ARC has just freed, the buffers come
+        // back with .error non-nil, and MLX's
+        // mlx::core::gpu::check_error throws an uncaught C++
+        // exception → SIGABRT. The May-12 .ips on Mark's laptop
+        // shows exactly this stack. See
+        // Docs/Two_Bug_Diagnosis_2026-05-15.md.
+        // Synchronous; will block for whatever time the GPU needs
+        // to drain (usually milliseconds, rarely more than ~500ms
+        // even under heavy load).
+        if modelContainer != nil {
+            halLog("HALDEBUG-MLX: Draining in-flight GPU work before unload...")
+            MLX.Stream.gpu.synchronize()
+            halLog("HALDEBUG-MLX: GPU drain complete; proceeding to release model.")
+        }
+
         // Clear the model container to release memory
         modelContainer = nil
         
@@ -4753,7 +4781,13 @@ class MLXWrapper: ObservableObject {
         loadingMessage = "Model unloaded"
         mlxError = nil
         
-        print("HALDEBUG-MLX: MLX model unloaded successfully. Memory freed.")
+        halLog("HALDEBUG-MLX: MLX model unloaded successfully. Memory freed.")
+
+        // Diagnostic memory snapshot — exit. Compare to entry to see
+        // how much memory the unload actually freed.
+        let memAfter = MLX.Memory.snapshot()
+        let delta = memBefore.delta(memAfter)
+        halLog("HALDEBUG-MEMORY: unloadModel EXIT  active=\(mb(memAfter.activeMemory)) cache=\(mb(memAfter.cacheMemory)) peak=\(mb(memAfter.peakMemory)) | Δactive=\(mb(delta.activeMemory)) Δcache=\(mb(delta.cacheMemory))")
     }
 
     // TEMPERATURE CHANGE 1/6: Add temperature parameter with default
