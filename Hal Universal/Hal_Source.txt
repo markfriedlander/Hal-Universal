@@ -5282,16 +5282,48 @@ struct HistoricalContext {
 }
 
 // MARK: - App Entry Point (for iOS)
-// MARK: - App Delegate (background URLSession dispatch)
+// MARK: - App Delegate (background URLSession dispatch + Watch bridge bootstrap)
 //
-// SwiftUI's @main App lifecycle doesn't directly expose
-// `application:handleEventsForBackgroundURLSession:completionHandler:`,
-// which iOS calls when the system wakes the app to deliver completion
-// events for a background URLSession (used by the model downloader so
-// downloads continue while the app is suspended or terminated).
-// `UIApplicationDelegateAdaptor` bridges UIKit's AppDelegate methods
-// into SwiftUI's App.
-class HalAppDelegate: NSObject, UIApplicationDelegate {
+// SwiftUI's @main App lifecycle doesn't directly expose UIKit AppDelegate
+// methods like `application:didFinishLaunchingWithOptions:` and
+// `application:handleEventsForBackgroundURLSession:completionHandler:`.
+// `UIApplicationDelegateAdaptor` (below) bridges UIKit's AppDelegate
+// methods into SwiftUI's App lifecycle.
+//
+// Two responsibilities live here:
+//
+//  1. Background URLSession completion dispatch — iOS calls
+//     handleEventsForBackgroundURLSession when it wakes the app to deliver
+//     completion events for a background download (used by the model
+//     downloader so downloads survive app suspension).
+//
+//  2. HalWatchBridge bootstrap — instantiate the WCSessionDelegate at
+//     didFinishLaunchingWithOptions so the bridge is wired even when iOS
+//     cold-launches the app in the background (in response to a Watch
+//     message arriving while the app was never opened, or was suspended
+//     long enough to be terminated). Previously the bridge was created
+//     in iOSChatView.onAppear, which only fires once the chat view comes
+//     onto screen — useless for the actual Watch use case where the
+//     iPhone is in someone's pocket and the chat view never appears.
+final class HalAppDelegate: NSObject, UIApplicationDelegate {
+
+    // Strong reference so the bridge (and its WCSession.default delegate
+    // registration) survives for the lifetime of the process.
+    private var watchBridge: HalWatchBridge?
+
+    func application(_ application: UIApplication,
+                     didFinishLaunchingWithOptions launchOptions: [UIApplication.LaunchOptionsKey: Any]? = nil) -> Bool {
+        // Build the bridge against the shared VM singleton. Touching
+        // ChatViewModel.shared here triggers its lazy `static let` init —
+        // happens once, on the main thread, exactly when we need it.
+        // The bridge constructor then calls WCSession.activate() so the
+        // session is ready for incoming Watch messages before any view
+        // body has run.
+        watchBridge = HalWatchBridge(chatViewModel: ChatViewModel.shared)
+        halLog("HALDEBUG-WATCH: AppDelegate bootstrapped HalWatchBridge at didFinishLaunchingWithOptions (cold-launch ready).")
+        return true
+    }
+
     func application(_ application: UIApplication,
                      handleEventsForBackgroundURLSession identifier: String,
                      completionHandler: @escaping () -> Void) {
@@ -5307,7 +5339,13 @@ class HalAppDelegate: NSObject, UIApplicationDelegate {
 @main
 struct Hal10000App: App {
     @UIApplicationDelegateAdaptor(HalAppDelegate.self) var appDelegate
-    @StateObject private var chatViewModel = ChatViewModel()
+    // Use the shared singleton so the AppDelegate-created bridge talks
+    // to the same VM instance the UI is bound to. @StateObject wrapping
+    // a singleton works correctly — the wrapper just observes the same
+    // object across re-renders without trying to recreate it (same
+    // pattern as DocumentImportManager.shared / MLXModelDownloader.shared
+    // below).
+    @StateObject private var chatViewModel = ChatViewModel.shared
     @StateObject private var documentImportManager = DocumentImportManager.shared
     @StateObject private var mlxDownloader = MLXModelDownloader.shared // Inject MLXModelDownloader
 
@@ -5343,7 +5381,9 @@ struct iOSChatView: View {
     // Sheet flags moved to ChatViewModel.showingSettings / showingThreadPanel /
     // showingDocumentPicker so the LocalAPIServer can read them via GET_UI_STATE.
     @FocusState private var isInputFocused: Bool // NEW: Track text field focus
-    @State private var watchBridge: HalWatchBridge? = nil
+    // watchBridge previously lived here as @State; moved to HalAppDelegate
+    // so it survives the case where iOSChatView never appears (background
+    // cold-launch via Watch message).
     @State private var userHasScrolled = false
 
     var body: some View {
@@ -5417,12 +5457,13 @@ struct iOSChatView: View {
                                 proxy.scrollTo("bottom", anchor: .bottom)
                             }
                         }
-                        
-                        // NEW: Initialize watch bridge on app launch
-                        if watchBridge == nil {
-                            watchBridge = HalWatchBridge(chatViewModel: chatViewModel)
-                            print("HALDEBUG-WATCH: Bridge initialized in iOSChatView")
-                        }
+                        // NOTE (May-14): HalWatchBridge is now bootstrapped
+                        // in HalAppDelegate.didFinishLaunchingWithOptions —
+                        // it's wired even when iOS cold-launches the app in
+                        // the background in response to a Watch message.
+                        // Previously this onAppear was the bridge's only
+                        // init site, which broke the actual Watch use case
+                        // (iPhone in pocket, chat view never appears).
                     }
                     .onChange(of: chatViewModel.messages.count) { oldValue, newValue in
                         // Only auto-scroll if user hasn't manually scrolled away
@@ -9391,6 +9432,16 @@ struct HalChatMessage {
 
 @MainActor
 class ChatViewModel: ObservableObject {
+    // Shared singleton so AppDelegate.didFinishLaunchingWithOptions can
+    // access the VM at cold-launch time (before any SwiftUI body runs)
+    // for HalWatchBridge construction. Pattern matches the existing
+    // `DocumentImportManager.shared` / `MLXModelDownloader.shared`
+    // singletons that this App struct already consumes. Lazy `static let`
+    // initialization runs on first access — same main-thread timing the
+    // App struct's `@StateObject = ChatViewModel()` would have produced,
+    // just earlier if AppDelegate touches it first.
+    static let shared = ChatViewModel()
+
     @Published var messages: [ChatMessage] = []
     @Published var currentMessage: String = ""
     @Published var isSendingMessage: Bool = false
