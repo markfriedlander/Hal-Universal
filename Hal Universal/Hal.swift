@@ -1990,7 +1990,100 @@ class MemoryStore: ObservableObject {
             
             print("HALDEBUG-REFLECTION: ✓ Stored \(typeLabel) reflection at turn \(turnNumber) (\(freeFormText.count) chars)")
         }
-        
+
+        // MARK: - Synthesis helpers (May-15)
+        //
+        // Used by reflectOnExperience to merge a newly-generated reflection
+        // into a semantically-similar existing reflection rather than
+        // accumulating near-duplicate entries. Mark's directive: "Self-
+        // knowledge grows in depth, not volume."
+
+        /// Return (id, freeFormText) tuples for every raw reflection currently
+        /// in the store. Used as the comparison set for similarity-driven
+        /// synthesis at write time.
+        func getReflectionRecordsForSimilarity() -> [(id: String, text: String)] {
+            guard ensureHealthyConnection() else { return [] }
+
+            let sql = """
+            SELECT id, value
+            FROM self_knowledge
+            WHERE format = 'raw_reflection' AND deleted_at IS NULL
+            ORDER BY created_at DESC
+            """
+
+            var stmt: OpaquePointer?
+            var results: [(String, String)] = []
+            if sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK {
+                while sqlite3_step(stmt) == SQLITE_ROW {
+                    if let idPtr = sqlite3_column_text(stmt, 0),
+                       let valPtr = sqlite3_column_text(stmt, 1) {
+                        results.append((String(cString: idPtr), String(cString: valPtr)))
+                    }
+                }
+            }
+            sqlite3_finalize(stmt)
+            return results
+        }
+
+        /// Replace an existing reflection's text in place. Used after
+        /// synthesis — the new "deeper" reflection takes over the old
+        /// entry's row (id stays stable so any references survive),
+        /// updated_at gets bumped, reinforcement_count increments, and
+        /// notes are extended with a synthesis breadcrumb.
+        ///
+        /// Returns true on successful update; false if the row didn't
+        /// exist or the SQL bind failed.
+        @discardableResult
+        func updateReflectionText(id: String, newText: String, synthesisNote: String) -> Bool {
+            guard ensureHealthyConnection() else { return false }
+            let now = Int(Date().timeIntervalSince1970)
+
+            let sql = """
+            UPDATE self_knowledge
+            SET value = ?,
+                notes = COALESCE(notes, '') || ' | ' || ?,
+                updated_at = ?,
+                last_reinforced = ?,
+                reinforcement_count = reinforcement_count + 1
+            WHERE id = ? AND format = 'raw_reflection' AND deleted_at IS NULL
+            """
+
+            var stmt: OpaquePointer?
+            var ok = false
+            if sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK {
+                sqlite3_bind_text(stmt, 1, (newText as NSString).utf8String, -1, nil)
+                sqlite3_bind_text(stmt, 2, (synthesisNote as NSString).utf8String, -1, nil)
+                sqlite3_bind_int64(stmt, 3, Int64(now))
+                sqlite3_bind_int64(stmt, 4, Int64(now))
+                sqlite3_bind_text(stmt, 5, (id as NSString).utf8String, -1, nil)
+                if sqlite3_step(stmt) == SQLITE_DONE {
+                    ok = sqlite3_changes(db) > 0
+                }
+            }
+            sqlite3_finalize(stmt)
+            return ok
+        }
+
+        /// One-shot targeted reset: delete every reflection and self-
+        /// knowledge entry, preserving conversations/threads/unified
+        /// content. Used to wipe testing-artifact data (junk reflections
+        /// from broken-conditions test runs) before a clean restart.
+        /// Returns the count of rows deleted.
+        @discardableResult
+        func resetSelfKnowledgeAndReflections() -> Int {
+            guard ensureHealthyConnection() else { return 0 }
+            var deletedTotal = 0
+            // Hard delete — these are test artifacts. The deleted_at soft-
+            // delete pattern is meant for traits the model has chosen to
+            // retire; a full reset should leave no trace.
+            let sql = "DELETE FROM self_knowledge WHERE deleted_at IS NULL OR deleted_at IS NOT NULL"
+            if sqlite3_exec(db, sql, nil, nil, nil) == SQLITE_OK {
+                deletedTotal = Int(sqlite3_changes(db))
+            }
+            print("HALDEBUG-REFLECTION: Reset wiped \(deletedTotal) self_knowledge rows (reflections + traits).")
+            return deletedTotal
+        }
+
         // MODIFIED: Retrieve shareable reflections from self_knowledge WHERE format='raw_reflection'
         func getShareableReflections() -> [(id: String, conversationId: String, timestamp: Int, reflectionType: Int, freeFormText: String, turnNumber: Int, modelId: String)] {
             guard ensureHealthyConnection() else {
@@ -2845,9 +2938,171 @@ class MemoryStore: ObservableObject {
 // ==== LEGO START: 4.3 MemoryStore (Self-Reflection Orchestration) ====
 
     // MARK: - Self-Reflection System
-    
+
     extension MemoryStore {
-        
+
+        // MARK: - Reflection synthesis at write time (May-15)
+        //
+        // Before storing a freshly-generated reflection, check it for
+        // semantic overlap with every existing raw reflection. If any
+        // match scores above the synthesis threshold (default 0.85,
+        // matching ragDedupSimilarityThreshold), ask the model to
+        // synthesize the two into a single deeper thought. The
+        // synthesized text replaces the older entry's value in-place;
+        // the new reflection is NOT inserted as a separate row.
+        //
+        // Why this matters: reflections about "the same kind of moment"
+        // would otherwise accumulate as a wall of near-duplicates,
+        // making the self-knowledge store grow in volume but not in
+        // depth. Synthesis is how human memory actually consolidates —
+        // repeated impressions of the same concept merge into a single
+        // more general principle rather than a stack of receipts.
+        //
+        // Threshold rationale: 0.85 is conservative. Apple's NLEmbedding
+        // sentence vectors score most English text >0.6 just from
+        // shared language structure, so 0.85 requires real conceptual
+        // overlap. False negatives (two related thoughts stored
+        // separately) are recoverable later via consolidation passes;
+        // false positives (merging unrelated thoughts) corrupt the
+        // store. Conservative bias toward false negatives is right.
+        //
+        // Fallback chain — if anything in this path fails, we MUST still
+        // persist the reflection rather than silently drop it:
+        //   - No existing reflections        → normal storeReflection
+        //   - Similarity below threshold     → normal storeReflection
+        //   - Synthesis call throws/empty    → normal storeReflection
+        //   - DB update fails                → normal storeReflection
+        func storeReflectionWithSynthesis(
+            conversationId: String,
+            verifiedReflection: String,
+            reflectionType: Int,
+            turnNumber: Int,
+            modelId: String,
+            llmService: LLMService,
+            synthesisThreshold: Double = 0.85
+        ) async {
+            let existing = getReflectionRecordsForSimilarity()
+            guard !existing.isEmpty else {
+                // No prior reflections — nothing to synthesize against.
+                storeReflection(
+                    conversationId: conversationId,
+                    freeFormText: verifiedReflection,
+                    reflectionType: reflectionType,
+                    turnNumber: turnNumber,
+                    modelId: modelId,
+                    shareable: true
+                )
+                return
+            }
+
+            let newEmbed = generateEmbedding(for: verifiedReflection)
+            guard !newEmbed.isEmpty else {
+                // Embedding failed — fall back to normal store (don't lose the reflection).
+                print("HALDEBUG-REFLECTION: Embedding failed for new reflection; storing without synthesis check.")
+                storeReflection(
+                    conversationId: conversationId,
+                    freeFormText: verifiedReflection,
+                    reflectionType: reflectionType,
+                    turnNumber: turnNumber,
+                    modelId: modelId,
+                    shareable: true
+                )
+                return
+            }
+
+            var bestMatch: (id: String, text: String, similarity: Double)? = nil
+            for entry in existing {
+                let entryEmbed = generateEmbedding(for: entry.text)
+                guard !entryEmbed.isEmpty, entryEmbed.count == newEmbed.count else { continue }
+                let sim = cosineSimilarity(newEmbed, entryEmbed)
+                if sim > (bestMatch?.similarity ?? -1.0) {
+                    bestMatch = (entry.id, entry.text, sim)
+                }
+            }
+
+            guard let match = bestMatch, match.similarity >= synthesisThreshold else {
+                // No close match — store as new.
+                if let near = bestMatch {
+                    print("HALDEBUG-REFLECTION: Best similarity \(String(format: "%.3f", near.similarity)) below threshold \(String(format: "%.2f", synthesisThreshold)); storing as new.")
+                }
+                storeReflection(
+                    conversationId: conversationId,
+                    freeFormText: verifiedReflection,
+                    reflectionType: reflectionType,
+                    turnNumber: turnNumber,
+                    modelId: modelId,
+                    shareable: true
+                )
+                return
+            }
+
+            print("HALDEBUG-REFLECTION: Found similar prior reflection (sim=\(String(format: "%.3f", match.similarity)) ≥ \(String(format: "%.2f", synthesisThreshold))); synthesizing.")
+
+            // Build the synthesis prompt. Direct + spare — the model gets
+            // the two texts and is told to produce one combined thought.
+            // The "Output only the synthesis" line is important: without
+            // it, models tend to add preamble like "Sure, here's a merged
+            // version:" that pollutes the stored entry.
+            let synthesisPrompt = """
+            You wrote these two reflections about your own experience. They're related — they touch the same underlying observation from slightly different angles.
+
+            Synthesize them into a SINGLE reflection that captures the depth of both. The result should read as one continuous thought, in your own voice, not a list. Make it more complete and more grounded than either alone — not a summary of two things, but a stronger version of the one thing they're both reaching for.
+
+            Output only the synthesized reflection. No preamble, no labels, no commentary.
+
+            Reflection A:
+            \(match.text)
+
+            Reflection B:
+            \(verifiedReflection)
+            """
+
+            let synthMessages: [HalChatMessage] = [.user(synthesisPrompt)]
+            do {
+                let raw = try await llmService.generateChatResponse(messages: synthMessages, temperature: 0.4)
+                let cleaned = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+                guard !cleaned.isEmpty, cleaned.count >= 20 else {
+                    // Suspiciously short — likely a refusal or boilerplate. Fall back.
+                    print("HALDEBUG-REFLECTION: Synthesis returned short/empty output (\(cleaned.count) chars); falling back to normal store.")
+                    storeReflection(
+                        conversationId: conversationId,
+                        freeFormText: verifiedReflection,
+                        reflectionType: reflectionType,
+                        turnNumber: turnNumber,
+                        modelId: modelId,
+                        shareable: true
+                    )
+                    return
+                }
+                let note = "synthesized@turn\(turnNumber) [sim=\(String(format: "%.3f", match.similarity))]"
+                let updated = updateReflectionText(id: match.id, newText: cleaned, synthesisNote: note)
+                if updated {
+                    print("HALDEBUG-REFLECTION: ✓ Synthesized reflection (\(cleaned.count) chars) → replaced existing entry \(match.id.prefix(8))")
+                } else {
+                    // Update failed (id gone? row deleted concurrently?) — store as new
+                    print("HALDEBUG-REFLECTION: updateReflectionText failed; falling back to new-row store.")
+                    storeReflection(
+                        conversationId: conversationId,
+                        freeFormText: verifiedReflection,
+                        reflectionType: reflectionType,
+                        turnNumber: turnNumber,
+                        modelId: modelId,
+                        shareable: true
+                    )
+                }
+            } catch {
+                print("HALDEBUG-REFLECTION: Synthesis call failed (\(error.localizedDescription)); falling back to normal store.")
+                storeReflection(
+                    conversationId: conversationId,
+                    freeFormText: verifiedReflection,
+                    reflectionType: reflectionType,
+                    turnNumber: turnNumber,
+                    modelId: modelId,
+                    shareable: true
+                )
+            }
+        }
+
         // MODIFIED: Main reflection function - now accepts conversationId and modelId
         // Called when reflection is due
         // Type 1 (every 5 turns): Practical/effectiveness patterns
@@ -2913,15 +3168,28 @@ class MemoryStore: ObservableObject {
             )
             
             print("HALDEBUG-REFLECTION: Reflection verified and grounded in experience")
-            
-            // NEW STEP 4.5: Store the verified free-form reflection before converting to structured
-            storeReflection(
+
+            // NEW STEP 4.5: Store the verified free-form reflection.
+            //
+            // Before persisting: check semantic similarity against every
+            // existing raw reflection. If we find one above the dedup
+            // threshold (using the model's own ragDedupThreshold setting,
+            // defaulting to 0.85), call the model with a synthesis prompt:
+            //   "These two reflections are related — synthesize them into
+            //   a single more complete thought that captures both."
+            // The synthesized text replaces the older entry's value
+            // in-place (id stable, reinforcement_count++, notes extended).
+            //
+            // Mark's directive (May-15): "Self-knowledge grows in depth,
+            // not volume." This is the write-time deduplication that
+            // implements that principle.
+            await storeReflectionWithSynthesis(
                 conversationId: conversationId,
-                freeFormText: verifiedReflection,
+                verifiedReflection: verifiedReflection,
                 reflectionType: reflectionType,
                 turnNumber: currentTurn,
                 modelId: modelId,
-                shareable: true  // Default shareable - Hal can change during consolidation
+                llmService: llmService
             )
             
             // Step 5: Call C - Structured recording (private, stores to database)
