@@ -4188,6 +4188,161 @@ fileprivate func trimToWordBoundary(_ text: String) -> String {
     return text
 }
 
+// MARK: - In-Stream Repetition Detection
+//
+// Some models, under certain prompts, fall into pathological repetition
+// loops mid-stream. Two distinct failure modes:
+//
+//   1. Paragraph-level loop — the model writes a paragraph, then writes
+//      the SAME paragraph again, then again. Common on Phi-4 under any
+//      repetition penalty (which is why Phi-4 ships with penalty=nil).
+//   2. Token-level loop — the model writes the same short n-gram over
+//      and over ("the the the the…"). Common on Qwen 3.5 2B without a
+//      repetition penalty, which is why curated MLX models ship with
+//      penalty=1.1.
+//
+// Per-model repetition penalty stops most of these at the sampler level,
+// but it's not bulletproof — a model occasionally still drifts into a
+// loop deep into a long generation. Without an in-stream check, the
+// loop continues until the 4096-token cap, burning ~120 seconds and
+// shipping a corrupt response to the user.
+//
+// `detectRepetitionLoop` is the runaway brake. It examines the tail of
+// generated text every ~50 characters and returns `true` if it finds:
+//   - A paragraph-sized chunk (30–80 chars) repeated 3 times in a row,
+//     OR
+//   - A short n-gram (2–10 chars) repeated 4+ times consecutively at
+//     the very end.
+//
+// Conservative tuning bias — we want false negatives over false
+// positives. Killing a real response mid-stream is worse than letting
+// a few extra repeated tokens through.
+//
+// `trimTrailingRepetition` cleans up the tail of a text where the
+// loop was detected, stripping the repetitive run back to the last
+// non-repeating point. Used after an early-stop so the user sees a
+// clean response rather than the loop residue.
+fileprivate func detectRepetitionLoop(in text: String) -> Bool {
+    // Don't even consider until we have enough text to make a confident
+    // call. 200 chars ≈ 30-40 words ≈ a couple of sentences — well past
+    // anything where natural repetition could be confused with a loop.
+    guard text.count >= 200 else { return false }
+
+    // ── Paragraph-level: same chunk appears 3 times in a row at end. ──
+    // Walk chunk sizes from 30 to 80 chars in steps of 10. For each
+    // size, check if the last three chunks of that length are all
+    // identical to each other. Stride length cap of 80 keeps the
+    // comparison bounded — longer "repetitions" might be legitimate.
+    for chunkSize in stride(from: 30, through: 80, by: 10) {
+        guard text.count >= chunkSize * 3 else { continue }
+        let endIndex = text.endIndex
+        let third  = text.index(endIndex, offsetBy: -chunkSize)
+        let second = text.index(endIndex, offsetBy: -chunkSize * 2)
+        let first  = text.index(endIndex, offsetBy: -chunkSize * 3)
+        let c3 = text[third..<endIndex]
+        let c2 = text[second..<third]
+        let c1 = text[first..<second]
+        if c1 == c2 && c2 == c3 {
+            return true
+        }
+    }
+
+    // ── Token-level: same short n-gram repeated 4+ times at very end. ──
+    // Catches "the the the the…" type degeneracy where the per-model
+    // repetition penalty failed (or wasn't set, for Phi-4).
+    let tail = String(text.suffix(60))
+    for ngramSize in 2...10 {
+        guard tail.count >= ngramSize * 4 else { continue }
+        let pattern = String(tail.suffix(ngramSize))
+        // Don't trigger on whitespace-only or single-character patterns
+        // (those can be legitimate trailing artifacts).
+        let trimmedPattern = pattern.trimmingCharacters(in: .whitespacesAndNewlines)
+        if trimmedPattern.count < 2 { continue }
+
+        var matches = 1
+        var cursor = tail.count - ngramSize
+        while cursor >= ngramSize {
+            let start = tail.index(tail.startIndex, offsetBy: cursor - ngramSize)
+            let end   = tail.index(tail.startIndex, offsetBy: cursor)
+            if String(tail[start..<end]) == pattern {
+                matches += 1
+                cursor -= ngramSize
+                if matches >= 4 { return true }
+            } else {
+                break
+            }
+        }
+    }
+
+    return false
+}
+
+/// Trim the repetitive tail off a text where `detectRepetitionLoop`
+/// returned true. Tries to strip back to the last point before the
+/// loop began, then ends with an ellipsis to signal a stopped response.
+fileprivate func trimTrailingRepetition(in text: String) -> String {
+    // Strip paragraph-level repetition first.
+    var working = text
+    for chunkSize in stride(from: 30, through: 80, by: 10) {
+        guard working.count >= chunkSize * 2 else { continue }
+        let endIndex = working.endIndex
+        let second = working.index(endIndex, offsetBy: -chunkSize)
+        let first  = working.index(endIndex, offsetBy: -chunkSize * 2)
+        let last  = working[second..<endIndex]
+        let prior = working[first..<second]
+        if last == prior {
+            // Found repetition. Keep stripping while the tail matches.
+            working = String(working[..<second])
+            while working.count >= chunkSize {
+                let s = working.index(working.endIndex, offsetBy: -chunkSize)
+                if working[s..<working.endIndex] == last {
+                    working = String(working[..<s])
+                } else {
+                    break
+                }
+            }
+            break  // done — paragraph repetition is handled
+        }
+    }
+
+    // Strip token-level repetition tail.
+    let tail = String(working.suffix(60))
+    for ngramSize in 2...10 {
+        guard tail.count >= ngramSize * 4 else { continue }
+        let pattern = String(tail.suffix(ngramSize))
+        let trimmedPattern = pattern.trimmingCharacters(in: .whitespacesAndNewlines)
+        if trimmedPattern.count < 2 { continue }
+
+        // Count consecutive matches at the end of `working`.
+        var matchCount = 0
+        var endCursor = working.count
+        while endCursor >= ngramSize {
+            let s = working.index(working.startIndex, offsetBy: endCursor - ngramSize)
+            let e = working.index(working.startIndex, offsetBy: endCursor)
+            if String(working[s..<e]) == pattern {
+                matchCount += 1
+                endCursor -= ngramSize
+            } else {
+                break
+            }
+        }
+        if matchCount >= 4 {
+            // Strip all but one occurrence of the pattern.
+            let cutCount = (matchCount - 1) * ngramSize
+            working = String(working.dropLast(cutCount))
+            break
+        }
+    }
+
+    // Normalize trailing whitespace and append ellipsis if we actually
+    // stripped something visible.
+    let cleaned = working.trimmingCharacters(in: .whitespacesAndNewlines)
+    if cleaned.count < text.trimmingCharacters(in: .whitespacesAndNewlines).count {
+        return cleaned + "\u{2026}"
+    }
+    return cleaned
+}
+
 // MARK: - MLXWrapper for MLX Model Interaction
 class MLXWrapper: ObservableObject {
     @Published var isModelLoaded: Bool = false
@@ -4511,8 +4666,11 @@ class MLXWrapper: ObservableObject {
                     var iterator = mlxStream.makeAsyncIterator()
                     var fullText = ""
                     var sawFirstToken = false
+                    var lastRepetitionCheck = 0
+                    let repetitionCheckEvery = 50  // chars between checks
+                    var stoppedForRepetition = false
 
-                    while let event = await iterator.next() {
+                    streamLoop: while let event = await iterator.next() {
                         switch event {
                         case .chunk(let text):
                             if !sawFirstToken {
@@ -4524,6 +4682,20 @@ class MLXWrapper: ObservableObject {
                             // Yield the cumulative text so the caller's UI can
                             // render the partial response as it grows.
                             continuation.yield(fullText)
+
+                            // In-stream repetition detection. Cheap check every
+                            // ~50 chars; bail out cleanly if a runaway pattern
+                            // emerges so we don't burn ~120s grinding out a loop
+                            // to the 4096-token cap. See detectRepetitionLoop
+                            // comments for the heuristic.
+                            if fullText.count - lastRepetitionCheck >= repetitionCheckEvery {
+                                lastRepetitionCheck = fullText.count
+                                if detectRepetitionLoop(in: fullText) {
+                                    halLog("HALDEBUG-MLX-CHAT: Repetition loop detected at \(fullText.count) chars; stopping early.")
+                                    stoppedForRepetition = true
+                                    break streamLoop
+                                }
+                            }
                         case .info(let info):
                             halLog("HALDEBUG-MLX-CHAT: Generation complete: \(info.generationTokenCount) tokens at \(String(format: "%.1f", info.tokensPerSecond)) tok/s")
                         case .toolCall(_):
@@ -4536,7 +4708,15 @@ class MLXWrapper: ObservableObject {
                     }
 
                     MLX.GPU.clearCache()
-                    let whitespaceTrimmed = fullText.trimmingCharacters(in: CharacterSet.whitespacesAndNewlines)
+                    var whitespaceTrimmed = fullText.trimmingCharacters(in: CharacterSet.whitespacesAndNewlines)
+                    // Repetition-loop cleanup. If we bailed early on a detected
+                    // loop, strip the loop residue so the user sees a clean
+                    // response rather than the repetitive tail.
+                    if stoppedForRepetition {
+                        let beforeTrim = whitespaceTrimmed.count
+                        whitespaceTrimmed = trimTrailingRepetition(in: whitespaceTrimmed)
+                        halLog("HALDEBUG-MLX-CHAT: trimTrailingRepetition stripped \(beforeTrim - whitespaceTrimmed.count) chars of loop residue")
+                    }
                     // Universal mid-word-truncation safeguard. If maxOutputTokens
                     // was hit (or anything else cut the response off mid-word),
                     // trim back to the last word boundary and append an ellipsis.
@@ -4788,12 +4968,36 @@ class LLMService: ObservableObject {
                 Task {
                     do {
                         var accumulatedText = ""
+                        var lastRepetitionCheck = 0
+                        let repetitionCheckEvery = 50  // chars between checks
+                        var stoppedForRepetition = false
+
                         let stream = session.streamResponse(options: GenerationOptions(temperature: temperature)) { Prompt(lastUser) }
-                        for try await snapshot in stream {
+                        streamLoop: for try await snapshot in stream {
                             accumulatedText = snapshot.content
                             // snapshot.content IS the cumulative text per
                             // Apple's API contract; just forward it through.
                             continuation.yield(accumulatedText)
+
+                            // In-stream repetition detection (May-15) — same
+                            // brake as the MLX path. AFM is much less prone
+                            // to runaway loops, but on long generations under
+                            // certain prompt shapes it can still get stuck.
+                            if accumulatedText.count - lastRepetitionCheck >= repetitionCheckEvery {
+                                lastRepetitionCheck = accumulatedText.count
+                                if detectRepetitionLoop(in: accumulatedText) {
+                                    halLog("HALDEBUG-LLM-CHAT: AFM repetition loop detected at \(accumulatedText.count) chars; stopping early.")
+                                    stoppedForRepetition = true
+                                    break streamLoop
+                                }
+                            }
+                        }
+                        var whitespaceTrimmed = accumulatedText.trimmingCharacters(in: .whitespacesAndNewlines)
+                        // Repetition-loop cleanup (mirrors MLX path).
+                        if stoppedForRepetition {
+                            let beforeTrim = whitespaceTrimmed.count
+                            whitespaceTrimmed = trimTrailingRepetition(in: whitespaceTrimmed)
+                            halLog("HALDEBUG-LLM-CHAT: AFM trimTrailingRepetition stripped \(beforeTrim - whitespaceTrimmed.count) chars of loop residue")
                         }
                         // Universal mid-word-truncation safeguard. AFM's
                         // default maximumResponseTokens is generous but not
@@ -4801,7 +5005,6 @@ class LLMService: ObservableObject {
                         // cap, trim back to the last word boundary and append
                         // an ellipsis so the user never sees a mid-word cut.
                         // No-op when the response ends naturally.
-                        let whitespaceTrimmed = accumulatedText.trimmingCharacters(in: .whitespacesAndNewlines)
                         let finalText = trimToWordBoundary(whitespaceTrimmed)
                         if finalText != whitespaceTrimmed {
                             halLog("HALDEBUG-LLM-CHAT: AFM truncation safeguard trimmed \(whitespaceTrimmed.count - finalText.count) chars from a mid-word cut")
