@@ -5987,6 +5987,23 @@ struct iOSChatView: View {
     // cold-launch via Watch message).
     @State private var userHasScrolled = false
 
+    // Outgoing-message scroll anchor (May-16 scroll-anchor UX work).
+    //
+    // When the user sends a message and the assistant begins streaming a
+    // response, the view scrolls so the user's outgoing message sits just
+    // below the nav chrome (anchor: .top of the visible area) and HOLDS
+    // there. The assistant's reply unfolds downward from a fixed reading
+    // origin — like reading a page — rather than the previous behavior
+    // which chased the bottom of the stream and made the early tokens of
+    // a response disappear above the fold at 30+ tok/s.
+    //
+    // pinnedExchangeID: the id of the user message we anchored to at send
+    // time. nil = no anchor currently engaged (initial state, or user
+    // scrolled manually mid-stream and disengaged).
+    //
+    // Spec: Docs/UX_Scroll_Anchor_Spec.md
+    @State private var pinnedExchangeID: UUID? = nil
+
     var body: some View {
         NavigationStack {
             VStack(spacing: 0) {
@@ -6038,11 +6055,20 @@ struct iOSChatView: View {
                     .gesture(
                         // Pause auto-scroll on upward drag (user reading history).
                         // Downward drags dismiss the keyboard but don't pause auto-scroll.
+                        //
+                        // Also disengage the outgoing-message anchor on ANY
+                        // user drag during streaming — once the user has
+                        // chosen a scroll position, we don't fight them
+                        // (spec point 6).
                         DragGesture(minimumDistance: 20)
                             .onChanged { value in
                                 if value.translation.height < -20 {
                                     // Scrolling up — pause auto-scroll
                                     userHasScrolled = true
+                                }
+                                // Any non-trivial drag disengages the anchor.
+                                if abs(value.translation.height) > 20 {
+                                    pinnedExchangeID = nil
                                 }
                             }
                             .onEnded { value in
@@ -6067,8 +6093,16 @@ struct iOSChatView: View {
                         // (iPhone in pocket, chat view never appears).
                     }
                     .onChange(of: chatViewModel.messages.count) { oldValue, newValue in
-                        // Only auto-scroll if user hasn't manually scrolled away
-                        if !userHasScrolled {
+                        // Auto-scroll to bottom when new messages arrive ONLY when:
+                        //   - The anchor isn't engaged (we're not mid-stream-following-anchor)
+                        //   - The user hasn't manually scrolled up
+                        //
+                        // During anchored streaming we leave scroll alone — the
+                        // user's outgoing message is pinned to the top and the
+                        // response unfolds downward from there. The previous
+                        // bottom-follow behavior was the "firehose" failure mode
+                        // the scroll-anchor spec was written to fix.
+                        if pinnedExchangeID == nil && !userHasScrolled {
                             DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) {
                                 withAnimation(.easeOut(duration: 0.3)) {
                                     proxy.scrollTo("bottom", anchor: .bottom)
@@ -6077,8 +6111,17 @@ struct iOSChatView: View {
                         }
                     }
                     .onChange(of: chatViewModel.messages.last?.content) { oldValue, newValue in
-                        // Only auto-scroll during streaming if user hasn't manually scrolled away
-                        if !userHasScrolled {
+                        // Token-by-token streaming updates fire here. During
+                        // anchored streaming we DELIBERATELY do nothing — the
+                        // anchor was set on send and the response grows below
+                        // it naturally. Auto-scrolling on every token was the
+                        // firehose problem.
+                        //
+                        // When no anchor is engaged AND the user hasn't
+                        // scrolled away, fall through to the bottom-follow
+                        // behavior (used for late-arriving Watch replies,
+                        // post-anchor-disengage streams, etc.).
+                        if pinnedExchangeID == nil && !userHasScrolled {
                             DispatchQueue.main.async {
                                 withAnimation(.easeOut(duration: 0.2)) {
                                     proxy.scrollTo("bottom", anchor: .bottom)
@@ -6087,25 +6130,33 @@ struct iOSChatView: View {
                         }
                     }
                     .onChange(of: chatViewModel.isSendingMessage) { oldValue, newValue in
-                        // Reset scroll tracking when user sends a message
                         if newValue == true {
+                            // Send-start: engage the outgoing-message anchor.
+                            // Find the most recent user message, pin it as
+                            // the exchange anchor, and scroll it to the top
+                            // of the visible area (just below nav chrome).
+                            // The assistant's response will unfold below it
+                            // without dragging the anchor away.
+                            //
+                            // Spec: Docs/UX_Scroll_Anchor_Spec.md — "the user
+                            // has a fixed reading origin (their question) and
+                            // the answer unfolds below it naturally."
                             userHasScrolled = false
-                            // Post-send positioning: Scroll based on message length
-                            DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
-                                if let lastMessage = chatViewModel.messages.last, lastMessage.isFromUser {
-                                    // For short messages, scroll to bottom immediately
-                                    // For long messages (>200 chars), user can see their full message
-                                    if lastMessage.content.count < 200 {
-                                        withAnimation(.easeOut(duration: 0.3)) {
-                                            proxy.scrollTo("bottom", anchor: .bottom)
-                                        }
-                                    } else {
-                                        withAnimation(.easeOut(duration: 0.3)) {
-                                            proxy.scrollTo("bottom", anchor: .top)
-                                        }
+                            if let latestUser = chatViewModel.messages.last(where: { $0.isFromUser }) {
+                                pinnedExchangeID = latestUser.id
+                                DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
+                                    withAnimation(.easeOut(duration: 0.3)) {
+                                        proxy.scrollTo(latestUser.id, anchor: .top)
                                     }
                                 }
                             }
+                        } else {
+                            // Send-end: turn completed. No forced scroll —
+                            // the user keeps whatever position they chose.
+                            // Disengage the anchor so a future non-send
+                            // update (e.g. a late Watch reply) can use the
+                            // bottom-follow fallback.
+                            pinnedExchangeID = nil
                         }
                     }
                 }
