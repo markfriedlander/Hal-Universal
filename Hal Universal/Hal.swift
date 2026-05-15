@@ -9448,6 +9448,15 @@ class ChatViewModel: ObservableObject {
     @Published var errorMessage: String?
     @Published var isAIResponding: Bool = false
     @Published var thinkingStart: Date?
+
+    /// True while a turn originating from the Apple Watch is being
+    /// processed. Set by `processWatchIncomingMessage` before the chat
+    /// pipeline runs, cleared when it completes (or in the iOS background-
+    /// task expiration handler). Read by `buildChatMessages` to prepend a
+    /// "this is going to the user's wrist" instruction to the system
+    /// prompt — the model adapts response length and form on its own
+    /// rather than us silently truncating. Mark's "honest UX" rule.
+    @Published var isWatchTurnInProgress: Bool = false
     
     // MARK: - Model State (Multi-Model Ready)
     
@@ -11268,6 +11277,20 @@ class ChatViewModel: ObservableObject {
                                                                                 }
                                                                             }
 
+                                                                            // Watch-delivery context. Added last so it sits closest to
+                                                                            // the user message — the most recently-read instruction has
+                                                                            // the strongest hold on response shape. Replaces the silent-
+                                                                            // truncation approach Strategic Claude suggested with an
+                                                                            // honest "you're writing for a wrist" instruction: the model
+                                                                            // adapts length and form itself rather than us clipping.
+                                                                            // Per Mark's May-14 directive — no silent optimizations.
+                                                                            if isWatchTurnInProgress {
+                                                                                contextSections.append("""
+                                                                                DELIVERY CONTEXT: This message is coming from the user's Apple Watch. The user is likely glancing at the screen while moving or otherwise occupied. Keep your reply brief — one to three short sentences, conversational, plain prose only. Do not use markdown, lists, headers, or code blocks. Get to the point quickly.
+                                                                                """)
+                                                                                halLog("HALDEBUG-WATCH: Watch-delivery context appended to system message.")
+                                                                            }
+
                                                                             let systemMessage: String
                                                                             if contextSections.isEmpty {
                                                                                 systemMessage = effectiveSystemPrompt
@@ -11820,22 +11843,158 @@ class ChatViewModel: ObservableObject {
                                                                 func processWatchIncomingMessage(_ text: String) async -> String? {
                                                                     let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
                                                                     guard !trimmed.isEmpty else {
-                                                                        print("HALDEBUG-WATCH: processWatchIncomingMessage called with empty text.")
+                                                                        halLog("HALDEBUG-WATCH: processWatchIncomingMessage called with empty text.")
                                                                         return nil
                                                                     }
 
-                                                                    print("HALDEBUG-WATCH: processWatchIncomingMessage: '\(trimmed.prefix(80))'")
+                                                                    halLog("HALDEBUG-WATCH: processWatchIncomingMessage: '\(trimmed.prefix(80))'")
+
+                                                                    // ── 1. Begin a UIBackgroundTask so iOS grants extended runtime.
+                                                                    //
+                                                                    // Apple's LanguageModelSession (AFM) and on-device MLX inference
+                                                                    // both run at full speed when the app has foreground time, but
+                                                                    // become aggressively throttled when iOS thinks we're idle in
+                                                                    // background. Empirically (May 14, 2026) the same prompt took
+                                                                    // 2.5s with the iPhone in foreground vs 437s with the iPhone
+                                                                    // backgrounded — Watch users are by definition the second case.
+                                                                    //
+                                                                    // beginBackgroundTask tells iOS "I have work to finish,
+                                                                    // please give me up to ~30 seconds before suspending me." iOS
+                                                                    // grants extended runtime when this is paired with a
+                                                                    // WCSession-triggered receive (which this method always is).
+                                                                    //
+                                                                    // The expiration handler is iOS's last-call signal. If we
+                                                                    // hit it, generation hasn't finished — we push a partial /
+                                                                    // fallback message to the Watch so the user sees something
+                                                                    // honest rather than an indefinite "Hal is thinking" hang.
+                                                                    let app = UIApplication.shared
+                                                                    var bgTaskID = UIBackgroundTaskIdentifier.invalid
+                                                                    var expirationHandled = false
+                                                                    bgTaskID = app.beginBackgroundTask(withName: "WatchIncomingMessage") { [weak self] in
+                                                                        guard let self else { return }
+                                                                        expirationHandled = true
+                                                                        halLog("HALDEBUG-WATCH: BG-task expiration handler fired (iOS budget reached).")
+                                                                        // Capture whatever partial assistant text we have so the
+                                                                        // user sees real progress rather than a generic apology.
+                                                                        let partial = self.messages.last(where: { !$0.isFromUser })?.content ?? ""
+                                                                        let trimmedPartial = partial.trimmingCharacters(in: .whitespacesAndNewlines)
+                                                                        let pushText: String
+                                                                        if !trimmedPartial.isEmpty && trimmedPartial != "\u{00A0}" {
+                                                                            pushText = trimmedPartial + "\n\n(Hal kept working — open the iPhone app to see the rest.)"
+                                                                        } else {
+                                                                            pushText = "Hal is still working on this. Open the iPhone app to see the full response when it's ready."
+                                                                        }
+                                                                        HalWatchBridge.pushToWatch(["reply": pushText])
+                                                                        halLog("HALDEBUG-WATCH: Pushed expiration fallback (\(pushText.count) chars) to Watch.")
+                                                                        // Clear the Watch-context flag so a subsequent (non-Watch)
+                                                                        // turn doesn't inherit it. selectedModelID restore is
+                                                                        // handled in the main flow below — if iOS suspends us
+                                                                        // before we get there, the picker may briefly show the
+                                                                        // Salon Host model on next foregrounding; acceptable
+                                                                        // trade-off given how rarely this path fires.
+                                                                        self.isWatchTurnInProgress = false
+                                                                        if bgTaskID != .invalid {
+                                                                            app.endBackgroundTask(bgTaskID)
+                                                                            bgTaskID = .invalid
+                                                                        }
+                                                                    }
+                                                                    halLog("HALDEBUG-WATCH: beginBackgroundTask=\(bgTaskID.rawValue)")
+
+                                                                    // ── 2. Salon-aware model selection (Mark's directive).
+                                                                    //
+                                                                    // Watch turns never run multi-seat. The model used is:
+                                                                    //   - Single-model mode → the user's selected model (no override)
+                                                                    //   - Salon mode + Host  → the Host's model
+                                                                    //   - Salon mode no Host → Seat 1's model
+                                                                    let watchModelOverride = pickWatchTurnModel()
+                                                                    let originalSelectedModelID = selectedModelID
+                                                                    if let override = watchModelOverride {
+                                                                        halLog("HALDEBUG-WATCH: Salon active; routing Watch turn through \(override.displayName) (id=\(override.id))")
+                                                                        selectedModelID = override.id
+                                                                        llmService.setupLLM(for: override, keepMlxResident: true)
+                                                                        // For MLX, wait briefly for load like Salon does.
+                                                                        if override.source == .mlx {
+                                                                            let loadStart = Date()
+                                                                            while !llmService.mlxWrapper.isModelLoaded && Date().timeIntervalSince(loadStart) < 30 {
+                                                                                try? await Task.sleep(nanoseconds: 100_000_000)
+                                                                            }
+                                                                            if !llmService.mlxWrapper.isModelLoaded {
+                                                                                halLog("HALDEBUG-WATCH: Warning: MLX override timed out waiting for model load; proceeding anyway")
+                                                                            }
+                                                                        }
+                                                                    }
+
+                                                                    // ── 3. Mark this turn as Watch-originated so buildChatMessages
+                                                                    // appends the wrist-context instruction.
+                                                                    isWatchTurnInProgress = true
+
+                                                                    // ── 4. Generate via the shared sendMessage(externalText:)
+                                                                    // entry point — does NOT touch currentMessage / TextField.
                                                                     let reply = await sendMessage(externalText: trimmed)
 
-                                                                    // Push reply to Watch (fails gracefully if no Watch paired —
-                                                                    // exactly the right behavior for the simulate path).
-                                                                    if let reply, !reply.isEmpty {
-                                                                        HalWatchBridge.pushToWatch(["reply": reply])
+                                                                    // ── 5. Clear the Watch-context flag and restore picker.
+                                                                    isWatchTurnInProgress = false
+                                                                    if watchModelOverride != nil && selectedModelID != originalSelectedModelID {
+                                                                        if let restored = ModelCatalogService.shared.getModel(byID: originalSelectedModelID) {
+                                                                            selectedModelID = originalSelectedModelID
+                                                                            llmService.setupLLM(for: restored, keepMlxResident: true)
+                                                                            halLog("HALDEBUG-WATCH: Restored selectedModelID to \(originalSelectedModelID) after Salon-routed Watch turn.")
+                                                                        } else if originalSelectedModelID == "apple-foundation-models" {
+                                                                            selectedModelID = originalSelectedModelID
+                                                                            llmService.setupLLM(for: .appleFoundation, keepMlxResident: true)
+                                                                            halLog("HALDEBUG-WATCH: Restored selectedModelID to AFM after Salon-routed Watch turn.")
+                                                                        }
+                                                                    }
+
+                                                                    // ── 6. Push to Watch — but only if the expiration handler
+                                                                    // didn't already push something. Otherwise the Watch sees
+                                                                    // both the fallback and the real reply.
+                                                                    if !expirationHandled {
+                                                                        if let reply, !reply.isEmpty {
+                                                                            HalWatchBridge.pushToWatch(["reply": reply])
+                                                                        } else {
+                                                                            HalWatchBridge.pushToWatch(["reply": "I tried to respond, but I couldn't find a new reply in our conversation."])
+                                                                        }
                                                                     } else {
-                                                                        HalWatchBridge.pushToWatch(["reply": "I tried to respond, but I couldn't find a new reply in our conversation."])
+                                                                        halLog("HALDEBUG-WATCH: Expiration already pushed a fallback; suppressing late final reply.")
+                                                                    }
+
+                                                                    // ── 7. End background task (idempotent — expiration handler
+                                                                    // may have already done this).
+                                                                    if bgTaskID != .invalid {
+                                                                        app.endBackgroundTask(bgTaskID)
+                                                                        bgTaskID = .invalid
                                                                     }
 
                                                                     return reply
+                                                                }
+
+                                                                /// Pick which model handles an incoming Watch turn.
+                                                                ///
+                                                                /// Returns:
+                                                                ///   - nil → single-model mode; use the user's currently selected
+                                                                ///     model. No override needed.
+                                                                ///   - non-nil → Salon mode; the Watch turn runs as a single voice
+                                                                ///     against this model. Host first; Seat 1 fallback.
+                                                                ///
+                                                                /// Per Mark's May-14 directive: "Use the active model. Always. No
+                                                                /// exceptions." Watch turns never run multi-seat Salon. One voice,
+                                                                /// one response, delivered quickly.
+                                                                private func pickWatchTurnModel() -> ModelConfiguration? {
+                                                                    guard salonConfig.isEnabled else {
+                                                                        // Single-model: caller uses selectedModel unchanged.
+                                                                        return nil
+                                                                    }
+                                                                    if let hostID = salonConfig.summarizerModel,
+                                                                       let hostModel = ModelCatalogService.shared.getModel(byID: hostID) {
+                                                                        return hostModel
+                                                                    }
+                                                                    if let firstSeat = salonConfig.activeSeats.first,
+                                                                       let seatModel = ModelCatalogService.shared.getModel(byID: firstSeat.modelID) {
+                                                                        return seatModel
+                                                                    }
+                                                                    halLog("HALDEBUG-WATCH: Salon active but no Host or Seat-1 model configured; using current selectedModelID for Watch turn.")
+                                                                    return nil
                                                                 }
                                                                 
                                                                 // Single-model turn execution (existing behavior)
