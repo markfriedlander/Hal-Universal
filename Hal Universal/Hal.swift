@@ -6067,7 +6067,8 @@ struct iOSChatView: View {
                                     userHasScrolled = true
                                 }
                                 // Any non-trivial drag disengages the anchor.
-                                if abs(value.translation.height) > 20 {
+                                if abs(value.translation.height) > 20 && pinnedExchangeID != nil {
+                                    halLog("HALDEBUG-SCROLL: Anchor disengaged by user drag (dy=\(Int(value.translation.height)))")
                                     pinnedExchangeID = nil
                                 }
                             }
@@ -6144,6 +6145,7 @@ struct iOSChatView: View {
                             userHasScrolled = false
                             if let latestUser = chatViewModel.messages.last(where: { $0.isFromUser }) {
                                 pinnedExchangeID = latestUser.id
+                                halLog("HALDEBUG-SCROLL: Anchor engaged on user message \(latestUser.id.uuidString.prefix(8)) (\(latestUser.content.count) chars)")
                                 DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
                                     withAnimation(.easeOut(duration: 0.3)) {
                                         proxy.scrollTo(latestUser.id, anchor: .top)
@@ -6156,6 +6158,9 @@ struct iOSChatView: View {
                             // Disengage the anchor so a future non-send
                             // update (e.g. a late Watch reply) can use the
                             // bottom-follow fallback.
+                            if pinnedExchangeID != nil {
+                                halLog("HALDEBUG-SCROLL: Anchor disengaged on generation complete")
+                            }
                             pinnedExchangeID = nil
                         }
                     }
