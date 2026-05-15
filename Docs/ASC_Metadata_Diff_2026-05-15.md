@@ -8,6 +8,36 @@ This is a target-diff against the live v1.5 metadata, not a redraft. Captures **
 
 ---
 
+## 2026-05-15 PM update — what got tried and what learned
+
+I attempted to apply three updates directly via Chrome MCP into the v1.5 ASC fields:
+
+| Field | Save result | Notes |
+|---|---|---|
+| **Copyright** → `© 2025-2026 Mark Friedlander` | ✅ **PERSISTED** | App-level field, editable anytime. Verified on page reload. |
+| **Description** → full v1.6 rewrite | ❌ Reverted on reload | Version-locked because v1.5 is "Ready for Distribution" |
+| **Keywords** → no-Phi3 version | ❌ Reverted on reload | Same — version-locked |
+
+**Key learning:** Once a version is "Ready for Distribution", its **description, keywords, and what's-new fields are immutable**. To update them you must first **create a new iOS App version** in ASC (the "+ Add iOS App version" button on the distribution page or in the App Store left nav). The new version inherits the previous metadata as a starting point, then becomes the editable target.
+
+**Implication:** the description + keywords updates have to **piggyback on Item 11 (Version + build bump)**. Sequence:
+
+1. Bump CFBundleShortVersionString in the Xcode project (v1.5 → v1.6, or whatever number you pick)
+2. Increment CFBundleVersion (3 → 4)
+3. Build + archive + upload to ASC
+4. In ASC, create the v1.6 version (or it may auto-create from the build)
+5. THEN apply the description / keywords / what's-new updates to v1.6
+6. Add the missing screenshot replacements
+7. Submit for review
+
+I can do the description + keywords mechanical re-fill as soon as v1.6 exists in ASC. The What's-New copy still needs your voice.
+
+**Also flagging — README is not live yet.** The Support URL and Privacy Policy URL both resolve to `github.com/markfriedlander/Hal-Universal/blob/main/README.md`. The new README I committed lives on `mlx-experiment`. **Until you merge `mlx-experiment` → `main`, App Store users still see the v1.5 README with Phi-3 references.** This is fine for the engineering rhythm (don't merge until v1.6 is genuinely ready), but it means the ASC privacy/support link integrity depends on the merge timing.
+
+---
+
+---
+
 ## App-level (not version-specific) — `/distribution/info`
 
 | Field | Current | Proposed change | Reason |
