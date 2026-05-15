@@ -5298,7 +5298,19 @@ class LLMService: ObservableObject {
                         MLX.GPU.clearCache()
                     }
 
-                    Task {
+                    // DETACHED so this work runs off the main actor. The
+                    // enclosing setupLLM is called from runSalonTurn, which
+                    // runs on the @MainActor-isolated ChatViewModel — without
+                    // .detached, the inherited-context Task pinned the
+                    // 500ms sleep and the 5-15s loadModel call to main,
+                    // blocking SwiftUI's gesture recognizer and causing
+                    // multi-second UI freezes during 4-seat salon turns
+                    // (Mark observed live 2026-05-15). loadModel already
+                    // self-routes its @Published mutations to main via
+                    // await MainActor.run, so the detach is safe.
+                    // See Docs/UI_Thread_Diagnosis_2026-05-15.md.
+                    Task.detached { [weak self] in
+                        guard let self else { return }
                         // For an MLX→MLX swap, give iOS a brief beat to
                         // reclaim the just-freed memory before we trigger
                         // the next load. 500ms is empirical — long enough
