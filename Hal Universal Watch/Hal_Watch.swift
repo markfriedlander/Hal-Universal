@@ -270,25 +270,27 @@ struct WatchResponseOverlay: View {
     let text: String
     let onDismiss: () -> Void
 
+    // Dismiss now lives INSIDE the scroll content at the bottom of the
+    // reply, instead of pinned to the screen. For short replies both
+    // fit on screen at once; for long replies the user scrolls down
+    // past the text to reach Dismiss. Trade: the button isn't always
+    // visible, but the reply text isn't squeezed by it either. Mark's
+    // May-14 feedback after the first hardware test.
     var body: some View {
-        VStack {
-            Spacer()
-
-            ScrollView {
+        ScrollView {
+            VStack(spacing: 14) {
                 Text(text)
                     .multilineTextAlignment(.center)
                     .padding()
                     .background(Color.black.opacity(0.4))
                     .clipShape(RoundedRectangle(cornerRadius: 12))
+
+                Button("Dismiss") {
+                    onDismiss()
+                }
+                .padding(.bottom, 4)
             }
             .padding()
-
-            Spacer(minLength: 20)
-
-            Button("Dismiss") {
-                onDismiss()
-            }
-            .padding(.bottom, 20)
         }
         .ignoresSafeArea()
     }

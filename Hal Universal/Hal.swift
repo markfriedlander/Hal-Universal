@@ -6144,6 +6144,9 @@ struct ActionsView: View {
                 Text("Hal will buzz your wrist when the reply is ready. You can lower your wrist after dictating — Hal keeps working.")
                     .font(.caption)
                     .foregroundColor(.secondary)
+                Text("After restarting your iPhone, open Hal once before using the Watch — that lets iOS wake Hal in the background for Watch messages.")
+                    .font(.caption)
+                    .foregroundColor(.secondary)
             }
             .padding(.vertical, 2)
         } header: {
