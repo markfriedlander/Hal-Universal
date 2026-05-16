@@ -15167,6 +15167,7 @@ class BackgroundDownloadCoordinator: NSObject, URLSessionDownloadDelegate, Obser
                     totalBytesWritten: Int64,
                     totalBytesExpectedToWrite: Int64) {
         guard let context = contextLookup(downloadTask.taskIdentifier) else { return }
+        let taskID = downloadTask.taskIdentifier
         Task { @MainActor in
             // Update the per-model totals. Each file contributes its own
             // expected-bytes count; we accumulate so the model's overall
@@ -15176,25 +15177,59 @@ class BackgroundDownloadCoordinator: NSObject, URLSessionDownloadDelegate, Obser
             // *for that single file*, we recompute by subtracting the
             // previous per-task contribution and adding the new one. We
             // keep that previous contribution in `bytesWrittenByTask`.
-            let prev = self.bytesWrittenByTask[downloadTask.taskIdentifier] ?? 0
+            let prev = self.bytesWrittenByTask[taskID] ?? 0
             let delta = max(0, totalBytesWritten - prev)
-            self.bytesWrittenByTask[downloadTask.taskIdentifier] = totalBytesWritten
+            self.bytesWrittenByTask[taskID] = totalBytesWritten
             self.bytesWrittenByModel[context.modelID, default: 0] += delta
 
             // Same trick for expected. Update if it shrank from -1 (unknown).
             if totalBytesExpectedToWrite > 0 {
-                let prevExpected = self.bytesExpectedByTask[downloadTask.taskIdentifier] ?? 0
+                let prevExpected = self.bytesExpectedByTask[taskID] ?? 0
                 let expectedDelta = totalBytesExpectedToWrite - prevExpected
                 if expectedDelta != 0 {
-                    self.bytesExpectedByTask[downloadTask.taskIdentifier] = totalBytesExpectedToWrite
+                    self.bytesExpectedByTask[taskID] = totalBytesExpectedToWrite
                     self.bytesExpectedByModel[context.modelID, default: 0] += expectedDelta
                 }
+            }
+
+            // Throttled byte-flow logging (v2.0 diagnostic addition).
+            // Log per-task throughput every ~5 seconds so we can SEE bytes
+            // flowing during a download — essential for diagnosing whether
+            // a background download is actually progressing or stalled,
+            // and for understanding what's happening across lifecycle
+            // events (background, lock, foreground).
+            let now = Date()
+            let lastLog = self.lastByteLogTimeByTask[taskID] ?? .distantPast
+            if now.timeIntervalSince(lastLog) >= 5.0 {
+                let prevBytesAtLog = self.lastByteLogBytesByTask[taskID] ?? 0
+                let bytesSinceLastLog = max(0, totalBytesWritten - prevBytesAtLog)
+                let secondsSinceLastLog = lastLog == .distantPast ? 0 : now.timeIntervalSince(lastLog)
+                let throughputMBs = secondsSinceLastLog > 0
+                    ? Double(bytesSinceLastLog) / 1_048_576.0 / secondsSinceLastLog
+                    : 0
+                let writtenMB = Double(totalBytesWritten) / 1_048_576.0
+                let expectedMB = totalBytesExpectedToWrite > 0
+                    ? Double(totalBytesExpectedToWrite) / 1_048_576.0
+                    : -1
+                let pct = totalBytesExpectedToWrite > 0
+                    ? Int(Double(totalBytesWritten) / Double(totalBytesExpectedToWrite) * 100)
+                    : -1
+                if expectedMB > 0 {
+                    halLog("HALDEBUG-BGDL-BYTES: task \(taskID) (\(context.filename)) \(String(format: "%.1f", writtenMB))/\(String(format: "%.1f", expectedMB)) MB (\(pct)%) | \(String(format: "%.2f", throughputMBs)) MB/s")
+                } else {
+                    halLog("HALDEBUG-BGDL-BYTES: task \(taskID) (\(context.filename)) \(String(format: "%.1f", writtenMB)) MB (expected unknown) | \(String(format: "%.2f", throughputMBs)) MB/s")
+                }
+                self.lastByteLogTimeByTask[taskID] = now
+                self.lastByteLogBytesByTask[taskID] = totalBytesWritten
             }
         }
     }
 
     private var bytesWrittenByTask: [Int: Int64] = [:]
     private var bytesExpectedByTask: [Int: Int64] = [:]
+    // For throttled byte-flow logging (5 second cadence per task).
+    private var lastByteLogTimeByTask: [Int: Date] = [:]
+    private var lastByteLogBytesByTask: [Int: Int64] = [:]
 
     func urlSession(_ session: URLSession, task: URLSessionTask, didCompleteWithError error: Error?) {
         guard let context = contextLookup(task.taskIdentifier) else { return }
@@ -15629,16 +15664,33 @@ class MLXModelDownloader: ObservableObject {
         let expectedBytes = sizeGB.map { Int64($0 * 1_073_741_824) } ?? 0
         print("HALDEBUG-PROGRESS: sizeGB=\(String(describing: sizeGB)) expectedBytes=\(expectedBytes) for \(modelID)")
 
-        // Polling task: reads filesystem bytes written every 0.5s for smooth, accurate progress.
-        // Only launched when we know the expected download size.
+        // Polling task: sources progress from BackgroundDownloadCoordinator's
+        // per-task byte tracking (urlSession didWriteData callbacks). This is
+        // a v2.0 fix for the long-standing broken progress meter — the
+        // previous implementation polled directorySize, which only updates
+        // when a file atomically moves from URLSession's staging area to the
+        // cache. For one big file (model.safetensors at 3.6 GB), that meant
+        // 0% until 100% in a single jump, with no in-flight visibility.
+        // BGDL's progress(for:) returns bytes-received / bytes-expected
+        // aggregated across all in-flight tasks for the model, giving us
+        // real-time accurate progress for both users and diagnostics.
         let progressPollingTask: Task<Void, Never>? = expectedBytes > 0 ? Task {
             while !Task.isCancelled {
                 try? await Task.sleep(nanoseconds: 500_000_000)
                 guard !Task.isCancelled else { break }
                 await MainActor.run {
-                    let written = self.directorySize(huggingfaceDir)
-                    let newBytes = max(0, written - priorBytes)
-                    let fraction = min(0.99, Double(newBytes) / Double(expectedBytes))
+                    let bgdlFraction = BackgroundDownloadCoordinator.shared.progress(for: modelID)
+                    // Fallback to legacy directorySize if BGDL hasn't yet
+                    // populated its byte tracking (e.g. session not yet
+                    // attached after restart). Keeps the meter alive.
+                    let fraction: Double
+                    if bgdlFraction > 0 {
+                        fraction = min(0.99, bgdlFraction)
+                    } else {
+                        let written = self.directorySize(huggingfaceDir)
+                        let newBytes = max(0, written - priorBytes)
+                        fraction = min(0.99, Double(newBytes) / Double(expectedBytes))
+                    }
                     if var state = self.downloadStates[modelID], state.isDownloading {
                         state.progress = fraction
                         state.message = "Downloading \(Int(fraction * 100))%..."
