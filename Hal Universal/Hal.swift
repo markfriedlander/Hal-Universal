@@ -4692,6 +4692,183 @@ actor PromptBudgetEvaluator {
     }
 }
 
+// MARK: - CompressedSegment + Cache Protocol
+
+/// Result of compressing a single PromptSegment for a specific model.
+/// Stored in the cache (Phase 5) so subsequent turns can reuse the work.
+/// Top-level (not nested inside SegmentCompressor) so the cache protocol
+/// and MemoryStore can reference it without actor-nested-type awkwardness.
+struct CompressedSegment {
+    let kind: PromptSegmentKind
+    let modelId: String
+    let rawContentHash: String
+    let compressedContent: String
+    let targetTokens: Int
+    let actualTokens: Int
+    let createdAt: Date
+    /// True if this was loaded from cache (no LLM work done this turn).
+    /// False if freshly computed via SegmentCompressor.compress.
+    let cacheHit: Bool
+    /// True if intelligent compression failed and we fell back to raw
+    /// truncation. Drives the "truncated" badge in the footer (Phase 6b).
+    /// Triggers: LLM call returned empty, output exceeded target by >20%,
+    /// or veracity checker rejected too many sentences.
+    let truncated: Bool
+}
+
+/// The cache interface. MemoryStore conforms in Phase 5; the compressor
+/// uses this protocol so we can swap implementations or skip caching
+/// during tests without changing the compressor.
+protocol CompressedSegmentCache {
+    /// Look up a previously-cached compression for (kind, model, content).
+    /// Returns nil on cache miss.
+    func cachedCompression(
+        segmentKind: PromptSegmentKind,
+        modelId: String,
+        rawContentHash: String
+    ) -> CompressedSegment?
+
+    /// Store a freshly-computed compression in the cache.
+    /// Idempotent: replacing an existing (kind, model, hash) row is fine.
+    func storeCachedCompression(_ compressed: CompressedSegment)
+}
+
+// MARK: - SegmentCompressor
+
+/// Compresses an oversize PromptSegment using the active model itself —
+/// each model compresses for itself, never cross-model. This preserves
+/// the same transparency principle as the RAG gate routing: cross-model
+/// compression would hand one model's interpretation to another, framed
+/// as that model's own.
+///
+/// Routes through TextSummarizer.summarizeWithVerification which provides
+/// LLM compression + sentence-level veracity check (NLEmbeddings cosine
+/// similarity, threshold 0.72; ungrounded sentences replaced with the
+/// nearest source sentence). The veracity check is what makes this
+/// compression trustworthy — Hal isn't getting a model's invention, he's
+/// getting a verified distillation of his own content.
+///
+/// Failure modes all fall back to RAW TRUNCATION with truncated=true on
+/// the result. The "truncated" badge in the footer (Phase 6b) is visually
+/// distinct from "condensed" precisely so this catastrophic-only fallback
+/// is honest to the user.
+actor SegmentCompressor {
+
+    /// Tolerance for compression overshoot before we treat it as a failure
+    /// and fall back to truncation. The summarizer may produce output
+    /// slightly larger than target (LLM doesn't count tokens perfectly).
+    /// 20% overshoot is acceptable; beyond that, we don't trust the result.
+    private static let overshootTolerance: Double = 1.2
+
+    /// Compress a single segment. Cache-aware: returns cached result if
+    /// available (cacheHit=true), otherwise runs a fresh compression and
+    /// stores the result in the cache before returning.
+    ///
+    /// - Parameters:
+    ///   - segment: the segment to compress. Must have `kind.isCompressible == true`.
+    ///   - model: the active model. Used for both compression (the LLM call) and
+    ///            for the cache key (each model has its own cached compression).
+    ///   - llmService: the LLMService routed to the active model.
+    ///   - cache: the cache to use, or nil to skip caching (useful in tests).
+    /// - Returns: a CompressedSegment, never throws. Failures surface as
+    ///            `truncated: true` on the returned value.
+    static func compress(
+        segment: PromptSegment,
+        usingModel model: ModelConfiguration,
+        llmService: LLMService,
+        cache: CompressedSegmentCache?
+    ) async -> CompressedSegment {
+        precondition(segment.kind.isCompressible,
+                     "SegmentCompressor.compress called on non-compressible kind \(segment.kind). The pre-flight check should have routed this to hard-cap handling instead.")
+
+        let modelId = model.id
+        let hash = segment.rawContentHash
+
+        // 1. Cache lookup
+        if let cached = cache?.cachedCompression(segmentKind: segment.kind,
+                                                  modelId: modelId,
+                                                  rawContentHash: hash) {
+            // Return cached result with cacheHit=true. Other fields preserved.
+            return CompressedSegment(
+                kind: cached.kind,
+                modelId: cached.modelId,
+                rawContentHash: cached.rawContentHash,
+                compressedContent: cached.compressedContent,
+                targetTokens: cached.targetTokens,
+                actualTokens: cached.actualTokens,
+                createdAt: cached.createdAt,
+                cacheHit: true,
+                truncated: cached.truncated
+            )
+        }
+
+        // 2. Cache miss — perform compression via the active model.
+        let sourceTokens = TokenEstimator.estimateTokens(from: segment.rawContent)
+        halLog("HALDEBUG-COMPRESS: \(segment.kind.displayName) starting (\(sourceTokens) → \(segment.budgetTokens) tokens, model: \(model.displayName))")
+
+        let compressionStart = Date()
+        let llmResult = await TextSummarizer.summarizeWithVerification(
+            text: segment.rawContent,
+            targetTokens: segment.budgetTokens,
+            llmService: llmService,
+            verificationThreshold: 0.72,
+            useRecencyWeighting: (segment.kind == .shortTermHistory)
+        )
+        let compressionMs = Int(Date().timeIntervalSince(compressionStart) * 1000)
+
+        // 3. Validate the compression result.
+        let resultTokens = TokenEstimator.estimateTokens(from: llmResult)
+        let overshootLimit = Int(Double(segment.budgetTokens) * overshootTolerance)
+
+        let finalContent: String
+        let finalTokens: Int
+        let didTruncate: Bool
+
+        if llmResult.isEmpty {
+            // LLM compression returned empty — fall back to raw truncation.
+            let maxChars = Int(Double(segment.budgetTokens) * 3.5)
+            finalContent = String(segment.rawContent.prefix(maxChars))
+            finalTokens = TokenEstimator.estimateTokens(from: finalContent)
+            didTruncate = true
+            halLog("HALDEBUG-COMPRESS: \(segment.kind.displayName) compression returned empty after \(compressionMs)ms — fell back to truncation (\(finalTokens) tokens)")
+
+        } else if resultTokens > overshootLimit {
+            // LLM compression overshot target by more than tolerance — fall back to raw truncation.
+            // Trusting an overshot output would defeat the purpose of having a budget.
+            let maxChars = Int(Double(segment.budgetTokens) * 3.5)
+            finalContent = String(segment.rawContent.prefix(maxChars))
+            finalTokens = TokenEstimator.estimateTokens(from: finalContent)
+            didTruncate = true
+            halLog("HALDEBUG-COMPRESS: \(segment.kind.displayName) compression overshot (\(resultTokens) > \(overshootLimit) tolerance) after \(compressionMs)ms — fell back to truncation (\(finalTokens) tokens)")
+
+        } else {
+            // Compression succeeded within tolerance.
+            finalContent = llmResult
+            finalTokens = resultTokens
+            didTruncate = false
+            halLog("HALDEBUG-COMPRESS: \(segment.kind.displayName) compressed \(sourceTokens) → \(finalTokens) tokens (budget: \(segment.budgetTokens)) in \(compressionMs)ms")
+        }
+
+        let compressed = CompressedSegment(
+            kind: segment.kind,
+            modelId: modelId,
+            rawContentHash: hash,
+            compressedContent: finalContent,
+            targetTokens: segment.budgetTokens,
+            actualTokens: finalTokens,
+            createdAt: Date(),
+            cacheHit: false,
+            truncated: didTruncate
+        )
+
+        // 4. Store in cache. Idempotent — if a stale row exists for this
+        // (kind, model, hash) tuple, it's replaced.
+        cache?.storeCachedCompression(compressed)
+
+        return compressed
+    }
+}
+
 // ==== LEGO END: 07.6 Prompt Segment Budgeting & Compression ====
 
 
