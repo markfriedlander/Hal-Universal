@@ -15001,6 +15001,30 @@ class BackgroundDownloadCoordinator: NSObject, URLSessionDownloadDelegate, Obser
     func startDownload(modelID: String, repoID: String) async throws {
         halLog("HALDEBUG-BGDL: startDownload modelID=\(modelID) repoID=\(repoID)")
 
+        // DEDUP: cancel any in-flight tasks for this model before enqueuing
+        // fresh ones. Without this, repeat calls to startDownload — or the
+        // auto-resume on app launch combining with a user-triggered retry —
+        // accumulate duplicate tasks racing for the same bytes, dividing
+        // throughput and confusing per-model byte accounting. We surfaced
+        // this bug today via the new HALDEBUG-BGDL-BYTES logging:
+        // model.safetensors had three concurrent tasks (5, 6, 10) all
+        // downloading the same file at ~0.7 MB/s each instead of one task
+        // at ~2-3 MB/s. Each startDownload is now idempotent and self-
+        // cleaning.
+        let activeTaskSnapshot = await session.allTasks
+        var cancelledTaskIDs: [Int] = []
+        for task in activeTaskSnapshot {
+            guard let context = contextLookup(task.taskIdentifier),
+                  context.modelID == modelID else { continue }
+            if task.state == .running || task.state == .suspended {
+                task.cancel()
+                cancelledTaskIDs.append(task.taskIdentifier)
+            }
+        }
+        if !cancelledTaskIDs.isEmpty {
+            halLog("HALDEBUG-BGDL: Cancelled \(cancelledTaskIDs.count) stale in-flight task(s) for \(modelID) before fresh enqueue: \(cancelledTaskIDs.sorted())")
+        }
+
         // Fetch the file list from the HF tree API.
         let allFiles = try await fetchRepoFileList(repoID: repoID)
         let mlxFiles = allFiles.filter { Self.matchesMLXPattern($0) }
@@ -15242,6 +15266,9 @@ class BackgroundDownloadCoordinator: NSObject, URLSessionDownloadDelegate, Obser
         Task { @MainActor in
             self.bytesWrittenByTask.removeValue(forKey: task.taskIdentifier)
             self.bytesExpectedByTask.removeValue(forKey: task.taskIdentifier)
+            // Also clean up the log-throttle dictionaries (added v2.0).
+            self.lastByteLogTimeByTask.removeValue(forKey: task.taskIdentifier)
+            self.lastByteLogBytesByTask.removeValue(forKey: task.taskIdentifier)
         }
     }
 
