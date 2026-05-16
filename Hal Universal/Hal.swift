@@ -15402,6 +15402,29 @@ class BackgroundDownloadCoordinator: NSObject, URLSessionDownloadDelegate, Obser
         }
     }
 
+    // MARK: - Helpers for upstream coordination
+
+    /// True if there's at least one in-flight (running or suspended) download
+    /// task for this model in either session. Used by MLXModelDownloader to
+    /// decide whether to re-trigger startDownload on launch — if BGDL has
+    /// already auto-reconnected to in-flight URLSession tasks (which
+    /// URLSessionConfiguration.background does automatically), the upstream
+    /// auto-resume should NOT re-trigger and wipe BGDL's recovered state.
+    func hasActiveTasks(for modelID: String) async -> Bool {
+        for session in [foregroundSession, backgroundSession] {
+            let kind = sessionKind(of: session)
+            let tasks = await session.allTasks
+            for task in tasks {
+                guard let context = contextLookup(session: kind, taskID: task.taskIdentifier),
+                      context.modelID == modelID else { continue }
+                if task.state == .running || task.state == .suspended {
+                    return true
+                }
+            }
+        }
+        return false
+    }
+
     // MARK: - Cancellation
 
     /// Cancel all in-flight download tasks for a specific model in BOTH
@@ -15657,11 +15680,11 @@ class MLXModelDownloader: ObservableObject {
     /// terminated. Called from init() after the existing models are detected.
     /// Models already fully downloaded (detected by the existing loop) get
     /// cleared from the in-flight set automatically.
-    private func resumeInFlightDownloadsIfAny() {
+    private func resumeInFlightDownloadsIfAny() async {
         let pending = inFlightDownloadIDs
         guard !pending.isEmpty else { return }
         let meta = (UserDefaults.standard.dictionary(forKey: "inFlightDownloadMeta") as? [String: [String: Any]]) ?? [:]
-        print("HALDEBUG-DOWNLOAD: Found \(pending.count) in-flight download(s) to resume after relaunch")
+        print("HALDEBUG-DOWNLOAD: Found \(pending.count) in-flight download marker(s) to evaluate after relaunch")
         for modelID in pending {
             if isModelDownloaded(modelID) {
                 // Already done — clean up the stale in-flight marker.
@@ -15669,11 +15692,27 @@ class MLXModelDownloader: ObservableObject {
                 print("HALDEBUG-DOWNLOAD: \(modelID) is already downloaded; clearing in-flight marker")
                 continue
             }
+
+            // CRITICAL: do NOT re-trigger startDownload if BGDL has already
+            // auto-reconnected to in-flight URLSession tasks for this model
+            // (URLSessionConfiguration.background does this automatically on
+            // app launch, restoring tasks that survived termination). If we
+            // re-fired startDownload, its dedup logic would cancel BGDL's
+            // recovered tasks — including any that came back via the
+            // willEnterForeground migration with valid resume data — and
+            // restart from byte 0. We observed exactly this regression
+            // during the §7 locked-phone test in v2.0 hybrid testing.
+            let bgdlAlreadyActive = await BackgroundDownloadCoordinator.shared.hasActiveTasks(for: modelID)
+            if bgdlAlreadyActive {
+                print("HALDEBUG-DOWNLOAD: \(modelID) — BGDL already has in-flight tasks (auto-reconnected); NOT re-triggering startDownload. Letting BGDL continue.")
+                continue
+            }
+
             let modelMeta = meta[modelID] ?? [:]
             let repoID = modelMeta["repoID"] as? String ?? modelID
             let sizeGB = modelMeta["sizeGB"] as? Double
             let size = (sizeGB ?? 0.0) > 0.0 ? sizeGB : nil
-            print("HALDEBUG-DOWNLOAD: Auto-resuming download for \(modelID)")
+            print("HALDEBUG-DOWNLOAD: Auto-resuming download for \(modelID) (no in-flight BGDL tasks found)")
             Task { await self.startDownload(modelID: modelID, repoID: repoID, sizeGB: size) }
         }
     }
@@ -15820,13 +15859,16 @@ class MLXModelDownloader: ObservableObject {
                 }
                 
                 print("HALDEBUG-DETECTION: MLXModelDownloader.init() complete - \(self.downloadStates.count) models ready")
-
-                // After model detection, re-fire any in-flight downloads
-                // that were interrupted by app termination. See the
-                // resumeInFlightDownloadsIfAny() comment block for the
-                // rationale and the two-mitigation design.
-                self.resumeInFlightDownloadsIfAny()
             }
+
+            // After model detection, re-fire any in-flight downloads
+            // that were interrupted by app termination. See the
+            // resumeInFlightDownloadsIfAny() comment block for the
+            // rationale and the two-mitigation design. (Now async
+            // because it consults BGDL's task state before re-triggering;
+            // pulled out of the MainActor.run above because the await
+            // can't live inside a synchronous closure.)
+            await self.resumeInFlightDownloadsIfAny()
 
             // Calculate cache size in background
             await self.updateCacheSize()
