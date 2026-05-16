@@ -15688,6 +15688,22 @@ class MLXModelDownloader: ObservableObject {
         }
         let meta = (UserDefaults.standard.dictionary(forKey: "inFlightDownloadMeta") as? [String: [String: Any]]) ?? [:]
         halLog("HALDEBUG-DOWNLOAD: resumeInFlightDownloadsIfAny: found \(pending.count) in-flight marker(s): \(pending.sorted())")
+
+        // Settle delay before consulting BGDL state. On relaunch, two
+        // recovery paths can fire concurrently: (a) URLSessionConfiguration.
+        // background auto-reconnects to in-flight tasks the system kept
+        // alive in nsurlsessiond, and (b) willEnterForeground fires
+        // BGDL's migrateBackgroundTasksToForeground. The migration moves
+        // bg tasks → fg tasks via cancel-with-resume-data, which leaves
+        // the bg task in `cancelling` state for a few ms — and during that
+        // window our hasActiveTasks check returns false because cancelling
+        // tasks aren't .running or .suspended. We've seen this race lose
+        // by ~1ms in testing. 1.5s is plenty for migration to settle (it
+        // typically completes in ~10ms total) and only fires on relaunches
+        // with in-flight markers (rare in practice).
+        try? await Task.sleep(nanoseconds: 1_500_000_000)
+        halLog("HALDEBUG-DOWNLOAD: resumeInFlightDownloadsIfAny: settle complete, evaluating each marker")
+
         for modelID in pending {
             if isModelDownloaded(modelID) {
                 // Already done — clean up the stale in-flight marker.
