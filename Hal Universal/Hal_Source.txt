@@ -16691,6 +16691,40 @@ class MLXModelDownloader: ObservableObject {
     
     // MARK: - Multi-Model Download Management
     
+    /// Checks the device's available storage against a required size.
+    /// Returns nil if there's enough space; returns a human-readable
+    /// error message if not. Uses the `.volumeAvailableCapacityForImportantUsageKey`
+    /// resource value, which accounts for iOS's purgeable-storage reclamation
+    /// (it's the same number iOS uses internally when deciding whether to
+    /// allow a download). 30% margin covers temp files during download +
+    /// any post-download decompression overhead.
+    ///
+    /// Pre-flight check added 2026-05-16 per SC + Mark — covers BOTH curated
+    /// and community models. The same code path handles either; the only
+    /// difference is the model-name lookup for the error message.
+    private nonisolated func checkAvailableSpace(forModelSizeGB sizeGB: Double, modelDisplayName: String) -> String? {
+        let cachesURL = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask)[0]
+        guard let values = try? cachesURL.resourceValues(forKeys: [.volumeAvailableCapacityForImportantUsageKey]),
+              let availableBytes = values.volumeAvailableCapacityForImportantUsage else {
+            // We couldn't determine free space at all. Refuse rather than
+            // silently proceed — partial download + cryptic iOS error is
+            // worse than an upfront refusal with a clear message.
+            return "\(modelDisplayName) couldn't be downloaded: this device's available storage couldn't be determined. Free up some space and try again."
+        }
+
+        let requiredBytes = Int64(sizeGB * 1.3 * 1_073_741_824)  // 30% margin
+        if availableBytes >= requiredBytes {
+            return nil  // Sufficient space — proceed.
+        }
+
+        let formatter = ByteCountFormatter()
+        formatter.allowedUnits = [.useGB, .useMB]
+        formatter.countStyle = .file
+        let requiredStr = formatter.string(fromByteCount: requiredBytes)
+        let availableStr = formatter.string(fromByteCount: availableBytes)
+        return "Downloading \(modelDisplayName) needs about \(requiredStr) free, but only \(availableStr) is available on this device. Free up some space and try again."
+    }
+
     func startDownload(modelID: String, repoID: String, sizeGB: Double? = nil) async {
         // Check if already downloaded
         if isModelDownloaded(modelID) {
@@ -16718,7 +16752,7 @@ class MLXModelDownloader: ObservableObject {
                 // Add to queue
                 let queuedDownload = QueuedDownload(modelID: modelID, repoID: repoID, sizeGB: sizeGB)
                 downloadQueue.append(queuedDownload)
-                
+
                 var state = downloadStates[modelID] ?? DownloadState(
                     isDownloading: false,
                     progress: 0.0,
@@ -16728,12 +16762,56 @@ class MLXModelDownloader: ObservableObject {
                 )
                 state.message = "Queued (position \(downloadQueue.count))..."
                 downloadStates[modelID] = state
-                
+
                 print("HALDEBUG-DOWNLOAD: Queued download for \(modelID) (position \(downloadQueue.count))")
             }
             return
         }
-        
+
+        // PRE-FLIGHT DISK SPACE CHECK (added 2026-05-16 per SC + Mark).
+        //
+        // Refuse cleanly here rather than starting a download that will
+        // fail partway through with a cryptic iOS "cannot write file" error
+        // and leave the user wondering what went wrong. Two cases:
+        //
+        //   1. sizeGB known (curated models always; community models when
+        //      HF returned siblings.size) → check available space against
+        //      sizeGB * 1.3 (30% margin for temp + decompression overhead).
+        //   2. sizeGB unknown (rare community-model edge case where HF
+        //      didn't return per-file sizes) → refuse outright, ask the
+        //      user to ensure they have enough free space first. Better to
+        //      refuse than silently start a download we can't size-check.
+        let modelDisplayName = await MainActor.run {
+            ModelCatalogService.shared.getModel(byID: modelID)?.displayName ?? modelID
+        }
+        let spaceError: String? = {
+            guard let sizeGB = sizeGB, sizeGB > 0 else {
+                return "\(modelDisplayName) couldn't be downloaded: this model's size couldn't be determined from its repository. Make sure you have plenty of free space on the device before trying again."
+            }
+            return checkAvailableSpace(forModelSizeGB: sizeGB, modelDisplayName: modelDisplayName)
+        }()
+        if let spaceError = spaceError {
+            await MainActor.run {
+                print("HALDEBUG-DOWNLOAD: Refusing \(modelID) — insufficient space. \(spaceError)")
+                var state = downloadStates[modelID] ?? DownloadState(
+                    isDownloading: false,
+                    progress: 0.0,
+                    message: spaceError,
+                    error: spaceError,
+                    localPath: nil
+                )
+                state.isDownloading = false
+                state.progress = 0.0
+                state.message = spaceError
+                state.error = spaceError
+                downloadStates[modelID] = state
+                // downloadError is a computed property that surfaces the
+                // first non-nil error across downloadStates — setting
+                // state.error above is sufficient to make it visible.
+            }
+            return
+        }
+
         // Start download
         await MainActor.run {
             currentDownloadModelID = modelID
