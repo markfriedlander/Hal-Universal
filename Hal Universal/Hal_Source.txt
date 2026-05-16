@@ -19519,6 +19519,66 @@ class HalTestConsole: ObservableObject {
             vm.startNewConversation()
             return "{\"status\":\"ok\",\"command\":\"CLEAR_TEST_DATA\",\"threadsDeleted\":\(threads),\"factsDeleted\":\(facts),\"messagesDeleted\":\(messages),\"newConversationId\":\"\(vm.conversationId)\"}"
 
+        } else if trimmed.hasPrefix("MEMORY_INJECT_TEST:") {
+            // MEMORY_INJECT_TEST:<count>:<tokens_each>[:<category>]
+            //
+            // Inserts N synthetic self-knowledge entries of approximately
+            // <tokens_each> tokens each, into the self_knowledge table. Dual
+            // purpose per the implementation plan:
+            //
+            //   1. Context-budget testing: deterministically reproduce AFM
+            //      context overflow without waiting for organic accumulation.
+            //      Phase 8 validation uses this to verify compression triggers
+            //      correctly when self-knowledge exceeds AFM's prompt budget.
+            //
+            //   2. Evolutionary Salon threshold testing: verify the salon
+            //      Easter-egg trigger threshold (THRESHOLD ~50) without waiting
+            //      weeks for organic accumulation.
+            //
+            // Same injection primitive, two consumer use cases.
+            //
+            // Each synthetic entry uses category=<provided> (default "test_synthetic"),
+            // key=`synthetic_<index>`, value=padded-Lorem-Ipsum to ~tokens_each
+            // tokens. Confidence is 0.95 so entries land at typical injection
+            // strength. Use RESET_SELF_KNOWLEDGE to clear them when done testing.
+            let payload = String(trimmed.dropFirst("MEMORY_INJECT_TEST:".count))
+            let parts = payload.split(separator: ":", maxSplits: 2, omittingEmptySubsequences: false).map(String.init)
+            guard parts.count >= 2,
+                  let count = Int(parts[0].trimmingCharacters(in: .whitespaces)),
+                  let tokensEach = Int(parts[1].trimmingCharacters(in: .whitespaces)),
+                  count > 0, count <= 500,
+                  tokensEach > 0, tokensEach <= 2000 else {
+                return "{\"status\":\"error\",\"message\":\"MEMORY_INJECT_TEST requires <count>:<tokens_each>[:<category>]; count 1-500, tokens 1-2000\"}"
+            }
+            let category = parts.count >= 3 ? parts[2].trimmingCharacters(in: .whitespaces) : "test_synthetic"
+            // Compose a value of approximately tokensEach tokens. We use
+            // TokenEstimator's chars/3.5 heuristic in reverse.
+            let charsPerValue = tokensEach * 3
+            let pad = "Lorem ipsum dolor sit amet, consectetur adipiscing elit. Sed do eiusmod tempor incididunt ut labore et dolore magna aliqua. Ut enim ad minim veniam, quis nostrud exercitation ullamco laboris nisi ut aliquip ex ea commodo consequat. Duis aute irure dolor in reprehenderit in voluptate velit esse cillum dolore eu fugiat nulla pariatur. Excepteur sint occaecat cupidatat non proident, sunt in culpa qui officia deserunt mollit anim id est laborum. "
+            var paddedValue = ""
+            while paddedValue.count < charsPerValue {
+                paddedValue += pad
+            }
+            paddedValue = String(paddedValue.prefix(charsPerValue))
+
+            for i in 1...count {
+                vm.memoryStore.storeSelfKnowledge(
+                    modelId: nil,
+                    category: category,
+                    key: "synthetic_\(i)",
+                    value: "Entry \(i): \(paddedValue)",
+                    confidence: 0.95,
+                    source: "MEMORY_INJECT_TEST",
+                    shareable: false,
+                    format: "structured_trait"
+                )
+            }
+            // Invalidate any cached self-knowledge compressions so the next
+            // turn sees the inflated raw state.
+            vm.memoryStore.invalidateCachedCompressions(forSegmentKind: .selfKnowledge)
+            print("HALDEBUG-TESTCONSOLE: MEMORY_INJECT_TEST — injected \(count) synthetic entries of ~\(tokensEach) tokens each (category: \(category))")
+            return "{\"status\":\"ok\",\"command\":\"MEMORY_INJECT_TEST\",\"injected\":\(count),\"tokensEach\":\(tokensEach),\"category\":\"\(category)\"}"
+
         } else {
             print("HALDEBUG-TESTCONSOLE: Unknown command: \(trimmed.prefix(60))")
             return "{\"status\":\"error\",\"message\":\"Unknown command: \(jsonStringEscape(String(trimmed.prefix(60))))\"}"
