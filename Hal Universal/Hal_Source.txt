@@ -9571,7 +9571,22 @@ struct WidgetTestView: View {
 
     
 // ==== LEGO START: 13 ChatBubbleView & TimerView (Message UI Components) ====
-    
+
+    // PreferenceKey used by ChatBubbleView to read the bubble's actual
+    // container width via GeometryReader. This is what fixes rotation
+    // reflow — UIScreen-based screenWidth doesn't reactively update on
+    // device rotation (no observable triggers a body recompute), so
+    // bubble maxWidth stayed pinned to the orientation at first render.
+    // GeometryReader is reactive to size changes, so the measured width
+    // tracks rotation correctly. Reduce takes max so the outermost
+    // measurement wins if multiple geometry readers stack.
+    private struct BubbleContainerWidthKey: PreferenceKey {
+        static var defaultValue: CGFloat = 0
+        static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) {
+            value = max(value, nextValue())
+        }
+    }
+
     // MARK: - ChatBubbleView (from Hal10000App.swift for consistent UI)
     struct ChatBubbleView: View {
         let message: ChatMessage
@@ -9610,7 +9625,23 @@ struct WidgetTestView: View {
             if mainWidth > 0 { return mainWidth }
             return 390 // iPhone 16 logical width — safe fallback so maxWidth is never 0
         }
-        
+
+        // Reactive measurement of the bubble's actual container width.
+        // Populated by a GeometryReader background in `body`. Updates on
+        // every layout pass (including rotation), so chat bubbles reflow
+        // correctly when the user rotates between portrait and landscape.
+        // Falls back to screenWidth on the very first render before the
+        // first layout pass populates this value.
+        @State private var measuredContainerWidth: CGFloat = 0
+
+        // Single source of truth for bubble maxWidth. Prefers the
+        // GeometryReader-measured value when available (reactive),
+        // falls back to screenWidth (cold-launch first render only).
+        private var bubbleMaxWidth: CGFloat {
+            let base = measuredContainerWidth > 0 ? measuredContainerWidth : screenWidth
+            return base * 0.90
+        }
+
         // SALON MODE FIX: Use stored turnNumber from database instead of calculating from array position
         var actualTurnNumber: Int {
             return message.turnNumber
@@ -9751,7 +9782,7 @@ struct WidgetTestView: View {
                             .textSelection(.enabled)
                             .padding(.vertical, 10)
                             .padding(.horizontal, 14)
-                            .frame(maxWidth: screenWidth * 0.90, alignment: .trailing)
+                            .frame(maxWidth: bubbleMaxWidth, alignment: .trailing)
                             .background(Color.gray.opacity(0.8))
                             .foregroundColor(.white)
                             .cornerRadius(12)
@@ -9792,13 +9823,13 @@ struct WidgetTestView: View {
                                     .textSelection(.enabled)
                                     .padding(.vertical, 10)
                                     .padding(.horizontal, 14)
-                                    .frame(maxWidth: screenWidth * 0.90, alignment: .leading)
+                                    .frame(maxWidth: bubbleMaxWidth, alignment: .leading)
                             } else {
                                 MarkdownView(text: message.content)
                                     .textSelection(.enabled)
                                     .padding(.vertical, 10)
                                     .padding(.horizontal, 14)
-                                    .frame(maxWidth: screenWidth * 0.90, alignment: .leading)
+                                    .frame(maxWidth: bubbleMaxWidth, alignment: .leading)
                             }
                             if chatViewModel.showInlineDetails {
                                 VStack(alignment: .leading, spacing: 4) {
@@ -9873,9 +9904,26 @@ struct WidgetTestView: View {
                     print("HALDEBUG-UI: Message bubble completed - turn \(actualTurnNumber), \(message.content.count) characters")
                 }
             }
+            // Measure the bubble's actual container width via a clear
+            // GeometryReader background — non-layout-impacting, reactive
+            // to size changes including rotation. Feeds measuredContainerWidth,
+            // which bubbleMaxWidth reads, which the three .frame(maxWidth:)
+            // modifiers above reference. This is what makes chat bubbles
+            // reflow correctly when the device rotates portrait↔landscape.
+            .background(
+                GeometryReader { proxy in
+                    Color.clear.preference(key: BubbleContainerWidthKey.self,
+                                           value: proxy.size.width)
+                }
+            )
+            .onPreferenceChange(BubbleContainerWidthKey.self) { newWidth in
+                if newWidth > 0 && newWidth != measuredContainerWidth {
+                    measuredContainerWidth = newWidth
+                }
+            }
         }
     }
-    
+
     // TimerView
     struct TimerView: View {
         let startDate: Date
