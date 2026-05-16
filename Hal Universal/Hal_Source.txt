@@ -12431,12 +12431,59 @@ class ChatViewModel: ObservableObject {
                                                                                 recentExcerpt = parts.joined(separator: "\n\n")
                                                                             }
 
+                                                                            // Phase 7 (per audit Finding 2): the gate prompt is built from
+                                                                            // recentExcerpt + injectedSummary + fixed instructions + user input
+                                                                            // and sent to the active model. Without bounds, this can overflow
+                                                                            // AFM (4K) — a second path to the same crash Mark hit. Apply
+                                                                            // per-segment compression here too, using the same machinery as
+                                                                            // the main prompt path. Compression result is not surfaced to
+                                                                            // the user (the gate is an internal sub-decision, not a
+                                                                            // user-visible turn) but the budget enforcement IS critical.
+                                                                            let gateLimits = HalModelLimits.config(for: selectedModel)
+                                                                            // Cap recentExcerpt at the short-term memory allocation
+                                                                            // (the gate's "recent context" lives in the same conceptual slot).
+                                                                            let gateShortTermBudget = gateLimits.shortTermMemoryTokens
+                                                                            // Cap injectedSummary tightly — the gate doesn't need much summary
+                                                                            // detail to make YES/NO classification.
+                                                                            let gateSummaryBudget = min(300, gateLimits.maxPromptTokens / 4)
+
+                                                                            if !recentExcerpt.isEmpty {
+                                                                                let segment = PromptSegment(kind: .shortTermHistory, rawContent: recentExcerpt, budgetTokens: gateShortTermBudget)
+                                                                                let eval = PromptBudgetEvaluator.evaluate(segment)
+                                                                                if case .overBudgetCompressible = eval.status {
+                                                                                    let result = await SegmentCompressor.compress(
+                                                                                        segment: segment,
+                                                                                        usingModel: selectedModel,
+                                                                                        llmService: llmService,
+                                                                                        cache: memoryStore
+                                                                                    )
+                                                                                    recentExcerpt = result.compressedContent
+                                                                                    halLog("HALDEBUG-TOOLS: Gate recentExcerpt over budget — \(result.cacheHit ? "cached" : "fresh") \(result.truncated ? "truncation" : "compression") applied")
+                                                                                }
+                                                                            }
+
+                                                                            var gateSummary = injectedSummary
+                                                                            if !gateSummary.isEmpty {
+                                                                                let segment = PromptSegment(kind: .autoSummary, rawContent: gateSummary, budgetTokens: gateSummaryBudget)
+                                                                                let eval = PromptBudgetEvaluator.evaluate(segment)
+                                                                                if case .overBudgetCompressible = eval.status {
+                                                                                    let result = await SegmentCompressor.compress(
+                                                                                        segment: segment,
+                                                                                        usingModel: selectedModel,
+                                                                                        llmService: llmService,
+                                                                                        cache: memoryStore
+                                                                                    )
+                                                                                    gateSummary = result.compressedContent
+                                                                                    halLog("HALDEBUG-TOOLS: Gate injectedSummary over budget — \(result.cacheHit ? "cached" : "fresh") \(result.truncated ? "truncation" : "compression") applied")
+                                                                                }
+                                                                            }
+
                                                                             var contextSection = ""
                                                                             if !recentExcerpt.isEmpty {
                                                                                 contextSection += "Recent conversation:\n\(recentExcerpt)\n\n"
                                                                             }
-                                                                            if !injectedSummary.isEmpty {
-                                                                                contextSection += "Summary of earlier context:\n\(injectedSummary)\n\n"
+                                                                            if !gateSummary.isEmpty {
+                                                                                contextSection += "Summary of earlier context:\n\(gateSummary)\n\n"
                                                                             }
 
                                                                             let toolDecisionPrompt = """
@@ -13077,10 +13124,75 @@ class ChatViewModel: ObservableObject {
                                                                         // temporal context, summary, RAG snippets, self-knowledge. See
                                                                         // HANDOFF_BRIEF "prompt format" section for rationale.
                                                                         func buildChatMessages(currentInput: String,
-                                                                                               historyOverride: [ChatMessage]? = nil) async -> [HalChatMessage] {
+                                                                                               historyOverride: [ChatMessage]? = nil) async
+                                                                                               -> (messages: [HalChatMessage],
+                                                                                                   compressedSegments: Set<PromptSegmentKind>,
+                                                                                                   truncatedSegments: Set<PromptSegmentKind>) {
                                                                             halLog("HALDEBUG-CHAT: Building chat messages for input: '\(currentInput.prefix(60))…'")
 
                                                                             var msgs: [HalChatMessage] = []
+                                                                            var compressedSegments: Set<PromptSegmentKind> = []
+                                                                            var truncatedSegments: Set<PromptSegmentKind> = []
+
+                                                                            let limits = HalModelLimits.config(for: selectedModel)
+
+                                                                            // PHASE 7 — per-segment budgets within the model's prompt allocation.
+                                                                            //
+                                                                            // The 50% "prompt" allocation (limits.maxPromptTokens) holds the
+                                                                            // system message body. Within that, static segments have hard
+                                                                            // caps and dynamic segments share whatever room remains. RAG
+                                                                            // and short-term have their own separate slots from limits.
+                                                                            //
+                                                                            // For AFM (prompt budget 2048): self-knowledge gets ~400-600
+                                                                            // tokens after static caps. Tight, but the compressor produces
+                                                                            // a meaningful distillation that fits.
+                                                                            // For Gemma (prompt budget 65k): self-knowledge gets ~64k.
+                                                                            // Compression will essentially never trigger.
+                                                                            let sysPromptActualTokens = TokenEstimator.estimateTokens(from: effectiveSystemPrompt)
+                                                                            let temporalReserveTokens = 64
+                                                                            let dynamicPromptRoom = max(
+                                                                                limits.maxPromptTokens - sysPromptActualTokens - temporalReserveTokens,
+                                                                                200  // never let dynamic segments fall below this floor
+                                                                            )
+                                                                            // Split: summary gets the smaller share, self-knowledge the larger
+                                                                            // (summary is usually short; self-knowledge is what tends to bloat).
+                                                                            let summaryBudgetTokens = max(dynamicPromptRoom * 30 / 100, 150)
+                                                                            let selfKnowledgeBudgetTokens = max(dynamicPromptRoom - summaryBudgetTokens, 150)
+
+                                                                            halLog("HALDEBUG-BUDGET: \(selectedModel.displayName) prompt=\(limits.maxPromptTokens) sys=\(sysPromptActualTokens) summary=\(summaryBudgetTokens) selfKnowledge=\(selfKnowledgeBudgetTokens) RAG=\(limits.maxRagTokens) shortTerm=\(limits.shortTermMemoryTokens)")
+
+                                                                            // Local helper: pre-flight evaluate a segment, compress if over
+                                                                            // budget, and update the tracking sets in this scope.
+                                                                            // Returns the content to actually inject (possibly compressed
+                                                                            // or truncated).
+                                                                            @MainActor
+                                                                            func resolveSegment(_ kind: PromptSegmentKind, rawContent: String, budgetTokens: Int) async -> String {
+                                                                                guard !rawContent.isEmpty else { return rawContent }
+                                                                                let segment = PromptSegment(kind: kind, rawContent: rawContent, budgetTokens: budgetTokens)
+                                                                                let eval = PromptBudgetEvaluator.evaluate(segment)
+                                                                                switch eval.status {
+                                                                                case .withinBudget:
+                                                                                    return rawContent
+                                                                                case .overBudgetCompressible:
+                                                                                    let result = await SegmentCompressor.compress(
+                                                                                        segment: segment,
+                                                                                        usingModel: selectedModel,
+                                                                                        llmService: llmService,
+                                                                                        cache: memoryStore
+                                                                                    )
+                                                                                    if result.truncated {
+                                                                                        truncatedSegments.insert(kind)
+                                                                                    } else {
+                                                                                        compressedSegments.insert(kind)
+                                                                                    }
+                                                                                    return result.compressedContent
+                                                                                case .overBudgetHardCap(let actual, let budget):
+                                                                                    halLog("HALDEBUG-COMPRESS: ⚠️ Hard-cap segment \(kind.displayName) over budget (\(actual) > \(budget)) — fallback truncation. THIS IS A BUG; static-segment caps should be enforced upstream.")
+                                                                                    truncatedSegments.insert(kind)
+                                                                                    let maxChars = Int(Double(budget) * 3.5)
+                                                                                    return String(rawContent.prefix(maxChars))
+                                                                                }
+                                                                            }
 
                                                                             // System message = persona + CURRENT CONTEXT block.
                                                                             // The CONTEXT block carries:
@@ -13104,7 +13216,8 @@ class ChatViewModel: ObservableObject {
                                                                             }
 
                                                                             if !injectedSummary.isEmpty {
-                                                                                contextSections.append("Summary of earlier conversation:\n\(injectedSummary)")
+                                                                                let resolvedSummary = await resolveSegment(.autoSummary, rawContent: injectedSummary, budgetTokens: summaryBudgetTokens)
+                                                                                contextSections.append("Summary of earlier conversation:\n\(resolvedSummary)")
                                                                             }
 
                                                                             // STEP 5: Self-awareness (stats) + self-knowledge (persistent traits).
@@ -13127,7 +13240,8 @@ class ChatViewModel: ObservableObject {
                                                                                     .replacingOccurrences(of: "#=== END SELF_KNOWLEDGE ===#", with: "")
                                                                                     .trimmingCharacters(in: .whitespacesAndNewlines)
                                                                                 if !selfKnowledgeBody.isEmpty {
-                                                                                    contextSections.append(selfKnowledgeBody)
+                                                                                    let resolvedSelfKnowledge = await resolveSegment(.selfKnowledge, rawContent: selfKnowledgeBody, budgetTokens: selfKnowledgeBudgetTokens)
+                                                                                    contextSections.append(resolvedSelfKnowledge)
                                                                                 }
                                                                             }
 
@@ -13136,7 +13250,6 @@ class ChatViewModel: ObservableObject {
                                                                             // runs the memory search and returns up to 10 snippets within the
                                                                             // model's RAG token budget.
                                                                             if !currentInput.isEmpty {
-                                                                                let limits = HalModelLimits.config(for: selectedModel)
                                                                                 let toolDecision = await decideTools(userInput: currentInput)
                                                                                 let shortTermTurns = getShortTermTurns(currentTurns: countCompletedTurns())
                                                                                 let toolResults = await executeTools(
@@ -13151,7 +13264,9 @@ class ChatViewModel: ObservableObject {
                                                                                     for (idx, s) in snippets.enumerated() {
                                                                                         ragLines.append("[\(idx + 1)] \(s.source) | relevance \(String(format: "%.2f", s.relevance))\n\(s.content)")
                                                                                     }
-                                                                                    contextSections.append("Relevant past context:\n\(ragLines.joined(separator: "\n\n"))")
+                                                                                    let ragRaw = "Relevant past context:\n\(ragLines.joined(separator: "\n\n"))"
+                                                                                    let resolvedRag = await resolveSegment(.ragRetrieval, rawContent: ragRaw, budgetTokens: limits.maxRagTokens)
+                                                                                    contextSections.append(resolvedRag)
                                                                                     halLog("HALDEBUG-CHAT: Folded in \(snippets.count) RAG snippets")
                                                                                 }
                                                                             }
@@ -13222,7 +13337,12 @@ class ChatViewModel: ObservableObject {
                                                                             msgs.append(.user(currentInput))
 
                                                                             halLog("HALDEBUG-CHAT: Built \(msgs.count) chat messages (step 1: system + \(history.count) history + current user, depth=\(effectiveMemoryDepth))")
-                                                                            return msgs
+                                                                            if !compressedSegments.isEmpty || !truncatedSegments.isEmpty {
+                                                                                halLog("HALDEBUG-CHAT: This turn compressed=\(compressedSegments.map { $0.displayName }.sorted()) truncated=\(truncatedSegments.map { $0.displayName }.sorted())")
+                                                                            }
+                                                                            return (messages: msgs,
+                                                                                    compressedSegments: compressedSegments,
+                                                                                    truncatedSegments: truncatedSegments)
                                                                         }
 
 
@@ -13943,10 +14063,24 @@ class ChatViewModel: ObservableObject {
                                                                         }
                                                                         try? await Task.sleep(nanoseconds: 200_000_000)
 
-                                                                        let chatMessages = await buildChatMessages(
+                                                                        let chatBuildResult = await buildChatMessages(
                                                                             currentInput: userInput,
                                                                             historyOverride: historyMessagesOverride
                                                                         )
+                                                                        let chatMessages = chatBuildResult.messages
+
+                                                                        // Phase 7: surface compression/truncation flags on the partial
+                                                                        // placeholder so the footer badge (Phase 6b) can render. The
+                                                                        // partial message's id is `pid`; we look it up and update its
+                                                                        // segment-tracking sets in place. Streaming will continue to
+                                                                        // update .content; these flag fields are stable.
+                                                                        if !chatBuildResult.compressedSegments.isEmpty || !chatBuildResult.truncatedSegments.isEmpty {
+                                                                            if let i = messages.firstIndex(where: { $0.id == pid }) {
+                                                                                messages[i].compressedSegments = chatBuildResult.compressedSegments
+                                                                                messages[i].truncatedSegments = chatBuildResult.truncatedSegments
+                                                                            }
+                                                                        }
+
                                                                         // For diagnostics & legacy fields (fullPromptUsed, tokenBreakdown), keep
                                                                         // a synthetic "prompt" string that approximates what was sent.
                                                                         let prompt = chatMessages.map { "[\($0.role.rawValue)] \($0.content)" }.joined(separator: "\n\n")
