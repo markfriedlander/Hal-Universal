@@ -6047,10 +6047,12 @@ struct Hal10000App: App {
                 .environmentObject(documentImportManager)
                 .environmentObject(mlxDownloader) // Pass MLXModelDownloader
         }
-        #if targetEnvironment(macCatalyst)
-        // Mac-specific window sizing to eliminate black bars in "Designed for iPad" mode
-        .defaultSize(width: 450, height: 700)
-        #endif
+        // Mac support is via "Designed for iPad" (automatic for any iPad-targeted
+        // app on Apple Silicon Macs) — NOT Mac Catalyst. The OS chooses the window
+        // shape; we don't configure it from here. A prior #if targetEnvironment(macCatalyst)
+        // block lived here aiming to override the default size, but it was dead code
+        // (no Catalyst target exists in this project) and .defaultSize is a Catalyst-only
+        // API anyway. Removed in v2.0.
     }
 }
 

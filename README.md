@@ -125,5 +125,5 @@ You can also file issues on this repository.
 ### 📄 Version
 
 Hal Universal
-**1.6**
+**2.0**
 May 2026
