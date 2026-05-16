@@ -15682,14 +15682,17 @@ class MLXModelDownloader: ObservableObject {
     /// cleared from the in-flight set automatically.
     private func resumeInFlightDownloadsIfAny() async {
         let pending = inFlightDownloadIDs
-        guard !pending.isEmpty else { return }
+        guard !pending.isEmpty else {
+            halLog("HALDEBUG-DOWNLOAD: resumeInFlightDownloadsIfAny: no pending markers")
+            return
+        }
         let meta = (UserDefaults.standard.dictionary(forKey: "inFlightDownloadMeta") as? [String: [String: Any]]) ?? [:]
-        print("HALDEBUG-DOWNLOAD: Found \(pending.count) in-flight download marker(s) to evaluate after relaunch")
+        halLog("HALDEBUG-DOWNLOAD: resumeInFlightDownloadsIfAny: found \(pending.count) in-flight marker(s): \(pending.sorted())")
         for modelID in pending {
             if isModelDownloaded(modelID) {
                 // Already done — clean up the stale in-flight marker.
                 clearInFlight(modelID)
-                print("HALDEBUG-DOWNLOAD: \(modelID) is already downloaded; clearing in-flight marker")
+                halLog("HALDEBUG-DOWNLOAD: \(modelID) is already downloaded; clearing in-flight marker")
                 continue
             }
 
@@ -15704,7 +15707,7 @@ class MLXModelDownloader: ObservableObject {
             // during the §7 locked-phone test in v2.0 hybrid testing.
             let bgdlAlreadyActive = await BackgroundDownloadCoordinator.shared.hasActiveTasks(for: modelID)
             if bgdlAlreadyActive {
-                print("HALDEBUG-DOWNLOAD: \(modelID) — BGDL already has in-flight tasks (auto-reconnected); NOT re-triggering startDownload. Letting BGDL continue.")
+                halLog("HALDEBUG-DOWNLOAD: \(modelID) — BGDL already has in-flight tasks (auto-reconnected); NOT re-triggering startDownload. Letting BGDL continue.")
                 continue
             }
 
@@ -15712,7 +15715,7 @@ class MLXModelDownloader: ObservableObject {
             let repoID = modelMeta["repoID"] as? String ?? modelID
             let sizeGB = modelMeta["sizeGB"] as? Double
             let size = (sizeGB ?? 0.0) > 0.0 ? sizeGB : nil
-            print("HALDEBUG-DOWNLOAD: Auto-resuming download for \(modelID) (no in-flight BGDL tasks found)")
+            halLog("HALDEBUG-DOWNLOAD: Auto-resuming download for \(modelID) (no in-flight BGDL tasks found)")
             Task { await self.startDownload(modelID: modelID, repoID: repoID, sizeGB: size) }
         }
     }
