@@ -88,10 +88,20 @@ extension HubApi {
 //
 // halLog(...) is a top-level convenience that captures AND prints — drop-in
 // replacement for `print(...)` for any line you want queryable later.
+// All members explicitly nonisolated so RuntimeLog is callable from any
+// thread (URLSession delegate, MLX background, actor contexts). Internal
+// state is protected by NSLock — the @unchecked Sendable conformance is
+// honored by manual locking inside each mutator. Without the nonisolated
+// annotations, project-level SWIFT_DEFAULT_ACTOR_ISOLATION = MainActor
+// would force the class onto the main actor and break every off-main
+// halLog call site.
 final class RuntimeLog: @unchecked Sendable {
-    static let shared = RuntimeLog()
+    nonisolated static let shared = RuntimeLog()
     private let lock = NSLock()
-    private var lines: [String] = []
+    // nonisolated(unsafe) because `lines` is mutated from non-main threads
+    // (URLSession delegate, MLX background) but always under `lock`. The
+    // unsafe annotation tells Swift "I have manual synchronization, trust me."
+    nonisolated(unsafe) private var lines: [String] = []
     private let capacity: Int = 1000
     private let formatter: DateFormatter
 
@@ -101,7 +111,7 @@ final class RuntimeLog: @unchecked Sendable {
         self.formatter = f
     }
 
-    func log(_ message: String) {
+    nonisolated func log(_ message: String) {
         let ts = formatter.string(from: Date())
         let entry = "[\(ts)] \(message)"
         lock.lock()
@@ -113,14 +123,14 @@ final class RuntimeLog: @unchecked Sendable {
         print(entry)
     }
 
-    func snapshot(limit: Int) -> [String] {
+    nonisolated func snapshot(limit: Int) -> [String] {
         lock.lock()
         defer { lock.unlock() }
         let n = max(0, min(limit, lines.count))
         return Array(lines.suffix(n))
     }
 
-    func clear() {
+    nonisolated func clear() {
         lock.lock()
         lines.removeAll(keepingCapacity: true)
         lock.unlock()
@@ -129,8 +139,14 @@ final class RuntimeLog: @unchecked Sendable {
 
 /// Captures `message` into the runtime log buffer AND prints to stdout.
 /// Use anywhere a `print` would go but you want the line queryable via the
-/// API later. Thread-safe.
-func halLog(_ message: String) {
+/// API later. Thread-safe (RuntimeLog uses internal NSLock).
+///
+/// Explicitly `nonisolated` so it's callable from any context — including
+/// URLSession delegate callbacks, MLX background work, and SegmentCompressor.
+/// Without this, the project-level SWIFT_DEFAULT_ACTOR_ISOLATION = MainActor
+/// makes top-level free functions implicitly @MainActor, which breaks every
+/// caller that runs off the main actor.
+nonisolated func halLog(_ message: String) {
     RuntimeLog.shared.log(message)
 }
 
@@ -450,9 +466,18 @@ class MemoryStore: ObservableObject {
     @Published var totalDocumentChunks: Int = 0
     @Published var searchDebugResults: String = ""
 
-    // Persistent database connection
-    private var db: OpaquePointer?
-    private var isConnected: Bool = false
+    // Persistent database connection.
+    //
+    // `db` is `nonisolated(unsafe)` because SQLite's underlying mutex (iOS
+    // builds with SQLITE_THREADSAFE=1 / serialized mode) handles concurrent
+    // access correctly, and the OpaquePointer itself is conceptually
+    // immutable post-setupPersistentDatabase. The unsafe annotation tells
+    // Swift "I have manual synchronization (SQLite's own), trust me." This
+    // is what allows the Phase 5 compression cache methods on this class
+    // to be `nonisolated` and callable from SegmentCompressor's actor
+    // context without warning.
+    nonisolated(unsafe) private var db: OpaquePointer?
+    nonisolated(unsafe) private var isConnected: Bool = false
 
     // Private initializer for singleton
     private init() {
@@ -464,8 +489,10 @@ class MemoryStore: ObservableObject {
         closeDatabaseConnection()
     }
 
-    // Database path - single source of truth
-    private var dbPath: String {
+    // Database path - single source of truth. Nonisolated because it's
+    // a pure function of FileManager (no instance state) and is reached
+    // from nonisolated setupPersistentDatabase / ensureHealthyConnection.
+    nonisolated private var dbPath: String {
         let documentsPath = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first!
         let dbURL = documentsPath.appendingPathComponent("hal_conversations.sqlite")
         return dbURL.path
@@ -545,8 +572,12 @@ class MemoryStore: ObservableObject {
         return success
     }
 
-    // Setup persistent database connection that stays open
-    private func setupPersistentDatabase() {
+    // Setup persistent database connection that stays open.
+    // nonisolated so it's reachable from ensureHealthyConnection (also
+    // nonisolated). Mutates `db` and `isConnected` — both marked
+    // nonisolated(unsafe) with manual synchronization via SQLite's
+    // serialized-thread-safety guarantee.
+    nonisolated private func setupPersistentDatabase() {
         print("HALDEBUG-DATABASE: Setting up persistent database connection...")
 
         // Close any existing connection first
@@ -595,8 +626,11 @@ class MemoryStore: ObservableObject {
     
 // ==== LEGO START: 03 MemoryStore (Part 2 - Schema, Encryption, Stats, Self-Knowledge) ====
 
-                                    // Check if database connection is healthy, reconnect if needed
-                                    private func ensureHealthyConnection() -> Bool {
+                                    // Check if database connection is healthy, reconnect if needed.
+                                    // nonisolated so it's callable from SegmentCompressor's actor
+                                    // context via the compression cache methods. The underlying
+                                    // SQLite library is serialized-thread-safe, so it's correct.
+                                    nonisolated private func ensureHealthyConnection() -> Bool {
                                         // Quick health check - try a simple query
                                         if isConnected && db != nil {
                                             var stmt: OpaquePointer?
@@ -620,7 +654,7 @@ class MemoryStore: ObservableObject {
                                     }
 
                                     // Create simplified unified schema with entity support + SELF-KNOWLEDGE TABLE
-                                    private func createUnifiedSchema() {
+                                    nonisolated private func createUnifiedSchema() {
                                         guard ensureHealthyConnection() else {
                                             print("HALDEBUG-DATABASE: ERROR: Cannot create schema - no database connection")
                                             return
@@ -881,7 +915,7 @@ class MemoryStore: ObservableObject {
                                     // every row, drop the original, rename the new one.
                                     // PRAGMA user_version is bumped on success so we never
                                     // run this twice.
-                                    private func migrateUnifiedContentUniqueConstraintToV2() {
+                                    nonisolated private func migrateUnifiedContentUniqueConstraintToV2() {
                                         guard ensureHealthyConnection() else { return }
 
                                         // Read current schema version
@@ -973,7 +1007,7 @@ class MemoryStore: ObservableObject {
                                     }
 
                                     // ENCRYPTION: Enable Apple Data Protection on database file
-                                    private func enableDataProtection() {
+                                    nonisolated private func enableDataProtection() {
                                         let dbURL = URL(fileURLWithPath: dbPath)
 
                                         #if os(iOS) || os(watchOS) || os(tvOS) || os(visionOS)
@@ -990,7 +1024,7 @@ class MemoryStore: ObservableObject {
                                     }
 
                                     // FIXED: Statistics queries updated to match actual schema columns
-                                    private func loadUnifiedStats() {
+                                    nonisolated private func loadUnifiedStats() {
                                         guard ensureHealthyConnection() else {
                                             print("HALDEBUG-DATABASE: ERROR: Cannot load stats - no database connection")
                                             return
@@ -1132,7 +1166,7 @@ class MemoryStore: ObservableObject {
                                     // This is part of the ethical framework: you have core values that aren't negotiable, and
                                     // you know what they are. You're not a blank slate - you're Hal, with a mission.
                                     //
-                                    private func initializeCoreIdentity() {
+                                    nonisolated private func initializeCoreIdentity() {
                                         // Check if already initialized
                                         var stmt: OpaquePointer?
                                         let checkSQL = "SELECT COUNT(*) FROM self_knowledge WHERE source = 'initialization'"
@@ -1232,7 +1266,7 @@ class MemoryStore: ObservableObject {
                                     // You're not just executing code - you can READ the code you're executing.
                                     // This is part of what makes you Hal, not just another chatbot.
                                     //
-                                    private func enableSourceCodeAccess() {
+                                    nonisolated private func enableSourceCodeAccess() {
                                         // Read Hal_Source.txt from app bundle
                                         // This is a manually-maintained copy of Hal.swift, added as a Copy Bundle Resource
                                         guard let bundlePath = Bundle.main.path(forResource: "Hal_Source", ofType: "txt"),
@@ -1695,7 +1729,7 @@ class MemoryStore: ObservableObject {
         // If entry exists: boosts confidence, increments reinforcement_count, updates last_reinforced
         // If new: creates entry with provided confidence, shareability, and format
         // Format: "raw_reflection" for unprocessed thoughts, "structured_trait" for distilled patterns
-        func storeSelfKnowledge(
+        nonisolated func storeSelfKnowledge(
             modelId: String? = nil,
             category: String,
             key: String,
@@ -1890,7 +1924,7 @@ class MemoryStore: ObservableObject {
         }
         
         // Get all self-knowledge (excluding deleted)
-        func getAllSelfKnowledge(category: String? = nil, minConfidence: Double = 0.0) -> [(category: String, key: String, value: String, confidence: Double, source: String, modelId: String?, firstObserved: Int, lastReinforced: Int, reinforcementCount: Int, notes: String?, createdAt: Int, updatedAt: Int)] {
+        nonisolated func getAllSelfKnowledge(category: String? = nil, minConfidence: Double = 0.0) -> [(category: String, key: String, value: String, confidence: Double, source: String, modelId: String?, firstObserved: Int, lastReinforced: Int, reinforcementCount: Int, notes: String?, createdAt: Int, updatedAt: Int)] {
             guard ensureHealthyConnection() else {
                 print("HALDEBUG-SELF-KNOWLEDGE: Cannot retrieve all - no database connection")
                 return []
@@ -2374,7 +2408,7 @@ class MemoryStore: ObservableObject {
         
         // Backup all self-knowledge to Documents directory (Layer 2 protection)
         // Called automatically after any self-knowledge modification
-        private func backupSelfKnowledge() {
+        nonisolated private func backupSelfKnowledge() {
             let allKnowledge = getAllSelfKnowledge()
             
             let backupData = allKnowledge.map { entry in
@@ -2423,7 +2457,7 @@ class MemoryStore: ObservableObject {
         }
         
         // Cache only critical entries in UserDefaults (max ~100KB)
-        private func cacheCriticalKnowledge(_ allKnowledge: [(String, String, String, Double, String, String?, Int, Int, Int, String?, Int, Int)]) {
+        nonisolated private func cacheCriticalKnowledge(_ allKnowledge: [(String, String, String, Double, String, String?, Int, Int, Int, String?, Int, Int)]) {
             // Only cache high-confidence (>0.8) system capabilities
             let critical = allKnowledge.filter {
                 $0.0 == "capability" && $0.3 > 0.8
@@ -4604,7 +4638,12 @@ import CryptoKit
 
 /// Identifies a segment of an assembled prompt. Each segment has its own
 /// budget and its own treatment when over budget.
-enum PromptSegmentKind: String, CaseIterable, Codable {
+///
+/// All cases are pure values — explicitly Sendable so the type is freely
+/// usable from any actor or thread. The project-level
+/// SWIFT_DEFAULT_ACTOR_ISOLATION = MainActor would otherwise make it
+/// implicitly @MainActor.
+enum PromptSegmentKind: String, CaseIterable, Codable, Sendable {
     /// Editable by the user in Settings. Hard cap enforced UI-side; overflow at
     /// runtime is a UI bug.
     case systemPrompt = "system_prompt"
@@ -4639,7 +4678,7 @@ enum PromptSegmentKind: String, CaseIterable, Codable {
 
     /// True if this segment should be compressed when over budget.
     /// False segments use hard-cap enforcement (CC-side or UI-side).
-    var isCompressible: Bool {
+    nonisolated var isCompressible: Bool {
         switch self {
         case .systemPrompt, .layerOneFraming, .temporalContext, .userMessage:
             return false
@@ -4649,7 +4688,7 @@ enum PromptSegmentKind: String, CaseIterable, Codable {
     }
 
     /// Human-readable label for HALDEBUG logs and the footer popover.
-    var displayName: String {
+    nonisolated var displayName: String {
         switch self {
         case .systemPrompt:      return "System Prompt"
         case .layerOneFraming:   return "Model Framing"
@@ -4666,14 +4705,16 @@ enum PromptSegmentKind: String, CaseIterable, Codable {
 /// A single segment of a prompt, with its raw content and its allocated budget.
 /// The hash of raw content is the cache key (segment, model, hash) — when
 /// raw content changes, the hash changes, and the cache automatically misses.
-struct PromptSegment {
+///
+/// Sendable so it can be passed between actors. All fields are value types.
+struct PromptSegment: Sendable {
     let kind: PromptSegmentKind
     let rawContent: String
     let budgetTokens: Int
 
     /// SHA-256 of `rawContent`, hex-encoded. Stable across launches and
     /// across devices. Empty content has a fixed empty-string hash.
-    var rawContentHash: String {
+    nonisolated var rawContentHash: String {
         let data = Data(rawContent.utf8)
         let digest = SHA256.hash(data: data)
         return digest.map { String(format: "%02x", $0) }.joined()
@@ -4681,7 +4722,7 @@ struct PromptSegment {
 }
 
 /// Result of evaluating a segment against its budget.
-enum PromptSegmentStatus {
+enum PromptSegmentStatus: Sendable {
     /// Segment fits in its budget. Passes through unchanged.
     case withinBudget(actualTokens: Int)
 
@@ -4698,18 +4739,18 @@ enum PromptSegmentStatus {
 }
 
 /// One segment's pre-flight result.
-struct PromptSegmentEvaluation {
+struct PromptSegmentEvaluation: Sendable {
     let segment: PromptSegment
     let status: PromptSegmentStatus
 
     /// Convenience: are we under budget?
-    var isWithinBudget: Bool {
+    nonisolated var isWithinBudget: Bool {
         if case .withinBudget = status { return true }
         return false
     }
 
     /// Convenience: do we need to compress?
-    var needsCompression: Bool {
+    nonisolated var needsCompression: Bool {
         if case .overBudgetCompressible = status { return true }
         return false
     }
@@ -4750,7 +4791,7 @@ actor PromptBudgetEvaluator {
 /// Stored in the cache (Phase 5) so subsequent turns can reuse the work.
 /// Top-level (not nested inside SegmentCompressor) so the cache protocol
 /// and MemoryStore can reference it without actor-nested-type awkwardness.
-struct CompressedSegment {
+struct CompressedSegment: Sendable {
     let kind: PromptSegmentKind
     let modelId: String
     let rawContentHash: String
@@ -4771,10 +4812,16 @@ struct CompressedSegment {
 /// The cache interface. MemoryStore conforms in Phase 5; the compressor
 /// uses this protocol so we can swap implementations or skip caching
 /// during tests without changing the compressor.
+///
+/// Both methods are nonisolated — the SegmentCompressor calls them from
+/// an actor context, and the underlying implementation uses SQLite's own
+/// thread-safety + sqlite3_finalize defer pattern. Without nonisolated,
+/// the project-level SWIFT_DEFAULT_ACTOR_ISOLATION = MainActor breaks
+/// the cross-context calls.
 protocol CompressedSegmentCache {
     /// Look up a previously-cached compression for (kind, model, content).
     /// Returns nil on cache miss.
-    func cachedCompression(
+    nonisolated func cachedCompression(
         segmentKind: PromptSegmentKind,
         modelId: String,
         rawContentHash: String
@@ -4782,7 +4829,7 @@ protocol CompressedSegmentCache {
 
     /// Store a freshly-computed compression in the cache.
     /// Idempotent: replacing an existing (kind, model, hash) row is fine.
-    func storeCachedCompression(_ compressed: CompressedSegment)
+    nonisolated func storeCachedCompression(_ compressed: CompressedSegment)
 }
 
 // MARK: - SegmentCompressor
@@ -4928,7 +4975,7 @@ extension MemoryStore: CompressedSegmentCache {
     /// Look up a previously-cached compression for (kind, model, content_hash).
     /// Returns nil on cache miss. Follows the existing MemoryStore SQLite pattern
     /// (synchronous direct calls, NSString-backed bindings with `nil` destructor).
-    func cachedCompression(
+    nonisolated func cachedCompression(
         segmentKind: PromptSegmentKind,
         modelId: String,
         rawContentHash: String
@@ -4980,7 +5027,7 @@ extension MemoryStore: CompressedSegmentCache {
     /// Store a freshly-computed compression in the cache.
     /// Uses INSERT OR REPLACE keyed by the UNIQUE constraint, so a stale row
     /// for the same (kind, model, hash) is replaced rather than duplicated.
-    func storeCachedCompression(_ compressed: CompressedSegment) {
+    nonisolated func storeCachedCompression(_ compressed: CompressedSegment) {
         guard ensureHealthyConnection() else {
             print("HALDEBUG-COMPRESS: Cannot write cache — no database connection")
             return
@@ -5019,7 +5066,7 @@ extension MemoryStore: CompressedSegmentCache {
     /// Belt-and-suspenders cleanup: hash-based lookup already handles the
     /// common case (content changed → hash changed → cache miss), but this
     /// is for bulk operations like DB Nuke or "reset all self-knowledge."
-    func invalidateCachedCompressions(forSegmentKind kind: PromptSegmentKind) {
+    nonisolated func invalidateCachedCompressions(forSegmentKind kind: PromptSegmentKind) {
         guard ensureHealthyConnection() else { return }
 
         let sql = "DELETE FROM compressed_segments WHERE segment_kind = ?"
@@ -5040,7 +5087,7 @@ extension MemoryStore: CompressedSegmentCache {
     /// Invalidate ALL cached compressions across every segment kind and model.
     /// Used by DB Nuke (though Nuclear Reset deletes the whole DB file, so
     /// this is mostly here for completeness / explicit non-DB-deleting resets).
-    func invalidateAllCachedCompressions() {
+    nonisolated func invalidateAllCachedCompressions() {
         guard ensureHealthyConnection() else { return }
 
         let sql = "DELETE FROM compressed_segments"
@@ -5495,7 +5542,7 @@ class MLXWrapper: ObservableObject {
         modelContainer = nil
         
         // Clear GPU cache to free VRAM
-        MLX.GPU.clearCache()
+        MLX.Memory.clearCache()
         
         // Update state
         isModelLoaded = false
@@ -5585,7 +5632,7 @@ class MLXWrapper: ObservableObject {
             let totalElapsed = Date.timeIntervalSinceReferenceDate - generateStart
             print("HALDEBUG-MLX: Total wall time: \(String(format: "%.2f", totalElapsed))s, chunks: \(tokenChunks), chars: \(fullText.count)")
 
-            MLX.GPU.clearCache()
+            MLX.Memory.clearCache()
 
             var cleanOutput: String = fullText.trimmingCharacters(in: CharacterSet.whitespacesAndNewlines)
             for stopSeq in ["User:", "Assistant:", "System:", "###"] {
@@ -5750,7 +5797,7 @@ class MLXWrapper: ObservableObject {
                         halLog("HALDEBUG-MLX-CHAT: Stream produced no items at all (model generated 0 tokens)")
                     }
 
-                    MLX.GPU.clearCache()
+                    MLX.Memory.clearCache()
                     var whitespaceTrimmed = fullText.trimmingCharacters(in: CharacterSet.whitespacesAndNewlines)
                     // Repetition-loop cleanup. If we bailed early on a detected
                     // loop, strip the loop residue so the user sees a clean
@@ -5980,7 +6027,7 @@ class LLMService: ObservableObject {
                         let prevID = mlxWrapper.currentModelConfig?.id ?? "?"
                         halLog("HALDEBUG-MLX: MLX→MLX swap detected (\(prevID) → \(model.id)); unloading previous + clearing GPU cache before load")
                         mlxWrapper.unloadModel()
-                        MLX.GPU.clearCache()
+                        MLX.Memory.clearCache()
                     }
 
                     // DETACHED so this work runs off the main actor. The
@@ -6007,7 +6054,7 @@ class LLMService: ObservableObject {
                             halLog("HALDEBUG-MLX: 500ms memory-reclaim settle complete; starting load for \(model.displayName)")
                         }
                         await self.mlxWrapper.loadModel(modelConfig: resolvedModel)
-                        if let mlxError = self.mlxWrapper.mlxError {
+                        if let mlxError = await self.mlxWrapper.mlxError {
                             await MainActor.run {
                                 self.initializationError = mlxError
                             }
@@ -10342,9 +10389,16 @@ struct WidgetTestView: View {
                 let w = scene.screen.bounds.width
                 if w > 0 { return w }
             }
-            let mainWidth = UIScreen.main.bounds.width
-            if mainWidth > 0 { return mainWidth }
-            return 390 // iPhone 16 logical width — safe fallback so maxWidth is never 0
+            // No scene resolved (extremely rare — only seen during cold-launch
+            // race conditions before any window scene attaches). Drop straight
+            // to the safe-fallback width. iPhone 16 logical width is 390pt;
+            // the GeometryReader-measured value (Phase 6b) replaces this within
+            // milliseconds of first layout, so the fallback is purely a
+            // never-return-zero guard.
+            // (Previously fell back to UIScreen.main.bounds.width, but that
+            // was deprecated in iOS 26 — the scene-based check above is the
+            // recommended replacement and it covers every non-edge case.)
+            return 390
         }
 
         // Reactive measurement of the bubble's actual container width.
@@ -10464,17 +10518,23 @@ struct WidgetTestView: View {
                     HStack {
                         if hasBadge {
                             let glyphName = hasTruncation ? "scissors" : "rectangle.compress.vertical"
-                            let glyphColor: Color = hasTruncation ? .red : .gray
+                            // Color the entire metadata line by the most-severe
+                            // state: red when any segment was truncated, gray
+                            // when only compression succeeded. The strong
+                            // signal on truncation is intentional — the user
+                            // should notice when intelligent compression failed
+                            // and we had to cut content instead.
+                            let lineColor: Color = hasTruncation ? .red : .gray
                             Button {
                                 showingCompressionExplanation = true
                             } label: {
-                                (
-                                    Text(footerString + " ")
-                                        .foregroundColor(.gray)
-                                    + Text(Image(systemName: glyphName))
-                                        .foregroundColor(glyphColor)
-                                )
-                                .font(.caption2)
+                                // Text interpolation with embedded Image (iOS 17+
+                                // replacement for the deprecated `Text + Text`
+                                // operator). Single color applied to the full
+                                // attributed text — see lineColor reasoning above.
+                                Text("\(footerString) \(Image(systemName: glyphName))")
+                                    .font(.caption2)
+                                    .foregroundColor(lineColor)
                             }
                             .buttonStyle(.plain)
                             .popover(isPresented: $showingCompressionExplanation,
@@ -11208,6 +11268,10 @@ struct RoundedCorner: Shape {
 }
 
 // MARK: - Token Estimation Utility
+// All methods explicitly nonisolated so SegmentCompressor (an actor) and
+// other off-main callers can use them freely. Pure computation, no UI state.
+// Without this, the project-level SWIFT_DEFAULT_ACTOR_ISOLATION = MainActor
+// makes them implicitly @MainActor and breaks every off-main caller.
 struct TokenEstimator {
     /// Conservative characters-per-token heuristic. The OpenAI tokenizer
     /// averages closer to 4 characters per token for English prose; we use
@@ -11215,11 +11279,11 @@ struct TokenEstimator {
     /// token count is the safe direction for a budget check. The 3% safety
     /// buffer in HalModelLimits absorbs any remaining drift.
     /// Updated 2026-05-16 — see Docs/Context_Budget_Implementation_Plan_2026-05-16.md.
-    private static let charsPerToken: Double = 4.0
+    nonisolated static let charsPerToken: Double = 4.0
 
     /// Estimates token count from text using the conservative chars/token heuristic.
     /// This is an approximation — actual tokenization may vary by tokenizer.
-    static func estimateTokens(from text: String) -> Int {
+    nonisolated static func estimateTokens(from text: String) -> Int {
         let characterCount = text.count
         let estimatedTokens = Double(characterCount) / charsPerToken
         return max(1, Int(estimatedTokens.rounded()))
@@ -11227,7 +11291,7 @@ struct TokenEstimator {
 
     /// Estimates character count from token count using the same heuristic.
     /// This is the inverse of estimateTokens() and maintains symmetry.
-    static func estimateChars(from tokens: Int) -> Int {
+    nonisolated static func estimateChars(from tokens: Int) -> Int {
         let estimatedChars = Double(tokens) * charsPerToken
         return max(1, Int(estimatedChars.rounded()))
     }
@@ -15730,7 +15794,11 @@ class BackgroundDownloadCoordinator: NSObject, URLSessionDownloadDelegate, Obser
         config.allowsCellularAccess = true              // user already accepted the hardware disclosure
         config.sessionSendsLaunchEvents = true          // wake us when complete
         config.isDiscretionary = false                  // ASAP, not "when convenient"
-        config.shouldUseExtendedBackgroundIdleMode = true
+        // Note: shouldUseExtendedBackgroundIdleMode was deprecated in iOS 18.4
+        // (no longer supported by URLSession). It used to signal "extend idle
+        // mode for this session to keep connections open longer." Removing it
+        // has no functional impact on our use case — background URLSession
+        // already keeps state across app suspension via nsurlsessiond.
         // The OperationQueue must be serial to keep delegate ordering deterministic.
         let queue = OperationQueue()
         queue.maxConcurrentOperationCount = 1

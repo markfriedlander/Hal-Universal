@@ -130,6 +130,7 @@ Full spec: `Docs/Hal_Persistent_Memory_Architecture.md`
 4. **One block at a time** — when modifying existing code, change one LEGO block per exchange
 5. **Ask rather than assume** — if something is unclear, ask Mark
 6. **Evidence over intuition** — use console logs and real device testing, not assumptions
+7. **Warnings are errors** — Swift compiler warnings get fixed in real time, in the same commit that introduced them, treated no differently than errors. We don't ship sloppy code. If a change generates a new warning, the change isn't done until the warning is resolved. The only exception is third-party code we don't own (e.g. mlx-swift, system tooling) — for those, leave them, but note them in the commit message if relevant.
 
 ### When You Start a Session
 1. Read this file
