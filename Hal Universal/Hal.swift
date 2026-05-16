@@ -14920,21 +14920,28 @@ class BackgroundDownloadCoordinator: NSObject, URLSessionDownloadDelegate, Obser
     /// to suspend us again.
     var backgroundCompletionHandler: (() -> Void)?
 
-    // MARK: - Per-Task Persisted Metadata
+    // MARK: - Per-Task Metadata (session-aware)
     //
-    // URLSession.background tasks survive app termination, but our in-memory
-    // taskIdentifier → context mapping does not. We persist it to disk so
-    // delegate callbacks on the next launch can still route to the right
-    // model. Keyed by URLSessionTask.taskIdentifier (Int as String).
+    // Two storage backends:
+    //   - Background tasks: persisted to UserDefaults. Background URLSession
+    //     tasks survive app termination, so on relaunch we need to look up
+    //     each reconnected task's modelID/filename/target to route delegate
+    //     callbacks correctly.
+    //   - Foreground tasks: in-memory only. Foreground URLSession tasks die
+    //     with the app, so persistence would be pointless. Lighter weight.
+    //
+    // Key collision is avoided naturally because the two dictionaries are
+    // separate. Within each session, taskIdentifier is unique.
     struct TaskContext: Codable {
-        let modelID: String     // e.g. "mlx-community/Phi-4-mini-instruct-4bit"
+        let modelID: String     // e.g. "mlx-community/gemma-4-e2b-it-4bit"
         let filename: String    // e.g. "model.safetensors"
         let targetPath: String  // absolute path where the finished file lands
     }
 
     private let taskContextDefaultsKey = "bgDownloadTaskContexts.v1"
 
-    private var taskContexts: [String: TaskContext] {
+    /// Background-session task contexts. Persisted across app launches.
+    private var backgroundTaskContexts: [String: TaskContext] {
         get {
             guard let data = UserDefaults.standard.data(forKey: taskContextDefaultsKey) else { return [:] }
             return (try? JSONDecoder().decode([String: TaskContext].self, from: data)) ?? [:]
@@ -14946,29 +14953,82 @@ class BackgroundDownloadCoordinator: NSObject, URLSessionDownloadDelegate, Obser
         }
     }
 
-    private func contextLookup(_ taskID: Int) -> TaskContext? {
-        return taskContexts[String(taskID)]
+    /// Foreground-session task contexts. In-memory only.
+    private var foregroundTaskContexts: [Int: TaskContext] = [:]
+
+    private func contextLookup(session: SessionKind, taskID: Int) -> TaskContext? {
+        switch session {
+        case .foreground: return foregroundTaskContexts[taskID]
+        case .background: return backgroundTaskContexts[String(taskID)]
+        }
     }
 
-    private func saveContext(_ context: TaskContext, for taskID: Int) {
-        var contexts = taskContexts
-        contexts[String(taskID)] = context
-        taskContexts = contexts
+    private func saveContext(_ context: TaskContext, session: SessionKind, taskID: Int) {
+        switch session {
+        case .foreground:
+            foregroundTaskContexts[taskID] = context
+        case .background:
+            var contexts = backgroundTaskContexts
+            contexts[String(taskID)] = context
+            backgroundTaskContexts = contexts
+        }
     }
 
-    private func removeContext(for taskID: Int) {
-        var contexts = taskContexts
-        contexts.removeValue(forKey: String(taskID))
-        taskContexts = contexts
+    private func removeContext(session: SessionKind, taskID: Int) {
+        switch session {
+        case .foreground:
+            foregroundTaskContexts.removeValue(forKey: taskID)
+        case .background:
+            var contexts = backgroundTaskContexts
+            contexts.removeValue(forKey: String(taskID))
+            backgroundTaskContexts = contexts
+        }
     }
 
-    // MARK: - Lazy URLSession
+    // MARK: - Dual URLSessions (v2.0 hybrid architecture)
     //
-    // Lazy so we don't trigger the background URLSession's reconnection
-    // dance until something actually asks for it. iOS may immediately
-    // start replaying pending delegate callbacks once the session is
-    // created — that's the point of the background mode.
-    private lazy var session: URLSession = {
+    // Hal uses TWO URLSession instances for model downloads:
+    //
+    //   foregroundSession — standard config. Fast (~99 Mbps observed on
+    //   110 Mbps WiFi). Active while the app is in the foreground. Tasks
+    //   die when the app is suspended or terminated.
+    //
+    //   backgroundSession — background mode with the stable identifier
+    //   below. Bandwidth-throttled by iOS (~1.7 MB/s observed) but
+    //   survives app suspension, screen lock, and even termination.
+    //   Reconnects automatically on relaunch.
+    //
+    // On didEnterBackground, in-flight foreground tasks are migrated to
+    // the background session via cancel-with-resume-data so the download
+    // keeps going (slowly) while the user is away. On willEnterForeground,
+    // they're migrated back so the user gets full bandwidth while watching.
+    //
+    // This matches the canonical iOS pattern used by Apple's own apps
+    // (App Store, Podcasts, Music): fast when watching, resilient when not.
+
+    enum SessionKind { case foreground, background }
+
+    /// Per-task tracking key — discriminates foreground vs background tasks
+    /// because URLSession.taskIdentifier is unique only within a single
+    /// session. A foreground task with ID 5 and a background task with ID 5
+    /// are completely different tasks; keying by raw Int would collide.
+    struct TaskKey: Hashable {
+        let session: SessionKind
+        let id: Int
+    }
+
+    private lazy var foregroundSession: URLSession = {
+        let config = URLSessionConfiguration.default
+        config.allowsCellularAccess = true
+        config.requestCachePolicy = .reloadIgnoringLocalCacheData
+        config.httpMaximumConnectionsPerHost = 4
+        // Serial queue keeps delegate callbacks ordered, matching background.
+        let queue = OperationQueue()
+        queue.maxConcurrentOperationCount = 1
+        return URLSession(configuration: config, delegate: self, delegateQueue: queue)
+    }()
+
+    private lazy var backgroundSession: URLSession = {
         let config = URLSessionConfiguration.background(withIdentifier: Self.backgroundSessionID)
         config.allowsCellularAccess = true              // user already accepted the hardware disclosure
         config.sessionSendsLaunchEvents = true          // wake us when complete
@@ -14980,12 +15040,47 @@ class BackgroundDownloadCoordinator: NSObject, URLSessionDownloadDelegate, Obser
         return URLSession(configuration: config, delegate: self, delegateQueue: queue)
     }()
 
+    /// Resolve which session a delegate callback came from.
+    private func sessionKind(of session: URLSession) -> SessionKind {
+        return session === foregroundSession ? .foreground : .background
+    }
+
+    /// Lifecycle observers held for the coordinator's lifetime so the
+    /// notification subscriptions persist. Set up in init.
+    private var lifecycleObservers: [NSObjectProtocol] = []
+
     private override init() {
         super.init()
-        halLog("HALDEBUG-BGDL: BackgroundDownloadCoordinator init; will lazily create URLSession id=\(Self.backgroundSessionID)")
-        // Touch the lazy session so iOS immediately replays any pending
-        // events from a previous app instance.
-        _ = session
+        halLog("HALDEBUG-BGDL: BackgroundDownloadCoordinator init; will lazily create URLSessions (fg + bg id=\(Self.backgroundSessionID))")
+        // Touch the lazy background session so iOS immediately replays any
+        // pending events from a previous app instance. Foreground session
+        // is touched on first download attempt.
+        _ = backgroundSession
+        setupLifecycleObservers()
+    }
+
+    deinit {
+        for observer in lifecycleObservers {
+            NotificationCenter.default.removeObserver(observer)
+        }
+    }
+
+    private func setupLifecycleObservers() {
+        let bgObserver = NotificationCenter.default.addObserver(
+            forName: UIApplication.didEnterBackgroundNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            Task { await self?.migrateForegroundTasksToBackground() }
+        }
+        let fgObserver = NotificationCenter.default.addObserver(
+            forName: UIApplication.willEnterForegroundNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            Task { await self?.migrateBackgroundTasksToForeground() }
+        }
+        lifecycleObservers = [bgObserver, fgObserver]
     }
 
     // MARK: - Public API
@@ -15001,28 +15096,26 @@ class BackgroundDownloadCoordinator: NSObject, URLSessionDownloadDelegate, Obser
     func startDownload(modelID: String, repoID: String) async throws {
         halLog("HALDEBUG-BGDL: startDownload modelID=\(modelID) repoID=\(repoID)")
 
-        // DEDUP: cancel any in-flight tasks for this model before enqueuing
-        // fresh ones. Without this, repeat calls to startDownload — or the
-        // auto-resume on app launch combining with a user-triggered retry —
-        // accumulate duplicate tasks racing for the same bytes, dividing
-        // throughput and confusing per-model byte accounting. We surfaced
-        // this bug today via the new HALDEBUG-BGDL-BYTES logging:
-        // model.safetensors had three concurrent tasks (5, 6, 10) all
-        // downloading the same file at ~0.7 MB/s each instead of one task
-        // at ~2-3 MB/s. Each startDownload is now idempotent and self-
-        // cleaning.
-        let activeTaskSnapshot = await session.allTasks
-        var cancelledTaskIDs: [Int] = []
-        for task in activeTaskSnapshot {
-            guard let context = contextLookup(task.taskIdentifier),
-                  context.modelID == modelID else { continue }
-            if task.state == .running || task.state == .suspended {
-                task.cancel()
-                cancelledTaskIDs.append(task.taskIdentifier)
+        // DEDUP: cancel any in-flight tasks for this model in EITHER session
+        // before enqueuing fresh ones. Without this, repeat calls accumulate
+        // duplicate tasks racing for the same bytes (we surfaced this bug
+        // today via HALDEBUG-BGDL-BYTES: model.safetensors had 3 concurrent
+        // tasks at ~0.7 MB/s each instead of 1 at ~2-3 MB/s).
+        var cancelledIDs: [String] = []
+        for session in [foregroundSession, backgroundSession] {
+            let kind = sessionKind(of: session)
+            let snapshot = await session.allTasks
+            for task in snapshot {
+                guard let context = contextLookup(session: kind, taskID: task.taskIdentifier),
+                      context.modelID == modelID else { continue }
+                if task.state == .running || task.state == .suspended {
+                    task.cancel()
+                    cancelledIDs.append("\(kind == .foreground ? "fg" : "bg"):\(task.taskIdentifier)")
+                }
             }
         }
-        if !cancelledTaskIDs.isEmpty {
-            halLog("HALDEBUG-BGDL: Cancelled \(cancelledTaskIDs.count) stale in-flight task(s) for \(modelID) before fresh enqueue: \(cancelledTaskIDs.sorted())")
+        if !cancelledIDs.isEmpty {
+            halLog("HALDEBUG-BGDL: Cancelled \(cancelledIDs.count) stale in-flight task(s) for \(modelID): \(cancelledIDs)")
         }
 
         // Fetch the file list from the HF tree API.
@@ -15045,11 +15138,18 @@ class BackgroundDownloadCoordinator: NSObject, URLSessionDownloadDelegate, Obser
         bytesWrittenByModel[modelID] = 0
         filesPendingByModel[modelID] = Set(mlxFiles)
 
+        // Choose session based on current app state. Foreground = fast for
+        // active downloads; background = resilient if app is suspended.
+        // The didEnterBackground / willEnterForeground migration handlers
+        // will move tasks between sessions as the app's state changes.
+        let appActive = await MainActor.run { UIApplication.shared.applicationState == .active }
+        let chosenSession = appActive ? foregroundSession : backgroundSession
+        let chosenKind: SessionKind = appActive ? .foreground : .background
+        halLog("HALDEBUG-BGDL: Enqueuing on \(chosenKind == .foreground ? "FOREGROUND" : "BACKGROUND") session (app state: \(appActive ? "active" : "inactive/background"))")
+
         // Enqueue a download task per file.
         for filename in mlxFiles {
-            // Files already present at target with non-zero size: skip — the
-            // delegate's didFinishDownloading wouldn't fire for them anyway,
-            // and we want to keep the existing partial-download resilience.
+            // Files already present at target with non-zero size: skip.
             let targetURL = modelDir.appendingPathComponent(filename)
             if let existingSize = try? FileManager.default.attributesOfItem(atPath: targetURL.path)[.size] as? Int64,
                existingSize > 0 {
@@ -15065,11 +15165,11 @@ class BackgroundDownloadCoordinator: NSObject, URLSessionDownloadDelegate, Obser
                 continue
             }
 
-            let task = session.downloadTask(with: url)
+            let task = chosenSession.downloadTask(with: url)
             let context = TaskContext(modelID: modelID, filename: filename, targetPath: targetURL.path)
-            saveContext(context, for: task.taskIdentifier)
+            saveContext(context, session: chosenKind, taskID: task.taskIdentifier)
             task.resume()
-            halLog("HALDEBUG-BGDL: Enqueued task \(task.taskIdentifier) for \(filename)")
+            halLog("HALDEBUG-BGDL: Enqueued \(chosenKind == .foreground ? "fg" : "bg") task \(task.taskIdentifier) for \(filename)")
         }
 
         // If all files were already present, treat the model as complete now.
@@ -15156,8 +15256,9 @@ class BackgroundDownloadCoordinator: NSObject, URLSessionDownloadDelegate, Obser
     // MARK: - URLSessionDownloadDelegate
 
     func urlSession(_ session: URLSession, downloadTask: URLSessionDownloadTask, didFinishDownloadingTo location: URL) {
-        guard let context = contextLookup(downloadTask.taskIdentifier) else {
-            halLog("HALDEBUG-BGDL: didFinishDownloadingTo received for unknown task \(downloadTask.taskIdentifier); ignoring")
+        let kind = sessionKind(of: session)
+        guard let context = contextLookup(session: kind, taskID: downloadTask.taskIdentifier) else {
+            halLog("HALDEBUG-BGDL: didFinishDownloadingTo received for unknown \(kind == .foreground ? "fg" : "bg") task \(downloadTask.taskIdentifier); ignoring")
             return
         }
 
@@ -15168,7 +15269,7 @@ class BackgroundDownloadCoordinator: NSObject, URLSessionDownloadDelegate, Obser
         try? FileManager.default.removeItem(at: target)
         do {
             try FileManager.default.moveItem(at: location, to: target)
-            halLog("HALDEBUG-BGDL: Moved \(context.filename) → \(target.path)")
+            halLog("HALDEBUG-BGDL: Moved \(context.filename) → \(target.path) (\(kind == .foreground ? "fg" : "bg") task \(downloadTask.taskIdentifier))")
         } catch {
             halLog("HALDEBUG-BGDL: ❌ Move failed for \(context.filename): \(error.localizedDescription)")
         }
@@ -15190,8 +15291,9 @@ class BackgroundDownloadCoordinator: NSObject, URLSessionDownloadDelegate, Obser
                     didWriteData bytesWritten: Int64,
                     totalBytesWritten: Int64,
                     totalBytesExpectedToWrite: Int64) {
-        guard let context = contextLookup(downloadTask.taskIdentifier) else { return }
-        let taskID = downloadTask.taskIdentifier
+        let kind = sessionKind(of: session)
+        guard let context = contextLookup(session: kind, taskID: downloadTask.taskIdentifier) else { return }
+        let key = TaskKey(session: kind, id: downloadTask.taskIdentifier)
         Task { @MainActor in
             // Update the per-model totals. Each file contributes its own
             // expected-bytes count; we accumulate so the model's overall
@@ -15199,33 +15301,29 @@ class BackgroundDownloadCoordinator: NSObject, URLSessionDownloadDelegate, Obser
             //
             // Because didWriteData fires repeatedly with cumulative totals
             // *for that single file*, we recompute by subtracting the
-            // previous per-task contribution and adding the new one. We
-            // keep that previous contribution in `bytesWrittenByTask`.
-            let prev = self.bytesWrittenByTask[taskID] ?? 0
+            // previous per-task contribution and adding the new one.
+            let prev = self.bytesWrittenByTask[key] ?? 0
             let delta = max(0, totalBytesWritten - prev)
-            self.bytesWrittenByTask[taskID] = totalBytesWritten
+            self.bytesWrittenByTask[key] = totalBytesWritten
             self.bytesWrittenByModel[context.modelID, default: 0] += delta
 
             // Same trick for expected. Update if it shrank from -1 (unknown).
             if totalBytesExpectedToWrite > 0 {
-                let prevExpected = self.bytesExpectedByTask[taskID] ?? 0
+                let prevExpected = self.bytesExpectedByTask[key] ?? 0
                 let expectedDelta = totalBytesExpectedToWrite - prevExpected
                 if expectedDelta != 0 {
-                    self.bytesExpectedByTask[taskID] = totalBytesExpectedToWrite
+                    self.bytesExpectedByTask[key] = totalBytesExpectedToWrite
                     self.bytesExpectedByModel[context.modelID, default: 0] += expectedDelta
                 }
             }
 
             // Throttled byte-flow logging (v2.0 diagnostic addition).
-            // Log per-task throughput every ~5 seconds so we can SEE bytes
-            // flowing during a download — essential for diagnosing whether
-            // a background download is actually progressing or stalled,
-            // and for understanding what's happening across lifecycle
-            // events (background, lock, foreground).
+            // Logs include session kind (fg/bg) so we can correlate
+            // throughput with which session is actively transferring.
             let now = Date()
-            let lastLog = self.lastByteLogTimeByTask[taskID] ?? .distantPast
+            let lastLog = self.lastByteLogTimeByTask[key] ?? .distantPast
             if now.timeIntervalSince(lastLog) >= 5.0 {
-                let prevBytesAtLog = self.lastByteLogBytesByTask[taskID] ?? 0
+                let prevBytesAtLog = self.lastByteLogBytesByTask[key] ?? 0
                 let bytesSinceLastLog = max(0, totalBytesWritten - prevBytesAtLog)
                 let secondsSinceLastLog = lastLog == .distantPast ? 0 : now.timeIntervalSince(lastLog)
                 let throughputMBs = secondsSinceLastLog > 0
@@ -15238,39 +15336,63 @@ class BackgroundDownloadCoordinator: NSObject, URLSessionDownloadDelegate, Obser
                 let pct = totalBytesExpectedToWrite > 0
                     ? Int(Double(totalBytesWritten) / Double(totalBytesExpectedToWrite) * 100)
                     : -1
+                let kindStr = kind == .foreground ? "fg" : "bg"
                 if expectedMB > 0 {
-                    halLog("HALDEBUG-BGDL-BYTES: task \(taskID) (\(context.filename)) \(String(format: "%.1f", writtenMB))/\(String(format: "%.1f", expectedMB)) MB (\(pct)%) | \(String(format: "%.2f", throughputMBs)) MB/s")
+                    halLog("HALDEBUG-BGDL-BYTES: \(kindStr) task \(downloadTask.taskIdentifier) (\(context.filename)) \(String(format: "%.1f", writtenMB))/\(String(format: "%.1f", expectedMB)) MB (\(pct)%) | \(String(format: "%.2f", throughputMBs)) MB/s")
                 } else {
-                    halLog("HALDEBUG-BGDL-BYTES: task \(taskID) (\(context.filename)) \(String(format: "%.1f", writtenMB)) MB (expected unknown) | \(String(format: "%.2f", throughputMBs)) MB/s")
+                    halLog("HALDEBUG-BGDL-BYTES: \(kindStr) task \(downloadTask.taskIdentifier) (\(context.filename)) \(String(format: "%.1f", writtenMB)) MB (expected unknown) | \(String(format: "%.2f", throughputMBs)) MB/s")
                 }
-                self.lastByteLogTimeByTask[taskID] = now
-                self.lastByteLogBytesByTask[taskID] = totalBytesWritten
+                self.lastByteLogTimeByTask[key] = now
+                self.lastByteLogBytesByTask[key] = totalBytesWritten
             }
         }
     }
 
-    private var bytesWrittenByTask: [Int: Int64] = [:]
-    private var bytesExpectedByTask: [Int: Int64] = [:]
+    // Per-task tracking keyed by TaskKey (session + taskID) because
+    // taskIdentifier is unique only within a single URLSession.
+    private var bytesWrittenByTask: [TaskKey: Int64] = [:]
+    private var bytesExpectedByTask: [TaskKey: Int64] = [:]
     // For throttled byte-flow logging (5 second cadence per task).
-    private var lastByteLogTimeByTask: [Int: Date] = [:]
-    private var lastByteLogBytesByTask: [Int: Int64] = [:]
+    private var lastByteLogTimeByTask: [TaskKey: Date] = [:]
+    private var lastByteLogBytesByTask: [TaskKey: Int64] = [:]
 
     func urlSession(_ session: URLSession, task: URLSessionTask, didCompleteWithError error: Error?) {
-        guard let context = contextLookup(task.taskIdentifier) else { return }
-        if let error = error {
-            halLog("HALDEBUG-BGDL: Task \(task.taskIdentifier) (\(context.filename)) failed: \(error.localizedDescription)")
+        let kind = sessionKind(of: session)
+        let key = TaskKey(session: kind, id: task.taskIdentifier)
+        let kindStr = kind == .foreground ? "fg" : "bg"
+        guard let context = contextLookup(session: kind, taskID: task.taskIdentifier) else { return }
+
+        // Suppress noisy "cancelled" logs when this cancellation is part of
+        // a planned lifecycle migration (foreground↔background). Those
+        // cancellations are expected — they produce the resume data that
+        // we hand to the other session.
+        let isMigrationCancel = migratingTaskIDs.remove(key) != nil
+        if let error = error as NSError? {
+            if isMigrationCancel {
+                halLog("HALDEBUG-BGDL: \(kindStr) task \(task.taskIdentifier) (\(context.filename)) cancelled-for-migration (expected)")
+            } else if error.code == NSURLErrorCancelled {
+                halLog("HALDEBUG-BGDL: \(kindStr) task \(task.taskIdentifier) (\(context.filename)) cancelled")
+            } else {
+                halLog("HALDEBUG-BGDL-ERROR: \(kindStr) task \(task.taskIdentifier) (\(context.filename)) failed: \(error.localizedDescription) (domain=\(error.domain), code=\(error.code))")
+            }
         } else {
-            halLog("HALDEBUG-BGDL: Task \(task.taskIdentifier) (\(context.filename)) completed")
+            halLog("HALDEBUG-BGDL: \(kindStr) task \(task.taskIdentifier) (\(context.filename)) completed")
         }
-        removeContext(for: task.taskIdentifier)
+        removeContext(session: kind, taskID: task.taskIdentifier)
         Task { @MainActor in
-            self.bytesWrittenByTask.removeValue(forKey: task.taskIdentifier)
-            self.bytesExpectedByTask.removeValue(forKey: task.taskIdentifier)
-            // Also clean up the log-throttle dictionaries (added v2.0).
-            self.lastByteLogTimeByTask.removeValue(forKey: task.taskIdentifier)
-            self.lastByteLogBytesByTask.removeValue(forKey: task.taskIdentifier)
+            self.bytesWrittenByTask.removeValue(forKey: key)
+            self.bytesExpectedByTask.removeValue(forKey: key)
+            self.lastByteLogTimeByTask.removeValue(forKey: key)
+            self.lastByteLogBytesByTask.removeValue(forKey: key)
         }
     }
+
+    /// Tracks task keys that we have cancelled deliberately as part of a
+    /// foreground↔background migration. didCompleteWithError uses this to
+    /// suppress the noisy "task X failed: cancelled" log for those cases.
+    /// Entries are consumed (removed) when didCompleteWithError fires for
+    /// them.
+    private var migratingTaskIDs: Set<TaskKey> = []
 
     func urlSessionDidFinishEvents(forBackgroundURLSession session: URLSession) {
         halLog("HALDEBUG-BGDL: urlSessionDidFinishEvents — invoking app delegate completion handler")
@@ -15282,27 +15404,148 @@ class BackgroundDownloadCoordinator: NSObject, URLSessionDownloadDelegate, Obser
 
     // MARK: - Cancellation
 
-    /// Cancel all in-flight download tasks for a specific model. Called by
-    /// MLXModelDownloader.startDownload when the user explicitly cancels via
-    /// the UI. Background URLSession cancellation propagates as
+    /// Cancel all in-flight download tasks for a specific model in BOTH
+    /// sessions (foreground + background). Called when the user explicitly
+    /// cancels via the UI. URLSession cancellation propagates as
     /// `URLError.cancelled` to didCompleteWithError, where we remove the
     /// per-task context. We also drop the per-model bookkeeping here so a
     /// follow-up retry starts clean.
     func cancelDownload(modelID: String) async {
         halLog("HALDEBUG-BGDL: cancelDownload requested for \(modelID)")
-        let allTasks = await session.allTasks
         var cancelled = 0
-        for task in allTasks {
-            if let context = contextLookup(task.taskIdentifier), context.modelID == modelID {
-                task.cancel()
-                cancelled += 1
+        for session in [foregroundSession, backgroundSession] {
+            let kind = sessionKind(of: session)
+            let allTasks = await session.allTasks
+            for task in allTasks {
+                if let context = contextLookup(session: kind, taskID: task.taskIdentifier),
+                   context.modelID == modelID {
+                    task.cancel()
+                    cancelled += 1
+                }
             }
         }
-        halLog("HALDEBUG-BGDL: Cancelled \(cancelled) in-flight task(s) for \(modelID)")
+        halLog("HALDEBUG-BGDL: Cancelled \(cancelled) in-flight task(s) for \(modelID) across both sessions")
         await MainActor.run {
             self.filesPendingByModel.removeValue(forKey: modelID)
             self.bytesWrittenByModel.removeValue(forKey: modelID)
             self.bytesExpectedByModel.removeValue(forKey: modelID)
+        }
+    }
+
+    // MARK: - Lifecycle Migration (v2.0 hybrid)
+    //
+    // When the app backgrounds, transfer in-flight foreground tasks to the
+    // background session so the download keeps going (slowly) while the
+    // user is away. When the app foregrounds, reverse the migration so the
+    // user gets full bandwidth while watching.
+    //
+    // The migration uses `URLSessionDownloadTask.cancel(byProducingResumeData:)`
+    // which returns a `Data` blob iOS uses to resume the download from the
+    // exact byte where it stopped. HuggingFace's CDN supports HTTP Range
+    // requests so resumption should work cleanly.
+
+    func migrateForegroundTasksToBackground() async {
+        let snapshot = await foregroundSession.allTasks
+        let downloadTasks = snapshot.compactMap { $0 as? URLSessionDownloadTask }
+        guard !downloadTasks.isEmpty else {
+            halLog("HALDEBUG-BGDL: migrateForegroundTasksToBackground: no foreground tasks to migrate")
+            return
+        }
+        halLog("HALDEBUG-BGDL: migrateForegroundTasksToBackground: migrating \(downloadTasks.count) task(s) to background session")
+
+        for task in downloadTasks {
+            guard task.state == .running || task.state == .suspended else { continue }
+            guard let context = contextLookup(session: .foreground, taskID: task.taskIdentifier) else {
+                halLog("HALDEBUG-BGDL: migrate: foreground task \(task.taskIdentifier) has no context; skipping")
+                continue
+            }
+            let oldKey = TaskKey(session: .foreground, id: task.taskIdentifier)
+            migratingTaskIDs.insert(oldKey)
+
+            // cancel-with-resume-data is async via callback. Wrap in
+            // withCheckedContinuation so we can await it cleanly.
+            let resumeData: Data? = await withCheckedContinuation { continuation in
+                task.cancel(byProducingResumeData: { data in
+                    continuation.resume(returning: data)
+                })
+            }
+
+            // Tear down foreground bookkeeping for this task.
+            // (didCompleteWithError will also fire and remove the context,
+            // but doing it here too is idempotent and safer against races.)
+            await MainActor.run {
+                self.bytesWrittenByTask.removeValue(forKey: oldKey)
+                self.bytesExpectedByTask.removeValue(forKey: oldKey)
+                self.lastByteLogTimeByTask.removeValue(forKey: oldKey)
+                self.lastByteLogBytesByTask.removeValue(forKey: oldKey)
+            }
+            removeContext(session: .foreground, taskID: task.taskIdentifier)
+
+            // Hand off to background session.
+            let newTask: URLSessionDownloadTask
+            if let resumeData {
+                newTask = backgroundSession.downloadTask(withResumeData: resumeData)
+                halLog("HALDEBUG-BGDL: migrate ✅ \(context.filename) fg→bg with \(resumeData.count) bytes of resume data; new bg task \(newTask.taskIdentifier)")
+            } else if let url = task.originalRequest?.url {
+                // No resume data — restart from byte 0. Loud log so we
+                // notice if this happens often (would indicate the CDN
+                // isn't supporting Range requests, which would be bad).
+                newTask = backgroundSession.downloadTask(with: url)
+                halLog("HALDEBUG-BGDL: migrate ⚠️ \(context.filename) fg→bg WITHOUT resume data; restarting from 0; new bg task \(newTask.taskIdentifier)")
+            } else {
+                halLog("HALDEBUG-BGDL: migrate ❌ \(context.filename) has no URL — cannot continue")
+                continue
+            }
+            saveContext(context, session: .background, taskID: newTask.taskIdentifier)
+            newTask.resume()
+        }
+    }
+
+    func migrateBackgroundTasksToForeground() async {
+        let snapshot = await backgroundSession.allTasks
+        let downloadTasks = snapshot.compactMap { $0 as? URLSessionDownloadTask }
+        guard !downloadTasks.isEmpty else {
+            halLog("HALDEBUG-BGDL: migrateBackgroundTasksToForeground: no background tasks to migrate")
+            return
+        }
+        halLog("HALDEBUG-BGDL: migrateBackgroundTasksToForeground: migrating \(downloadTasks.count) task(s) to foreground session")
+
+        for task in downloadTasks {
+            guard task.state == .running || task.state == .suspended else { continue }
+            guard let context = contextLookup(session: .background, taskID: task.taskIdentifier) else {
+                halLog("HALDEBUG-BGDL: migrate: background task \(task.taskIdentifier) has no context; skipping")
+                continue
+            }
+            let oldKey = TaskKey(session: .background, id: task.taskIdentifier)
+            migratingTaskIDs.insert(oldKey)
+
+            let resumeData: Data? = await withCheckedContinuation { continuation in
+                task.cancel(byProducingResumeData: { data in
+                    continuation.resume(returning: data)
+                })
+            }
+
+            await MainActor.run {
+                self.bytesWrittenByTask.removeValue(forKey: oldKey)
+                self.bytesExpectedByTask.removeValue(forKey: oldKey)
+                self.lastByteLogTimeByTask.removeValue(forKey: oldKey)
+                self.lastByteLogBytesByTask.removeValue(forKey: oldKey)
+            }
+            removeContext(session: .background, taskID: task.taskIdentifier)
+
+            let newTask: URLSessionDownloadTask
+            if let resumeData {
+                newTask = foregroundSession.downloadTask(withResumeData: resumeData)
+                halLog("HALDEBUG-BGDL: migrate ✅ \(context.filename) bg→fg with \(resumeData.count) bytes of resume data; new fg task \(newTask.taskIdentifier)")
+            } else if let url = task.originalRequest?.url {
+                newTask = foregroundSession.downloadTask(with: url)
+                halLog("HALDEBUG-BGDL: migrate ⚠️ \(context.filename) bg→fg WITHOUT resume data; restarting from 0; new fg task \(newTask.taskIdentifier)")
+            } else {
+                halLog("HALDEBUG-BGDL: migrate ❌ \(context.filename) has no URL — cannot continue")
+                continue
+            }
+            saveContext(context, session: .foreground, taskID: newTask.taskIdentifier)
+            newTask.resume()
         }
     }
 }
