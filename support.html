@@ -1,0 +1,117 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Support — Hal Universal</title>
+<style>
+  :root { color-scheme: dark; }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  html, body {
+    background: #000;
+    color: #fff;
+    font-family: -apple-system, "Helvetica Neue", Helvetica, Arial, sans-serif;
+    font-weight: 300;
+    line-height: 1.6;
+    min-height: 100vh;
+  }
+  body {
+    max-width: 640px;
+    margin: 0 auto;
+    padding: 12vh 32px 12vh 32px;
+  }
+  .eyebrow {
+    font-size: 11px;
+    font-weight: 400;
+    text-transform: uppercase;
+    letter-spacing: 0.28em;
+    color: rgba(255,255,255,0.55);
+    margin-bottom: 4em;
+  }
+  h1 {
+    font-size: 13px;
+    font-weight: 400;
+    text-transform: uppercase;
+    letter-spacing: 0.32em;
+    color: #fff;
+    margin-bottom: 2.5em;
+  }
+  h2 {
+    font-size: 11px;
+    font-weight: 500;
+    letter-spacing: 0.18em;
+    text-transform: uppercase;
+    color: rgba(255,255,255,0.7);
+    margin: 2.5em 0 1em;
+  }
+  hr {
+    border: 0;
+    border-top: 1px solid rgba(255,255,255,0.18);
+    margin: 3.5em 0;
+  }
+  p {
+    font-size: 17px;
+    color: rgba(255,255,255,0.92);
+    margin-bottom: 1.5em;
+    max-width: 560px;
+  }
+  p.small {
+    font-size: 13px;
+    color: rgba(255,255,255,0.55);
+  }
+  a {
+    color: #fff;
+    text-decoration: none;
+    border-bottom: 1px solid rgba(255,255,255,0.35);
+    padding-bottom: 1px;
+  }
+  a:hover { border-bottom-color: #fff; }
+  footer {
+    margin-top: 6em;
+    font-size: 11px;
+    text-transform: uppercase;
+    letter-spacing: 0.28em;
+    color: rgba(255,255,255,0.4);
+  }
+</style>
+</head>
+<body>
+  <div class="eyebrow">Hal Universal</div>
+
+  <h1>Support</h1>
+
+  <p>Thanks for using Hal.</p>
+
+  <h2>Getting started</h2>
+
+  <p>Hal ships with Apple Intelligence built in — no download required. For a fully private on-device experience, open Settings and tap Browse Model Library to download one of Hal's curated local models: Gemma, Llama, Qwen, or Dolphin. Each runs entirely on your device with no network connection.</p>
+
+  <h2>Model downloads</h2>
+
+  <p>Model downloads continue in the background while your phone is locked or another app is in the foreground. To delete and redownload a model, open Settings → Browse Model Library, find the model in the list, and use the inline delete control on its row. The next download starts fresh.</p>
+
+  <h2>Memory and reset</h2>
+
+  <p>To clear Hal's memory of past conversations, reflections, and self-knowledge, open Settings → Power User → Database and tap Nuclear Reset. This wipes Hal's local SQLite database. Your downloaded models are not affected and nothing is sent externally.</p>
+
+  <h2>Salon mode</h2>
+
+  <p>Salon Mode lets you run multiple AI voices in conversation with each other. It is a power user feature accessible in Settings → Power User Mode. Switch from Single LLM to Multi LLM (Salon) to configure up to four seats.</p>
+
+  <h2>Memory condensing</h2>
+
+  <p>When you use a model with a smaller context window than the size of Hal's full memory (Apple Intelligence in particular has a tighter window than the local MLX models), Hal asks that model to condense its own self-knowledge for the turn — never silently trim. When this happens, the response footer shows a small icon. Tap the metadata line to see exactly which parts of Hal's memory were condensed. Hal's full memory remains preserved in the database; condensing only affects what the model sees for that single turn.</p>
+
+  <h2>Contact</h2>
+
+  <p>For questions, feedback, or anything else:<br>
+  Mark Friedlander<br>
+  <a href="mailto:markfriedlander@yahoo.com">markfriedlander@yahoo.com</a></p>
+
+  <hr>
+
+  <p class="small">Privacy: <a href="privacy.html">No data is collected</a></p>
+
+  <footer>© 2026 Mark Friedlander</footer>
+</body>
+</html>

@@ -1,0 +1,91 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Privacy — Hal Universal</title>
+<style>
+  :root { color-scheme: dark; }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  html, body {
+    background: #000;
+    color: #fff;
+    font-family: -apple-system, "Helvetica Neue", Helvetica, Arial, sans-serif;
+    font-weight: 300;
+    line-height: 1.6;
+    min-height: 100vh;
+  }
+  body {
+    max-width: 640px;
+    margin: 0 auto;
+    padding: 12vh 32px 12vh 32px;
+  }
+  .eyebrow {
+    font-size: 11px;
+    font-weight: 400;
+    text-transform: uppercase;
+    letter-spacing: 0.28em;
+    color: rgba(255,255,255,0.55);
+    margin-bottom: 4em;
+  }
+  h1 {
+    font-size: 13px;
+    font-weight: 400;
+    text-transform: uppercase;
+    letter-spacing: 0.32em;
+    color: #fff;
+    margin-bottom: 2.5em;
+  }
+  hr {
+    border: 0;
+    border-top: 1px solid rgba(255,255,255,0.18);
+    margin: 3.5em 0;
+  }
+  p {
+    font-size: 17px;
+    color: rgba(255,255,255,0.92);
+    margin-bottom: 1.5em;
+    max-width: 560px;
+  }
+  p.small {
+    font-size: 13px;
+    color: rgba(255,255,255,0.55);
+  }
+  a {
+    color: #fff;
+    text-decoration: none;
+    border-bottom: 1px solid rgba(255,255,255,0.35);
+    padding-bottom: 1px;
+  }
+  a:hover { border-bottom-color: #fff; }
+  footer {
+    margin-top: 6em;
+    font-size: 11px;
+    text-transform: uppercase;
+    letter-spacing: 0.28em;
+    color: rgba(255,255,255,0.4);
+  }
+</style>
+</head>
+<body>
+  <div class="eyebrow">Hal Universal</div>
+
+  <h1>Privacy</h1>
+
+  <p>Hal Universal does not collect, store, transmit, or share any personal data of any kind.</p>
+
+  <p>It has no accounts, no analytics, no telemetry, no advertising identifiers, no third-party SDKs. There are no servers operated by the developer. All conversations, memories, and reflections are stored exclusively on your device in a local SQLite database, protected by iOS Data Protection — the file-level encryption iOS applies to app data when your device is locked.</p>
+
+  <p>When you use a local MLX model (Gemma, Llama, Qwen, or Dolphin), inference runs entirely on your device with no network calls of any kind. When you use Apple Intelligence, inference occurs on-device when offline. When connected, Apple's Private Cloud Compute may be used — your prompts are encrypted in transit and processed only in short-lived, non-persistent memory on Apple-controlled servers. Apple states no data is retained after processing. The developer of Hal Universal does not see or have access to any data Apple Intelligence processes.</p>
+
+  <p>MLX model downloads are fetched from Hugging Face over standard HTTPS at your explicit request. Once downloaded, models run entirely on your device.</p>
+
+  <p>You can delete all of Hal's local data at any time via Settings → Power User → Database → Nuclear Reset.</p>
+
+  <hr>
+
+  <p class="small">Questions: <a href="support.html">Support</a></p>
+
+  <footer>© 2026 Mark Friedlander</footer>
+</body>
+</html>
