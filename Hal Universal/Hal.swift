@@ -4523,6 +4523,179 @@ struct HalModelLimits {
 
 
 
+// ==== LEGO START: 07.6 Prompt Segment Budgeting & Compression ====
+//
+// Implements the per-segment pre-flight check + compression architecture
+// described in Docs/Context_Budget_Implementation_Plan_2026-05-16.md.
+//
+// The single architectural rule: before any prompt is sent to any model,
+// every dynamic segment is evaluated against its budget allocation. If a
+// segment is within budget, it passes through unchanged. If a segment
+// exceeds budget, it is compressed (by the active model — never a
+// different model) through TextSummarizer.summarizeWithVerification,
+// then cached for reuse. Static segments (system prompt, Layer 1
+// framing) have hard caps enforced earlier — overflow at those is
+// either a CC build bug (Layer 1) or a UI bug (system prompt UI must
+// reject input above the cap, see Phase 6a).
+//
+// Compression vs trimming: we deliberately do NOT silently drop content.
+// Compression preserves intent within the model's constraints — Hal
+// always gets the best possible representation of what he knows. The
+// footer indicator (Phase 6b) makes this visible to the user.
+//
+// This block declares the types only. The compressor and cache live
+// downstream (compressor calls into LLMService + TextSummarizer; cache
+// lives in MemoryStore). The integration into the prompt-build path is
+// Phase 7.
+
+import CryptoKit
+
+/// Identifies a segment of an assembled prompt. Each segment has its own
+/// budget and its own treatment when over budget.
+enum PromptSegmentKind: String, CaseIterable, Codable {
+    /// Editable by the user in Settings. Hard cap enforced UI-side; overflow at
+    /// runtime is a UI bug.
+    case systemPrompt = "system_prompt"
+
+    /// CC-authored per-model framing. Hard cap enforced at build time; overflow
+    /// at runtime is a CC bug to fix before ship.
+    case layerOneFraming = "layer_one_framing"
+
+    /// Tiny (~50 tokens). Never compressed; not budgeted explicitly.
+    case temporalContext = "temporal_context"
+
+    /// Persistent self-knowledge entries injected into every turn. Unbounded
+    /// in raw form, compressed when over budget. The largest unbounded
+    /// component in the prompt and the original culprit of the AFM crash.
+    case selfKnowledge = "self_knowledge"
+
+    /// Auto-summary of older conversation history. Compressed when over budget.
+    case autoSummary = "auto_summary"
+
+    /// RAG retrieval results. Already capped at retrieval time, but assembled
+    /// content may still exceed budget on small-context models.
+    case ragRetrieval = "rag_retrieval"
+
+    /// Recent verbatim conversation history. Compressed when over budget
+    /// (rare — short-term is intentionally small).
+    case shortTermHistory = "short_term_history"
+
+    /// The user's current message. Hard cap enforced UI-side (in chat input);
+    /// overflow at runtime surfaces a clear user-visible error rather than
+    /// silently truncating.
+    case userMessage = "user_message"
+
+    /// True if this segment should be compressed when over budget.
+    /// False segments use hard-cap enforcement (CC-side or UI-side).
+    var isCompressible: Bool {
+        switch self {
+        case .systemPrompt, .layerOneFraming, .temporalContext, .userMessage:
+            return false
+        case .selfKnowledge, .autoSummary, .ragRetrieval, .shortTermHistory:
+            return true
+        }
+    }
+
+    /// Human-readable label for HALDEBUG logs and the footer popover.
+    var displayName: String {
+        switch self {
+        case .systemPrompt:      return "System Prompt"
+        case .layerOneFraming:   return "Model Framing"
+        case .temporalContext:   return "Temporal Context"
+        case .selfKnowledge:     return "Self-Knowledge"
+        case .autoSummary:       return "Conversation Summary"
+        case .ragRetrieval:      return "Retrieved Memories"
+        case .shortTermHistory:  return "Recent History"
+        case .userMessage:       return "Your Message"
+        }
+    }
+}
+
+/// A single segment of a prompt, with its raw content and its allocated budget.
+/// The hash of raw content is the cache key (segment, model, hash) — when
+/// raw content changes, the hash changes, and the cache automatically misses.
+struct PromptSegment {
+    let kind: PromptSegmentKind
+    let rawContent: String
+    let budgetTokens: Int
+
+    /// SHA-256 of `rawContent`, hex-encoded. Stable across launches and
+    /// across devices. Empty content has a fixed empty-string hash.
+    var rawContentHash: String {
+        let data = Data(rawContent.utf8)
+        let digest = SHA256.hash(data: data)
+        return digest.map { String(format: "%02x", $0) }.joined()
+    }
+}
+
+/// Result of evaluating a segment against its budget.
+enum PromptSegmentStatus {
+    /// Segment fits in its budget. Passes through unchanged.
+    case withinBudget(actualTokens: Int)
+
+    /// Segment exceeds budget and CAN be compressed. Caller should route
+    /// to `SegmentCompressor`. Used for self-knowledge, summary, RAG,
+    /// and short-term history.
+    case overBudgetCompressible(actualTokens: Int, budgetTokens: Int)
+
+    /// Segment exceeds budget but CANNOT be compressed (hard cap).
+    /// For system prompt / user message this means the UI should have
+    /// prevented this and we surface a clear error. For Layer 1 framing
+    /// it means a CC build bug — log loudly and fall back to truncation.
+    case overBudgetHardCap(actualTokens: Int, budgetTokens: Int)
+}
+
+/// One segment's pre-flight result.
+struct PromptSegmentEvaluation {
+    let segment: PromptSegment
+    let status: PromptSegmentStatus
+
+    /// Convenience: are we under budget?
+    var isWithinBudget: Bool {
+        if case .withinBudget = status { return true }
+        return false
+    }
+
+    /// Convenience: do we need to compress?
+    var needsCompression: Bool {
+        if case .overBudgetCompressible = status { return true }
+        return false
+    }
+}
+
+/// Stateless per-segment budget evaluator. Pure function on inputs.
+/// Token estimation uses the existing TokenEstimator (chars / 3.5).
+actor PromptBudgetEvaluator {
+
+    /// Evaluate a list of segments against their budgets in a single pass.
+    /// Returns one evaluation per segment, in the same order as input.
+    static func evaluate(_ segments: [PromptSegment]) -> [PromptSegmentEvaluation] {
+        return segments.map { evaluate($0) }
+    }
+
+    /// Evaluate a single segment.
+    static func evaluate(_ segment: PromptSegment) -> PromptSegmentEvaluation {
+        let actual = TokenEstimator.estimateTokens(from: segment.rawContent)
+        let status: PromptSegmentStatus
+
+        if actual <= segment.budgetTokens {
+            status = .withinBudget(actualTokens: actual)
+        } else if segment.kind.isCompressible {
+            status = .overBudgetCompressible(actualTokens: actual,
+                                             budgetTokens: segment.budgetTokens)
+        } else {
+            status = .overBudgetHardCap(actualTokens: actual,
+                                        budgetTokens: segment.budgetTokens)
+        }
+
+        return PromptSegmentEvaluation(segment: segment, status: status)
+    }
+}
+
+// ==== LEGO END: 07.6 Prompt Segment Budgeting & Compression ====
+
+
+
 // ==== LEGO START: 08 MLXWrapper & LLMService (Foundation + MLX Routing) ====
 
 // MARK: - Truncation-safe response trimming
