@@ -4678,8 +4678,53 @@ class MLXWrapper: ObservableObject {
     private var modelContainer: ModelContainer?
     internal var currentModelConfig: ModelConfiguration?  // Changed to internal so LLMService can check which model is loaded
 
+    /// Held to keep the lifecycle observer alive for the wrapper's lifetime.
+    /// Released automatically when the wrapper deinits (which is "never" in
+    /// practice because the wrapper is held by the app's singleton chain).
+    private var lifecycleObserver: NSObjectProtocol?
+
     init() {
         print("HALDEBUG-MLX: MLXWrapper initialized.")
+
+        // BACKGROUND LIFECYCLE — drop the resident MLX model when iOS
+        // backgrounds the app (screen lock, swipe to home, app switcher).
+        // The motivation: a foregrounded Hal with Gemma 4 E2B resident is
+        // ~2.5 GB. When iOS backgrounds the app, that large memory footprint
+        // makes Hal a prime jetsam target. If we unload proactively, Hal's
+        // backgrounded footprint drops to ~100-200 MB, and iOS is far less
+        // likely to kill us under memory pressure.
+        //
+        // This matters most during background model downloads (the 3.6 GB
+        // model.safetensors needs ~10+ minutes to complete on typical WiFi,
+        // and we don't want to lose the BGDL coordinator's in-flight state
+        // to a jetsam kill mid-download).
+        //
+        // Trade-off: when user returns and types, the next setupLLM call
+        // re-loads the model (~5-15s). That delay is similar to first-launch
+        // and acceptable.
+        //
+        // Uses didEnterBackgroundNotification (not willResignActive) so
+        // transient interruptions like Control Center or notification banner
+        // don't trigger an unload — only true backgrounding.
+        //
+        // Safe to call unloadModel here because Fix 2A's GPU sync barrier
+        // ensures any in-flight Metal command buffers drain before teardown.
+        lifecycleObserver = NotificationCenter.default.addObserver(
+            forName: UIApplication.didEnterBackgroundNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            guard let self else { return }
+            guard self.isModelLoaded else { return }
+            halLog("HALDEBUG-LIFECYCLE: App entered background; unloading MLX model to reduce jetsam pressure")
+            self.unloadModel()
+        }
+    }
+
+    deinit {
+        if let lifecycleObserver {
+            NotificationCenter.default.removeObserver(lifecycleObserver)
+        }
     }
 
     // Function to load the MLX model using ModelConfiguration from Block 30
