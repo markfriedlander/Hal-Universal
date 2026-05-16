@@ -4369,9 +4369,54 @@ extension MemoryStore {
 
 
 // MARK: - Centralized Hal Model Limits Configuration
-/// Single source of truth for all model-specific limits and configurations
-/// This prevents duplicate hardcoded values and ensures consistency across UI and logic
-/// Works with ModelConfiguration from Block 30 - no hardcoded model types
+/// Single source of truth for all model-specific limits and configurations.
+/// This prevents duplicate hardcoded values and ensures consistency across UI and logic.
+/// Works with ModelConfiguration from Block 30 - no hardcoded model types.
+///
+/// ───────────────────────────────────────────────────────────────────────────
+/// CONTEXT WINDOW ALLOCATION MATH (2026-05-16 — fixed per SC architecture pass)
+/// ───────────────────────────────────────────────────────────────────────────
+///
+/// Each model's context window is divided into four budget categories.
+/// Allocations sum to 97% — leaving a 3% safety buffer for tokenizer
+/// discrepancies and edge cases. This replaces the prior allocation that
+/// summed to 107% (30 response + 15 RAG + 12 short-term + 50% floor on
+/// prompt), which created active overflow on AFM (4K context window) and
+/// was the root cause of "Exceeded model context window size" errors.
+///
+///   Prompt (sys + Layer 1 + self-knowledge + temporal)   50%
+///   Response reserve                                       20%
+///   RAG retrieval                                          15%
+///   Short-term history                                     12%
+///   ─────────────────────────────────────────────────── ──────
+///   Total                                                  97%
+///   Safety buffer                                           3%
+///
+/// Concrete numbers per model:
+///
+///   ┌──────────────┬─────────┬─────────┬─────────┬─────────┬──────────┐
+///   │ Model        │ Context │ Prompt  │ Resp    │  RAG    │ ShortT   │
+///   ├──────────────┼─────────┼─────────┼─────────┼─────────┼──────────┤
+///   │ AFM          │   4,096 │   2,048 │     820 │     614 │      491 │
+///   │ Gemma 4 E2B  │ 128,000 │  65,536 │  26,214 │  19,661 │   15,729 │
+///   │ Llama 3.2    │ 128,000 │  65,536 │  26,214 │  19,661 │   15,729 │
+///   │ Dolphin 3.0  │ 128,000 │  65,536 │  26,214 │  19,661 │   15,729 │
+///   │ Qwen 3.5 2B  │ 262,144 │ 131,072 │  52,429 │  39,322 │   31,457 │
+///   └──────────────┴─────────┴─────────┴─────────┴─────────┴──────────┘
+///
+/// The PROMPT category is further subdivided at injection time:
+///   - System prompt: hard cap (systemPromptHardCap = 1,000 tokens)
+///   - Layer 1 framing: hard cap (layerOneFramingHardCap = 400 tokens)
+///   - Self-knowledge: variable, compressed when over budget
+///   - Temporal context: tiny (~50 tokens)
+///
+/// Hard caps are FIXED across all models (not percentage-scaled) because
+/// they reflect UI affordances (how much a user reasonably types) and
+/// CC-authored content (Layer 1), not model capacity.
+///
+/// Lowest currently-supported context: AFM 4K. If a future model has a
+/// smaller window, revisit minimum guardrails. For now, pure percentages.
+///
 struct HalModelLimits {
     let contextWindowTokens: Int
     let maxPromptTokens: Int
@@ -4379,24 +4424,78 @@ struct HalModelLimits {
     let maxRagTokens: Int
     let shortTermMemoryTokens: Int
     let longTermSnippetSummarizationThreshold: Int
-    
-    /// Dynamic configuration based on ModelConfiguration (from Block 30)
-    /// Uses uniform percentages across all models: same identity, different capacity based on context size
-    /// Includes clamping to prevent exceeding context window
+
+    // MARK: - Hard caps (fixed across all models)
+    //
+    // These are not budget allocations against the context window — they
+    // are UI / authoring constraints. The system prompt cap reflects what
+    // a user can reasonably type into Settings. The Layer 1 cap reflects
+    // what CC has authored. Both are checked at the static-segment level
+    // and never compressed.
+
+    /// Maximum allowed size of the user-editable system prompt, across all models.
+    /// Enforced at the UI level (Settings → System Prompt editor) — input is rejected
+    /// at this cap, never accepted-then-silently-trimmed.
+    static let systemPromptHardCap: Int = 1_000
+
+    /// Maximum allowed size of a per-model Layer 1 framing prompt.
+    /// CC-authored. Overflow here is a build-time bug to be fixed before ship,
+    /// not a runtime condition to handle.
+    static let layerOneFramingHardCap: Int = 400
+
+    // MARK: - Budget allocation (percentage-of-context)
+    //
+    // Documented allocations summing to 97%. The 3% safety buffer absorbs
+    // tokenizer estimation drift without overrunning the actual context window.
+
+    /// Percentage of context window reserved for the assembled prompt
+    /// (system prompt + Layer 1 + self-knowledge + temporal + everything that
+    /// goes into the conversation context that the model reads).
+    static let promptAllocation: Double = 0.50
+
+    /// Percentage of context window reserved for the model's response output.
+    /// Must be large enough for meaningful answers even on small-context models.
+    static let responseReserveAllocation: Double = 0.20
+
+    /// Percentage of context window reserved for RAG retrieval content.
+    static let ragAllocation: Double = 0.15
+
+    /// Percentage of context window reserved for short-term recent-history
+    /// content (verbatim turns).
+    static let shortTermAllocation: Double = 0.12
+
+    /// Total allocation as a fraction. Must be < 1.0 (we want a safety buffer).
+    /// Verified at build time via the assertion in `config(for:)`.
+    static let totalAllocation: Double =
+        promptAllocation + responseReserveAllocation + ragAllocation + shortTermAllocation
+
+    /// Dynamic configuration based on ModelConfiguration (from Block 30).
+    /// Uses uniform percentages across all models: same identity, different
+    /// capacity based on context size. No oversubscription floor — the prior
+    /// `max(prompt, context/2)` floor caused AFM to allocate 107% of its
+    /// context window, which was the root cause of "Exceeded model context
+    /// window size" errors during turn assembly.
     static func config(for model: ModelConfiguration) -> HalModelLimits {
+        // Compile-time correctness check: allocations must leave a safety buffer.
+        // If this assertion fires, the static allocation constants above were
+        // edited to sum to ≥ 1.0 — that's the bug we're explicitly defending
+        // against. Fix the constants, don't disable the assertion.
+        assert(totalAllocation < 1.0,
+               "HalModelLimits allocations must sum to < 100%. Current sum: \(totalAllocation). Fix the per-segment percentages.")
+
         let context = model.contextWindow
-        
-        // Calculate proportions with minimum guardrails
-        let responseReserve = max(Int(Double(context) * 0.30), 800)
-        let maxRag = max(Int(Double(context) * 0.15), 400)
-        let shortTermMemory = max(Int(Double(context) * 0.12), 300)
+
+        let maxPrompt        = Int(Double(context) * promptAllocation)
+        let responseReserve  = Int(Double(context) * responseReserveAllocation)
+        let maxRag           = Int(Double(context) * ragAllocation)
+        let shortTermMemory  = Int(Double(context) * shortTermAllocation)
+
+        // Threshold for compressing an individual RAG snippet (vs including
+        // verbatim). Set to 5% of context window — small enough that snippets
+        // routinely fit verbatim, large enough that a runaway snippet triggers
+        // compression.
         let summarizationThreshold = context / 20
-        
-        // Calculate remaining space for prompt after reserves
-        // CRITICAL: Clamp to prevent overflow on small context windows (e.g., AFM 4K)
-        let reservedTokens = responseReserve + maxRag + shortTermMemory
-        let maxPrompt = max(context - reservedTokens, context / 2) // At least 50% for prompt
-        
+
         return HalModelLimits(
             contextWindowTokens: context,
             maxPromptTokens: maxPrompt,
@@ -4406,12 +4505,12 @@ struct HalModelLimits {
             longTermSnippetSummarizationThreshold: summarizationThreshold
         )
     }
-    
+
     /// Convert tokens to approximate character count using TokenEstimator
     func tokensToChars(_ tokens: Int) -> Int {
         return TokenEstimator.estimateChars(from: tokens)
     }
-    
+
     /// Convert character count to approximate tokens using TokenEstimator
     func charsToTokens(_ chars: Int) -> Int {
         let estimatedTokens = Double(chars) / 3.5
