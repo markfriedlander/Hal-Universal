@@ -7,11 +7,9 @@
 	objects = {
 
 /* Begin PBXBuildFile section */
-		850EFD642EEB507700A8AA7D /* Hal Universal Watch.app in Embed Watch Content */ = {isa = PBXBuildFile; fileRef = 850EFD5A2EEB507500A8AA7D /* Hal Universal Watch.app */; settings = {ATTRIBUTES = (RemoveHeadersOnCopy, ); }; };
 		850EFD6A2EEB551500A8AA7D /* WatchConnectivity.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 850EFD692EEB551500A8AA7D /* WatchConnectivity.framework */; };
 		8522367E2FB68EA600A88135 /* WidgetKit.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 8522367D2FB68EA600A88135 /* WidgetKit.framework */; };
 		852236802FB68EA600A88135 /* SwiftUI.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 8522367F2FB68EA600A88135 /* SwiftUI.framework */; };
-		8522368B2FB68EAA00A88135 /* HalWatchComplicationExtension.appex in Embed Foundation Extensions */ = {isa = PBXBuildFile; fileRef = 8522367C2FB68EA600A88135 /* HalWatchComplicationExtension.appex */; settings = {ATTRIBUTES = (RemoveHeadersOnCopy, ); }; };
 		855E38602EA94A620029C420 /* FoundationModels.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 855E385F2EA94A620029C420 /* FoundationModels.framework */; };
 		855E38622EA94A730029C420 /* NaturalLanguage.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 855E38612EA94A730029C420 /* NaturalLanguage.framework */; };
 		855E38642EA94AF40029C420 /* libsqlite3.tbd in Frameworks */ = {isa = PBXBuildFile; fileRef = 855E38632EA94AE60029C420 /* libsqlite3.tbd */; };
@@ -52,7 +50,6 @@
 			dstPath = "$(CONTENTS_FOLDER_PATH)/Watch";
 			dstSubfolderSpec = 16;
 			files = (
-				850EFD642EEB507700A8AA7D /* Hal Universal Watch.app in Embed Watch Content */,
 			);
 			name = "Embed Watch Content";
 			runOnlyForDeploymentPostprocessing = 0;
@@ -63,7 +60,6 @@
 			dstPath = "";
 			dstSubfolderSpec = 13;
 			files = (
-				8522368B2FB68EAA00A88135 /* HalWatchComplicationExtension.appex in Embed Foundation Extensions */,
 			);
 			name = "Embed Foundation Extensions";
 			runOnlyForDeploymentPostprocessing = 0;
