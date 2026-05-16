@@ -2579,7 +2579,13 @@ class MemoryStore: ObservableObject {
                     return
                 }
                 
-                let jsonString = String(response[jsonStart.lowerBound...jsonEnd.upperBound])
+                // NOTE: use half-open range (..<) not closed (...) — when the
+                // LLM response ends exactly at `]` (which Gemma reliably does
+                // when asked to return `[]`), jsonEnd.upperBound equals
+                // response.endIndex, and a closed-range subscript including
+                // endIndex traps. Half-open includes the same characters
+                // (`[` through `]` inclusive) but never dereferences endIndex.
+                let jsonString = String(response[jsonStart.lowerBound..<jsonEnd.upperBound])
                 guard let jsonData = jsonString.data(using: .utf8),
                       let changes = try? JSONSerialization.jsonObject(with: jsonData) as? [[String: Any]] else {
                     print("HALDEBUG-SELF-KNOWLEDGE: Failed to parse shareability JSON")
