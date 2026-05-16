@@ -4565,7 +4565,7 @@ struct HalModelLimits {
 
     /// Convert character count to approximate tokens using TokenEstimator
     func charsToTokens(_ chars: Int) -> Int {
-        let estimatedTokens = Double(chars) / 3.5
+        let estimatedTokens = Double(chars) / 4.0
         return max(1, Int(estimatedTokens.rounded()))
     }
 }
@@ -4716,7 +4716,7 @@ struct PromptSegmentEvaluation {
 }
 
 /// Stateless per-segment budget evaluator. Pure function on inputs.
-/// Token estimation uses the existing TokenEstimator (chars / 3.5).
+/// Token estimation uses the existing TokenEstimator (chars / 4 conservative).
 actor PromptBudgetEvaluator {
 
     /// Evaluate a list of segments against their budgets in a single pass.
@@ -4878,7 +4878,7 @@ actor SegmentCompressor {
 
         if llmResult.isEmpty {
             // LLM compression returned empty — fall back to raw truncation.
-            let maxChars = Int(Double(segment.budgetTokens) * 3.5)
+            let maxChars = Int(Double(segment.budgetTokens) * 4.0)
             finalContent = String(segment.rawContent.prefix(maxChars))
             finalTokens = TokenEstimator.estimateTokens(from: finalContent)
             didTruncate = true
@@ -4887,7 +4887,7 @@ actor SegmentCompressor {
         } else if resultTokens > overshootLimit {
             // LLM compression overshot target by more than tolerance — fall back to raw truncation.
             // Trusting an overshot output would defeat the purpose of having a budget.
-            let maxChars = Int(Double(segment.budgetTokens) * 3.5)
+            let maxChars = Int(Double(segment.budgetTokens) * 4.0)
             finalContent = String(segment.rawContent.prefix(maxChars))
             finalTokens = TokenEstimator.estimateTokens(from: finalContent)
             didTruncate = true
@@ -11209,19 +11209,26 @@ struct RoundedCorner: Shape {
 
 // MARK: - Token Estimation Utility
 struct TokenEstimator {
-    /// Estimates token count from text using Apple's recommended 3.5 characters per token average
-    /// This is an approximation - actual tokenization may vary
+    /// Conservative characters-per-token heuristic. The OpenAI tokenizer
+    /// averages closer to 4 characters per token for English prose; we use
+    /// 4 (rather than the previous 3.5) because slightly overestimating
+    /// token count is the safe direction for a budget check. The 3% safety
+    /// buffer in HalModelLimits absorbs any remaining drift.
+    /// Updated 2026-05-16 — see Docs/Context_Budget_Implementation_Plan_2026-05-16.md.
+    private static let charsPerToken: Double = 4.0
+
+    /// Estimates token count from text using the conservative chars/token heuristic.
+    /// This is an approximation — actual tokenization may vary by tokenizer.
     static func estimateTokens(from text: String) -> Int {
         let characterCount = text.count
-        let estimatedTokens = Double(characterCount) / 3.5
+        let estimatedTokens = Double(characterCount) / charsPerToken
         return max(1, Int(estimatedTokens.rounded()))
     }
-    
-    /// Estimates character count from token count using Apple's recommended 3.5 characters per token average
-    /// This is the inverse of estimateTokens() and maintains symmetry
-    /// This is an approximation - actual tokenization may vary
+
+    /// Estimates character count from token count using the same heuristic.
+    /// This is the inverse of estimateTokens() and maintains symmetry.
     static func estimateChars(from tokens: Int) -> Int {
-        let estimatedChars = Double(tokens) * 3.5
+        let estimatedChars = Double(tokens) * charsPerToken
         return max(1, Int(estimatedChars.rounded()))
     }
 }
@@ -11527,7 +11534,7 @@ class ChatViewModel: ObservableObject {
         
         /// Maximum RAG retrieval characters based on current model's RAG token budget
         /// Uses NEW dynamic percentage system (15% of context window for RAG)
-        /// Converts tokens to characters using HalModelLimits.tokensToChars (3.5 chars/token)
+        /// Converts tokens to characters using HalModelLimits.tokensToChars (4 chars/token conservative)
         var maxRAGCharsForModel: Int {
             let limits = HalModelLimits.config(for: selectedModel)
             return limits.tokensToChars(limits.maxRagTokens)
@@ -12776,351 +12783,6 @@ class ChatViewModel: ObservableObject {
                                                                         }
                                                                         
                                                                         
-                                                                        // MARK: - Context Window Management for Prompt Building (HelPML Compliant)
-                                                                        /// CORRECTED PRIORITY ORDER (Human-Like Memory Hierarchy):
-                                                                        /// 1. System Prompt (Non-negotiable, defines AI persona)
-                                                                        /// 2. Short-Term Memory (Recent conversation history - HIGHEST PRIORITY, most protected)
-                                                                        /// 3. Conversation Summary (Compressed long-term context of older turns)
-                                                                        /// 4. Retrieved Context/RAG (Semantically relevant facts from database)
-                                                                        /// 5. Metadata (Temporal, Self-Awareness, Self-Knowledge - LOWEST PRIORITY, removed first)
-                                                                        /// 6. Current User Input (The immediate query, truncated only as last resort)
-                                                                        ///
-                                                                        /// ⚠️ DEAD CODE — INTENTIONALLY PRESERVED.
-                                                                        /// As of cbe1ea4 (May 11, 2026) nothing in the codebase calls this function.
-                                                                        /// The chat-message path in `buildChatMessages` is the replacement; it
-                                                                        /// captures the same intents (system/short-term/summary/RAG/temporal/
-                                                                        /// self-awareness/self-knowledge/user) but expressed as [HalChatMessage]
-                                                                        /// for chat-template models. This function is preserved as reference for
-                                                                        /// the design thinking the HelPML format represents. Safe to delete
-                                                                        /// whenever — see HANDOFF_BRIEF "dead code cleanup" open item.
-                                                                        func buildPromptHistory(
-                                                                            currentInput: String = "",
-                                                                            historyMessagesOverride: [ChatMessage]? = nil,
-                                                                            forPreview: Bool = false,
-                                                                            onStatusUpdate: ((String) -> Void)? = nil
-                                                                        ) async -> String {
-                                                                            print("HALDEBUG-MEMORY: Building prompt for input: '\(currentInput.prefix(50))....'")
-                                                                            
-                                                                            // Get model-specific limits from centralized configuration
-                                                                            let limits = HalModelLimits.config(for: selectedModel)
-                                                                            let maxPromptTokens = limits.maxPromptTokens
-                                                                            let maxRagTokens = limits.maxRagTokens
-                                                                            let longTermSnippetSummarizationThreshold = limits.longTermSnippetSummarizationThreshold
-                                                                            
-                                                                            print("HALDEBUG-MEMORY: Using \(selectedModel.displayName) limits - prompt: \(maxPromptTokens) tokens, RAG: \(maxRagTokens) tokens")
-                                                                            
-                                                                            // TOOL ROUTER: Decide which tools to use (if not preview mode)
-                                                                            var toolResults: ToolResults? = nil
-                                                                            if !forPreview && !currentInput.isEmpty {
-                                                                                let toolDecision = await decideTools(userInput: currentInput)
-                                                                                let shortTermTurns = getShortTermTurns(currentTurns: countCompletedTurns())
-                                                                                toolResults = await executeTools(
-                                                                                    decision: toolDecision,
-                                                                                    userInput: currentInput,
-                                                                                    excludeTurns: shortTermTurns,
-                                                                                    tokenBudget: maxRagTokens
-                                                                                )
-                                                                                
-                                                                                // Store full RAG context for later use (used in Block 21 for ChatMessage metadata)
-                                                                                if let results = toolResults?.memorySearchResults {
-                                                                                    fullRAGContext = results
-                                                                                }
-                                                                            }
-                                                                            
-                                                                            // PRIORITY 1: System Prompt (always included, never removed) - HelPML wrapped
-                                                                            var currentPrompt = """
-                                                                            
-                                                                            #=== BEGIN SYSTEM ===#
-                                                                            
-                                                                            \(effectiveSystemPrompt)
-                                                                            
-                                                                            #=== END SYSTEM ===#
-                                                                            """
-                                                                            var currentPromptTokens = TokenEstimator.estimateTokens(from: currentPrompt)
-                                                                            print("HALDEBUG-MEMORY: Initial prompt tokens (system prompt): \(currentPromptTokens)")
-                                                                            
-                                                                            // PRIORITY 2: Short-Term Memory (recent conversation history - VERBATIM, most protected)
-                                                                            // Status Stage 1: Short-term memory processing
-                                                                            await MainActor.run { onStatusUpdate?("Assembling recent context... (short-term memory)") }
-                                                                            try? await Task.sleep(nanoseconds: 500_000_000) // 0.5 sec readability delay
-                                                                            
-                                                                            var shortTermText = ""
-                                                                            if !forPreview {
-                                                                                let shortTermDepth = effectiveMemoryDepth
-                                                                                
-                                                                                // FIXED: Independent Mode History Filtering
-                                                                                // When historyMessagesOverride is provided (Independent Mode in Salon),
-                                                                                // each seat sees user messages + its OWN past responses, but NOT other seats' responses
-                                                                                let sourceMessages: [ChatMessage]
-                                                                                if let override = historyMessagesOverride {
-                                                                                    // Independent Mode: Show user messages + this seat's own responses only
-                                                                                    sourceMessages = override.filter { msg in
-                                                                                        msg.isFromUser || msg.recordedByModel == selectedModel.id
-                                                                                    }
-                                                                                    let userCount = sourceMessages.filter { $0.isFromUser }.count
-                                                                                    let ownCount = sourceMessages.filter { !$0.isFromUser }.count
-                                                                                    print("HALDEBUG-SALON: Independent Mode - filtered to \(userCount) user messages + \(ownCount) own responses (model: \(selectedModel.id))")
-                                                                                } else {
-                                                                                    // Normal mode or Context-Aware mode: Use all messages
-                                                                                    sourceMessages = messages
-                                                                                }
-                                                                                
-                                                                                let shortTermMessages = Array(sourceMessages.filter { !$0.isPartial }.suffix(shortTermDepth))
-                                                                                
-                                                                                if !shortTermMessages.isEmpty {
-                                                                                    let shortTermParts = shortTermMessages.map { msg in
-                                                                                        if msg.isFromUser {
-                                                                                            return "[user]: \(msg.content)"
-                                                                                        } else {
-                                                                                            let modelName = ModelCatalogService.shared.getModel(byID: msg.recordedByModel)?.displayName ?? msg.recordedByModel
-                                                                                            return "[assistant] (\(modelName)): \(msg.content)"
-                                                                                        }
-                                                                                    }
-                                                                                    let combinedShortTermContent = shortTermParts.joined(separator: "\n\n")
-                                                                                    
-                                                                                    shortTermText = """
-                                                                                    
-                                                                                    #=== BEGIN MEMORY_SHORT ===#
-                                                                                    
-                                                                                    Recent conversation history (verbatim):
-                                                                                    
-                                                                                    \(combinedShortTermContent)
-                                                                                    
-                                                                                    #=== END MEMORY_SHORT ===#
-                                                                                    """
-                                                                                    let shortTermTokens = TokenEstimator.estimateTokens(from: shortTermText)
-                                                                                    print("HALDEBUG-MEMORY: Added short-term verbatim history (\(shortTermTokens) tokens). Current prompt: \(currentPromptTokens) tokens")
-                                                                                } else {
-                                                                                    print("HALDEBUG-MEMORY: No short-term history to add (first turn or empty conversation).")
-                                                                                }
-                                                                                
-                                                                                if !shortTermText.isEmpty {
-                                                                                    let shortTermTokens = TokenEstimator.estimateTokens(from: shortTermText)
-                                                                                    if currentPromptTokens + shortTermTokens + 2 < maxPromptTokens {
-                                                                                        currentPrompt += "\n\n\(shortTermText.trimmingCharacters(in: .whitespacesAndNewlines))"
-                                                                                        currentPromptTokens += shortTermTokens
-                                                                                    } else {
-                                                                                        print("HALDEBUG-MEMORY: Skipped short-term memory due to context window limit.")
-                                                                                    }
-                                                                                }
-                                                                            }
-                                                                            
-                                                                            // PRIORITY 3: Conversation Summary (compressed long-term context)
-                                                                            // Persists on every turn once set — injectedSummary is cleared only on thread reset,
-                                                                            // and overwritten by the next summarization cycle. pendingAutoInject is no longer used
-                                                                            // to gate injection; the flag is kept for bookkeeping only.
-                                                                            if !injectedSummary.isEmpty {
-                                                                                let summaryTokens = TokenEstimator.estimateTokens(from: injectedSummary)
-                                                                                if currentPromptTokens + summaryTokens < maxPromptTokens {
-                                                                                    let summaryBlock = """
-
-                                                                                    #=== BEGIN SUMMARY ===#
-
-                                                                                    Context from earlier in this conversation:
-
-                                                                                    \(injectedSummary)
-
-                                                                                    #=== END SUMMARY ===#
-                                                                                    """
-                                                                                    currentPrompt += summaryBlock
-                                                                                    currentPromptTokens += summaryTokens
-                                                                                    print("HALDEBUG-MEMORY: Injected auto-summary (\(summaryTokens) tokens). Current prompt: \(currentPromptTokens) tokens")
-                                                                                } else {
-                                                                                    print("HALDEBUG-MEMORY: Skipped injected summary due to context window limit.")
-                                                                                }
-                                                                            }
-                                                                            
-                                                                            // PRIORITY 4: Temporal Context (small, fundamental — never dropped before RAG)
-                                                                            // Elevated from Priority 5: date/time awareness is more fundamental than retrieved memories.
-                                                                            // A model that doesn't know the date can't hold a coherent conversation.
-                                                                            if enableSelfKnowledge {
-                                                                                let temporalContext = buildTemporalContext()
-                                                                                let temporalTokens = TokenEstimator.estimateTokens(from: temporalContext)
-                                                                                if currentPromptTokens + temporalTokens < maxPromptTokens {
-                                                                                    currentPrompt += temporalContext
-                                                                                    currentPromptTokens += temporalTokens
-                                                                                    print("HALDEBUG-TEMPORAL: Added temporal context (\(temporalTokens) tokens). Current prompt: \(currentPromptTokens) tokens")
-                                                                                } else {
-                                                                                    print("HALDEBUG-TEMPORAL: Skipped temporal context due to token limit")
-                                                                                }
-                                                                            }
-
-                                                                            // PRIORITY 5: Long-Term RAG (semantically relevant facts from database)
-                                                                            // Status Stage 2: Long-term memory (RAG) processing begins
-                                                                            await MainActor.run { onStatusUpdate?("Recalling relevant memories... (long-term memory)") }
-                                                                            try? await Task.sleep(nanoseconds: 1_000_000_000) // 1.0 sec readability delay
-                                                                            
-                                                                            var longTermSearchText = ""
-                                                                            var currentRagTokens = 0 // Track total RAG tokens
-                                                                            
-                                                                            // Use tool results if memory_search was executed
-                                                                            if let results = toolResults?.memorySearchResults, !results.isEmpty {
-                                                                                print("HALDEBUG-MEMORY: Using tool router memory search results (\(results.count) snippets)")
-                                                                                var snippetParts: [String] = []
-
-                                                                                // Cosine dedup: compute reference embedding from STM + summary so we can
-                                                                                // drop RAG snippets that duplicate content already verbatim in the prompt.
-                                                                                let referenceText = [shortTermText, injectedSummary]
-                                                                                    .filter { !$0.isEmpty }
-                                                                                    .joined(separator: "\n\n")
-                                                                                let referenceEmbedding = referenceText.isEmpty ? [] : memoryStore.generateEmbedding(for: referenceText)
-
-                                                                                // Process each snippet from tool results.
-                                                                                // partIndex provides sequential labels [1],[2],[3]... after dedup drops.
-                                                                                var partIndex = 1
-                                                                                for (idx, ragSnippet) in results.enumerated() {
-                                                                                    // Dedup check: skip snippet if too similar to content already in the prompt
-                                                                                    if !referenceEmbedding.isEmpty {
-                                                                                        let snippetEmbedding = memoryStore.generateEmbedding(for: ragSnippet.content)
-                                                                                        let sim = memoryStore.cosineSimilarity(referenceEmbedding, snippetEmbedding)
-                                                                                        if sim >= ragDedupSimilarityThreshold {
-                                                                                            print("HALDEBUG-RAG: Dedup dropped snippet \(idx + 1) (similarity \(String(format: "%.3f", sim)) >= \(ragDedupSimilarityThreshold))")
-                                                                                            continue
-                                                                                        }
-                                                                                    }
-                                                                                    let snippetTokens = TokenEstimator.estimateTokens(from: ragSnippet.content)
-
-                                                                                    // Check if snippet needs summarization
-                                                                                    if snippetTokens > longTermSnippetSummarizationThreshold {
-                                                                                        print("HALDEBUG-MEMORY: Snippet exceeds threshold (\(snippetTokens) > \(longTermSnippetSummarizationThreshold)). Summarizing...")
-
-                                                                                        let summarizedSnippet = await TextSummarizer.summarizeWithVerification(
-                                                                                            text: ragSnippet.content,
-                                                                                            targetTokens: longTermSnippetSummarizationThreshold,
-                                                                                            llmService: llmService
-                                                                                        )
-                                                                                        let summarizedTokens = TokenEstimator.estimateTokens(from: summarizedSnippet)
-                                                                                        print("HALDEBUG-MEMORY: Summarized snippet from \(snippetTokens) to \(summarizedTokens) tokens")
-
-                                                                                        if currentRagTokens + summarizedTokens <= maxRagTokens {
-                                                                                            snippetParts.append("[\(partIndex)] \(ragSnippet.source) | Relevance: \(String(format: "%.2f", ragSnippet.relevance))\n\(summarizedSnippet)")
-                                                                                            currentRagTokens += summarizedTokens
-                                                                                            partIndex += 1
-                                                                                        } else {
-                                                                                            print("HALDEBUG-MEMORY: Stopped adding snippets - reached max RAG tokens (\(maxRagTokens))")
-                                                                                            break
-                                                                                        }
-                                                                                    } else {
-                                                                                        // Use snippet as-is if under threshold
-                                                                                        if currentRagTokens + snippetTokens <= maxRagTokens {
-                                                                                            snippetParts.append("[\(partIndex)] \(ragSnippet.source) | Relevance: \(String(format: "%.2f", ragSnippet.relevance))\n\(ragSnippet.content)")
-                                                                                            currentRagTokens += snippetTokens
-                                                                                            partIndex += 1
-                                                                                        } else {
-                                                                                            print("HALDEBUG-MEMORY: Stopped adding snippets - reached max RAG tokens (\(maxRagTokens))")
-                                                                                            break
-                                                                                        }
-                                                                                    }
-                                                                                }
-                                                                                
-                                                                                if !snippetParts.isEmpty {
-                                                                                    longTermSearchText = """
-                                                                                    
-                                                                                    #=== BEGIN MEMORY_LONG ===#
-                                                                                    
-                                                                                    Relevant information from past conversations and documents:
-                                                                                    
-                                                                                    \(snippetParts.joined(separator: "\n\n---\n\n"))
-                                                                                    
-                                                                                    #=== END MEMORY_LONG ===#
-                                                                                    """
-                                                                                    print("HALDEBUG-MEMORY: Created RAG block from tool results (\(currentRagTokens) tokens)")
-                                                                                }
-                                                                            } else {
-                                                                                print("HALDEBUG-MEMORY: No memory search results from tool router - skipping RAG")
-                                                                            }
-                                                                            
-                                                                            if !longTermSearchText.isEmpty {
-                                                                                let ragTokens = TokenEstimator.estimateTokens(from: longTermSearchText)
-                                                                                if currentPromptTokens + ragTokens < maxPromptTokens {
-                                                                                    currentPrompt += longTermSearchText
-                                                                                    currentPromptTokens += ragTokens
-                                                                                    print("HALDEBUG-MEMORY: Added long-term RAG (\(ragTokens) tokens). Current prompt: \(currentPromptTokens) tokens")
-                                                                                } else {
-                                                                                    print("HALDEBUG-MEMORY: Skipped long-term RAG due to token limit")
-                                                                                }
-                                                                            }
-                                                                            
-                                                                            // PRIORITY 6: Self-Awareness + Self-Knowledge - LOWEST PRIORITY
-                                                                            // (Temporal context elevated to Priority 4 above)
-                                                                            // Only included if enableSelfKnowledge is true
-                                                                            if enableSelfKnowledge {
-                                                                                // 6a. Self-awareness context
-                                                                                let selfAwarenessContext = buildSelfAwarenessContext()
-                                                                                let selfAwarenessTokens = TokenEstimator.estimateTokens(from: selfAwarenessContext)
-                                                                                if currentPromptTokens + selfAwarenessTokens < maxPromptTokens {
-                                                                                    currentPrompt += selfAwarenessContext
-                                                                                    currentPromptTokens += selfAwarenessTokens
-                                                                                    print("HALDEBUG-SELF-AWARENESS: Added self-awareness context (\(selfAwarenessTokens) tokens). Current prompt: \(currentPromptTokens) tokens")
-                                                                                } else {
-                                                                                    print("HALDEBUG-SELF-AWARENESS: Skipped - would exceed token limit")
-                                                                                }
-
-                                                                                // 6b. Self-knowledge context
-                                                                                let selfKnowledgeContext = buildSelfKnowledgeContext()
-                                                                                let selfKnowledgeTokens = TokenEstimator.estimateTokens(from: selfKnowledgeContext)
-                                                                                if currentPromptTokens + selfKnowledgeTokens < maxPromptTokens {
-                                                                                    currentPrompt += selfKnowledgeContext
-                                                                                    currentPromptTokens += selfKnowledgeTokens
-                                                                                    print("HALDEBUG-SELF-KNOWLEDGE: Added self-knowledge context (\(selfKnowledgeTokens) tokens). Current prompt: \(currentPromptTokens) tokens")
-                                                                                } else {
-                                                                                    print("HALDEBUG-SELF-KNOWLEDGE: Skipped - would exceed token limit")
-                                                                                }
-                                                                            } else {
-                                                                                print("HALDEBUG-SELF-KNOWLEDGE: Self-knowledge disabled - skipping self-awareness and self-knowledge context")
-                                                                            }
-
-                                                                            // PRIORITY 7: Current User Input (always included, truncated only as last resort)
-                                                                            let remainingTokensForInput = maxPromptTokens - currentPromptTokens
-                                                                            
-                                                                            if remainingTokensForInput > 0 {
-                                                                                let inputTokens = TokenEstimator.estimateTokens(from: currentInput)
-                                                                                let truncatedInput: String
-                                                                                if inputTokens <= remainingTokensForInput {
-                                                                                    truncatedInput = currentInput
-                                                                                } else {
-                                                                                    // Truncate to fit remaining space
-                                                                                    let maxChars = limits.tokensToChars(remainingTokensForInput)
-                                                                                    truncatedInput = String(currentInput.prefix(maxChars))
-                                                                                }
-                                                                                let userInputBlock = """
-                                                                                
-                                                                                #=== BEGIN USER ===#
-                                                                                
-                                                                                \(truncatedInput)
-                                                                                
-                                                                                #=== END USER ===#
-                                                                                """
-                                                                                currentPrompt += userInputBlock
-                                                                                let addedTokens = TokenEstimator.estimateTokens(from: userInputBlock)
-                                                                                currentPromptTokens += addedTokens
-                                                                                print("HALDEBUG-MEMORY: Added user input (\(TokenEstimator.estimateTokens(from: truncatedInput)) tokens). Final prompt: \(currentPromptTokens) tokens")
-                                                                            } else {
-                                                                                // Drastic truncation if very little space left, or just the user input itself is too long
-                                                                                let drasticTruncationTokens = max(0, maxPromptTokens)
-                                                                                let maxChars = limits.tokensToChars(drasticTruncationTokens)
-                                                                                let truncatedInput = String(currentInput.prefix(maxChars))
-                                                                                currentPrompt = """
-                                                                                
-                                                                                #=== BEGIN SYSTEM ===#
-                                                                                
-                                                                                \(effectiveSystemPrompt)
-                                                                                
-                                                                                #=== END SYSTEM ===#
-                                                                                
-                                                                                #=== BEGIN USER ===#
-                                                                                
-                                                                                \(truncatedInput)
-                                                                                
-                                                                                #=== END USER ===#
-                                                                                """
-                                                                                currentPromptTokens = TokenEstimator.estimateTokens(from: currentPrompt)
-                                                                                print("HALDEBUG-MEMORY: CRITICAL: Prompt severely truncated to fit user input. Final prompt: \(currentPromptTokens) tokens")
-                                                                            }
-                                                                            
-                                                                            print("HALDEBUG-MEMORY: Built prompt - \(currentPromptTokens) total tokens")
-                                                                            return currentPrompt
-                                                                        }
 
                                                                         // MARK: - Chat-Message-Based Prompt Construction (new path)
                                                                         //
@@ -13202,7 +12864,7 @@ class ChatViewModel: ObservableObject {
                                                                                 case .overBudgetHardCap(let actual, let budget):
                                                                                     halLog("HALDEBUG-COMPRESS: ⚠️ Hard-cap segment \(kind.displayName) over budget (\(actual) > \(budget)) — fallback truncation. THIS IS A BUG; static-segment caps should be enforced upstream.")
                                                                                     truncatedSegments.insert(kind)
-                                                                                    let maxChars = Int(Double(budget) * 3.5)
+                                                                                    let maxChars = Int(Double(budget) * 4.0)
                                                                                     return String(rawContent.prefix(maxChars))
                                                                                 }
                                                                             }
@@ -19565,8 +19227,9 @@ class HalTestConsole: ObservableObject {
             }
             let category = parts.count >= 3 ? parts[2].trimmingCharacters(in: .whitespaces) : "test_synthetic"
             // Compose a value of approximately tokensEach tokens. We use
-            // TokenEstimator's chars/3.5 heuristic in reverse.
-            let charsPerValue = tokensEach * 3
+            // TokenEstimator's chars/4 heuristic in reverse so the generated
+            // synthetic content gets estimated at close to tokensEach tokens.
+            let charsPerValue = tokensEach * 4
             let pad = "Lorem ipsum dolor sit amet, consectetur adipiscing elit. Sed do eiusmod tempor incididunt ut labore et dolore magna aliqua. Ut enim ad minim veniam, quis nostrud exercitation ullamco laboris nisi ut aliquip ex ea commodo consequat. Duis aute irure dolor in reprehenderit in voluptate velit esse cillum dolore eu fugiat nulla pariatur. Excepteur sint occaecat cupidatat non proident, sunt in culpa qui officia deserunt mollit anim id est laborum. "
             var paddedValue = ""
             while paddedValue.count < charsPerValue {
