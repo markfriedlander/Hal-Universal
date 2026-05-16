@@ -10442,30 +10442,39 @@ struct WidgetTestView: View {
                     let hostText: String? = (!message.isFromUser && message.content.hasPrefix("\u{1F4CB} Summary:")) ? "Host" : nil
                     let footerString = ([formattedDate, turnText, durationText, modelName, seatText, hostText].compactMap { $0 }).joined(separator: ", ")
 
-                    HStack(spacing: 8) {
-                        Text(footerString)
-                            .font(.caption2)
-                            .foregroundColor(.gray)
+                    // Compression / truncation footer (Phase 6b, refined per Mark
+                    // 2026-05-16): when a segment was compressed or truncated
+                    // during this turn's prompt assembly, the metadata text and
+                    // the badge glyph render as a SINGLE inline Text — the
+                    // glyph flows directly after the last word with no
+                    // multi-line layout gap. The entire footer line becomes
+                    // tappable so the user can hit anywhere on the metadata
+                    // line to see what happened, not just the small icon.
+                    //
+                    // Glyph choice:
+                    //   rectangle.compress.vertical = intelligent compression
+                    //   scissors                     = truncation fallback
+                    //
+                    // No text label on the badge — the popover is the
+                    // explanation. The glyph is distinctive enough on its own.
+                    let hasCompression = !message.compressedSegments.isEmpty
+                    let hasTruncation = !message.truncatedSegments.isEmpty
+                    let hasBadge = hasCompression || hasTruncation
 
-                        // Compression / truncation badge (Phase 6b).
-                        // Visible only when at least one prompt segment was
-                        // compressed or truncated during this turn's assembly.
-                        // Tappable — opens a popover explaining what happened.
-                        // If both compressed AND truncated occurred during the
-                        // same turn (mixed result across segments), we surface
-                        // "truncated" as the more severe state; the popover
-                        // explains both.
-                        if !message.compressedSegments.isEmpty || !message.truncatedSegments.isEmpty {
-                            let hasTruncation = !message.truncatedSegments.isEmpty
+                    HStack {
+                        if hasBadge {
+                            let glyphName = hasTruncation ? "scissors" : "rectangle.compress.vertical"
+                            let glyphColor: Color = hasTruncation ? .red : .gray
                             Button {
                                 showingCompressionExplanation = true
                             } label: {
-                                HStack(spacing: 3) {
-                                    Image(systemName: hasTruncation ? "scissors" : "rectangle.compress.vertical")
-                                    Text(hasTruncation ? "truncated" : "condensed")
-                                }
+                                (
+                                    Text(footerString + " ")
+                                        .foregroundColor(.gray)
+                                    + Text(Image(systemName: glyphName))
+                                        .foregroundColor(glyphColor)
+                                )
                                 .font(.caption2)
-                                .foregroundColor(hasTruncation ? .red : .secondary)
                             }
                             .buttonStyle(.plain)
                             .popover(isPresented: $showingCompressionExplanation,
@@ -10477,6 +10486,10 @@ struct WidgetTestView: View {
                                 )
                                 .presentationCompactAdaptation(.popover)
                             }
+                        } else {
+                            Text(footerString)
+                                .font(.caption2)
+                                .foregroundColor(.gray)
                         }
                     }
                     .transition(.opacity)
