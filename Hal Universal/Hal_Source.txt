@@ -16792,7 +16792,7 @@ class MLXModelDownloader: ObservableObject {
         }()
         if let spaceError = spaceError {
             await MainActor.run {
-                print("HALDEBUG-DOWNLOAD: Refusing \(modelID) — insufficient space. \(spaceError)")
+                halLog("HALDEBUG-DOWNLOAD: Refusing \(modelID) — insufficient space. \(spaceError)")
                 var state = downloadStates[modelID] ?? DownloadState(
                     isDownloading: false,
                     progress: 0.0,
@@ -19517,9 +19517,15 @@ class HalTestConsole: ObservableObject {
         let isDownloaded = downloader.isModelDownloaded(modelID)
         let isDownloading = downloader.isDownloading && downloader.currentDownloadID == modelID
         let prog = isDownloading ? String(format: "%.3f", downloader.progress) : (isDownloaded ? "1.0" : "0.0")
-        let errorStr = (downloader.downloadError != nil && downloader.currentDownloadID == modelID)
-            ? "\"\(jsonStringEscape(downloader.downloadError!))\""
-            : "null"
+        // Surface error directly from downloadStates[modelID].error — this
+        // covers refused downloads (insufficient disk space, etc.) which
+        // set state.error WITHOUT setting currentDownloadID, since they
+        // never actually started downloading. Previous logic only surfaced
+        // errors for in-flight downloads, hiding refusal messages from API
+        // consumers. UI was unaffected (ModelLibraryRow reads state.error
+        // directly), but tests + automation now see the same view.
+        let stateError = downloader.downloadStates[modelID]?.error
+        let errorStr = stateError.map { "\"\(jsonStringEscape($0))\"" } ?? "null"
         return "{\"status\":\"ok\",\"modelID\":\"\(jsonStringEscape(modelID))\",\"isDownloaded\":\(isDownloaded),\"isDownloading\":\(isDownloading),\"progress\":\(prog),\"error\":\(errorStr)}"
     }
 
