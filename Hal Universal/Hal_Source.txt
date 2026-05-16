@@ -8251,13 +8251,95 @@ struct SystemPromptEditorView: View {
     @EnvironmentObject var chatViewModel: ChatViewModel
     @State private var editedPrompt: String = ""
     @State private var showingResetAlert = false
-    
+
+    // Hard cap on system prompt size, enforced UI-side per Mark + SC directive
+    // (Context Budget Implementation Plan §6a). The cap is global across all
+    // models — it reflects how much a user can reasonably type into a system
+    // prompt editor, not model capacity. AFM 4K has the tightest budget; the
+    // 1000-token cap fits comfortably even within AFM's prompt allocation.
+    private var cap: Int { HalModelLimits.systemPromptHardCap }
+
+    // Live token count of the current edit buffer.
+    private var currentTokens: Int {
+        TokenEstimator.estimateTokens(from: editedPrompt)
+    }
+
+    // Three-state UI as approved by SC (refinement #1):
+    //   < 80%  : neutral counter, secondary color
+    //   80-99% : amber counter, "approaching limit"
+    //   ≥ 100% : red counter, "limit reached", input editor stops accepting growth
+    private enum CounterState { case neutral, approaching, atLimit }
+
+    private var counterState: CounterState {
+        let percentage = Double(currentTokens) / Double(cap)
+        if percentage >= 1.0 { return .atLimit }
+        if percentage >= 0.80 { return .approaching }
+        return .neutral
+    }
+
+    private var counterLabel: String {
+        switch counterState {
+        case .neutral:     return "\(currentTokens) / \(cap) tokens"
+        case .approaching: return "\(currentTokens) / \(cap) tokens — approaching limit"
+        case .atLimit:     return "\(currentTokens) / \(cap) tokens — limit reached"
+        }
+    }
+
+    private var counterColor: Color {
+        switch counterState {
+        case .neutral:     return .secondary
+        case .approaching: return .orange
+        case .atLimit:     return .red
+        }
+    }
+
+    // Binding wrapper that enforces the cap. Per SC's directive: "Do not allow
+    // input beyond the limit and tell the user it will be ignored. That's hidden
+    // behavior and it's wrong for Hal. The field stops accepting input at the cap."
+    //
+    // Logic:
+    //   - Deletion (newValue is shorter than current): always accept, regardless
+    //     of cap. This is the only way out for a legacy prompt that exceeds the
+    //     cap on first open — the user can shrink it down.
+    //   - Growth or same-length replacement: accept only if the resulting token
+    //     count stays at or below the cap. Otherwise, silently reject (no
+    //     change to the binding source — the typed character / pasted block
+    //     just doesn't land).
+    private var cappedPromptBinding: Binding<String> {
+        Binding(
+            get: { editedPrompt },
+            set: { newValue in
+                // Allow any deletion regardless of cap (escape hatch for legacy
+                // prompts and normal editing flow).
+                if newValue.count < editedPrompt.count {
+                    editedPrompt = newValue
+                    return
+                }
+                // For growth or replacement, enforce the cap on the resulting tokens.
+                let newTokens = TokenEstimator.estimateTokens(from: newValue)
+                if newTokens <= cap {
+                    editedPrompt = newValue
+                }
+                // else: silently drop the input. The field stops accepting growth.
+            }
+        )
+    }
+
     var body: some View {
         NavigationView {
             VStack(spacing: 0) {
-                TextEditor(text: $editedPrompt)
+                TextEditor(text: cappedPromptBinding)
                     .font(.system(.body, design: .monospaced))
                     .padding(8)
+
+                // Token counter (three-state) — always visible, lives below the
+                // editor so it's never obscured by the keyboard.
+                Text(counterLabel)
+                    .font(.caption)
+                    .foregroundColor(counterColor)
+                    .padding(.horizontal, 12)
+                    .padding(.bottom, 8)
+                    .frame(maxWidth: .infinity, alignment: .trailing)
             }
             .navigationTitle("System Prompt")
             .navigationBarTitleDisplayMode(.inline)
@@ -8273,6 +8355,10 @@ struct SystemPromptEditorView: View {
                         dismiss()
                     }
                     .fontWeight(.semibold)
+                    // Disable save if a legacy prompt is over cap. The user
+                    // can still Cancel without saving. Once they delete enough
+                    // to be under the cap, Save re-enables.
+                    .disabled(currentTokens > cap)
                 }
                 ToolbarItem(placement: .bottomBar) {
                     Button {
