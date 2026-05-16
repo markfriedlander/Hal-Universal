@@ -725,13 +725,41 @@ class MemoryStore: ObservableObject {
                                         );
                                         """
 
+                                        // COMPRESSED_SEGMENTS TABLE — per-model cache for compressed prompt segments
+                                        // (Phase 5 of the context-budget architecture, 2026-05-16).
+                                        //
+                                        // Keyed by (segment_kind, model_id, raw_content_hash). The hash gives
+                                        // automatic invalidation: when raw content changes, its hash changes,
+                                        // and the lookup misses. Explicit invalidation also exists for DB Nuke
+                                        // and bulk self-knowledge resets.
+                                        //
+                                        // Storing actual_tokens lets us audit compression quality over time.
+                                        // Storing truncated lets us surface the distinction between
+                                        // "condensed" (intelligent compression) and "truncated" (fallback)
+                                        // in the chat footer indicator.
+                                        let compressedSegmentsSQL = """
+                                        CREATE TABLE IF NOT EXISTS compressed_segments (
+                                            id INTEGER PRIMARY KEY AUTOINCREMENT,
+                                            segment_kind TEXT NOT NULL,
+                                            model_id TEXT NOT NULL,
+                                            raw_content_hash TEXT NOT NULL,
+                                            target_tokens INTEGER NOT NULL,
+                                            actual_tokens INTEGER NOT NULL,
+                                            compressed_content TEXT NOT NULL,
+                                            truncated INTEGER NOT NULL DEFAULT 0,
+                                            created_at INTEGER NOT NULL,
+                                            UNIQUE(segment_kind, model_id, raw_content_hash)
+                                        );
+                                        """
+
                                         // Execute schema creation with proper error handling
                                         let tables = [
                                             ("sources", sourcesSQL),
                                             ("unified_content", unifiedContentSQL),
                                             ("self_knowledge", selfKnowledgeSQL),
                                             ("conversation_artifacts", conversationArtifactsSQL),
-                                            ("threads", threadsSQL)
+                                            ("threads", threadsSQL),
+                                            ("compressed_segments", compressedSegmentsSQL)
                                         ]
 
                                         for (tableName, sql) in tables {
@@ -756,7 +784,8 @@ class MemoryStore: ObservableObject {
                                             "CREATE INDEX IF NOT EXISTS idx_self_knowledge_format ON self_knowledge(format);",
                                             "CREATE INDEX IF NOT EXISTS idx_conversation_artifacts_turn ON conversation_artifacts(turn_number);",
                                             "CREATE INDEX IF NOT EXISTS idx_conversation_artifacts_conversation ON conversation_artifacts(conversation_id);",
-                                            "CREATE INDEX IF NOT EXISTS idx_threads_last_active ON threads(last_active_at DESC);"
+                                            "CREATE INDEX IF NOT EXISTS idx_threads_last_active ON threads(last_active_at DESC);",
+                                            "CREATE INDEX IF NOT EXISTS idx_compressed_segments_lookup ON compressed_segments(segment_kind, model_id, raw_content_hash);"
                                         ]
 
                                         for sql in unifiedIndexes {
@@ -2081,6 +2110,13 @@ class MemoryStore: ObservableObject {
                 deletedTotal = Int(sqlite3_changes(db))
             }
             print("HALDEBUG-REFLECTION: Reset wiped \(deletedTotal) self_knowledge rows (reflections + traits).")
+
+            // Belt-and-suspenders: also invalidate any cached compressions of
+            // self-knowledge content. Hash-based invalidation would handle the
+            // common case (new hash → cache miss → recompress), but bulk reset
+            // is the right moment to prune stale rows eagerly.
+            invalidateCachedCompressions(forSegmentKind: .selfKnowledge)
+
             return deletedTotal
         }
 
@@ -4866,6 +4902,139 @@ actor SegmentCompressor {
         cache?.storeCachedCompression(compressed)
 
         return compressed
+    }
+}
+
+// MARK: - MemoryStore conformance to CompressedSegmentCache
+
+extension MemoryStore: CompressedSegmentCache {
+
+    /// Look up a previously-cached compression for (kind, model, content_hash).
+    /// Returns nil on cache miss. Follows the existing MemoryStore SQLite pattern
+    /// (synchronous direct calls, NSString-backed bindings with `nil` destructor).
+    func cachedCompression(
+        segmentKind: PromptSegmentKind,
+        modelId: String,
+        rawContentHash: String
+    ) -> CompressedSegment? {
+        guard ensureHealthyConnection() else {
+            print("HALDEBUG-COMPRESS: Cannot read cache — no database connection")
+            return nil
+        }
+
+        let sql = """
+            SELECT compressed_content, target_tokens, actual_tokens, truncated, created_at
+            FROM compressed_segments
+            WHERE segment_kind = ? AND model_id = ? AND raw_content_hash = ?
+            LIMIT 1
+        """
+        var stmt: OpaquePointer?
+        defer { sqlite3_finalize(stmt) }
+
+        guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else {
+            return nil
+        }
+
+        sqlite3_bind_text(stmt, 1, (segmentKind.rawValue as NSString).utf8String, -1, nil)
+        sqlite3_bind_text(stmt, 2, (modelId as NSString).utf8String, -1, nil)
+        sqlite3_bind_text(stmt, 3, (rawContentHash as NSString).utf8String, -1, nil)
+
+        guard sqlite3_step(stmt) == SQLITE_ROW else { return nil }
+
+        guard let cStr = sqlite3_column_text(stmt, 0) else { return nil }
+        let content = String(cString: cStr)
+        let targetTokens = Int(sqlite3_column_int(stmt, 1))
+        let actualTokens = Int(sqlite3_column_int(stmt, 2))
+        let truncated = sqlite3_column_int(stmt, 3) != 0
+        let createdAtUnix = TimeInterval(sqlite3_column_int64(stmt, 4))
+
+        return CompressedSegment(
+            kind: segmentKind,
+            modelId: modelId,
+            rawContentHash: rawContentHash,
+            compressedContent: content,
+            targetTokens: targetTokens,
+            actualTokens: actualTokens,
+            createdAt: Date(timeIntervalSince1970: createdAtUnix),
+            cacheHit: true,  // we're reading from cache, so by definition this is a hit
+            truncated: truncated
+        )
+    }
+
+    /// Store a freshly-computed compression in the cache.
+    /// Uses INSERT OR REPLACE keyed by the UNIQUE constraint, so a stale row
+    /// for the same (kind, model, hash) is replaced rather than duplicated.
+    func storeCachedCompression(_ compressed: CompressedSegment) {
+        guard ensureHealthyConnection() else {
+            print("HALDEBUG-COMPRESS: Cannot write cache — no database connection")
+            return
+        }
+
+        let sql = """
+            INSERT OR REPLACE INTO compressed_segments
+              (segment_kind, model_id, raw_content_hash, target_tokens,
+               actual_tokens, compressed_content, truncated, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        """
+        var stmt: OpaquePointer?
+        defer { sqlite3_finalize(stmt) }
+
+        guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else {
+            print("HALDEBUG-COMPRESS: Failed to prepare cache-store statement")
+            return
+        }
+
+        sqlite3_bind_text(stmt, 1, (compressed.kind.rawValue as NSString).utf8String, -1, nil)
+        sqlite3_bind_text(stmt, 2, (compressed.modelId as NSString).utf8String, -1, nil)
+        sqlite3_bind_text(stmt, 3, (compressed.rawContentHash as NSString).utf8String, -1, nil)
+        sqlite3_bind_int(stmt, 4, Int32(compressed.targetTokens))
+        sqlite3_bind_int(stmt, 5, Int32(compressed.actualTokens))
+        sqlite3_bind_text(stmt, 6, (compressed.compressedContent as NSString).utf8String, -1, nil)
+        sqlite3_bind_int(stmt, 7, compressed.truncated ? 1 : 0)
+        sqlite3_bind_int64(stmt, 8, Int64(compressed.createdAt.timeIntervalSince1970))
+
+        if sqlite3_step(stmt) != SQLITE_DONE {
+            let err = String(cString: sqlite3_errmsg(db))
+            print("HALDEBUG-COMPRESS: Failed to store cache row: \(err)")
+        }
+    }
+
+    /// Invalidate all cached compressions for a given segment kind.
+    /// Belt-and-suspenders cleanup: hash-based lookup already handles the
+    /// common case (content changed → hash changed → cache miss), but this
+    /// is for bulk operations like DB Nuke or "reset all self-knowledge."
+    func invalidateCachedCompressions(forSegmentKind kind: PromptSegmentKind) {
+        guard ensureHealthyConnection() else { return }
+
+        let sql = "DELETE FROM compressed_segments WHERE segment_kind = ?"
+        var stmt: OpaquePointer?
+        defer { sqlite3_finalize(stmt) }
+
+        guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else { return }
+        sqlite3_bind_text(stmt, 1, (kind.rawValue as NSString).utf8String, -1, nil)
+        let result = sqlite3_step(stmt)
+        if result == SQLITE_DONE {
+            let changes = Int(sqlite3_changes(db))
+            if changes > 0 {
+                halLog("HALDEBUG-COMPRESS: Invalidated \(changes) cached \(kind.displayName) compressions")
+            }
+        }
+    }
+
+    /// Invalidate ALL cached compressions across every segment kind and model.
+    /// Used by DB Nuke (though Nuclear Reset deletes the whole DB file, so
+    /// this is mostly here for completeness / explicit non-DB-deleting resets).
+    func invalidateAllCachedCompressions() {
+        guard ensureHealthyConnection() else { return }
+
+        let sql = "DELETE FROM compressed_segments"
+        var errMsg: UnsafeMutablePointer<CChar>?
+        if sqlite3_exec(db, sql, nil, nil, &errMsg) == SQLITE_OK {
+            halLog("HALDEBUG-COMPRESS: All cached compressions cleared")
+        } else if let err = errMsg {
+            print("HALDEBUG-COMPRESS: Failed to clear cache: \(String(cString: err))")
+            sqlite3_free(err)
+        }
     }
 }
 
