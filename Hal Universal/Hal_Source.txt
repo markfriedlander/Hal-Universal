@@ -262,7 +262,21 @@ struct ChatMessage: Identifiable, Equatable { // Added Equatable for ForEach
     let seatNumber: Int? // SALON MODE FIX: Seat number for multi-LLM mode (NULL for user messages and single-LLM mode)
     let deliberationRound: Int // SALON MODE FIX: Deliberation round for "pass turn" feature in Context-Aware mode
 
-    init(id: UUID = UUID(), content: String, isFromUser: Bool, timestamp: Date = Date(), isPartial: Bool = false, thinkingDuration: TimeInterval? = nil, fullPromptUsed: String? = nil, usedContextSnippets: [UnifiedSearchResult]? = nil, tokenBreakdown: TokenBreakdown? = nil, toolsUsed: [String]? = nil, recordedByModel: String, turnNumber: Int, seatNumber: Int? = nil, deliberationRound: Int = 1) {
+    /// Which prompt segments were intelligently compressed (via TextSummarizer
+    /// + veracity check) during this turn's prompt assembly. Drives the
+    /// "condensed" badge in the bubble footer (Phase 6b). Non-empty when at
+    /// least one dynamic segment exceeded its budget and was compressed by
+    /// the active model. Empty by default.
+    var compressedSegments: Set<PromptSegmentKind>
+
+    /// Which prompt segments fell back to raw truncation during this turn —
+    /// catastrophic-only failure modes for compression (LLM call returned
+    /// empty, output overshot target by >20%, veracity rejected too much).
+    /// Drives the visually-distinct "truncated" badge in the bubble footer.
+    /// Should be rare in normal use.
+    var truncatedSegments: Set<PromptSegmentKind>
+
+    init(id: UUID = UUID(), content: String, isFromUser: Bool, timestamp: Date = Date(), isPartial: Bool = false, thinkingDuration: TimeInterval? = nil, fullPromptUsed: String? = nil, usedContextSnippets: [UnifiedSearchResult]? = nil, tokenBreakdown: TokenBreakdown? = nil, toolsUsed: [String]? = nil, recordedByModel: String, turnNumber: Int, seatNumber: Int? = nil, deliberationRound: Int = 1, compressedSegments: Set<PromptSegmentKind> = [], truncatedSegments: Set<PromptSegmentKind> = []) {
         self.id = id
         self.content = content
         self.isFromUser = isFromUser
@@ -277,6 +291,8 @@ struct ChatMessage: Identifiable, Equatable { // Added Equatable for ForEach
         self.turnNumber = turnNumber
         self.seatNumber = seatNumber
         self.deliberationRound = deliberationRound
+        self.compressedSegments = compressedSegments
+        self.truncatedSegments = truncatedSegments
     }
 }
 
@@ -10297,6 +10313,7 @@ struct WidgetTestView: View {
         let messageIndex: Int
         @EnvironmentObject var chatViewModel: ChatViewModel
         @State private var showingDetails: Bool = false
+        @State private var showingCompressionExplanation: Bool = false
 
         // Provide screen width directly.
         //
@@ -10425,10 +10442,42 @@ struct WidgetTestView: View {
                     let hostText: String? = (!message.isFromUser && message.content.hasPrefix("\u{1F4CB} Summary:")) ? "Host" : nil
                     let footerString = ([formattedDate, turnText, durationText, modelName, seatText, hostText].compactMap { $0 }).joined(separator: ", ")
 
-                    HStack {
+                    HStack(spacing: 8) {
                         Text(footerString)
                             .font(.caption2)
                             .foregroundColor(.gray)
+
+                        // Compression / truncation badge (Phase 6b).
+                        // Visible only when at least one prompt segment was
+                        // compressed or truncated during this turn's assembly.
+                        // Tappable — opens a popover explaining what happened.
+                        // If both compressed AND truncated occurred during the
+                        // same turn (mixed result across segments), we surface
+                        // "truncated" as the more severe state; the popover
+                        // explains both.
+                        if !message.compressedSegments.isEmpty || !message.truncatedSegments.isEmpty {
+                            let hasTruncation = !message.truncatedSegments.isEmpty
+                            Button {
+                                showingCompressionExplanation = true
+                            } label: {
+                                HStack(spacing: 3) {
+                                    Image(systemName: hasTruncation ? "scissors" : "rectangle.compress.vertical")
+                                    Text(hasTruncation ? "truncated" : "condensed")
+                                }
+                                .font(.caption2)
+                                .foregroundColor(hasTruncation ? .red : .secondary)
+                            }
+                            .buttonStyle(.plain)
+                            .popover(isPresented: $showingCompressionExplanation,
+                                     attachmentAnchor: .point(.center),
+                                     arrowEdge: .top) {
+                                CompressionExplanationView(
+                                    compressedSegments: message.compressedSegments,
+                                    truncatedSegments: message.truncatedSegments
+                                )
+                                .presentationCompactAdaptation(.popover)
+                            }
+                        }
                     }
                     .transition(.opacity)
                     .fixedSize(horizontal: false, vertical: true)
@@ -10625,6 +10674,81 @@ struct WidgetTestView: View {
                     measuredContainerWidth = newWidth
                 }
             }
+        }
+    }
+
+    // CompressionExplanationView — popover content for the footer badge.
+    // Per Mark's Phase 6b direction: "let's give them like a little tool tip
+    // or something that explains it... lead to greater transparency."
+    //
+    // Two distinct copy blocks: one for intelligent compression (the normal
+    // path), one for truncation fallback (the catastrophic failure path).
+    // Both can appear together if some segments compressed cleanly and
+    // others fell back during the same turn.
+    //
+    // Below the explanations: a list of segments that were affected, so the
+    // user can see *exactly* which parts of Hal's memory were touched. This
+    // is the "transparency as architecture" principle applied to the UI.
+    struct CompressionExplanationView: View {
+        let compressedSegments: Set<PromptSegmentKind>
+        let truncatedSegments: Set<PromptSegmentKind>
+
+        var body: some View {
+            ScrollView {
+                VStack(alignment: .leading, spacing: 14) {
+                    if !compressedSegments.isEmpty {
+                        Text("Memory condensed")
+                            .font(.headline)
+                        Text("The model you're using has a smaller context window than the size of Hal's full memory. To stay honest about everything Hal knows about you, Hal's full memory is preserved in the database — but for this turn it was condensed by the model itself to fit. Open Settings → Power User → Database to see Hal's full memory anytime.")
+                            .font(.callout)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
+
+                    if !truncatedSegments.isEmpty {
+                        if !compressedSegments.isEmpty {
+                            Divider()
+                        }
+                        Text("Memory truncated")
+                            .font(.headline)
+                            .foregroundColor(.red)
+                        Text("The model couldn't condense part of Hal's memory in time (the LLM was unavailable, took too long, or the condensed result didn't pass verification). For this turn, that part was cut at the budget limit rather than intelligently distilled. Hal's full memory is preserved in the database — this only affects what the model saw for this single turn.")
+                            .font(.callout)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
+
+                    Divider()
+
+                    let allAffected: [PromptSegmentKind] = Array(compressedSegments.union(truncatedSegments))
+                        .sorted { $0.rawValue < $1.rawValue }
+                    if !allAffected.isEmpty {
+                        Text("Affected this turn:")
+                            .font(.caption)
+                            .foregroundColor(.secondary)
+                        ForEach(allAffected, id: \.self) { kind in
+                            let isTruncated = truncatedSegments.contains(kind)
+                            HStack(spacing: 6) {
+                                Image(systemName: isTruncated ? "scissors" : "rectangle.compress.vertical")
+                                    .foregroundColor(isTruncated ? .red : .secondary)
+                                    .font(.caption)
+                                Text(kind.displayName)
+                                    .font(.caption)
+                                if isTruncated {
+                                    Text("(truncated)")
+                                        .font(.caption2)
+                                        .foregroundColor(.red)
+                                } else {
+                                    Text("(condensed)")
+                                        .font(.caption2)
+                                        .foregroundColor(.secondary)
+                                }
+                            }
+                        }
+                    }
+                }
+                .padding(20)
+            }
+            .frame(idealWidth: 340, maxWidth: 340,
+                   idealHeight: 320, maxHeight: 480)
         }
     }
 
