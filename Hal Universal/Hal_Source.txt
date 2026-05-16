@@ -7967,8 +7967,7 @@ struct ModelLibraryView: View {
     @AppStorage("hasSeenHardwareDisclosure") private var hasSeenHardwareDisclosure: Bool = false
 
     var body: some View {
-        ZStack {
-            List {
+        List {
                 // ── HAL'S PICKS ──────────────────────────────────────────
                 Section {
                     ForEach(halsPicks) { model in
@@ -8006,6 +8005,23 @@ struct ModelLibraryView: View {
                     }
                     .padding(.vertical, 4)
 
+                    // Inline catalog-loading indicator. Lives in the
+                    // scrollable section (not a floating overlay) so it
+                    // never obscures Hal's Picks above. Collapses
+                    // automatically when catalog.isLoading flips false.
+                    if catalog.isLoading {
+                        HStack(spacing: 10) {
+                            ProgressView()
+                                .controlSize(.small)
+                            Text("Loading models from Hugging Face…")
+                                .font(.caption)
+                                .foregroundColor(.secondary)
+                            Spacer()
+                        }
+                        .padding(.vertical, 4)
+                        .transition(.opacity)
+                    }
+
                     // Local search bar (not the global .searchable so it
                     // only filters this section).
                     HStack(spacing: 6) {
@@ -8028,14 +8044,18 @@ struct ModelLibraryView: View {
                     }
                     .padding(.vertical, 4)
 
-                    if filteredLibraryModels.isEmpty {
+                    if filteredLibraryModels.isEmpty && !catalog.isLoading {
+                        // While catalog.isLoading is true the inline
+                        // loading row above is doing the talking; we
+                        // suppress this empty-state copy then so the
+                        // user isn't told "no models" mid-fetch.
                         Text(librarySearchText.isEmpty
-                             ? "Open Model Library after a successful network fetch to browse experimental models from mlx-community."
+                             ? "No experimental community models available right now."
                              : "No community models match \"\(librarySearchText)\".")
                             .font(.caption)
                             .foregroundColor(.secondary)
                             .padding(.vertical, 4)
-                    } else {
+                    } else if !filteredLibraryModels.isEmpty {
                         ForEach(filteredLibraryModels) { model in
                             ModelLibraryRow(
                                 model: model,
@@ -8108,20 +8128,6 @@ struct ModelLibraryView: View {
                     Text("This will permanently delete \(model.displayName).")
                 }
             }
-
-            // Loading overlay
-            if catalog.isLoading {
-                VStack(spacing: 12) {
-                    ProgressView().scaleEffect(1.2)
-                    Text("Loading models from Hugging Face...")
-                        .font(.subheadline)
-                        .foregroundColor(.secondary)
-                }
-                .padding(20)
-                .background(.regularMaterial)
-                .cornerRadius(12)
-            }
-        }
     }
 
     // MARK: - Model partitioning
