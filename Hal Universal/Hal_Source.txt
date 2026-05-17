@@ -413,7 +413,7 @@ class MemoryStore: ObservableObject {
     static let shared = MemoryStore() // Singleton pattern
 
     @Published var isEnabled: Bool = true
-    @AppStorage("relevanceThreshold") var relevanceThreshold: Double = 0.75 {
+    @AppStorage("relevanceThreshold") var relevanceThreshold: Double = 0.25 {
         didSet {
             // Notify other parts of the app that the threshold has changed
             NotificationCenter.default.post(name: .relevanceThresholdDidChange, object: nil)
@@ -614,9 +614,61 @@ class MemoryStore: ObservableObject {
 
         // Create all tables using the persistent connection
         createUnifiedSchema()
+
+        // Embedding system version check (2026-05-17 architectural upgrade
+        // to NLContextualEmbedding). The old NLEmbedding vectors are in a
+        // different vector space and dimension — incomparable to the new
+        // model's output. Per Mark's directive ("data is disposable; wipe
+        // and start fresh"), on first launch after the upgrade we NULL
+        // every embedding BLOB. Rows stay (so conversation history isn't
+        // lost from the UI thread view), but the embedding column is
+        // cleared so the next access re-embeds with the new model.
+        wipeStaleEmbeddingsIfNeeded()
+
         loadUnifiedStats()
 
         print("HALDEBUG-DATABASE: Persistent database setup complete")
+    }
+
+    /// One-time wipe of embedding columns when the embedding system
+    /// version changes. Idempotent — the persisted flag prevents repeated
+    /// wipes on subsequent launches.
+    nonisolated private func wipeStaleEmbeddingsIfNeeded() {
+        let currentEmbeddingVersion = 2  // 1 = NLEmbedding.sentenceEmbedding; 2 = NLContextualEmbedding
+        let key = "embeddingSystemVersion"
+        let stored = UserDefaults.standard.integer(forKey: key)  // returns 0 if missing
+        if stored == currentEmbeddingVersion {
+            return  // already on current system
+        }
+        halLog("HALDEBUG-EMBEDDING: Embedding system version upgrade detected (stored=\(stored), current=\(currentEmbeddingVersion)) — NULLing existing embedding columns so rows re-embed with NLContextualEmbedding")
+        let wipeUnified = "UPDATE unified_content SET embedding = NULL;"
+        let wipeSelf = "UPDATE self_knowledge SET embedding = NULL WHERE 1=1;"  // self_knowledge may not have an embedding column on all schemas; the WHERE clause is harmless and avoids accidental table-scan-with-side-effects
+        var unifiedChanges = 0
+        var selfChanges = 0
+        if sqlite3_exec(db, wipeUnified, nil, nil, nil) == SQLITE_OK {
+            unifiedChanges = Int(sqlite3_changes(db))
+        }
+        // self_knowledge may not have an embedding column; guard via PRAGMA
+        var hasSelfEmbeddingColumn = false
+        var infoStmt: OpaquePointer?
+        if sqlite3_prepare_v2(db, "PRAGMA table_info(self_knowledge);", -1, &infoStmt, nil) == SQLITE_OK {
+            while sqlite3_step(infoStmt) == SQLITE_ROW {
+                if let colName = sqlite3_column_text(infoStmt, 1) {
+                    if String(cString: colName) == "embedding" {
+                        hasSelfEmbeddingColumn = true
+                        break
+                    }
+                }
+            }
+        }
+        sqlite3_finalize(infoStmt)
+        if hasSelfEmbeddingColumn {
+            if sqlite3_exec(db, wipeSelf, nil, nil, nil) == SQLITE_OK {
+                selfChanges = Int(sqlite3_changes(db))
+            }
+        }
+        halLog("HALDEBUG-EMBEDDING: Wiped embeddings — unified_content: \(unifiedChanges) rows, self_knowledge: \(selfChanges) rows. Embeddings regenerate on next access.")
+        UserDefaults.standard.set(currentEmbeddingVersion, forKey: key)
     }
     
     
@@ -3607,58 +3659,155 @@ extension MemoryStore {
     }
 }
 
-// MARK: - Simplified 2-Tier Embedding System (Based on MENTAT's Proven Approach, from Hal10000App.swift)
+// MARK: - Embedding System (NLContextualEmbedding, 2026-05-17 architectural upgrade)
+//
+// Single embedding system everywhere. Replaces the older
+// NLEmbedding.sentenceEmbedding API which had documented limitations:
+// no contextual understanding, clusters by grammatical shape rather than
+// semantic content, and on Hal's short-conversational-content workload
+// produced unusable similarity scores (related content ~0.27, unrelated
+// query-shape ~0.62 — the noise floor was higher than the plant signal).
+//
+// NLContextualEmbedding is Apple's transformer-based replacement, available
+// on iOS 17+. It returns per-token vectors which we mean-pool to a single
+// sentence vector. The model assets may need a one-time download via
+// `requestEmbeddingAssets()` — done lazily on first use. Once loaded the
+// model stays resident for the app's lifetime.
+//
+// There is no fallback. The old NLEmbedding path and the hash-based
+// emergency fallback are both removed. If NLContextualEmbedding fails to
+// load (no network for asset download on first launch, etc.), embed()
+// returns nil and the BM25 keyword path (Commit B) carries retrieval
+// until the model is available.
+
+/// Single-instance wrapper around NLContextualEmbedding. Lazy-loaded on
+/// first use; subsequent calls are synchronous and fast.
+///
+/// Thread safety: `NLContextualEmbedding` documentation says model
+/// instances are safe to share across threads after `load()`. We guard
+/// the one-time load with an NSLock so concurrent first calls don't race.
+final class EmbeddingProvider: @unchecked Sendable {
+    nonisolated static let shared = EmbeddingProvider()
+
+    private let lock = NSLock()
+    nonisolated(unsafe) private var model: NLContextualEmbedding?
+    nonisolated(unsafe) private var loadAttempted: Bool = false
+
+    private init() {}
+
+    /// Pooled sentence-level vector for `text`, or nil if the model isn't
+    /// loaded (first-launch asset download in progress, or download
+    /// failed). Callers should treat nil as "semantic embedding currently
+    /// unavailable" — the search pipeline must not crash; it just gets no
+    /// semantic hit for that row/query.
+    nonisolated func embed(_ text: String) -> [Double]? {
+        let cleanText = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !cleanText.isEmpty else { return nil }
+
+        ensureModelLoadedBlocking()
+
+        lock.lock()
+        let loaded = model
+        lock.unlock()
+
+        guard let model = loaded else { return nil }
+
+        do {
+            let result = try model.embeddingResult(for: cleanText, language: .english)
+            let dim = model.dimension
+            guard dim > 0 else { return nil }
+
+            var sum = [Double](repeating: 0, count: dim)
+            var tokenCount = 0
+            result.enumerateTokenVectors(in: cleanText.startIndex..<cleanText.endIndex) { vector, _ in
+                let limit = min(dim, vector.count)
+                for i in 0..<limit {
+                    sum[i] += vector[i]
+                }
+                tokenCount += 1
+                return true
+            }
+            guard tokenCount > 0 else { return nil }
+            let pooled = sum.map { $0 / Double(tokenCount) }
+            return pooled
+        } catch {
+            halLog("HALDEBUG-EMBEDDING: NLContextualEmbedding.embeddingResult failed: \(error.localizedDescription)")
+            return nil
+        }
+    }
+
+    /// True if the model is loaded and ready. Used by diagnostic APIs and
+    /// for warm-up logging at app launch.
+    nonisolated var isLoaded: Bool {
+        lock.lock(); defer { lock.unlock() }
+        return model != nil
+    }
+
+    /// Trigger an async warm-up — used from app boot so the model loads
+    /// (and downloads assets if needed) in the background before any
+    /// chat turn fires. Idempotent.
+    nonisolated func warmUp() {
+        Task.detached { [weak self] in
+            self?.ensureModelLoadedBlocking()
+        }
+    }
+
+    /// Synchronous lazy-load. Blocks the calling thread on first use if
+    /// asset download is required. Subsequent calls return immediately.
+    private nonisolated func ensureModelLoadedBlocking() {
+        lock.lock()
+        if model != nil { lock.unlock(); return }
+        if loadAttempted { lock.unlock(); return }
+        loadAttempted = true
+        lock.unlock()
+
+        guard let candidate = NLContextualEmbedding(language: .english) else {
+            halLog("HALDEBUG-EMBEDDING: NLContextualEmbedding(language:.english) returned nil — model unavailable")
+            return
+        }
+
+        if !candidate.hasAvailableAssets {
+            halLog("HALDEBUG-EMBEDDING: Assets not on device; requesting download (this happens once per install)")
+            let sem = DispatchSemaphore(value: 0)
+            var assetError: Error?
+            candidate.requestAssets(completionHandler: { _, err in
+                if let e = err { assetError = e }
+                sem.signal()
+            })
+            sem.wait()
+            if let error = assetError {
+                halLog("HALDEBUG-EMBEDDING: Asset request failed: \(error.localizedDescription) — semantic search will be unavailable until next attempt")
+                lock.lock(); loadAttempted = false; lock.unlock()  // allow retry next call
+                return
+            }
+        }
+
+        do {
+            try candidate.load()
+            lock.lock()
+            self.model = candidate
+            lock.unlock()
+            halLog("HALDEBUG-EMBEDDING: NLContextualEmbedding loaded — dimension=\(candidate.dimension)")
+        } catch {
+            halLog("HALDEBUG-EMBEDDING: NLContextualEmbedding.load() failed: \(error.localizedDescription)")
+            lock.lock(); loadAttempted = false; lock.unlock()  // allow retry next call
+        }
+    }
+}
+
 extension MemoryStore {
 
-    // SIMPLIFIED: Generate embeddings using only sentence embeddings + hash fallback
+    /// Returns the pooled sentence vector for `text`. Empty array if the
+    /// embedding model isn't loaded yet (first-launch download pending or
+    /// failed). Storage callers that get an empty array store NULL in the
+    /// embedding column; search callers that get an empty array return
+    /// zero semantic results (BM25 keyword path still applies).
     func generateEmbedding(for text: String) -> [Double] {
-        let cleanText = text.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !cleanText.isEmpty else { return [] }
-
-        print("HALDEBUG-MEMORY: Generating simplified embedding for text length \(cleanText.count)")
-
-        // TIER 1: Apple Sentence Embeddings (Primary - proven reliable on modern systems)
-        // FIX: Corrected typo 'NLEmb_edding' to 'NLEmbedding'
-        if let embedding = NLEmbedding.sentenceEmbedding(for: .english) {
-            if let vector = embedding.vector(for: cleanText) {
-                let baseVector = (0..<vector.count).map { Double(vector[$0]) }
-                print("HALDEBUG-MEMORY: Generated sentence embedding with \(baseVector.count) dimensions")
-                return baseVector
-            }
-        }
-
-        // TIER 3: Hash-Based Mathematical Embeddings (Crash prevention fallback only)
-        print("HALDEBUG-MEMORY: Falling back to hash-based embedding for text length \(cleanText.count)")
-        let hashVector = generateHashEmbedding(for: cleanText)
-
-        return hashVector
+        return EmbeddingProvider.shared.embed(text) ?? []
     }
 
-    // FALLBACK: Hash-based embeddings when Apple's NLEmbedding.sentenceEmbedding() returns nil
-    private func generateHashEmbedding(for text: String) -> [Double] {
-        let normalizedText = text.lowercased().trimmingCharacters(in: .whitespacesAndNewlines)
-        var embedding: [Double] = []
-        let seeds = [1, 31, 131, 1313, 13131] // Prime-like numbers for hash variation
-
-        for seed in seeds {
-            let hash = abs(normalizedText.hashValue ^ seed)
-            for i in 0..<13 { // 5 seeds * 13 = 65 dimensions
-                let value = Double((hash >> (i % 32)) & 0xFF) / 255.0
-                embedding.append(value)
-            }
-        }
-
-        // Normalize to unit vector for cosine similarity
-        let magnitude = sqrt(embedding.map { $0 * $0 }.reduce(0, +))
-        if magnitude > 0 {
-            embedding = embedding.map { $0 / magnitude }
-        }
-
-        print("HALDEBUG-MEMORY: Generated hash embedding with \(embedding.count) dimensions")
-        return Array(embedding.prefix(64)) // Keep 64 dimensions for consistency
-    }
-
-    // UTILITY: Standard cosine similarity calculation for vector comparison
+    /// Standard cosine similarity. Rejects dimension mismatches (returns 0)
+    /// so embedding-system migrations can't silently produce noise.
     func cosineSimilarity(_ v1: [Double], _ v2: [Double]) -> Double {
         guard v1.count == v2.count && v1.count > 0 else { return 0 }
         let dot = zip(v1, v2).map(*).reduce(0, +)
@@ -4444,6 +4593,324 @@ extension MemoryStore {
 
         print("HALDEBUG-DATABASE: clearAllConversationData — deleted \(threadCount) threads, \(messageCount) messages. Documents and self-knowledge preserved.")
         return (threadCount, 0, messageCount)
+    }
+
+    // MARK: - Diagnostic API helpers (RAG investigation, 2026-05-16)
+    //
+    // Two read-side methods used by the LocalAPIServer's MEMORY_DUMP and
+    // MEMORY_SEARCH_DEBUG commands to inspect the RAG pipeline during
+    // diagnosis of the planted-fact-recall regression.
+    //
+    // `debugDumpRecentUnifiedContent` lists the most recent rows in
+    // `unified_content` with whether each has an embedding stored. Use to
+    // verify (a) write-side stored the planted turn, (b) the embedding
+    // BLOB is present and non-empty, (c) source_type / position / turn
+    // metadata is correct.
+    //
+    // `debugSearchUnifiedContent` runs the same `searchUnifiedContent`
+    // path the chat pipeline uses and returns the snippets along with the
+    // similarity scores. Use to verify (a) search retrieves the planted
+    // turn for a paraphrased query, (b) the score is above the relevance
+    // threshold, (c) what content the model actually receives.
+    //
+    // Both return JSON strings for direct embedding in the API response.
+
+    /// Read-only diagnostic for the RAG threshold-tuning evaluation
+    /// (2026-05-17). Writes a realistic, varied conversational corpus to
+    /// `unified_content` so we can measure how the relevance threshold
+    /// behaves against a populated database — not just the 6-row trivial
+    /// case we used initially. The corpus mirrors what a real user's
+    /// database might look like after weeks of varied conversation:
+    /// short turns mixed with long, personal facts mixed with chatty
+    /// discussion, varied topics. The first 10 entries are PLANTED facts
+    /// that the evaluation harness will run recall queries against; the
+    /// remainder is general background content that should NOT match
+    /// those queries (and lets us see how noise scores in the presence
+    /// of real facts).
+    @discardableResult
+    func injectRealisticTestCorpus() -> Int {
+        guard ensureHealthyConnection() else { return 0 }
+
+        // The conversation ID is shared across all injected rows so a
+        // single NUCLEAR_RESET later wipes them. Distinct from any real
+        // user conversation.
+        let conversationId = "test-corpus-\(UUID().uuidString.prefix(8))"
+
+        // 10 planted (user, assistant) pairs. The user message is the
+        // "plant" — the natural language statement of a fact. The
+        // assistant restatement is what Hal would have said back. The
+        // evaluation harness queries against natural-language recall
+        // phrasings that do NOT echo the plant text directly.
+        let planted: [(String, String)] = [
+            ("My dog's name is Pepper. She's a six-year-old border collie who loves swimming.",
+             "Pepper the border collie, six years old, swimmer. Got it."),
+            ("I work as a software engineer at a startup called Anthropic, on the Claude team.",
+             "Anthropic, Claude team, software engineer. Noted."),
+            ("My favorite restaurant is Tartine in San Francisco. I go for the morning bun.",
+             "Tartine in SF, you love the morning bun. Will remember."),
+            ("I'm taking a trip to Iceland in September with my partner Sarah.",
+             "Iceland trip in September with Sarah. Logged."),
+            ("My wife and I just bought a house in Berkeley, on Vine Street near the rose garden.",
+             "House in Berkeley on Vine Street near the rose garden. Congrats!"),
+            ("I started taking cello lessons six months ago and I'm working through the Bach suites.",
+             "Cello, six months in, Bach suites. Got it."),
+            ("My favorite book is The Brothers Karamazov by Dostoevsky.",
+             "The Brothers Karamazov by Dostoevsky as your favorite. Noted."),
+            ("My cat is named Atlas. He's an orange tabby, seven years old, mostly sleeps on the bookshelf.",
+             "Atlas the orange tabby, seven, lives on the bookshelf. Will remember."),
+            ("I run an annual half marathon every March in Oakland.",
+             "Annual half marathon in Oakland every March. Noted."),
+            ("I drive a 2018 Subaru Outback in dark blue. Manual transmission.",
+             "2018 Subaru Outback, dark blue, manual. Got it.")
+        ]
+
+        // 50 general conversation turns spanning varied topics. Mix of
+        // user statements, questions, and assistant responses. None of
+        // these should match the 10 recall queries (used to measure
+        // false-positive rate).
+        let general: [(String, Bool)] = [
+            ("How's the weather looking for the weekend?", true),
+            ("Currently sunny and mid-60s in your area through Saturday, clouds rolling in Sunday afternoon.", false),
+            ("Can you help me brainstorm a name for a new project?", true),
+            ("Sure. Tell me a bit about what the project does and the vibe you're going for.", false),
+            ("What's the deal with quantum entanglement in simple terms?", true),
+            ("Two particles linked so that measuring one instantly tells you something about the other, regardless of distance. Einstein called it spooky action at a distance.", false),
+            ("I've been thinking about getting into woodworking.", true),
+            ("That's a great hobby — what kind of projects are you imagining? Furniture, small carving, turning?", false),
+            ("Pour-over coffee technique tips please.", true),
+            ("Bloom for 30 seconds with twice the coffee weight in water, then pour in slow concentric circles, total brew time around 3 to 4 minutes.", false),
+            ("Can you summarize the plot of Crime and Punishment?", true),
+            ("A poor ex-student murders a pawnbroker to test his theory of being above ordinary morality, then spends the rest of the novel unraveling under guilt until he confesses.", false),
+            ("What's a good intro programming language for a kid?", true),
+            ("Python is the most common pick — readable syntax, immediate feedback, lots of beginner resources. Scratch first if they're younger than ten.", false),
+            ("How do I deal with imposter syndrome at work?", true),
+            ("Recognize that the feeling persists even with success, talk to peers who've felt it, document your wins so you can review them when the doubt spikes.", false),
+            ("Is sourdough really that much better than regular bread?", true),
+            ("It's different more than strictly better — longer fermentation gives it more complex flavor and may be easier on digestion, but a good baguette is still a good baguette.", false),
+            ("Recommend me a podcast about history.", true),
+            ("Hardcore History by Dan Carlin if you want long-form deep dives. Revolutions by Mike Duncan if you want narrative arcs.", false),
+            ("What's the best way to learn a new language as an adult?", true),
+            ("Daily exposure beats occasional intensity. Comprehensible input — content you can mostly follow — plus speaking practice with a tutor or partner.", false),
+            ("Thinking about getting a standing desk.", true),
+            ("Mixed evidence on standing desks — the win is the ability to alternate. A fixed-height standing desk often just trades one fatigue for another.", false),
+            ("How do compilers work, roughly?", true),
+            ("Source code goes through lexing, parsing into a tree, semantic analysis, then optimization passes, and finally code generation into the target machine code or bytecode.", false),
+            ("What's a fun easy recipe for a weeknight?", true),
+            ("Sheet-pan chicken with potatoes and a vegetable, single tray, 425 for about 35 minutes. Toss everything with olive oil and salt before it goes in.", false),
+            ("I've been having trouble sleeping lately.", true),
+            ("Common factors are caffeine timing, screen exposure late at night, and inconsistent wake times. Fixing wake time first is usually the highest leverage move.", false),
+            ("Tell me about the Pacific Crest Trail.", true),
+            ("2,650 miles from Mexico to Canada through California, Oregon, and Washington. Most thru-hikers take 4 to 6 months northbound.", false),
+            ("What's the deal with sourdough starter?", true),
+            ("It's flour and water fermenting wild yeast and bacteria from the air. Feed it regularly, keep it warm, and it becomes your leaven instead of commercial yeast.", false),
+            ("Can you explain what an API is to a non-programmer?", true),
+            ("Think of a restaurant menu — you don't see the kitchen, you just order from the menu and the kitchen handles the details. An API is the menu between two pieces of software.", false),
+            ("Best practice for naming git branches?", true),
+            ("Conventions vary by team but type/short-description works well, like feature/checkout-redesign or fix/login-redirect. Keep them short and grep-friendly.", false),
+            ("What's the difference between espresso and a regular coffee?", true),
+            ("Espresso forces hot water under pressure through finely ground coffee in about 25 to 30 seconds. Drip coffee uses gravity through a coarser grind over a few minutes.", false),
+            ("Suggest a documentary worth watching.", true),
+            ("The Up Series follows the same group of British children from age 7 into their 60s, one film every 7 years. Unlike anything else.", false),
+            ("How do passwords actually get stored?", true),
+            ("Modern systems store a cryptographic hash of the password with a per-user salt, not the password itself. When you log in, the system hashes what you typed and compares.", false),
+            ("What's a reasonable savings rate to aim for?", true),
+            ("Common targets are 15 to 20 percent of gross income toward retirement, with separate buffers for short-term goals and emergency reserves.", false),
+            ("How do I keep cilantro fresh longer?", true),
+            ("Trim the stems, stand them in a glass of water like flowers, loosely cover the leaves with a bag, and refrigerate. Keeps about two weeks.", false),
+            ("Tell me about the difference between deciduous and evergreen.", true),
+            ("Deciduous trees drop their leaves seasonally, usually fall; evergreens retain foliage year-round and shed continuously. Both are adaptations to climate.", false)
+        ]
+
+        var position = 0
+        var count = 0
+        let now = Date()
+
+        for (user, asst) in planted {
+            let turnNumber = position / 2 + 1
+            _ = storeUnifiedContentWithEntities(
+                content: user, sourceType: .conversation, sourceId: conversationId,
+                position: position, timestamp: now, isFromUser: true,
+                entityKeywords: "", metadataJson: "{}", recordedByModel: nil,
+                deviceType: nil, turnNumber: turnNumber, deliberationRound: nil, seatNumber: nil)
+            position += 1
+            count += 1
+            _ = storeUnifiedContentWithEntities(
+                content: asst, sourceType: .conversation, sourceId: conversationId,
+                position: position, timestamp: now, isFromUser: false,
+                entityKeywords: "", metadataJson: "{}", recordedByModel: "test-corpus",
+                deviceType: nil, turnNumber: turnNumber, deliberationRound: nil, seatNumber: nil)
+            position += 1
+            count += 1
+        }
+
+        for (text, isFromUser) in general {
+            let turnNumber = position / 2 + 1
+            _ = storeUnifiedContentWithEntities(
+                content: text, sourceType: .conversation, sourceId: conversationId,
+                position: position, timestamp: now, isFromUser: isFromUser,
+                entityKeywords: "", metadataJson: "{}",
+                recordedByModel: isFromUser ? nil : "test-corpus",
+                deviceType: nil, turnNumber: turnNumber, deliberationRound: nil, seatNumber: nil)
+            position += 1
+            count += 1
+        }
+
+        halLog("HALDEBUG-TESTCONSOLE: INJECT_REALISTIC_TEST_CORPUS — injected \(count) rows into conversation \(conversationId)")
+        return count
+    }
+
+    /// Local JSON-string escape (the LocalAPIServer's `jsonStringEscape`
+    /// is fileprivate; we mirror it here so MemoryStore can produce
+    /// API-safe response strings without coupling to that scope).
+    private func dbgEscape(_ s: String) -> String {
+        s.replacingOccurrences(of: "\\", with: "\\\\")
+         .replacingOccurrences(of: "\"", with: "\\\"")
+         .replacingOccurrences(of: "\n", with: "\\n")
+         .replacingOccurrences(of: "\r", with: "\\r")
+         .replacingOccurrences(of: "\t", with: "\\t")
+    }
+
+    /// Read-only diagnostic: return the most recent `limit` rows of
+    /// `unified_content` as a JSON array. Each entry includes a content
+    /// preview, the embedding length (0 if missing), and the key metadata
+    /// fields. Used to verify write-side stored the planted turn with an
+    /// embedding attached.
+    func debugDumpRecentUnifiedContent(limit: Int) -> String {
+        guard ensureHealthyConnection() else {
+            return "{\"status\":\"error\",\"message\":\"no database connection\"}"
+        }
+        let cappedLimit = max(1, min(limit, 200))
+        let sql = """
+        SELECT id, content, source_type, source_id, position, turn_number, is_from_user,
+               recorded_by_model, length(embedding) AS embedding_bytes, timestamp, created_at
+        FROM unified_content
+        ORDER BY created_at DESC, timestamp DESC
+        LIMIT ?
+        """
+        var stmt: OpaquePointer?
+        defer { sqlite3_finalize(stmt) }
+        guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else {
+            return "{\"status\":\"error\",\"message\":\"prepare failed\"}"
+        }
+        sqlite3_bind_int(stmt, 1, Int32(cappedLimit))
+
+        var entries: [String] = []
+        var totalRows = 0
+        var rowsWithEmbedding = 0
+        while sqlite3_step(stmt) == SQLITE_ROW {
+            totalRows += 1
+            let id = sqlite3_column_text(stmt, 0).map { String(cString: $0) } ?? ""
+            let content = sqlite3_column_text(stmt, 1).map { String(cString: $0) } ?? ""
+            let sourceType = sqlite3_column_text(stmt, 2).map { String(cString: $0) } ?? ""
+            let sourceId = sqlite3_column_text(stmt, 3).map { String(cString: $0) } ?? ""
+            let position = Int(sqlite3_column_int(stmt, 4))
+            let turnNumber = sqlite3_column_type(stmt, 5) == SQLITE_NULL ? -1 : Int(sqlite3_column_int(stmt, 5))
+            let isFromUser = sqlite3_column_int(stmt, 6) == 1
+            let recordedByModel = sqlite3_column_text(stmt, 7).map { String(cString: $0) } ?? ""
+            let embeddingBytes = Int(sqlite3_column_int(stmt, 8))
+            let timestamp = sqlite3_column_int64(stmt, 9)
+            let createdAt = sqlite3_column_int64(stmt, 10)
+
+            let embeddingDoubles = embeddingBytes / 8  // each Double is 8 bytes
+            if embeddingDoubles > 0 { rowsWithEmbedding += 1 }
+            let contentPreview = String(content.prefix(200))
+
+            let entry = """
+            {"id":"\(id.prefix(8))","sourceType":"\(sourceType)","sourceId":"\(sourceId.prefix(8))","position":\(position),"turnNumber":\(turnNumber),"isFromUser":\(isFromUser),"recordedByModel":"\(dbgEscape(recordedByModel))","embeddingDoubles":\(embeddingDoubles),"contentLength":\(content.count),"contentPreview":"\(dbgEscape(contentPreview))","timestamp":\(timestamp),"createdAt":\(createdAt)}
+            """
+            entries.append(entry)
+        }
+
+        return """
+        {"status":"ok","totalRowsReturned":\(totalRows),"rowsWithEmbedding":\(rowsWithEmbedding),"limit":\(cappedLimit),"entries":[\(entries.joined(separator: ","))]}
+        """
+    }
+
+    /// Read-only diagnostic: run the same semantic-+-keyword search the
+    /// chat pipeline uses, return the resulting snippets with similarity
+    /// scores. Defaults match the production search caller: no exclusion
+    /// of recent turns, generous result count, generous token budget.
+    /// Use to verify retrieval finds the planted fact for a paraphrased
+    /// query and at what score.
+    /// Read-only diagnostic: compute cosine similarity between the query
+    /// embedding and every row in `unified_content` that has an embedding.
+    /// Returns the raw scores WITHOUT applying any threshold or recency
+    /// boost. Used to diagnose why high-confidence matches (like the query
+    /// "Pepper" against stored "Pepper is my dog.") fail the production
+    /// semantic-search filter — if scores here are all below the
+    /// `relevanceThreshold`, the threshold is the problem; if they're
+    /// near-zero, the embeddings themselves are broken.
+    func debugSemanticSimilarity(query: String) -> String {
+        guard ensureHealthyConnection() else {
+            return "{\"status\":\"error\",\"message\":\"no database connection\"}"
+        }
+        let queryEmbedding = generateEmbedding(for: query)
+        guard !queryEmbedding.isEmpty else {
+            return "{\"status\":\"error\",\"message\":\"empty query embedding\"}"
+        }
+
+        let sql = """
+        SELECT id, content, source_type, source_id, position, length(embedding) AS bytes, embedding
+        FROM unified_content
+        WHERE embedding IS NOT NULL
+        ORDER BY created_at DESC, timestamp DESC
+        LIMIT 500
+        """
+        var stmt: OpaquePointer?
+        defer { sqlite3_finalize(stmt) }
+        guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else {
+            return "{\"status\":\"error\",\"message\":\"prepare failed\"}"
+        }
+
+        var entries: [(score: Double, id: String, sourceType: String, sourceId: String, position: Int, embeddingDoubles: Int, contentPreview: String)] = []
+        while sqlite3_step(stmt) == SQLITE_ROW {
+            let id = sqlite3_column_text(stmt, 0).map { String(cString: $0) } ?? ""
+            let content = sqlite3_column_text(stmt, 1).map { String(cString: $0) } ?? ""
+            let sourceType = sqlite3_column_text(stmt, 2).map { String(cString: $0) } ?? ""
+            let sourceId = sqlite3_column_text(stmt, 3).map { String(cString: $0) } ?? ""
+            let position = Int(sqlite3_column_int(stmt, 4))
+            let bytes = Int(sqlite3_column_int(stmt, 5))
+            guard let blobPtr = sqlite3_column_blob(stmt, 6) else { continue }
+            let blobData = Data(bytes: blobPtr, count: bytes)
+            let storedEmbedding = blobData.withUnsafeBytes { (ptr: UnsafeRawBufferPointer) -> [Double] in
+                Array(ptr.bindMemory(to: Double.self))
+            }
+            let similarity = cosineSimilarity(queryEmbedding, storedEmbedding)
+            entries.append((similarity, id, sourceType, sourceId, position, storedEmbedding.count, String(content.prefix(120))))
+        }
+        // Sort descending by score so highest matches come first
+        entries.sort { $0.score > $1.score }
+
+        let entryStrs = entries.map { e in
+            """
+            {"score":\(String(format: "%.4f", e.score)),"id":"\(e.id.prefix(8))","sourceType":"\(e.sourceType)","sourceId":"\(e.sourceId.prefix(8))","position":\(e.position),"embeddingDoubles":\(e.embeddingDoubles),"contentPreview":"\(dbgEscape(e.contentPreview))"}
+            """
+        }
+
+        return """
+        {"status":"ok","query":"\(dbgEscape(query))","queryEmbeddingDoubles":\(queryEmbedding.count),"relevanceThreshold":\(String(format: "%.3f", relevanceThreshold)),"rowsScored":\(entries.count),"entries":[\(entryStrs.joined(separator: ","))]}
+        """
+    }
+
+    func debugSearchUnifiedContent(query: String, currentConversationId: String) -> String {
+        let result = searchUnifiedContent(
+            for: query,
+            currentConversationId: currentConversationId,
+            excludeTurns: [],
+            maxResults: 20,
+            tokenBudget: 4000
+        )
+        var entries: [String] = []
+        for snippet in result.snippets {
+            let preview = String(snippet.content.prefix(200))
+            let entry = """
+            {"relevanceScore":\(String(format: "%.4f", snippet.relevanceScore)),"sourceType":"\(dbgEscape(snippet.sourceType.rawValue))","sourceName":"\(dbgEscape(snippet.sourceName))","isEntityMatch":\(snippet.isEntityMatch),"recordedByModel":"\(dbgEscape(snippet.recordedByModel ?? ""))","contentPreview":"\(dbgEscape(preview))","contentLength":\(snippet.content.count)}
+            """
+            entries.append(entry)
+        }
+        return """
+        {"status":"ok","query":"\(dbgEscape(query))","conversationId":"\(dbgEscape(currentConversationId))","resultCount":\(result.snippets.count),"totalTokens":\(result.totalTokens),"relevanceThreshold":\(String(format: "%.3f", relevanceThreshold)),"recencyWeight":\(String(format: "%.3f", recencyWeight)),"entries":[\(entries.joined(separator: ","))]}
+        """
     }
 }
 
@@ -6490,9 +6957,17 @@ struct TextSummarizer {
 
     // MARK: - Stage 2: Verification Against Source
     
-    /// Verify each sentence in summary is grounded in source text
-    /// Uses NaturalLanguage embeddings with TF-IDF fallback
-    /// Replaces ungrounded sentences with nearest source sentence
+    /// Verify each sentence in summary is grounded in source text.
+    ///
+    /// Uses `EmbeddingProvider` (NLContextualEmbedding) — the same
+    /// embedding system the RAG path uses, so verification quality
+    /// tracks retrieval quality. If the embedding model isn't loaded
+    /// yet (first-launch asset download in progress), falls back to
+    /// the TF-IDF sentence comparison — a real algorithmic fallback,
+    /// not a placeholder.
+    ///
+    /// Replaces ungrounded sentences with the nearest source sentence
+    /// (cosine similarity above `threshold`).
     static func verifyNarrative(
         _ summary: String,
         against sourceSentences: [String],
@@ -6500,76 +6975,73 @@ struct TextSummarizer {
     ) async -> String {
         let outputSentences = sentenceSplit(summary)
         guard !outputSentences.isEmpty else { return summary }
-        
+
         print("HALDEBUG-SUMMARIZER: Verifying \(outputSentences.count) sentences against \(sourceSentences.count) source sentences")
-        
-        // Try NaturalLanguage sentence embeddings first
-        let revisions: [Int] = [3, 2, 1]
-        var embedding: NLEmbedding? = nil
-        for r in revisions {
-            if let e = NLEmbedding.sentenceEmbedding(for: .english, revision: r) {
-                embedding = e
-                print("HALDEBUG-SUMMARIZER: Using NL sentence embeddings (revision \(r))")
-                break
-            }
-        }
-        
-        guard let model = embedding else {
-            print("HALDEBUG-SUMMARIZER: NL embeddings unavailable, using TF-IDF fallback")
-            return verifyNarrative_TFIDF(summary, against: sourceSentences, threshold: threshold)
-        }
-        
-        // Precompute source sentence vectors
+
+        // Precompute source sentence vectors via the shared embedding
+        // provider. Any source sentence that fails to embed is skipped
+        // (won't be a replacement candidate); we keep the rest so
+        // partial coverage still helps.
         var sourceVecs: [[Double]] = []
         var sourceKeep: [String] = []
         sourceVecs.reserveCapacity(sourceSentences.count)
-        
+
         for s in sourceSentences {
-            if let v = model.vector(for: s) {
+            let v = EmbeddingProvider.shared.embed(s) ?? []
+            if !v.isEmpty {
                 sourceVecs.append(v)
                 sourceKeep.append(s)
             }
         }
-        
+
         if sourceVecs.isEmpty {
-            print("HALDEBUG-SUMMARIZER: No source vectors generated, using TF-IDF fallback")
+            print("HALDEBUG-SUMMARIZER: No source vectors generated (embedding model not loaded yet?), using TF-IDF fallback")
             return verifyNarrative_TFIDF(summary, against: sourceSentences, threshold: threshold)
         }
-        
+
+        // Local cosine — verification runs in TextSummarizer (struct, no
+        // MemoryStore instance handy), so we inline the same math used by
+        // MemoryStore.cosineSimilarity.
+        func cosine(_ a: [Double], _ b: [Double]) -> Double {
+            guard a.count == b.count && a.count > 0 else { return 0 }
+            let dot = zip(a, b).map(*).reduce(0, +)
+            let na = sqrt(a.map { $0 * $0 }.reduce(0, +))
+            let nb = sqrt(b.map { $0 * $0 }.reduce(0, +))
+            return na == 0 || nb == 0 ? 0 : dot / (na * nb)
+        }
+
         var verified: [String] = []
         var replacedCount = 0
-        
+
         for s in outputSentences {
-            guard let v = model.vector(for: s) else {
-                // If we can't embed the sentence, use TF-IDF to find best match
+            let v = EmbeddingProvider.shared.embed(s) ?? []
+            guard !v.isEmpty else {
+                // Can't embed this output sentence — use TF-IDF to find best source match
                 verified.append(bestMatchTFIDF(for: s, in: sourceSentences))
                 replacedCount += 1
                 continue
             }
-            
-            // Find best matching source sentence
+
             var bestSim = -1.0
             var bestIdx = 0
             for (i, u) in sourceVecs.enumerated() {
-                let sim = cosineSimilarity(v, u)
+                let sim = cosine(v, u)
                 if sim > bestSim {
                     bestSim = sim
                     bestIdx = i
                 }
             }
-            
+
             if bestSim >= threshold {
-                // Sentence is grounded, keep it
                 verified.append(s)
             } else {
-                // Sentence not grounded, replace with nearest source
                 verified.append(sourceKeep[bestIdx])
                 replacedCount += 1
             }
         }
-        
+
         print("HALDEBUG-SUMMARIZER: Replaced \(replacedCount) ungrounded sentences")
-        
+
         // Deduplicate adjacent repeats
         var dedup: [String] = []
         for s in verified {
@@ -6577,7 +7049,6 @@ struct TextSummarizer {
                 dedup.append(s)
             }
         }
-        
         return dedup.joined(separator: " ")
     }
     
@@ -6839,6 +7310,15 @@ final class HalAppDelegate: NSObject, UIApplicationDelegate {
         // body has run.
         watchBridge = HalWatchBridge(chatViewModel: ChatViewModel.shared)
         halLog("HALDEBUG-WATCH: AppDelegate bootstrapped HalWatchBridge at didFinishLaunchingWithOptions (cold-launch ready).")
+
+        // Warm up the contextual embedding model in the background. The
+        // first call to NLContextualEmbedding.requestEmbeddingAssets() may
+        // need to download model files; doing it at launch (rather than
+        // lazily on the first chat turn) keeps the first turn responsive
+        // once the assets are in place.
+        EmbeddingProvider.shared.warmUp()
+        halLog("HALDEBUG-EMBEDDING: AppDelegate triggered EmbeddingProvider warm-up.")
+
         return true
     }
 
@@ -12097,7 +12577,7 @@ class ChatViewModel: ObservableObject {
         static let memoryDepth = 5
         static let maxRagSnippetsCharacters: Double = 800
         static let temperature: Double = 0.7
-        static let relevanceThreshold: Double = 0.75
+        static let relevanceThreshold: Double = 0.25
         static let recencyWeight: Double = 0.30
         static let recencyHalfLifeDays: Double = 90
         static let enableSelfKnowledge: Bool = true
@@ -12260,7 +12740,7 @@ class ChatViewModel: ObservableObject {
 
         // Generate reset dialogue (creates bilateral messages in chat)
         let userMsg = "Hal, I reset all your settings to factory defaults."
-        let halMsg = "All settings reset to defaults! I'm back to 5-turn memory, 0.75 similarity threshold, 30% recency weight, 90-day half-life, and self-knowledge enabled. Everything should work smoothly now."
+        let halMsg = "All settings reset to defaults! I'm back to 5-turn memory, 0.25 similarity threshold, 30% recency weight, 90-day half-life, and self-knowledge enabled. Everything should work smoothly now."
         
         injectSettingsChangeDialogue(userMessage: userMsg, halResponse: halMsg)
 
@@ -17963,7 +18443,7 @@ struct ModelConfiguration: Identifiable, Codable, Equatable, Hashable {
         defaultSettings: ModelSettings(
             temperature: 0.7,
             effectiveMemoryDepth: 4,
-            similarityThreshold: 0.75,
+            similarityThreshold: 0.25,
             recencyWeight: 0.3,
             recencyHalfLifeDays: 90,
             maxRagSnippetsCharacters: 600,
@@ -18030,7 +18510,7 @@ struct ModelConfiguration: Identifiable, Codable, Equatable, Hashable {
         defaultSettings: ModelSettings(
             temperature: 0.7,
             effectiveMemoryDepth: 8,
-            similarityThreshold: 0.75,
+            similarityThreshold: 0.25,
             recencyWeight: 0.3,
             recencyHalfLifeDays: 90,
             maxRagSnippetsCharacters: 1400,
@@ -18078,7 +18558,7 @@ struct ModelConfiguration: Identifiable, Codable, Equatable, Hashable {
         defaultSettings: ModelSettings(
             temperature: 0.7,
             effectiveMemoryDepth: 6,
-            similarityThreshold: 0.75,
+            similarityThreshold: 0.25,
             recencyWeight: 0.3,
             recencyHalfLifeDays: 90,
             maxRagSnippetsCharacters: 1000,
@@ -18113,7 +18593,7 @@ struct ModelConfiguration: Identifiable, Codable, Equatable, Hashable {
         defaultSettings: ModelSettings(
             temperature: 0.7,
             effectiveMemoryDepth: 6,
-            similarityThreshold: 0.75,
+            similarityThreshold: 0.25,
             recencyWeight: 0.3,
             recencyHalfLifeDays: 90,
             maxRagSnippetsCharacters: 1400,
@@ -18173,7 +18653,7 @@ struct ModelConfiguration: Identifiable, Codable, Equatable, Hashable {
         defaultSettings: ModelSettings(
             temperature: 0.7,
             effectiveMemoryDepth: 8,
-            similarityThreshold: 0.75,
+            similarityThreshold: 0.25,
             recencyWeight: 0.3,
             recencyHalfLifeDays: 90,
             maxRagSnippetsCharacters: 1000,
@@ -18229,7 +18709,7 @@ struct ModelConfiguration: Identifiable, Codable, Equatable, Hashable {
         defaultSettings: ModelSettings(
             temperature: 0.7,
             effectiveMemoryDepth: 8,
-            similarityThreshold: 0.75,
+            similarityThreshold: 0.25,
             recencyWeight: 0.3,
             recencyHalfLifeDays: 90,
             maxRagSnippetsCharacters: 1000,
@@ -19597,6 +20077,66 @@ class HalTestConsole: ObservableObject {
             let (threads, facts, messages) = vm.memoryStore.clearAllConversationData()
             vm.startNewConversation()
             return "{\"status\":\"ok\",\"command\":\"CLEAR_TEST_DATA\",\"threadsDeleted\":\(threads),\"factsDeleted\":\(facts),\"messagesDeleted\":\(messages),\"newConversationId\":\"\(vm.conversationId)\"}"
+
+        } else if trimmed == "EMBEDDING_STATUS" {
+            // Read-only diagnostic for the contextual embedding model.
+            // Returns whether NLContextualEmbedding has loaded yet, plus
+            // a sanity-check vector dim by embedding a short test string.
+            let isLoaded = EmbeddingProvider.shared.isLoaded
+            let testVec = EmbeddingProvider.shared.embed("test")
+            let dim = testVec?.count ?? 0
+            return "{\"status\":\"ok\",\"isLoaded\":\(isLoaded),\"sampleVectorDim\":\(dim)}"
+
+        } else if trimmed == "INJECT_REALISTIC_TEST_CORPUS" {
+            // Inject ~70 rows of realistic conversational content into
+            // unified_content for RAG threshold evaluation. Used by the
+            // 2026-05-17 threshold-tuning eval (build out a populated DB
+            // so the threshold isn't tuned against a 6-row trivial case).
+            let count = vm.memoryStore.injectRealisticTestCorpus()
+            return "{\"status\":\"ok\",\"command\":\"INJECT_REALISTIC_TEST_CORPUS\",\"rowsInjected\":\(count)}"
+
+        } else if trimmed.hasPrefix("MEMORY_DUMP:") {
+            // MEMORY_DUMP:<limit>
+            //
+            // Read-only diagnostic for inspecting the most recent rows in
+            // unified_content. Returns each row's id prefix, source_type,
+            // source_id prefix, position, turn_number, is_from_user,
+            // recorded_by_model, embedding doubles count, content length,
+            // and a 200-char content preview. Used to verify write-side
+            // behavior (planted turns get stored, embeddings get attached).
+            // Added 2026-05-16 night for the RAG planted-fact-recall
+            // regression investigation.
+            let limitStr = String(trimmed.dropFirst("MEMORY_DUMP:".count)).trimmingCharacters(in: .whitespaces)
+            let limit = Int(limitStr) ?? 20
+            return vm.memoryStore.debugDumpRecentUnifiedContent(limit: limit)
+
+        } else if trimmed.hasPrefix("MEMORY_SIMILARITY_DEBUG:") {
+            // MEMORY_SIMILARITY_DEBUG:<query>
+            //
+            // Read-only diagnostic that scores the query against EVERY row
+            // in unified_content via cosineSimilarity, without applying any
+            // threshold or recency boost. Returns sorted by score desc.
+            // Used to diagnose the semantic-search failure mode where rows
+            // that should be high-confidence (e.g., query "Pepper" against
+            // stored "Pepper is my dog.") fail the production threshold.
+            // Added 2026-05-16 night for RAG regression diagnosis.
+            let query = String(trimmed.dropFirst("MEMORY_SIMILARITY_DEBUG:".count))
+            return vm.memoryStore.debugSemanticSimilarity(query: query)
+
+        } else if trimmed.hasPrefix("MEMORY_SEARCH_DEBUG:") {
+            // MEMORY_SEARCH_DEBUG:<query>
+            //
+            // Read-only diagnostic that runs the SAME semantic + entity
+            // search the chat pipeline uses (searchUnifiedContent) and
+            // returns the resulting snippets with similarity scores plus a
+            // 200-char content preview. Defaults to maxResults=20 and
+            // tokenBudget=4000 (generous, so we see what the real ranking
+            // looks like without budget-trimming hiding low-ranked hits).
+            // Use to verify retrieval finds the planted fact for a
+            // paraphrased query and at what score. Added 2026-05-16 night
+            // for the RAG planted-fact-recall regression investigation.
+            let query = String(trimmed.dropFirst("MEMORY_SEARCH_DEBUG:".count))
+            return vm.memoryStore.debugSearchUnifiedContent(query: query, currentConversationId: vm.conversationId)
 
         } else if trimmed.hasPrefix("MEMORY_INJECT_TEST:") {
             // MEMORY_INJECT_TEST:<count>:<tokens_each>[:<category>]
