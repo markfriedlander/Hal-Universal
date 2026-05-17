@@ -4877,34 +4877,77 @@ extension MemoryStore {
         var count = 0
         let now = Date()
 
+        // Proposal B (2026-05-17): populate entity_keywords via
+        // extractNamedEntities so the test corpus matches the real chat-store
+        // flow (Hal.swift around line 1590). Without this, all 70 rows have
+        // empty entity_keywords and BM25 is denied the entity-shape signal
+        // it gets in production. The eval previously understated BM25's
+        // real-world contribution.
+        //
+        // Pair convention mirrors storeTurn: combined entities from both
+        // halves of a (user, assistant) turn are written to both rows.
+        // For the `general` array we pair adjacent (i, i+1) since it
+        // alternates user-question / assistant-answer in order.
         for (user, asst) in planted {
             let turnNumber = position / 2 + 1
+            let userEntities = extractNamedEntities(from: user)
+            let assistantEntities = extractNamedEntities(from: asst)
+            let combinedKeywords = (userEntities + assistantEntities)
+                .map { $0.text.lowercased() }
+                .joined(separator: " ")
             _ = storeUnifiedContentWithEntities(
                 content: user, sourceType: .conversation, sourceId: conversationId,
                 position: position, timestamp: now, isFromUser: true,
-                entityKeywords: "", metadataJson: "{}", recordedByModel: nil,
+                entityKeywords: combinedKeywords, metadataJson: "{}", recordedByModel: nil,
                 deviceType: nil, turnNumber: turnNumber, deliberationRound: nil, seatNumber: nil)
             position += 1
             count += 1
             _ = storeUnifiedContentWithEntities(
                 content: asst, sourceType: .conversation, sourceId: conversationId,
                 position: position, timestamp: now, isFromUser: false,
-                entityKeywords: "", metadataJson: "{}", recordedByModel: "test-corpus",
+                entityKeywords: combinedKeywords, metadataJson: "{}", recordedByModel: "test-corpus",
                 deviceType: nil, turnNumber: turnNumber, deliberationRound: nil, seatNumber: nil)
             position += 1
             count += 1
         }
 
-        for (text, isFromUser) in general {
-            let turnNumber = position / 2 + 1
+        // Pair the general array two-at-a-time. The array is constructed
+        // as alternating (user-question, assistant-answer) so adjacent
+        // entries form a turn.
+        var generalIndex = 0
+        while generalIndex < general.count {
+            let (userText, userIsFromUser) = general[generalIndex]
+            let hasPair = generalIndex + 1 < general.count
+            let pairText = hasPair ? general[generalIndex + 1].0 : ""
+            let userEntities = extractNamedEntities(from: userText)
+            let assistantEntities = hasPair ? extractNamedEntities(from: pairText) : []
+            let combinedKeywords = (userEntities + assistantEntities)
+                .map { $0.text.lowercased() }
+                .joined(separator: " ")
+
+            let turnNumberA = position / 2 + 1
             _ = storeUnifiedContentWithEntities(
-                content: text, sourceType: .conversation, sourceId: conversationId,
-                position: position, timestamp: now, isFromUser: isFromUser,
-                entityKeywords: "", metadataJson: "{}",
-                recordedByModel: isFromUser ? nil : "test-corpus",
-                deviceType: nil, turnNumber: turnNumber, deliberationRound: nil, seatNumber: nil)
+                content: userText, sourceType: .conversation, sourceId: conversationId,
+                position: position, timestamp: now, isFromUser: userIsFromUser,
+                entityKeywords: combinedKeywords, metadataJson: "{}",
+                recordedByModel: userIsFromUser ? nil : "test-corpus",
+                deviceType: nil, turnNumber: turnNumberA, deliberationRound: nil, seatNumber: nil)
             position += 1
             count += 1
+
+            if hasPair {
+                let (asstText, asstIsFromUser) = general[generalIndex + 1]
+                let turnNumberB = position / 2 + 1
+                _ = storeUnifiedContentWithEntities(
+                    content: asstText, sourceType: .conversation, sourceId: conversationId,
+                    position: position, timestamp: now, isFromUser: asstIsFromUser,
+                    entityKeywords: combinedKeywords, metadataJson: "{}",
+                    recordedByModel: asstIsFromUser ? nil : "test-corpus",
+                    deviceType: nil, turnNumber: turnNumberB, deliberationRound: nil, seatNumber: nil)
+                position += 1
+                count += 1
+            }
+            generalIndex += 2
         }
 
         halLog("HALDEBUG-TESTCONSOLE: INJECT_REALISTIC_TEST_CORPUS — injected \(count) rows into conversation \(conversationId)")
@@ -4934,7 +4977,8 @@ extension MemoryStore {
         let cappedLimit = max(1, min(limit, 200))
         let sql = """
         SELECT id, content, source_type, source_id, position, turn_number, is_from_user,
-               recorded_by_model, length(embedding) AS embedding_bytes, timestamp, created_at
+               recorded_by_model, length(embedding) AS embedding_bytes, timestamp, created_at,
+               entity_keywords
         FROM unified_content
         ORDER BY created_at DESC, timestamp DESC
         LIMIT ?
@@ -4962,13 +5006,14 @@ extension MemoryStore {
             let embeddingBytes = Int(sqlite3_column_int(stmt, 8))
             let timestamp = sqlite3_column_int64(stmt, 9)
             let createdAt = sqlite3_column_int64(stmt, 10)
+            let entityKeywords = sqlite3_column_text(stmt, 11).map { String(cString: $0) } ?? ""
 
             let embeddingDoubles = embeddingBytes / 8  // each Double is 8 bytes
             if embeddingDoubles > 0 { rowsWithEmbedding += 1 }
             let contentPreview = String(content.prefix(200))
 
             let entry = """
-            {"id":"\(id.prefix(8))","sourceType":"\(sourceType)","sourceId":"\(sourceId.prefix(8))","position":\(position),"turnNumber":\(turnNumber),"isFromUser":\(isFromUser),"recordedByModel":"\(dbgEscape(recordedByModel))","embeddingDoubles":\(embeddingDoubles),"contentLength":\(content.count),"contentPreview":"\(dbgEscape(contentPreview))","timestamp":\(timestamp),"createdAt":\(createdAt)}
+            {"id":"\(id.prefix(8))","sourceType":"\(sourceType)","sourceId":"\(sourceId.prefix(8))","position":\(position),"turnNumber":\(turnNumber),"isFromUser":\(isFromUser),"recordedByModel":"\(dbgEscape(recordedByModel))","embeddingDoubles":\(embeddingDoubles),"contentLength":\(content.count),"contentPreview":"\(dbgEscape(contentPreview))","entityKeywords":"\(dbgEscape(entityKeywords))","timestamp":\(timestamp),"createdAt":\(createdAt)}
             """
             entries.append(entry)
         }
