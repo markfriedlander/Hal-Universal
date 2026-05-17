@@ -68,20 +68,20 @@ enum QueryExpansion {
 
     // MARK: - Entry point
 
-    /// Sync wrapper around the async LLM call. Caller checks
-    /// `shouldExpand` first and only invokes this on a cache miss path
-    /// (the cache lookup is also here, so callers can simply call this
-    /// and it does the right thing).
+    /// Async expansion path. Caller awaits the result; this avoids the
+    /// MainActor deadlock the earlier sync wrapper hit (the LLM call
+    /// hops to MainActor for `generateChatResponse`, which can't run
+    /// while the caller is holding MainActor in `sem.wait()`).
     ///
     /// Returns the list of expansion terms (may be empty if the LLM
     /// returns nothing useful or the call fails). On cache hit, returns
-    /// immediately without an LLM call. On cache miss, blocks for the
-    /// LLM round-trip (~0.5–2s on AFM for a 200-token prompt).
+    /// immediately without an LLM call. On cache miss, awaits the LLM
+    /// round-trip (~0.5–2s on AFM for a 200-token prompt).
     static func expand(
         query: String,
         memoryStore: MemoryStore,
         llmService: LLMService
-    ) -> [String] {
+    ) async -> [String] {
         let normalized = normalizeQuery(query)
         guard !normalized.isEmpty else { return [] }
         let hash = sha256(normalized)
@@ -97,7 +97,7 @@ enum QueryExpansion {
 
         halLog("HALDEBUG-EXPANSION: cache miss query='\(normalized.prefix(60))' — calling LLM (\(activeModel))…")
         let start = Date()
-        let terms = callLLMSync(for: query, service: llmService)
+        let terms = await callLLM(for: query, service: llmService)
         let elapsedMs = Int(Date().timeIntervalSince(start) * 1000)
         let sample = terms.prefix(8).joined(separator: ", ")
         halLog("HALDEBUG-EXPANSION: LLM returned \(terms.count) terms in \(elapsedMs)ms: \(sample)")
@@ -124,18 +124,12 @@ enum QueryExpansion {
         return digest.map { String(format: "%02x", $0) }.joined()
     }
 
-    /// Call the active LLM via a DispatchSemaphore bridge. **NOTE on
-    /// concurrency:** `expand()` is `@MainActor`-annotated and is called
-    /// from the MainActor-isolated chat tool path. If the inner Task
-    /// also targets MainActor, `sem.wait()` deadlocks the actor — the
-    /// LLM Task can never run because we're holding the MainActor's
-    /// thread inside `sem.wait()`. So we drop the LLM call into a
-    /// detached, non-MainActor Task. `LLMService.generateChatResponse`
-    /// is `async throws` and hops to whichever actor it needs internally;
-    /// it does not require MainActor at call time.
-    nonisolated private static func callLLMSync(for query: String, service: LLMService) -> [String] {
-        let sem = DispatchSemaphore(value: 0)
-        nonisolated(unsafe) var result: [String] = []
+    /// Async LLM call. Pure await chain — no semaphore, no deadlock
+    /// risk. The caller (`expand`) is `async` too, and propagates up
+    /// to the chat path (already async) and the diagnostic API
+    /// handler (wrapped in `Task { … }` at its callsite so the API
+    /// thread isn't blocked).
+    static func callLLM(for query: String, service: LLMService) async -> [String] {
         // Compact two-message prompt — system instruction + user query.
         // Token budget (rough): system ≈ 35 tokens, query ≈ 5–15 tokens,
         // response capped at 10 short terms ≈ 30 tokens. Total under
@@ -144,20 +138,16 @@ enum QueryExpansion {
             .system(systemPrompt),
             .user(query)
         ]
-        Task.detached(priority: .userInitiated) {
-            do {
-                let response = try await service.generateChatResponse(
-                    messages: messages,
-                    temperature: 0.0
-                )
-                result = parseTerms(from: response)
-            } catch {
-                halLog("HALDEBUG-EXPANSION: LLM call failed: \(error.localizedDescription)")
-            }
-            sem.signal()
+        do {
+            let response = try await service.generateChatResponse(
+                messages: messages,
+                temperature: 0.0
+            )
+            return parseTerms(from: response)
+        } catch {
+            halLog("HALDEBUG-EXPANSION: LLM call failed: \(error.localizedDescription)")
+            return []
         }
-        sem.wait()
-        return result
     }
 
     /// Parse the LLM's free-form text output into a list of clean terms.

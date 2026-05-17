@@ -5368,7 +5368,7 @@ extension MemoryStore {
         query: String,
         currentConversationId: String,
         llmService: LLMService
-    ) -> String {
+    ) async -> String {
         let first = searchUnifiedContent(
             for: query,
             currentConversationId: currentConversationId,
@@ -5383,7 +5383,7 @@ extension MemoryStore {
         if let top1 = first.snippets.first,
            QueryExpansion.shouldExpand(top1Score: top1.relevanceScore, top1IsEntityMatch: top1.isEntityMatch) {
             triggered = true
-            terms = QueryExpansion.expand(query: query, memoryStore: self, llmService: llmService)
+            terms = await QueryExpansion.expand(query: query, memoryStore: self, llmService: llmService)
             if !terms.isEmpty {
                 let expanded = searchUnifiedContent(
                     for: query,
@@ -14023,7 +14023,7 @@ class ChatViewModel: ObservableObject {
                                                                                        QueryExpansion.shouldExpand(top1Score: top1.relevanceScore, top1IsEntityMatch: top1.isEntityMatch) {
                                                                                         let beforeScoreStr = String(format: "%.4f", top1.relevanceScore)
                                                                                         halLog("HALDEBUG-EXPANSION: trigger fired — top1Score=\(beforeScoreStr) isEntityMatch=\(top1.isEntityMatch)")
-                                                                                        let terms = QueryExpansion.expand(
+                                                                                        let terms = await QueryExpansion.expand(
                                                                                             query: userInput,
                                                                                             memoryStore: memoryStore,
                                                                                             llmService: llmService
@@ -20826,7 +20826,7 @@ class HalTestConsole: ObservableObject {
             // Used by the eval harness to measure expansion's recall lift.
             // Added 2026-05-17.
             let query = String(trimmed.dropFirst("MEMORY_SEARCH_EXPANDED:".count))
-            return vm.memoryStore.debugSearchUnifiedContentWithExpansion(
+            return await vm.memoryStore.debugSearchUnifiedContentWithExpansion(
                 query: query,
                 currentConversationId: vm.conversationId,
                 llmService: vm.llmService
