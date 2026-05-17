@@ -3,75 +3,139 @@
 What we're planning to do next. Forward-looking, narrow scope.
 
 For where Hal is right now: `HANDOFF_BRIEF.md`.
-For how we got here: `HISTORY.md`.
+For how we got here: `HISTORY.md` (especially the 2026-05-17 entry).
 
 ---
 
-## Just landed (May 17)
+## What the next session should do first
 
-RAG architectural rebuild complete — three commits (A: NLContextualEmbedding,
-B: FTS5 BM25, C: RRF fusion). Detail in HISTORY.md 2026-05-17 entry. Plant
-recall on natural-language queries: 7/10 in top-10 (vs effectively 0 before
-on paraphrased queries). Architecture matches industry standard.
+1. **Read this file, then `HANDOFF_BRIEF.md`, then the 2026-05-17 entry of `HISTORY.md`.**
+   That's the full context for the RAG work and the three proposals below.
+2. **Verify the live state on the iPhone is what the docs claim:**
+   ```bash
+   python3 tests/hal_test.py state                         # should respond
+   python3 tests/hal_test.py cmd "EMBEDDING_STATUS"        # isLoaded: true, dim: 512
+   python3 tests/hal_test.py cmd "SALON_GET_STATE"         # should be disabled
+   ```
+   If anything fails, the phone may be asleep/off WiFi — Mark should wake it.
+3. **Run the eval to establish baseline before any new work:**
+   ```bash
+   python3 tests/hal_test.py reset
+   python3 tests/hal_test.py cmd "INJECT_REALISTIC_TEST_CORPUS"
+   python3 tests/rag_threshold_eval.py
+   ```
+   Expected: plant scores mean ~0.83, top-noise mean ~0.88, plants reachable
+   via semantic but rank-buried under question-shape rows.
+4. **Start with Proposal B** (cheapest, sharpens our measurement before any
+   architectural change).
 
 ---
 
-## Active queue
+## RAG work — three proposals in order
 
-### 1. Push to origin
+These came out of the 2026-05-17 investigation. SC and Mark received the
+proposals; no implementation decision was made before context ran low.
+Recommended order is **B → A → C** — establishes a fair baseline first,
+then tries the bigger embedding, then layers entity-aware expansion if
+still needed.
 
-Local `main` is **6 commits ahead of `origin/main`** (RAG rebuild A/B/C, plus
-the Cluster A + Salon + SPM fixes from May 16). Push pending.
+### Proposal B — Fix eval methodology (do this first)
 
-### 2. Cluster B verification — remaining items
+**Why first.** Our current eval corpus has empty `entity_keywords` for all
+70 rows because `INJECT_REALISTIC_TEST_CORPUS` calls
+`storeUnifiedContentWithEntities` with `entityKeywords: ""`. Real chat data
+goes through `storeTurn` → `extractNamedEntities` (Hal.swift:1597) and
+DOES populate entity_keywords. So today's eval understates BM25's real-
+world contribution. Without a fair baseline we can't tell whether
+Proposal A or C actually helps.
 
-The non-RAG Cluster B verification items from May 16 still apply. RAG itself
-is now verified separately via `tests/rag_threshold_eval.py`. Remaining:
+**What to do.** Modify `injectRealisticTestCorpus` (in MemoryStore around
+the new diagnostic section) so that each row's `entityKeywords` is
+populated via `extractNamedEntities(from: text)` (mirroring the real
+chat-store flow at Hal.swift:1597). Then re-run
+`tests/rag_threshold_eval.py` and the full-pipeline check via
+`MEMORY_SEARCH_DEBUG` on the 10 ground-truth queries.
 
-- **Visual checks**: Salon UI Pickers, System prompt counter, Model Library UI,
-  App icon — visual verification on device or simulator.
-- **Background downloads long-lock test** — delete Gemma (3.6 GB), start fresh
-  download, lock phone face-down 10+ minutes, verify BGDL coordinator handles
-  iOS suspension correctly.
+**What this should reveal.** Likely that BM25-via-entity_keywords lifts
+recall on queries that share entity-shape but not surface words. May or
+may not bridge the 3 specific misses (Berkeley / Subaru / cello) — those
+queries contain none of the entities NLTagger would extract from the
+plants. Measurement will tell.
 
-### 3. Cluster C — implementation (from May 16, was paused for RAG question)
+### Proposal A — Try EmbeddingGemma as alternative embedding backend
 
-- **Structured-trait synthesis** (Mark's decision: implement, design for
-  inspectability so it can surface in a future Evolutionary Salon)
-  - Add semantic similarity check to `storeSelfKnowledge` for
-    `structured_trait` format. New entry's embedding compared against
-    existing entries in the same category. Above threshold (start at 0.85
-    to match reflections), synthesize into existing.
-- **Scroll behavior** (Mark's decision: requirement — search SwiftUI examples
-  on the web first, find a working pattern, adapt it)
-  - User's message scrolls off the top, Hal's response follows immediately
-    below, user is in complete control. No automatic repositioning.
+**Context.** NLContextualEmbedding compresses cosine scores into a narrow
+band (0.69–0.91 across all short-text pairs) which limits discrimination.
+EmbeddingGemma is 308M parameters (vs ~50M for NLContextualEmbedding),
+trained explicitly for retrieval/semantic similarity, state-of-the-art on
+MTEB Multilingual v2 for open models under 500M. Should produce wider
+dynamic range. Already shipping in our deps via
+`mlx-swift-lm 3.31.3 → MLXEmbedders`.
 
-## On deck (post-clusters)
+**What to do.**
+1. Register a curated EmbeddingGemma model in the catalog (e.g.,
+   `mlx-community/embeddinggemma-300m-4bit` if available, else research
+   the right HuggingFace ID). May need a separate "embedding model"
+   category vs the LLM model catalog.
+2. Add a runtime selector — could be `@AppStorage("embeddingBackend")` with
+   values `"nlcontextual"` / `"embeddinggemma"`, or just compile-time
+   choice for the A/B run.
+3. Modify `EmbeddingProvider.embed(_:)` to dispatch to the chosen backend.
+   EmbeddingGemma path loads via `MLXEmbedders` and returns its vector
+   (likely 768-dim default, or smaller via Matryoshka).
+4. Wipe + re-embed all stored rows when backend changes (the existing
+   `wipeStaleEmbeddingsIfNeeded` pattern, version bumped). Or use a
+   separate UserDefaults flag per backend.
+5. Re-run `tests/rag_threshold_eval.py` with each backend. Compare:
+   plant scores, top-noise scores, plant ranks. If EmbeddingGemma
+   meaningfully separates signal from noise, make it the default.
 
-- **Screenshots × 6** for App Store
-- **ASC metadata fills** using `Docs/ASC_v2.0_Paste_Ready.md`
-- **One-off Docs/ consolidation** — many per-session recovery and finding
-  docs in `Docs/` should be consolidated. Queued for a dedicated pass.
+**Open question for Mark.** EmbeddingGemma adds ~200MB to model storage.
+Worth the trade for better RAG quality? Probably yes — Hal already ships
+multi-GB MLX models — but flag for explicit approval before adding it
+to the curated catalog.
 
-## Open RAG follow-ups (lower priority than active queue)
+### Proposal C — Entity-aware query expansion (if A doesn't close the gap)
 
-These are the 3 missed ground-truth queries from the RAG eval. They reflect
-genuine model-strength limits on short text, not architectural problems.
-Worth investigating after the active queue clears:
+**Why this is here.** Bridges the specific failure mode the other two
+don't directly address: queries with zero surface-term overlap to the
+plant ("What kind of car?" → "Subaru Outback"). Independent of A and B —
+could land alongside either.
 
-- **"Where do I live now?" → "house in Berkeley"** — pure-semantic + BM25
-  can't bridge "live" → "Berkeley" reliably. Would benefit from entity-
-  aware indexing (extract Berkeley, San Francisco, Iceland, etc. at write
-  time and store as searchable entities separate from raw content).
-- **"What kind of car?" → "Subaru Outback"** — same root cause; "car"
-  doesn't appear in plant content.
-- **"What instrument am I learning?" → "cello"** — same; "instrument"
-  doesn't appear in plant.
+**What to do.**
+1. At query time, run NLTagger over the recall query to extract entity-
+   type intent. "What kind of car?" → infer concept `vehicle`.
+2. Expand the FTS5 query to include common synonyms for that concept
+   (mini synonym dictionary, hand-curated for common categories: car/
+   vehicle/auto/drive, instrument/cello/guitar/piano, live/home/house/
+   reside, etc.).
+3. BM25 then matches the plant via the expanded terms (Subaru is a car,
+   cello is an instrument, Berkeley is a place where someone lives).
 
-Three options if/when this surfaces as a real problem:
-- (a) Entity extraction at write time (NLTagger names → entity_keywords)
-- (b) Synonym dictionary at query time ("car" → "vehicle, drive, auto,
-  Honda, Subaru, ...")
-- (c) Wait for a stronger on-device embedding model (e.g., EmbeddingGemma
-  when it's available via Swift bindings)
+**Trade-off.** Synonym dictionaries are brittle and English-specific. An
+LLM-based query rewriter would be more flexible but adds latency. Start
+with a small hand-curated dictionary for the categories the eval queries
+exercise; expand based on real-world miss patterns.
+
+---
+
+## Other work queued (deferred to make room for RAG)
+
+These were paused when the RAG question came up on May 16. Still relevant.
+
+- **Cluster B remaining (visual)**: Salon UI Pickers, System prompt counter,
+  Model Library UI, App icon — visual verification on device or simulator.
+- **Cluster B remaining (long duration)**: Background downloads long-lock test
+  — delete Gemma (3.6 GB), start fresh download, lock phone face-down 10+
+  minutes, verify BGDL coordinator handles iOS suspension.
+- **Cluster C from May 16** (orthogonal to the RAG proposals above):
+  - Structured-trait synthesis (Mark's decision: implement, design for
+    inspectability so it can surface in a future Evolutionary Salon)
+  - Scroll behavior (Mark's decision: requirement — search SwiftUI examples
+    on the web first, find a working pattern, adapt it)
+
+## On deck
+
+- Screenshots × 6 for App Store
+- ASC metadata fills using `Docs/ASC_v2.0_Paste_Ready.md`
+- One-off `Docs/` consolidation (many per-session recovery/finding docs)

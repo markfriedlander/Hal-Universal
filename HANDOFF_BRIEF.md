@@ -1,130 +1,160 @@
 # Hal Universal — Handoff Brief
-**Updated:** May 17, 2026 (post-RAG-rebuild)
-**Branch:** `main` @ `b6f964b` — working tree clean (HISTORY/HANDOFF/NEXT updates pending in next commit)
-**Origin:** `origin/main` at `eeb7dbc` — local is **ahead by 6 commits**, push pending
+**Updated:** May 17, 2026 (post-RAG-rebuild + threshold deletion)
+**Branch:** `main` @ `2e1bd26` — in sync with `origin/main` (everything pushed)
+**Working tree:** clean (only untracked: `Docs/SC_Release_Materials/`, pre-existing)
 
-> **For post-compaction or next-session CC:** read this brief for current state, then
-> `NEXT.md` for what's planned, then `HISTORY.md` for how we got here, then `CLAUDE.md`
-> for standing rules.
+> **For the next CC session:** read this brief, then `NEXT.md` for what to do first,
+> then `HISTORY.md` for how we got here (the 2026-05-17 entry covers the RAG rebuild
+> and threshold deletion in detail), then `CLAUDE.md` for standing rules.
 
 ---
 
 ## TL;DR — where Hal is right now
 
-The RAG memory retrieval pipeline was rebuilt May 17 (three commits A/B/C). The system
-now uses Apple's NLContextualEmbedding (transformer-based, replaces the older non-contextual
-NLEmbedding), SQLite FTS5 with Porter stemming for BM25 keyword search (replaces the
-LIKE-substring approach), and Reciprocal Rank Fusion to combine the two retrievers by
-rank (replaces threshold-based filtering and score-based combination).
+The RAG memory pipeline was architecturally rebuilt May 17:
+- **NLContextualEmbedding** replaces the older NLEmbedding.sentenceEmbedding (transformer-based, 512-dim, on Neural Engine, single embedding system everywhere)
+- **FTS5 + Porter stemming** replaces the LIKE-substring keyword search (proper BM25 ranking)
+- **Reciprocal Rank Fusion** combines semantic + BM25 by rank (k=60, industry standard, threshold-free)
+- **`relevanceThreshold` / `similarityThreshold` deleted entirely** — no variable, no AppStorage key, no UI
 
-Result: planted-fact recall went from effectively dead (carried only by literal-substring
-keyword matches) to 7/10 on natural-language queries against a realistic 70-row corpus.
-The 3 remaining misses are queries with zero surface-term overlap to the plant — a model-
-strength limit, not an architectural one.
+Working state on iPhone 16 Plus: build 5 deployed, NLContextualEmbedding loaded (512-dim),
+all builds clean (zero warnings, zero errors).
 
-Cluster A from earlier (AFM no self-knowledge, MLX raw injection, chunked compression
-strip) remains in place. Salon state-machine fix and SPM exact pin remain in place.
-
----
-
-## Working tree
-
-Clean as of `b6f964b`. The HISTORY/HANDOFF/NEXT doc updates for the RAG rebuild are
-pending in the next commit.
+**Eval result:** 7/10 ground-truth plants retrieved in top 10 from the 70-row realistic
+corpus. The 3 misses (Berkeley, Subaru, cello) plant-rank 13–48 of 70 in raw semantic;
+they're being beaten by question-shape unrelated rows that score 0.86–0.91. Three
+proposals submitted (B/A/C order) — no implementation started; pending next session.
 
 ---
 
-## Active work — pending decisions
+## What's in the code right now
 
-Cluster C from May 16 (structured-trait synthesis + scroll behavior) was deferred when
-the RAG question surfaced. Those items remain to be done. See `NEXT.md`.
-
----
-
-## Recent commits
+### RAG retrieval path (`searchUnifiedContent`, Hal.swift around line 4256)
 
 ```
+Query → sanitize → two retrievers in parallel:
+  1. Semantic: cosineSimilarity(queryEmb, allRowEmbs) → top-50 by score → ranks
+  2. BM25: FTS5 MATCH ... ORDER BY -bm25() → top-50 → ranks
+  → RRF fusion: rrf(d) = Σ over each list L of 1/(60 + rank_L(d))
+  → sort by RRF desc
+  → take top maxResults (10 single / 5 per sub-query)
+  → token-budget pass: skip too-large snippets, break on running-total overflow
+  → build RAGSnippet objects
+```
+
+No threshold filter. Source-code rows excluded from BM25 (1.18M-char blob would
+dominate every common-word match).
+
+### Embedding system (`EmbeddingProvider`, Hal.swift around line 3614)
+
+Single global singleton wraps `NLContextualEmbedding(language: .english)`. Lazy-loaded
+on first call (DispatchSemaphore around `requestAssets` for one-shot asset download).
+Warmed up at app launch (`AppDelegate.didFinishLaunchingWithOptions`). Per-token vectors
+mean-pooled to a single 512-dim sentence vector. `embed(_:) -> [Double]?` returns nil
+when model isn't loaded (BM25 carries until it is).
+
+No fallback embedding system. No hash fallback. The old NLEmbedding revision-loop is gone.
+
+### Self-knowledge (May 16, still in place)
+
+- AFM: skipped entirely in `buildChatMessages` (per Mark's directive, AFM gets no
+  persistent self-knowledge)
+- MLX: injected raw in `resolveSegment(.selfKnowledge, ...)` — no compression call
+
+### Salon (May 16, still in place)
+
+Invariant `salonConfig.isEnabled ⟹ activeSeats.count >= 1` enforced through helpers
+`setSalonEnabled` / `setSalonSeat`. Bad state unreachable via API + UI.
+
+---
+
+## Diagnostic APIs added during the rebuild
+
+| Command | Purpose |
+|---|---|
+| `EMBEDDING_STATUS` | Is NLContextualEmbedding loaded? Sample vector dim. |
+| `MEMORY_DUMP:<limit>` | Recent `unified_content` rows with embedding presence (`embeddingDoubles` field) |
+| `MEMORY_SEARCH_DEBUG:<query>` | Full hybrid retrieval pipeline trace — semantic + BM25 + RRF, returns ranked snippets |
+| `MEMORY_SIMILARITY_DEBUG:<query>` | Raw cosine similarity per row, threshold-free, no RRF. Used by the eval harness. |
+| `INJECT_REALISTIC_TEST_CORPUS` | Inject 70-row corpus (10 plants + 50 general turns) for reproducible eval |
+
+All four invoked via `python3 tests/hal_test.py cmd "<COMMAND>"` or direct
+`curl POST /command` with the bearer token from `tests/.hal_api_config.json`.
+
+---
+
+## Eval harness — `tests/rag_threshold_eval.py`
+
+**What it does.** Calls `MEMORY_SIMILARITY_DEBUG` for each of 10 hard-coded
+ground-truth recall queries against the 70-row corpus. For each query reports:
+- Plant's rank in the cosine-sorted list (and the plant's score)
+- Top non-plant score (worst false positive for that query)
+- At thresholds 0.25 / 0.35 / 0.45 / 0.50: does the plant pass, and how much
+  noise passes alongside
+
+**How to run (manual setup required first):**
+
+```bash
+# 1. Make sure Hal is running on the device and reachable
+python3 tests/hal_test.py state
+
+# 2. Reset DB and inject the corpus
+python3 tests/hal_test.py reset
+python3 tests/hal_test.py cmd "INJECT_REALISTIC_TEST_CORPUS"
+
+# 3. Run the eval
+python3 tests/rag_threshold_eval.py
+```
+
+**What "good" looks like.** With NLContextualEmbedding (current):
+- Plant scores: mean 0.83 (range 0.77–0.91)
+- Top-noise scores: mean 0.88 (range 0.86–0.91)
+- Plant recall @ all tested thresholds: 10/10 (because scores all clear them)
+- **But** the plant is buried under noise in raw rank — only the FULL RRF
+  pipeline (tested separately via `MEMORY_SEARCH_DEBUG`) achieves 7/10 in top 10.
+
+The eval probes RAW SEMANTIC similarity. To measure the full pipeline (semantic
++ BM25 + RRF), use `MEMORY_SEARCH_DEBUG:<query>` directly and count plant ranks
+in the returned `entries` list. There's no automated harness for the full
+pipeline yet; building one would be a Proposal-B-style improvement.
+
+**Important methodology caveat.** The corpus injection bypasses
+`extractNamedEntities` at write time — all 70 rows have empty `entity_keywords`.
+This understates BM25's real-world contribution (real chat turns DO populate
+entity_keywords via `extractNamedEntities` at `Hal.swift:1597`). Proposal B
+addresses this.
+
+---
+
+## Known behavior caveats
+
+- **NLContextualEmbedding compresses cosine into a narrow band.** Empirically:
+  all pairs of short conversational content score 0.69–0.91. Plants score 0.77–0.84
+  against their recall queries; noise scores 0.86–0.91. The model produces
+  meaningful semantic distance but doesn't strongly discriminate at this size.
+- **The eval corpus has no entity_keywords.** See above. Real chat data does.
+- **First-launch asset download for NLContextualEmbedding** blocks the calling
+  thread via DispatchSemaphore. Warm-up at app launch front-loads this so chat
+  turns don't pay. If offline at first launch, EmbeddingProvider sets
+  `loadAttempted = false` so the next call retries.
+- **3 ground-truth plants miss top-10 retrieval:** Subaru, Berkeley, cello.
+  Pure semantic + BM25 can't bridge `"live"` → `"Berkeley"` reliably given the
+  current embedding model. Proposals A/B/C address.
+
+---
+
+## Recent commits (since last brief)
+
+```
+2e1bd26  tests: rag_threshold_eval.py — 10-query ground-truth eval harness for RAG
+9712a87  Delete relevanceThreshold/similarityThreshold entirely
+c07cd4c  Docs: chronicle RAG rebuild (A/B/C), refresh HANDOFF + NEXT
 b6f964b  Commit C: Hybrid retrieval with Reciprocal Rank Fusion; remove relevance-threshold UI
 1550325  Commit B: FTS5 BM25 keyword search replaces LIKE substring path
 67efc30  Commit A: Replace NLEmbedding with NLContextualEmbedding everywhere
-158dc15  HANDOFF_BRIEF: post-Cluster-A refresh
-f43b1e2  Cluster A directive: AFM no self-knowledge, MLX raw inject, strip chunked compression
-b26ae8c  Ship blockers: Salon empty-seats safety net + swift-transformers exact pin
 ```
 
-Full per-commit detail in HISTORY.md.
-
----
-
-## Architecture (current)
-
-### RAG retrieval (May 17 rebuild)
-
-`searchUnifiedContent` is now hybrid with RRF fusion:
-
-1. **Semantic retrieval** — `NLContextualEmbedding` (via `EmbeddingProvider` singleton)
-   produces sentence vectors. Cosine similarity scored across all rows with embeddings.
-   Top 50 candidates by score, no threshold.
-2. **BM25 retrieval** — SQLite FTS5 (`unified_content_fts` virtual table) with
-   `porter unicode61` tokenizer. `bm25()` function ranks. Top 50 candidates.
-3. **RRF fusion** — `rrf(d) = sum over each list L of 1/(60 + rank_L(d))`. Combines
-   the two ranked lists by RANK, not score. Documents that rank highly in both win.
-4. Top `maxResults` from fused list, capped by token budget.
-
-The `relevanceThreshold` variable still exists in AppStorage and per-model settings
-for backward compat, but is no longer consulted in the retrieval path. The Settings UI
-slider was removed.
-
-### Self-knowledge (May 16)
-
-- AFM: skipped entirely in `buildChatMessages`. AFM users get no persistent self-knowledge.
-- MLX: injected raw in `resolveSegment(.selfKnowledge, ...)` — no compression call.
-
-### Salon state machine (May 16)
-
-- Invariant: `salonConfig.isEnabled ⟹ activeSeats.count >= 1`
-- Helpers `setSalonEnabled`/`setSalonSeat` enforce; bad state unreachable via API + UI.
-
-### Embedding model
-
-- `NLContextualEmbedding(language: .english)`, 512-dim, on Neural Engine
-- Loaded once at app launch via `EmbeddingProvider.shared.warmUp()`
-- Per-token vectors mean-pooled to sentence-level
-- No fallback embedding system
-
----
-
-## Diagnostic APIs (added May 16/17)
-
-- `EMBEDDING_STATUS` — is the contextual model loaded? sample vector dim?
-- `MEMORY_DUMP:<limit>` — recent unified_content rows, embedding presence
-- `MEMORY_SEARCH_DEBUG:<query>` — full hybrid retrieval pipeline trace
-- `MEMORY_SIMILARITY_DEBUG:<query>` — raw cosine similarity, threshold-free
-- `INJECT_REALISTIC_TEST_CORPUS` — 70-row realistic conversational fixture
-
-### New test harness
-
-- `tests/rag_threshold_eval.py` — 10 ground-truth queries × similarity scoring across
-  thresholds. Confirms threshold-based filtering is the wrong knob; RRF supersedes.
-
----
-
-## Known gotchas
-
-- **NLContextualEmbedding asset download** — on a brand-new install, the model needs to
-  download its assets via `requestAssets`. The EmbeddingProvider blocks on first use via
-  DispatchSemaphore; subsequent calls are fast. Warm-up at app launch front-loads this.
-- **Source code in unified_content** — `Hal_Source.txt` ingested for self-knowledge access
-  is a 1.18M-char blob. It's now excluded from BM25 (it matched every common word with
-  high TF and dominated ranking). Semantic still includes it. Source-code retrieval needs
-  its own dedicated path eventually.
-- **Cosine "negative" cases** — semantic loop now skips rows with `similarity <= 0`
-  (rare but possible for orthogonal/anti-correlated content). They would add noise to
-  RRF without contributing signal.
-- **3 ground-truth queries miss in top-10** — Subaru, Berkeley, cello. These are
-  queries with no surface-term overlap to the plant ("Where do I live now?" vs "house
-  in Berkeley on Vine Street"). Needs entity-aware indexing or a stronger embedding to
-  bridge.
+`origin/main` is at `2e1bd26`. Local matches. Everything pushed.
 
 ---
 
@@ -143,34 +173,12 @@ xcrun devicectl device install app --device D24FB384-9C55-5D33-9B0D-DAEBFA6528D6
 xcrun devicectl device process launch --device D24FB384-9C55-5D33-9B0D-DAEBFA6528D6 com.MarkFriedlander.Hal-Universal
 ```
 
-- **iPhone 16 Plus device ID:** `D24FB384-9C55-5D33-9B0D-DAEBFA6528D6`
-- **Bundle ID:** `com.MarkFriedlander.Hal-Universal`
-- **API host:** `marks-bigger-ass-fon-16.local`
-- **API port:** 8766
-- **API token:** per-install via Keychain — currently `e9ee9ec5b315467fa655bd4296873f43`
-- **iPhone 17 Pro simulator:** UDID `7D4E1F1A-E7EC-4C42-BDF1-BF3BC72F4352`
-
-The CLI build avoids the SPM destination-switch hazard fixed by `b26ae8c`.
-
----
-
-## Test runner — `tests/hal_test.py` + `tests/rag_threshold_eval.py`
-
-```bash
-python3 tests/hal_test.py state
-python3 tests/hal_test.py turn "Hi"
-python3 tests/hal_test.py switch_model "mlx-community/gemma-4-e2b-it-4bit"
-python3 tests/hal_test.py rendered_messages
-python3 tests/hal_test.py logs [N]
-python3 tests/hal_test.py reset
-python3 tests/hal_test.py cmd "EMBEDDING_STATUS"
-python3 tests/hal_test.py cmd "INJECT_REALISTIC_TEST_CORPUS"
-python3 tests/hal_test.py cmd "MEMORY_DUMP:20"
-python3 tests/hal_test.py cmd "SALON_GET_STATE"
-
-# RAG eval harness:
-python3 tests/rag_threshold_eval.py
-```
+- iPhone 16 Plus: `D24FB384-9C55-5D33-9B0D-DAEBFA6528D6`
+- Bundle ID: `com.MarkFriedlander.Hal-Universal`
+- API host: `marks-bigger-ass-fon-16.local` (mDNS — phone must be awake + on WiFi)
+- API port: 8766
+- API token: `e9ee9ec5b315467fa655bd4296873f43` (in `tests/.hal_api_config.json`)
+- Sim UDID: `7D4E1F1A-E7EC-4C42-BDF1-BF3BC72F4352` (iPhone 17 Pro)
 
 ---
 
@@ -181,19 +189,6 @@ python3 tests/rag_threshold_eval.py
 3. New AppStorage key? `defaults write com.MarkFriedlander.Hal10000 [key] "[value]"`.
 4. App build number bump happens at App Store submission (currently at 5).
 5. Never use `NUCLEAR_RESET` between plant and recall in a memory test.
-6. **Update HANDOFF_BRIEF.md, NEXT.md, and HISTORY.md as work lands** (CLAUDE.md Golden Rule #8).
-
----
-
-## Standing Architectural Rules
-
-- No third-party libraries without explicit discussion.
-- One block at a time — surgical changes, build clean after each.
-- Discussion before code when introducing new structure; autonomous mode OK when extending
-  an agreed plan.
-- Old code stays — broken or not — until we're confident the new path covers all callers.
-- iPhone 16 Plus is primary target.
-- 120-second MLX test timeout.
-- API > asking the human — if you can't get an answer from the API, expand the API.
-- Warnings are errors (CLAUDE.md Golden Rule #7).
-- Docs stay current as work lands (CLAUDE.md Golden Rule #8).
+6. **Update HISTORY/HANDOFF/NEXT as work lands** (CLAUDE.md Golden Rule #8).
+7. **Warnings = errors** (CLAUDE.md Golden Rule #7).
+8. **API > asking the human** — expand the API if a question can't be answered through it.

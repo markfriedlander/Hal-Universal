@@ -414,3 +414,83 @@ literal-substring keyword matches.
 - 3 plants out of 10 still don't reach top-10 for the harder queries
   ("Where do I live now?" needs entity bridging; that's follow-up
   work, not blocking)
+
+### Threshold deletion + SC investigation (later same day, 2026-05-17)
+
+Strategic Claude pushed back on the "model-strength limit" characterization
+of the 3 RAG misses. Six directives:
+
+1. Delete `relevanceThreshold` entirely — no variable, no AppStorage,
+   no comment.
+2. Show actual NLContextualEmbedding cosine scores for the 3 missed
+   plants against their recall queries.
+3. Verify NLTagger entity extractor is wired.
+4. Research EmbeddingGemma as alternative.
+5. Push everything.
+6. No explanations of why things are hard; findings and proposals only.
+
+**Commit `9712a87`** — `relevanceThreshold`/`similarityThreshold` deleted
+end-to-end. Removed: MemoryStore @AppStorage var, DefaultSettings
+constant, ModelSettings field + init/merge plumbing, all 6 per-model
+defaults, ModelSettingsStore.K constant + serialize/deserialize,
+snapshot/apply/restore plumbing in 3 sites, SET_SIMILARITY_THRESHOLD
+API command, /state JSON output entry, settings-change dialogue
+detection, NotificationName, debug-API JSON fields, doc comments.
+Build clean.
+
+**Commit `2e1bd26`** — `tests/rag_threshold_eval.py` committed (had been
+untracked from when it was created during the diagnostic work).
+
+**Investigation findings:**
+
+*Actual NLContextualEmbedding cosine scores for the 3 missed plants:*
+
+| Query | Plant | Plant rank | Plant score | Top-noise score |
+|---|---|---|---|---|
+| "Where do I live now?" | "house in Berkeley..." | **17** of 70 | 0.8033 | 0.8789 (imposter syndrome) |
+| "What kind of car do I have?" | "2018 Subaru Outback..." | **48** of 70 | 0.7719 | 0.8691 (imposter syndrome) |
+| "What instrument am I learning?" | "cello lessons..." | **13** of 70 | 0.8349 | 0.9025 (learn a new language) |
+
+The plants ARE embedded with sensible semantic scores — they're just
+not the highest-scoring rows. NLContextualEmbedding compresses scores
+into a narrow band (0.69–0.91 across all rows), so question-shape
+similarity from unrelated rows beats true semantic matches from
+plants. The "model-strength limit" framing from the previous entry
+was correct in conclusion but understated: this is a discrimination
+problem more than a "no surface overlap" problem.
+
+*NLTagger entity extractor: working in real chat path.* Verified by
+sending a real chat turn ("My wife and I just bought a house in
+Berkeley...") and then querying BM25 for the literal term "Berkeley" —
+returns the plant with `isEntityMatch: true`. `extractNamedEntities`
+fires at `Hal.swift:1597` in the `storeTurn` path. **But** the eval
+corpus injection (`INJECT_REALISTIC_TEST_CORPUS`) bypasses this — it
+passes `entityKeywords: ""` directly. So all 70 eval rows have empty
+entity_keywords; the eval understated BM25's real-world contribution.
+
+*EmbeddingGemma research:* 308M params, MTEB SOTA for open <500M
+models (61.15 mean Multilingual v2). Matryoshka dims 768→128.
+`mlx-swift-lm 3.31.3` (already in Hal's deps) ships `MLXEmbedders`
+library; available on HuggingFace as `mlx-community/embeddinggemma-*`
+variants. Same loading + macro pattern as Hal's existing MLX LLM
+models. No direct head-to-head benchmark vs NLContextualEmbedding
+on short conversational content — would need to run through the
+same eval harness to measure.
+
+*Three proposals submitted, no implementation started:*
+- B: Re-run eval with corpus injection that populates entity_keywords
+  (fair baseline for BM25 contribution)
+- A: Add EmbeddingGemma as alternative EmbeddingProvider backend, A/B
+  measure against NLContextualEmbedding
+- C: Entity-aware query expansion (orthogonal to A and B)
+
+Recommended order: B → A → C.
+
+### State at end of entry
+
+- `main` at `2e1bd26`, in sync with `origin/main`
+- Working tree clean (only untracked: `Docs/SC_Release_Materials/` which
+  has been untracked all along, not part of any planned commit)
+- Eval harness committed and pushed
+- threshold sites: zero remaining in code
+- Context low — next session needed for implementation work
