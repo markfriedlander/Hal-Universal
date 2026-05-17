@@ -1,3 +1,1034 @@
+// ==== FILE: EmbeddingBackend.swift ====
+// EmbeddingBackend.swift
+// Hal Universal
+//
+// Extracted from Hal.swift 2026-05-17 afternoon as part of the standing
+// refactor-as-you-go directive. Lives separately so the embedder backend
+// system has a clearly named home and doesn't bloat Hal.swift further.
+//
+// Two switchable embedding backends:
+//   - "nlcontextual" (default): NLContextualEmbedding, Apple's transformer-
+//     based replacement for the older NLEmbedding.sentenceEmbedding API.
+//     iOS 17+, on-device via Neural Engine, 512-dim, lazy asset download.
+//   - "embeddinggemma" (Proposal A, 2026-05-17): Google's EmbeddingGemma
+//     300M, MLX 4-bit quantized via `mlx-community/embeddinggemma-300m-4bit`.
+//     Loaded through MLXEmbedders (already linked via mlx-swift-lm). MTEB
+//     SOTA for open models under 500M; ~210 MB on disk after download.
+//     768-dim with optional Matryoshka truncation (we use full 768).
+//
+// The backend is selected via UserDefaults key "embeddingBackend"; default
+// is "nlcontextual". When the backend changes, wipeStaleEmbeddingsIfNeeded
+// detects the version mismatch (via systemVersion) and NULLs all stored
+// embeddings — the re-embed happens via reEmbedAllNullRows.
+//
+// Crash guard: if a previous launch attempted to load EmbeddingGemma and
+// didn't reset the counter (i.e. the load crashed the process before
+// completing), current() forces NLContextual on this launch. The user can
+// manually re-enable via SET_EMBEDDING_BACKEND once the underlying issue
+// is fixed. Keeps the app launchable even when a backend load is unstable.
+
+import Foundation
+
+// Marked nonisolated/Sendable so EmbeddingProvider (which is nonisolated
+// to allow calls from any thread) can read backend identity without a
+// hop to MainActor. Project default isolation is MainActor; without these
+// annotations the enum members get inherited isolation and produce
+// warnings in nonisolated contexts.
+/// Distinguishes how an embedding is being used. Required by retrieval-
+/// asymmetric models (e.g. Nomic Embed v1.5, which needs "search_query:"
+/// vs "search_document:" prefixes). Backends that don't care about
+/// purpose ignore the parameter.
+nonisolated enum EmbeddingPurpose: Sendable {
+    /// The text is being stored in the database for later retrieval.
+    case document
+    /// The text is a search query being matched against stored documents.
+    case query
+}
+
+nonisolated enum EmbeddingBackend: String, Sendable, CaseIterable {
+    case nlContextual = "nlcontextual"
+    case embeddingGemma = "embeddinggemma"
+    case nomicSwift = "nomicswift"
+
+    nonisolated static let defaultsKey = "embeddingBackend"
+    nonisolated static let crashGuardKey = "embeddingGemmaCrashAttempts"
+
+    /// Is this backend available in the current build? Used to compile out
+    /// the Gemma path in App Store builds (pending the upstream MLX Metal
+    /// init crash fix on iOS 26.5). Selecting an unavailable backend via
+    /// API or stale UserDefaults falls back to NLContextual on load.
+    ///
+    /// Build flag: HAL_ENABLE_EMBEDDING_GEMMA (Debug-only by default).
+    nonisolated var isAvailableInThisBuild: Bool {
+        switch self {
+        case .nlContextual: return true
+        case .nomicSwift: return true
+        case .embeddingGemma:
+            #if HAL_ENABLE_EMBEDDING_GEMMA
+            return true
+            #else
+            return false
+            #endif
+        }
+    }
+
+    /// Reads current backend from UserDefaults. Defaults to NLContextual
+    /// when the key is unset or invalid.
+    ///
+    /// Crash guard: a launch-time snapshot, not a per-call check. If the
+    /// previous launch wrote `crashGuardKey` (meaning Gemma load was in
+    /// progress when the process died), we force NLContextual on the next
+    /// launch. Once a load completes, recordLoadSuccess clears the key.
+    /// The check happens at AppDelegate startup; this function reads the
+    /// resolved value rather than re-evaluating every call (avoids the
+    /// race where the guard's own attempt counter trips current() during
+    /// the load).
+    nonisolated static func current() -> EmbeddingBackend {
+        let raw = UserDefaults.standard.string(forKey: defaultsKey) ?? Self.nlContextual.rawValue
+        return EmbeddingBackend(rawValue: raw) ?? .nlContextual
+    }
+
+    /// Called once at AppDelegate launch BEFORE any embed() call. If the
+    /// previous run left `crashGuardKey` set, the load crashed before
+    /// completing — force NLContextual and persist that choice so any
+    /// readers see a stable backend for this launch. Returns the resolved
+    /// backend so the caller can log it.
+    @discardableResult
+    nonisolated static func applyCrashGuardAtLaunch() -> EmbeddingBackend {
+        let selected = current()
+        guard selected == .embeddingGemma else { return selected }
+        let crashed = UserDefaults.standard.bool(forKey: crashGuardKey)
+        if crashed {
+            halLog("HALDEBUG-EMBEDDING: Crash guard tripped — previous Gemma load crashed before completing. Reverting to NLContextual. To re-try, call SET_EMBEDDING_BACKEND:embeddinggemma again after the fix.")
+            UserDefaults.standard.set(EmbeddingBackend.nlContextual.rawValue, forKey: defaultsKey)
+            UserDefaults.standard.removeObject(forKey: crashGuardKey)
+            return .nlContextual
+        }
+        return selected
+    }
+
+    /// Mark a Gemma load as in-flight. Stored as a Bool so reads are cheap
+    /// and idempotent — repeated attempts during the same launch are a no-op.
+    nonisolated static func recordLoadAttempt() {
+        UserDefaults.standard.set(true, forKey: crashGuardKey)
+    }
+
+    /// Load completed without crashing — clear the in-flight flag.
+    nonisolated static func recordLoadSuccess() {
+        UserDefaults.standard.removeObject(forKey: crashGuardKey)
+    }
+
+    /// Integer used by `wipeStaleEmbeddingsIfNeeded` so a backend change
+    /// triggers wipe-and-re-embed. Bump this when adding a new backend.
+    nonisolated var systemVersion: Int {
+        switch self {
+        case .nlContextual: return 2  // matches original (post-NLEmbedding migration)
+        case .embeddingGemma: return 3
+        case .nomicSwift: return 4
+        }
+    }
+
+    /// Sentence-vector dimension for this backend.
+    nonisolated var dimension: Int {
+        switch self {
+        case .nlContextual: return 512
+        case .embeddingGemma: return 768
+        case .nomicSwift: return 768
+        }
+    }
+
+    /// HuggingFace model id for backends that load a downloadable model.
+    nonisolated var modelID: String? {
+        switch self {
+        case .nlContextual: return nil
+        case .embeddingGemma: return "mlx-community/embeddinggemma-300m-4bit"
+        case .nomicSwift: return "nomic-ai/nomic-embed-text-v1.5"
+        }
+    }
+
+    // MARK: - UI surface (display strings)
+
+    /// Display name shown in the Model Library embedder section.
+    var displayName: String {
+        switch self {
+        case .nlContextual: return "Apple NLContextual"
+        case .embeddingGemma: return "EmbeddingGemma 300M"
+        case .nomicSwift: return "Nomic Embed Text v1.5"
+        }
+    }
+
+    /// Short description used in the embedder card body.
+    var blurb: String {
+        switch self {
+        case .nlContextual:
+            return "Built into iOS 26+. Runs on the Neural Engine. 512-dim sentence vectors. No download, always available."
+        case .embeddingGemma:
+            return "Google's open embedding model, 308M params, MLX 4-bit quantized. 768-dim, state-of-the-art on MTEB Multilingual v2 among models under 500M. Adds ~210 MB on disk. (Currently unavailable in App Store builds pending an upstream MLX iOS Metal fix.)"
+        case .nomicSwift:
+            return "Nomic AI's open embedding model, 137M params, 768-dim, purpose-built for asymmetric retrieval (query vs document). Runs via Apple's MLTensor framework (no MLX). Adds ~522 MB on disk."
+        }
+    }
+
+    /// Size note shown in the row header. nil for backends that don't ship a model file.
+    var sizeBlurb: String? {
+        switch self {
+        case .nlContextual: return nil
+        case .embeddingGemma: return "~210 MB"
+        case .nomicSwift: return "~522 MB"
+        }
+    }
+}
+
+// ==== FILE: EmbeddingProvider.swift ====
+// EmbeddingProvider.swift
+// Hal Universal
+//
+// Single-instance wrapper around whichever embedding backend is active.
+// Lazy-loaded on first use; subsequent calls are synchronous and fast.
+//
+// Three switchable backends:
+//   - NLContextualEmbedding (default, built-in, 512-dim)
+//   - EmbeddingGemma via MLXEmbedders (768-dim, ~210 MB) — gated behind
+//     HAL_ENABLE_EMBEDDING_GEMMA build flag because of an upstream MLX
+//     Metal init crash on iOS 26.5. Compiled out for App Store builds.
+//   - Nomic Embed Text v1.5 via swift-embeddings (768-dim, ~522 MB,
+//     uses Apple's MLTensor — no MLX, no Metal init crash). Asymmetric-
+//     retrieval tuned (requires "search_query:" / "search_document:"
+//     prefixes; handled here via EmbeddingPurpose).
+//
+// Thread safety: locked around the one-time backend load; subsequent
+// embed() calls are reentrant and serialize through the backend's own
+// thread-safety guarantees.
+//
+// Sync API preserved across all backends via DispatchSemaphore bridges
+// when the underlying load/inference is async. Callers continue to
+// receive a `[Double]?` per call.
+
+import Foundation
+import CoreML
+import NaturalLanguage
+import Embeddings
+
+#if HAL_ENABLE_EMBEDDING_GEMMA
+import MLX
+import MLXEmbedders
+import MLXLMCommon
+import MLXHuggingFace
+import Tokenizers
+#endif
+
+final class EmbeddingProvider: @unchecked Sendable {
+    nonisolated static let shared = EmbeddingProvider()
+
+    private let lock = NSLock()
+    nonisolated(unsafe) private var nlModel: NLContextualEmbedding?
+    nonisolated(unsafe) private var nlLoadAttempted: Bool = false
+    nonisolated(unsafe) private var nomicBundle: NomicBert.ModelBundle?
+    nonisolated(unsafe) private var nomicLoadAttempted: Bool = false
+
+    #if HAL_ENABLE_EMBEDDING_GEMMA
+    nonisolated(unsafe) private var gemmaContainer: EmbedderModelContainer?
+    nonisolated(unsafe) private var gemmaLoadAttempted: Bool = false
+    #endif
+
+    private init() {}
+
+    /// Pooled sentence-level vector for `text`, or nil if the active
+    /// backend isn't loaded.
+    ///
+    /// `purpose` is honored by retrieval-asymmetric backends (Nomic adds
+    /// "search_query:" / "search_document:" prefixes). NLContextual and
+    /// Gemma ignore it.
+    nonisolated func embed(_ text: String, as purpose: EmbeddingPurpose) -> [Double]? {
+        let cleanText = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !cleanText.isEmpty else { return nil }
+
+        switch EmbeddingBackend.current() {
+        case .nlContextual:
+            return embedNLContextual(cleanText)
+        case .embeddingGemma:
+            return embedEmbeddingGemma(cleanText)
+        case .nomicSwift:
+            return embedNomicSwift(cleanText, purpose: purpose)
+        }
+    }
+
+    /// Convenience overload — defaults to `.document` for callers that
+    /// don't yet distinguish purpose. New code should always pass a
+    /// purpose explicitly.
+    nonisolated func embed(_ text: String) -> [Double]? {
+        return embed(text, as: .document)
+    }
+
+    /// True if the *currently active* backend is loaded and ready.
+    nonisolated var isLoaded: Bool {
+        lock.lock(); defer { lock.unlock() }
+        switch EmbeddingBackend.current() {
+        case .nlContextual: return nlModel != nil
+        case .embeddingGemma:
+            #if HAL_ENABLE_EMBEDDING_GEMMA
+            return gemmaContainer != nil
+            #else
+            return false
+            #endif
+        case .nomicSwift: return nomicBundle != nil
+        }
+    }
+
+    /// Currently active backend (for diagnostics).
+    nonisolated var activeBackend: EmbeddingBackend {
+        return EmbeddingBackend.current()
+    }
+
+    /// Trigger an async warm-up of the active backend — used from app
+    /// boot so the model loads (and downloads assets if needed) in the
+    /// background before any chat turn fires. Idempotent.
+    nonisolated func warmUp() {
+        Task.detached { [weak self] in
+            guard let self = self else { return }
+            switch EmbeddingBackend.current() {
+            case .nlContextual: self.ensureNLLoadedBlocking()
+            case .embeddingGemma:
+                #if HAL_ENABLE_EMBEDDING_GEMMA
+                self.ensureGemmaLoadedBlocking()
+                #else
+                halLog("HALDEBUG-EMBEDDING: warmUp() skipped — EmbeddingGemma is not enabled in this build (HAL_ENABLE_EMBEDDING_GEMMA flag).")
+                #endif
+            case .nomicSwift: self.ensureNomicLoadedBlocking()
+            }
+        }
+    }
+
+    // MARK: - NLContextualEmbedding path
+
+    private nonisolated func embedNLContextual(_ cleanText: String) -> [Double]? {
+        ensureNLLoadedBlocking()
+
+        lock.lock()
+        let loaded = nlModel
+        lock.unlock()
+
+        guard let model = loaded else { return nil }
+
+        do {
+            let result = try model.embeddingResult(for: cleanText, language: .english)
+            let dim = model.dimension
+            guard dim > 0 else { return nil }
+
+            var sum = [Double](repeating: 0, count: dim)
+            var tokenCount = 0
+            result.enumerateTokenVectors(in: cleanText.startIndex..<cleanText.endIndex) { vector, _ in
+                let limit = min(dim, vector.count)
+                for i in 0..<limit {
+                    sum[i] += vector[i]
+                }
+                tokenCount += 1
+                return true
+            }
+            guard tokenCount > 0 else { return nil }
+            let pooled = sum.map { $0 / Double(tokenCount) }
+            return pooled
+        } catch {
+            halLog("HALDEBUG-EMBEDDING: NLContextualEmbedding.embeddingResult failed: \(error.localizedDescription)")
+            return nil
+        }
+    }
+
+    private nonisolated func ensureNLLoadedBlocking() {
+        lock.lock()
+        if nlModel != nil { lock.unlock(); return }
+        if nlLoadAttempted { lock.unlock(); return }
+        nlLoadAttempted = true
+        lock.unlock()
+
+        guard let candidate = NLContextualEmbedding(language: .english) else {
+            halLog("HALDEBUG-EMBEDDING: NLContextualEmbedding(language:.english) returned nil — model unavailable")
+            return
+        }
+
+        if !candidate.hasAvailableAssets {
+            halLog("HALDEBUG-EMBEDDING: Assets not on device; requesting download (this happens once per install)")
+            let sem = DispatchSemaphore(value: 0)
+            var assetError: Error?
+            candidate.requestAssets(completionHandler: { _, err in
+                if let e = err { assetError = e }
+                sem.signal()
+            })
+            sem.wait()
+            if let error = assetError {
+                halLog("HALDEBUG-EMBEDDING: Asset request failed: \(error.localizedDescription) — semantic search will be unavailable until next attempt")
+                lock.lock(); nlLoadAttempted = false; lock.unlock()  // allow retry next call
+                return
+            }
+        }
+
+        do {
+            try candidate.load()
+            lock.lock()
+            self.nlModel = candidate
+            lock.unlock()
+            halLog("HALDEBUG-EMBEDDING: NLContextualEmbedding loaded — dimension=\(candidate.dimension)")
+        } catch {
+            halLog("HALDEBUG-EMBEDDING: NLContextualEmbedding.load() failed: \(error.localizedDescription)")
+            lock.lock(); nlLoadAttempted = false; lock.unlock()  // allow retry next call
+        }
+    }
+
+    // MARK: - Nomic Embed Text v1.5 path (swift-embeddings, BertModel)
+
+    /// Nomic v1.5 was trained with task instruction prefixes; embeddings
+    /// require them or retrieval quality degrades sharply. See the model
+    /// card on HuggingFace.
+    private nonisolated func nomicPrefixed(_ text: String, purpose: EmbeddingPurpose) -> String {
+        switch purpose {
+        case .document: return "search_document: " + text
+        case .query: return "search_query: " + text
+        }
+    }
+
+    private nonisolated func embedNomicSwift(_ cleanText: String, purpose: EmbeddingPurpose) -> [Double]? {
+        ensureNomicLoadedBlocking()
+
+        lock.lock()
+        let loaded = nomicBundle
+        lock.unlock()
+
+        guard let bundle = loaded else { return nil }
+
+        let prefixed = nomicPrefixed(cleanText, purpose: purpose)
+
+        // Bridge async MLTensor inference to sync embed() API.
+        let sem = DispatchSemaphore(value: 0)
+        var resultVec: [Double]?
+        Task.detached {
+            do {
+                // bundle.encode returns an MLTensor with shape [1, seqLen, hidden]
+                // OR [1, hidden] depending on the model's pooling. For
+                // Nomic Embed v1.5 the model emits per-token outputs; we
+                // mean-pool over the sequence to get a single sentence
+                // vector. Cast to Float and collect scalars.
+                let encoded = try bundle.encode(prefixed, maxLength: 512)
+                let asFloat = await encoded.cast(to: Float.self).shapedArray(of: Float.self)
+                let shape = asFloat.shape
+                let scalars = asFloat.scalars
+                // Determine pooling. Common shapes:
+                //   [1, hidden]                  — already pooled
+                //   [1, seqLen, hidden]          — mean-pool over seqLen
+                //   [seqLen, hidden]             — mean-pool over seqLen
+                let hidden: Int
+                let pooled: [Double]
+                if shape.count == 2 && shape[0] == 1 {
+                    hidden = shape[1]
+                    pooled = (0..<hidden).map { Double(scalars[$0]) }
+                } else if shape.count == 3 && shape[0] == 1 {
+                    let seqLen = shape[1]
+                    hidden = shape[2]
+                    var acc = [Double](repeating: 0, count: hidden)
+                    for t in 0..<seqLen {
+                        let base = t * hidden
+                        for h in 0..<hidden {
+                            acc[h] += Double(scalars[base + h])
+                        }
+                    }
+                    pooled = acc.map { $0 / Double(seqLen) }
+                } else if shape.count == 2 {
+                    let seqLen = shape[0]
+                    hidden = shape[1]
+                    var acc = [Double](repeating: 0, count: hidden)
+                    for t in 0..<seqLen {
+                        let base = t * hidden
+                        for h in 0..<hidden {
+                            acc[h] += Double(scalars[base + h])
+                        }
+                    }
+                    pooled = acc.map { $0 / Double(seqLen) }
+                } else {
+                    halLog("HALDEBUG-EMBEDDING: Nomic returned unexpected tensor shape \(shape)")
+                    sem.signal()
+                    return
+                }
+                // L2-normalize so cosine similarity equals dot product.
+                let norm = sqrt(pooled.reduce(0) { $0 + $1 * $1 })
+                if norm > 0 {
+                    resultVec = pooled.map { $0 / norm }
+                } else {
+                    resultVec = pooled
+                }
+            } catch {
+                halLog("HALDEBUG-EMBEDDING: Nomic encode failed: \(error.localizedDescription)")
+            }
+            sem.signal()
+        }
+        sem.wait()
+        return resultVec
+    }
+
+    private nonisolated func ensureNomicLoadedBlocking() {
+        lock.lock()
+        if nomicBundle != nil { lock.unlock(); return }
+        if nomicLoadAttempted { lock.unlock(); return }
+        nomicLoadAttempted = true
+        lock.unlock()
+
+        guard let modelID = EmbeddingBackend.nomicSwift.modelID else {
+            halLog("HALDEBUG-EMBEDDING: Nomic has no modelID — programming error")
+            return
+        }
+
+        // Load from local directory. MLXModelDownloader / BackgroundDownloadCoordinator
+        // owns the actual HuggingFace download; we resolve the on-disk path
+        // and call swift-embeddings' local-loader.
+        let cacheDir = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask)[0]
+        let modelDirectory = cacheDir
+            .appendingPathComponent("huggingface", isDirectory: true)
+            .appendingPathComponent("models", isDirectory: true)
+            .appendingPathComponent(modelID, isDirectory: true)
+
+        // Verify required files are present before attempting load.
+        let configURL = modelDirectory.appendingPathComponent("config.json")
+        guard FileManager.default.fileExists(atPath: configURL.path) else {
+            halLog("HALDEBUG-EMBEDDING: Nomic model not present at \(modelDirectory.path) — user must download it via the Model Library first")
+            lock.lock(); nomicLoadAttempted = false; lock.unlock()  // allow retry after download
+            return
+        }
+
+        halLog("HALDEBUG-EMBEDDING: Loading Nomic Embed Text v1.5 from \(modelDirectory.path)...")
+        let sem = DispatchSemaphore(value: 0)
+        var loadedBundle: NomicBert.ModelBundle?
+        var loadError: Error?
+        Task.detached {
+            do {
+                loadedBundle = try await NomicBert.loadModelBundle(from: modelDirectory)
+            } catch {
+                loadError = error
+            }
+            sem.signal()
+        }
+        sem.wait()
+
+        if let e = loadError {
+            halLog("HALDEBUG-EMBEDDING: Nomic load failed: \(e.localizedDescription) — semantic search unavailable until next attempt")
+            lock.lock(); nomicLoadAttempted = false; lock.unlock()
+            return
+        }
+        guard let bundle = loadedBundle else {
+            halLog("HALDEBUG-EMBEDDING: Nomic load returned nil bundle")
+            lock.lock(); nomicLoadAttempted = false; lock.unlock()
+            return
+        }
+        lock.lock()
+        self.nomicBundle = bundle
+        lock.unlock()
+        halLog("HALDEBUG-EMBEDDING: Nomic Embed Text v1.5 loaded (\(modelID)) — dimension=\(EmbeddingBackend.nomicSwift.dimension)")
+    }
+
+    // MARK: - EmbeddingGemma path (compiled out unless HAL_ENABLE_EMBEDDING_GEMMA)
+
+    private nonisolated func embedEmbeddingGemma(_ cleanText: String) -> [Double]? {
+        #if HAL_ENABLE_EMBEDDING_GEMMA
+        ensureGemmaLoadedBlocking()
+
+        lock.lock()
+        let loaded = gemmaContainer
+        lock.unlock()
+
+        guard let container = loaded else { return nil }
+
+        let sem = DispatchSemaphore(value: 0)
+        var resultVec: [Double]?
+
+        Task.detached {
+            let embedding: [Float]? = await container.perform { ctx in
+                let tokens = ctx.tokenizer.encode(text: cleanText, addSpecialTokens: true)
+                let truncated = Array(tokens.prefix(2048))
+                guard !truncated.isEmpty else { return nil }
+
+                let inputArray = MLXArray(truncated).reshaped(1, truncated.count)
+                let attentionMask = MLXArray.ones(like: inputArray)
+                let tokenTypeIds = MLXArray.zeros(like: inputArray)
+
+                let modelOutput = ctx.model(
+                    inputArray,
+                    positionIds: nil,
+                    tokenTypeIds: tokenTypeIds,
+                    attentionMask: attentionMask
+                )
+                let pooled = ctx.pooling(
+                    modelOutput,
+                    mask: attentionMask,
+                    normalize: false,
+                    applyLayerNorm: false
+                )
+                pooled.eval()
+                let asFloats: [Float] = pooled.asArray(Float.self)
+                return asFloats
+            }
+            if let asFloats = embedding {
+                resultVec = asFloats.map { Double($0) }
+            }
+            sem.signal()
+        }
+        sem.wait()
+        return resultVec
+        #else
+        halLog("HALDEBUG-EMBEDDING: embedEmbeddingGemma called but HAL_ENABLE_EMBEDDING_GEMMA is off (App Store build). Returning nil.")
+        return nil
+        #endif
+    }
+
+    #if HAL_ENABLE_EMBEDDING_GEMMA
+    private nonisolated func ensureGemmaLoadedBlocking() {
+        lock.lock()
+        if gemmaContainer != nil { lock.unlock(); return }
+        if gemmaLoadAttempted { lock.unlock(); return }
+        gemmaLoadAttempted = true
+        lock.unlock()
+
+        guard let modelID = EmbeddingBackend.embeddingGemma.modelID else {
+            halLog("HALDEBUG-EMBEDDING: EmbeddingGemma has no modelID — programming error")
+            return
+        }
+
+        let cacheDir = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask)[0]
+        let modelDirectory = cacheDir
+            .appendingPathComponent("huggingface", isDirectory: true)
+            .appendingPathComponent("models", isDirectory: true)
+            .appendingPathComponent(modelID, isDirectory: true)
+
+        let configURL = modelDirectory.appendingPathComponent("config.json")
+        guard FileManager.default.fileExists(atPath: configURL.path) else {
+            halLog("HALDEBUG-EMBEDDING: EmbeddingGemma model not present at \(modelDirectory.path) — user must download it via the Model Library first")
+            lock.lock(); gemmaLoadAttempted = false; lock.unlock()  // allow retry after download
+            return
+        }
+
+        // Crash guard: see EmbeddingBackend.recordLoadAttempt for context.
+        EmbeddingBackend.recordLoadAttempt()
+
+        halLog("HALDEBUG-EMBEDDING: Loading EmbeddingGemma from \(modelDirectory.path)...")
+        let sem = DispatchSemaphore(value: 0)
+        var loadedContainer: EmbedderModelContainer?
+        var loadError: Error?
+
+        Task.detached {
+            do {
+                loadedContainer = try await EmbedderModelFactory.shared.loadContainer(
+                    from: modelDirectory,
+                    using: #huggingFaceTokenizerLoader()
+                )
+            } catch {
+                loadError = error
+            }
+            sem.signal()
+        }
+        sem.wait()
+
+        if let e = loadError {
+            halLog("HALDEBUG-EMBEDDING: EmbeddingGemma load failed: \(e.localizedDescription) — semantic search unavailable on this backend until next attempt")
+            lock.lock(); gemmaLoadAttempted = false; lock.unlock()
+            return
+        }
+        guard let container = loadedContainer else {
+            halLog("HALDEBUG-EMBEDDING: EmbeddingGemma load returned nil container")
+            lock.lock(); gemmaLoadAttempted = false; lock.unlock()
+            return
+        }
+        lock.lock()
+        self.gemmaContainer = container
+        lock.unlock()
+        EmbeddingBackend.recordLoadSuccess()
+        halLog("HALDEBUG-EMBEDDING: EmbeddingGemma container loaded (\(modelID)) — dimension=\(EmbeddingBackend.embeddingGemma.dimension)")
+    }
+    #endif
+}
+
+// MARK: - MemoryStore embedding helpers
+
+extension MemoryStore {
+
+    /// Returns the pooled sentence vector for `text`. Empty array if the
+    /// embedding model isn't loaded yet (first-launch download pending or
+    /// failed). Storage callers that get an empty array store NULL in the
+    /// embedding column; search callers that get an empty array return
+    /// zero semantic results (BM25 keyword path still applies).
+    ///
+    /// `purpose` is passed through to the backend; retrieval-asymmetric
+    /// backends like Nomic Embed v1.5 use it to choose the right task
+    /// instruction prefix. Backends that don't distinguish ignore it.
+    ///
+    /// nonisolated: callable from background work like the embedding
+    /// migration (`reEmbedAllNullRows`). Underlying EmbeddingProvider.embed
+    /// is also nonisolated and thread-safe via NSLock + per-backend
+    /// serial containers.
+    nonisolated func generateEmbedding(for text: String, as purpose: EmbeddingPurpose) -> [Double] {
+        return EmbeddingProvider.shared.embed(text, as: purpose) ?? []
+    }
+
+    /// Convenience overload — defaults to `.document` for callers in the
+    /// storage / write path (this is the dominant call site). Search
+    /// callers should always use the explicit form with `.query`.
+    nonisolated func generateEmbedding(for text: String) -> [Double] {
+        return generateEmbedding(for: text, as: .document)
+    }
+
+    /// Standard cosine similarity. Rejects dimension mismatches (returns 0)
+    /// so embedding-system migrations can't silently produce noise.
+    func cosineSimilarity(_ v1: [Double], _ v2: [Double]) -> Double {
+        guard v1.count == v2.count && v1.count > 0 else { return 0 }
+        let dot = zip(v1, v2).map(*).reduce(0, +)
+        let norm1 = sqrt(v1.map { $0 * $0 }.reduce(0, +))
+        let norm2 = sqrt(v2.map { $0 * $0 }.reduce(0, +))
+        return norm1 == 0 || norm2 == 0 ? 0 : dot / (norm1 * norm2)
+    }
+}
+
+// ==== FILE: EmbedderMigrationCoordinator.swift ====
+// EmbedderMigrationCoordinator.swift
+// Hal Universal
+//
+// Extracted from Hal.swift 2026-05-17 afternoon as part of the standing
+// refactor-as-you-go directive.
+//
+// Drives the user-facing flow for upgrading the embedding backend:
+//   1. Download EmbeddingGemma (~210MB) via the existing
+//      MLXModelDownloader / BackgroundDownloadCoordinator pipeline.
+//   2. Switch the active backend (UserDefaults + wipe existing embeddings).
+//   3. Re-embed all stored rows in the background (the migration).
+//
+// Two-way: every step is reversible. Switching from Gemma back to
+// Apple NLContextual goes through the same wipe + re-embed flow.
+//
+// State is a single @Published `phase`. The UI observes it to render
+// the appropriate label + progress (download progress bar, then migration
+// row counter, then idle). Errors land as an .error phase that the user
+// dismisses to retry.
+
+import Foundation
+import Combine
+import SwiftUI
+
+@MainActor
+final class EmbedderMigrationCoordinator: ObservableObject {
+    static let shared = EmbedderMigrationCoordinator()
+
+    enum Phase: Equatable {
+        case idle
+        case downloading(progress: Double, message: String)
+        case switching(target: String)
+        case migrating(updated: Int, total: Int)
+        case done(message: String)
+        case error(String)
+    }
+
+    @Published var phase: Phase = .idle
+    @Published var activeBackend: EmbeddingBackend = EmbeddingBackend.current()
+
+    private var pollTask: Task<Void, Never>?
+
+    private init() {}
+
+    /// Refresh from UserDefaults — called when the view appears so we
+    /// don't drift if the backend was changed by an API caller.
+    func refresh() {
+        activeBackend = EmbeddingBackend.current()
+    }
+
+    /// Trigger the Gemma download via the existing catalog downloader.
+    /// Returns immediately; polls progress until done or error.
+    func startDownload() {
+        guard let modelID = EmbeddingBackend.embeddingGemma.modelID else { return }
+        if MLXModelDownloader.shared.isModelDownloaded(modelID) {
+            phase = .done(message: "EmbeddingGemma already downloaded.")
+            return
+        }
+        phase = .downloading(progress: 0, message: "Starting download…")
+        Task {
+            await MLXModelDownloader.shared.startDownload(modelID: modelID, repoID: modelID, sizeGB: 0.21)
+        }
+        // Poll the downloader state on the main actor so SwiftUI updates.
+        // Strong self capture (coordinator is a singleton; lifetime is the app).
+        pollTask?.cancel()
+        pollTask = Task { @MainActor in
+            while !Task.isCancelled {
+                try? await Task.sleep(nanoseconds: 500_000_000)  // 0.5s
+                let state = MLXModelDownloader.shared.downloadStates[modelID]
+                let downloaded = MLXModelDownloader.shared.isModelDownloaded(modelID)
+                if downloaded {
+                    self.phase = .done(message: "EmbeddingGemma downloaded.")
+                    return
+                }
+                if let s = state, let err = s.error, !err.isEmpty {
+                    self.phase = .error("Download failed: \(err)")
+                    return
+                }
+                if let s = state {
+                    self.phase = .downloading(progress: s.progress, message: s.message)
+                }
+            }
+        }
+    }
+
+    /// Switch the active embedding backend and re-embed every existing
+    /// row that has a NULL embedding. Runs on a background task and
+    /// publishes progress.
+    func switchAndMigrate(to target: EmbeddingBackend, memoryStore: MemoryStore) {
+        // Refuse if the target backend requires a download that hasn't
+        // happened yet. Belt + suspenders — UI should not offer the
+        // switch button in that case.
+        if let id = target.modelID, !MLXModelDownloader.shared.isModelDownloaded(id) {
+            phase = .error("\(target.displayName) is not downloaded yet.")
+            return
+        }
+
+        phase = .switching(target: target.displayName)
+        pollTask?.cancel()
+        let coordinator = self
+        let storeRef = memoryStore
+        pollTask = Task.detached(priority: .userInitiated) {
+            // Persist the new backend, wipe existing embeddings.
+            UserDefaults.standard.set(target.rawValue, forKey: EmbeddingBackend.defaultsKey)
+            UserDefaults.standard.removeObject(forKey: "embeddingSystemVersion")
+            storeRef.wipeStaleEmbeddingsIfNeeded()
+            // Kick off async warm-up; wait until loaded (cap at ~60s so
+            // a busted load doesn't hang the UI forever).
+            EmbeddingProvider.shared.warmUp()
+            let deadline = Date().addingTimeInterval(60)
+            while !EmbeddingProvider.shared.isLoaded {
+                if Date() > deadline {
+                    await MainActor.run {
+                        coordinator.phase = .error("\(target.displayName) failed to load within 60s. Try again.")
+                    }
+                    return
+                }
+                try? await Task.sleep(nanoseconds: 250_000_000)
+            }
+            await MainActor.run {
+                coordinator.activeBackend = target
+                coordinator.phase = .migrating(updated: 0, total: 0)
+            }
+            // Run the migration. Single synchronous call — total runtime
+            // depends on row count and backend speed. Future variant
+            // could batch and publish per-row progress.
+            let result = storeRef.reEmbedAllNullRows()
+            await MainActor.run {
+                coordinator.phase = .done(message: "Migrated \(result.updated) rows to \(target.displayName). (\(result.skipped) skipped, \(result.failed) failed.)")
+            }
+        }
+    }
+
+    /// Reset to idle so the user can try again or see fresh state.
+    func dismissResult() {
+        phase = .idle
+    }
+}
+
+// MARK: - Embedder Backend Row + Migration Status
+
+/// Row for a single embedding backend in the Model Library "Embedding (Memory)"
+/// section. Renders name + size + blurb + the appropriate action button
+/// (Download / Switch / Active).
+struct EmbedderBackendRow: View {
+    let backend: EmbeddingBackend
+    @ObservedObject private var coordinator = EmbedderMigrationCoordinator.shared
+    @ObservedObject private var downloader = MLXModelDownloader.shared
+    @EnvironmentObject var chatViewModel: ChatViewModel
+
+    @State private var isExpanded: Bool = false
+    @State private var showingConfirm: Bool = false
+
+    private var isActive: Bool { coordinator.activeBackend == backend }
+
+    private var isDownloaded: Bool {
+        guard let id = backend.modelID else { return true }  // NLContextual built-in
+        return downloader.isModelDownloaded(id)
+    }
+
+    private var isDownloading: Bool {
+        guard let id = backend.modelID else { return false }
+        return downloader.downloadStates[id]?.isDownloading == true
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            // Collapsed header
+            Button(action: { withAnimation(.easeInOut(duration: 0.18)) { isExpanded.toggle() } }) {
+                HStack(spacing: 10) {
+                    Text(backend.displayName)
+                        .font(.subheadline)
+                        .fontWeight(.medium)
+                        .foregroundColor(.primary)
+                        .lineLimit(1)
+                    Spacer(minLength: 8)
+                    if let size = backend.sizeBlurb {
+                        Text(size)
+                            .font(.caption)
+                            .foregroundColor(.secondary)
+                            .monospacedDigit()
+                    }
+                    // Status dot: green = active, grey = downloaded, none = not downloaded
+                    if isActive {
+                        Circle().fill(Color.green).frame(width: 8, height: 8)
+                            .accessibilityLabel("Active")
+                    } else if isDownloaded {
+                        Circle().fill(Color.gray.opacity(0.5)).frame(width: 8, height: 8)
+                            .accessibilityLabel("Downloaded")
+                    }
+                    Image(systemName: isExpanded ? "chevron.up" : "chevron.down")
+                        .font(.caption2)
+                        .foregroundColor(.secondary)
+                }
+                .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+
+            if isExpanded {
+                Divider().padding(.vertical, 8)
+                Text(backend.blurb)
+                    .font(.caption)
+                    .foregroundColor(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .padding(.bottom, 8)
+                Text("\(backend.dimension)-dim sentence vectors")
+                    .font(.caption)
+                    .foregroundColor(.secondary)
+                    .padding(.bottom, 8)
+                actionRow
+            }
+        }
+        .padding(.vertical, 4)
+        .onAppear { coordinator.refresh() }
+        .confirmationDialog(
+            "Switch to \(backend.displayName)?",
+            isPresented: $showingConfirm,
+            titleVisibility: .visible
+        ) {
+            Button("Switch and re-embed memories", role: .destructive) {
+                coordinator.switchAndMigrate(to: backend, memoryStore: chatViewModel.memoryStore)
+            }
+            Button("Cancel", role: .cancel) {}
+        } message: {
+            Text("Existing embeddings will be wiped and regenerated with \(backend.displayName). This may take a few minutes depending on your memory size.")
+        }
+    }
+
+    @ViewBuilder
+    private var actionRow: some View {
+        HStack(spacing: 12) {
+            if isActive {
+                Label("Active", systemImage: "checkmark.circle.fill")
+                    .font(.subheadline)
+                    .foregroundColor(.secondary)
+                Spacer()
+            } else if !isDownloaded {
+                if isDownloading {
+                    if let state = downloader.downloadStates[backend.modelID ?? ""] {
+                        VStack(alignment: .leading, spacing: 4) {
+                            ProgressView(value: state.progress).progressViewStyle(.linear)
+                            Text(state.message).font(.caption2).foregroundColor(.secondary)
+                        }
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                    }
+                    Spacer()
+                    Button("Cancel", role: .destructive) {
+                        if let id = backend.modelID {
+                            downloader.cancelDownload(modelID: id)
+                        }
+                    }
+                    .font(.subheadline)
+                } else {
+                    Button(action: { coordinator.startDownload() }) {
+                        Label("Download \(backend.displayName)", systemImage: "arrow.down.circle")
+                            .font(.subheadline)
+                    }
+                    .buttonStyle(.borderedProminent)
+                    Spacer()
+                }
+            } else {
+                Button(action: { showingConfirm = true }) {
+                    Label("Switch to \(backend.displayName)", systemImage: "arrow.triangle.2.circlepath")
+                        .font(.subheadline)
+                }
+                .buttonStyle(.borderedProminent)
+                Spacer()
+                if backend.modelID != nil {
+                    Button(role: .destructive, action: {
+                        if let id = backend.modelID {
+                            Task { await downloader.deleteModel(modelID: id) }
+                        }
+                    }) {
+                        Image(systemName: "trash")
+                            .foregroundColor(.red)
+                    }
+                    .buttonStyle(.plain)
+                    .disabled(isActive)
+                }
+            }
+        }
+    }
+}
+
+/// Single-row status surface for the embedder migration. Renders nothing
+/// when the coordinator is idle so the section is quiet by default.
+struct EmbedderMigrationStatusRow: View {
+    @ObservedObject private var coordinator = EmbedderMigrationCoordinator.shared
+
+    var body: some View {
+        switch coordinator.phase {
+        case .idle:
+            EmptyView()
+        case .downloading(let progress, let message):
+            VStack(alignment: .leading, spacing: 4) {
+                Label("Downloading EmbeddingGemma…", systemImage: "arrow.down.circle")
+                    .font(.subheadline)
+                ProgressView(value: progress).progressViewStyle(.linear)
+                Text(message).font(.caption2).foregroundColor(.secondary)
+            }
+            .padding(.vertical, 4)
+        case .switching(let target):
+            HStack(spacing: 8) {
+                ProgressView().controlSize(.small)
+                Text("Switching to \(target)…")
+                    .font(.subheadline)
+            }
+            .padding(.vertical, 4)
+        case .migrating(let updated, let total):
+            VStack(alignment: .leading, spacing: 4) {
+                Label("Re-embedding memories…", systemImage: "brain")
+                    .font(.subheadline)
+                if total > 0 {
+                    ProgressView(value: Double(updated), total: Double(total))
+                        .progressViewStyle(.linear)
+                    Text("\(updated) / \(total) rows").font(.caption2).foregroundColor(.secondary)
+                } else {
+                    ProgressView().progressViewStyle(.linear)
+                }
+            }
+            .padding(.vertical, 4)
+        case .done(let message):
+            HStack(spacing: 8) {
+                Image(systemName: "checkmark.circle.fill").foregroundColor(.green)
+                Text(message).font(.caption)
+                Spacer()
+                Button("OK") { coordinator.dismissResult() }
+                    .font(.caption)
+                    .buttonStyle(.borderless)
+            }
+            .padding(.vertical, 4)
+        case .error(let message):
+            HStack(spacing: 8) {
+                Image(systemName: "exclamationmark.triangle.fill").foregroundColor(.orange)
+                Text(message).font(.caption).foregroundColor(.red)
+                Spacer()
+                Button("OK") { coordinator.dismissResult() }
+                    .font(.caption)
+                    .buttonStyle(.borderless)
+            }
+            .padding(.vertical, 4)
+        }
+    }
+}
+
+// ==== FILE: Hal.swift ====
 // ==== LEGO START: 01 Imports & App Entry & Environment Wiring ====
 //
 //  Hal.swift
@@ -750,7 +1781,7 @@ class MemoryStore: ObservableObject {
                 skipped += 1
                 continue
             }
-            let vector = generateEmbedding(for: trimmed)
+            let vector = generateEmbedding(for: trimmed, as: .document)
             if vector.isEmpty {
                 // Backend not ready or embed returned nil. Leave embedding
                 // NULL and try again later. Don't count as failure if the
@@ -3848,373 +4879,14 @@ extension MemoryStore {
     }
 }
 
-// MARK: - Embedding System (NLContextualEmbedding + EmbeddingGemma, 2026-05-17)
+// MARK: - Embedding System (extracted)
 //
-// Two switchable backends:
-//   - "nlcontextual" (default): NLContextualEmbedding, Apple's transformer-
-//     based replacement for the older NLEmbedding.sentenceEmbedding API.
-//     iOS 17+, on-device via Neural Engine, 512-dim, lazy asset download.
-//   - "embeddinggemma" (Proposal A, 2026-05-18): Google's EmbeddingGemma
-//     300M, MLX 4-bit quantized via `mlx-community/embeddinggemma-300m-4bit`.
-//     Loaded through MLXEmbedders (already linked via mlx-swift-lm). MTEB
-//     SOTA for open models under 500M; ~210 MB on disk after download.
-//     768-dim with optional Matryoshka truncation (we use full 768).
-//
-// The backend is selected via UserDefaults key "embeddingBackend"; default
-// is "nlcontextual". When the backend changes, `wipeStaleEmbeddingsIfNeeded`
-// detects the version mismatch and NULLs all stored embeddings — the
-// re-embed happens lazily on next write (test corpus injection or chat).
-//
-// Sync API surface preserved. The Gemma path bridges async loading and
-// async inference to the sync `embed()` interface via DispatchSemaphore,
-// mirroring how the NLContextualEmbedding asset-download bridge works.
-// Callers see no API change; they continue to get a `[Double]?` per call.
-//
-// If a backend's model isn't loaded (download pending, failed, no network),
-// embed() returns nil and the BM25 keyword path carries retrieval. The
-// chat pipeline never crashes on a missing embedding.
-
-// Marked nonisolated/Sendable so EmbeddingProvider (which is nonisolated
-// to allow calls from any thread) can read backend identity without a
-// hop to MainActor. Project default isolation is MainActor; without these
-// annotations the enum members get inherited isolation and produce
-// warnings in nonisolated contexts.
-nonisolated enum EmbeddingBackend: String, Sendable {
-    case nlContextual = "nlcontextual"
-    case embeddingGemma = "embeddinggemma"
-
-    nonisolated static let defaultsKey = "embeddingBackend"
-
-    /// Reads current backend from UserDefaults. Defaults to NLContextual
-    /// when the key is unset or invalid.
-    nonisolated static func current() -> EmbeddingBackend {
-        let raw = UserDefaults.standard.string(forKey: defaultsKey) ?? Self.nlContextual.rawValue
-        return EmbeddingBackend(rawValue: raw) ?? .nlContextual
-    }
-
-    /// Integer used by `wipeStaleEmbeddingsIfNeeded` so a backend change
-    /// triggers wipe-and-re-embed. Bump this when adding a new backend.
-    nonisolated var systemVersion: Int {
-        switch self {
-        case .nlContextual: return 2  // matches original (post-NLEmbedding migration)
-        case .embeddingGemma: return 3
-        }
-    }
-
-    /// Sentence-vector dimension for this backend. Used by callers that
-    /// need to allocate buffers or check dimension consistency.
-    nonisolated var dimension: Int {
-        switch self {
-        case .nlContextual: return 512
-        case .embeddingGemma: return 768
-        }
-    }
-
-    /// HuggingFace model id for backends that load via MLX.
-    nonisolated var modelID: String? {
-        switch self {
-        case .nlContextual: return nil
-        case .embeddingGemma: return "mlx-community/embeddinggemma-300m-4bit"
-        }
-    }
-}
-
-/// Single-instance wrapper for whichever embedding backend is active.
-/// Lazy-loaded on first use; subsequent calls are synchronous and fast.
-///
-/// Thread safety: locked around the one-time backend load; subsequent
-/// embed() calls are reentrant and serialize through MLX's own
-/// `EmbedderModelContainer` (Gemma) or `NLContextualEmbedding`'s
-/// documented thread-safety (NLContextual).
-final class EmbeddingProvider: @unchecked Sendable {
-    nonisolated static let shared = EmbeddingProvider()
-
-    private let lock = NSLock()
-    nonisolated(unsafe) private var nlModel: NLContextualEmbedding?
-    nonisolated(unsafe) private var nlLoadAttempted: Bool = false
-    nonisolated(unsafe) private var gemmaContainer: EmbedderModelContainer?
-    nonisolated(unsafe) private var gemmaLoadAttempted: Bool = false
-
-    private init() {}
-
-    /// Pooled sentence-level vector for `text`, or nil if the active
-    /// backend isn't loaded (first-launch download in progress, or
-    /// failed). Callers should treat nil as "semantic embedding currently
-    /// unavailable" — the search pipeline must not crash; it just gets no
-    /// semantic hit for that row/query.
-    nonisolated func embed(_ text: String) -> [Double]? {
-        let cleanText = text.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !cleanText.isEmpty else { return nil }
-
-        switch EmbeddingBackend.current() {
-        case .nlContextual:
-            return embedNLContextual(cleanText)
-        case .embeddingGemma:
-            return embedEmbeddingGemma(cleanText)
-        }
-    }
-
-    /// True if the *currently active* backend is loaded and ready.
-    nonisolated var isLoaded: Bool {
-        lock.lock(); defer { lock.unlock() }
-        switch EmbeddingBackend.current() {
-        case .nlContextual: return nlModel != nil
-        case .embeddingGemma: return gemmaContainer != nil
-        }
-    }
-
-    /// Currently active backend (for diagnostics).
-    nonisolated var activeBackend: EmbeddingBackend {
-        return EmbeddingBackend.current()
-    }
-
-    /// Trigger an async warm-up of the active backend — used from app
-    /// boot so the model loads (and downloads assets if needed) in the
-    /// background before any chat turn fires. Idempotent.
-    nonisolated func warmUp() {
-        Task.detached { [weak self] in
-            guard let self = self else { return }
-            switch EmbeddingBackend.current() {
-            case .nlContextual: self.ensureNLLoadedBlocking()
-            case .embeddingGemma: self.ensureGemmaLoadedBlocking()
-            }
-        }
-    }
-
-    // MARK: - NLContextualEmbedding path
-
-    private nonisolated func embedNLContextual(_ cleanText: String) -> [Double]? {
-        ensureNLLoadedBlocking()
-
-        lock.lock()
-        let loaded = nlModel
-        lock.unlock()
-
-        guard let model = loaded else { return nil }
-
-        do {
-            let result = try model.embeddingResult(for: cleanText, language: .english)
-            let dim = model.dimension
-            guard dim > 0 else { return nil }
-
-            var sum = [Double](repeating: 0, count: dim)
-            var tokenCount = 0
-            result.enumerateTokenVectors(in: cleanText.startIndex..<cleanText.endIndex) { vector, _ in
-                let limit = min(dim, vector.count)
-                for i in 0..<limit {
-                    sum[i] += vector[i]
-                }
-                tokenCount += 1
-                return true
-            }
-            guard tokenCount > 0 else { return nil }
-            let pooled = sum.map { $0 / Double(tokenCount) }
-            return pooled
-        } catch {
-            halLog("HALDEBUG-EMBEDDING: NLContextualEmbedding.embeddingResult failed: \(error.localizedDescription)")
-            return nil
-        }
-    }
-
-    private nonisolated func ensureNLLoadedBlocking() {
-        lock.lock()
-        if nlModel != nil { lock.unlock(); return }
-        if nlLoadAttempted { lock.unlock(); return }
-        nlLoadAttempted = true
-        lock.unlock()
-
-        guard let candidate = NLContextualEmbedding(language: .english) else {
-            halLog("HALDEBUG-EMBEDDING: NLContextualEmbedding(language:.english) returned nil — model unavailable")
-            return
-        }
-
-        if !candidate.hasAvailableAssets {
-            halLog("HALDEBUG-EMBEDDING: Assets not on device; requesting download (this happens once per install)")
-            let sem = DispatchSemaphore(value: 0)
-            var assetError: Error?
-            candidate.requestAssets(completionHandler: { _, err in
-                if let e = err { assetError = e }
-                sem.signal()
-            })
-            sem.wait()
-            if let error = assetError {
-                halLog("HALDEBUG-EMBEDDING: Asset request failed: \(error.localizedDescription) — semantic search will be unavailable until next attempt")
-                lock.lock(); nlLoadAttempted = false; lock.unlock()  // allow retry next call
-                return
-            }
-        }
-
-        do {
-            try candidate.load()
-            lock.lock()
-            self.nlModel = candidate
-            lock.unlock()
-            halLog("HALDEBUG-EMBEDDING: NLContextualEmbedding loaded — dimension=\(candidate.dimension)")
-        } catch {
-            halLog("HALDEBUG-EMBEDDING: NLContextualEmbedding.load() failed: \(error.localizedDescription)")
-            lock.lock(); nlLoadAttempted = false; lock.unlock()  // allow retry next call
-        }
-    }
-
-    // MARK: - EmbeddingGemma path (Proposal A, 2026-05-17)
-
-    private nonisolated func embedEmbeddingGemma(_ cleanText: String) -> [Double]? {
-        ensureGemmaLoadedBlocking()
-
-        lock.lock()
-        let loaded = gemmaContainer
-        lock.unlock()
-
-        guard let container = loaded else { return nil }
-
-        // Bridge async MLX inference to sync embed() API. Mirrors the
-        // semaphore pattern used elsewhere in the codebase (NLContextual
-        // asset download, LLMService generation). The closure runs on a
-        // background actor; we wait synchronously on the calling thread.
-        let sem = DispatchSemaphore(value: 0)
-        var resultVec: [Double]?
-
-        Task.detached {
-            // container.perform doesn't throw (rethrows from a non-throwing
-            // closure); MLX tokenizer/model/pooling calls don't throw either.
-            // Keep this as a non-throwing async pipeline.
-            let embedding: [Float]? = await container.perform { ctx in
-                let tokens = ctx.tokenizer.encode(text: cleanText, addSpecialTokens: true)
-                // EmbeddingGemma has a 2048 token context window. Long
-                // chat turns and source-code chunks may exceed this;
-                // truncate. Mean pooling makes truncation a graceful
-                // degradation rather than a hard fail.
-                let truncated = Array(tokens.prefix(2048))
-                guard !truncated.isEmpty else { return nil }
-
-                // Single-sentence batch of size 1.
-                let inputArray = MLXArray(truncated).reshaped(1, truncated.count)
-                let attentionMask = MLXArray.ones(like: inputArray)
-                let tokenTypeIds = MLXArray.zeros(like: inputArray)
-
-                let modelOutput = ctx.model(
-                    inputArray,
-                    positionIds: nil,
-                    tokenTypeIds: tokenTypeIds,
-                    attentionMask: attentionMask
-                )
-                // EmbeddingGemma's callAsFunction returns a
-                // pre-mean-pooled, L2-normalized pooledOutput. The
-                // Pooling layer with strategy .none returns that
-                // pooledOutput directly. Pass normalize=false to
-                // avoid double-normalizing.
-                let pooled = ctx.pooling(
-                    modelOutput,
-                    mask: attentionMask,
-                    normalize: false,
-                    applyLayerNorm: false
-                )
-                pooled.eval()
-                let asFloats: [Float] = pooled.asArray(Float.self)
-                return asFloats
-            }
-            if let asFloats = embedding {
-                resultVec = asFloats.map { Double($0) }
-            }
-            sem.signal()
-        }
-        sem.wait()
-        return resultVec
-    }
-
-    private nonisolated func ensureGemmaLoadedBlocking() {
-        lock.lock()
-        if gemmaContainer != nil { lock.unlock(); return }
-        if gemmaLoadAttempted { lock.unlock(); return }
-        gemmaLoadAttempted = true
-        lock.unlock()
-
-        guard let modelID = EmbeddingBackend.embeddingGemma.modelID else {
-            halLog("HALDEBUG-EMBEDDING: EmbeddingGemma has no modelID — programming error")
-            return
-        }
-
-        // We load from a local directory rather than via #hubDownloader().
-        // The catalog system (MLXModelDownloader / BackgroundDownloadCoordinator)
-        // owns the download; we just resolve the on-disk path.
-        // Cache layout follows the HubApi.default config (line ~73):
-        //   .cachesDirectory/huggingface/models/<orgId>/<modelName>/
-        let cacheDir = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask)[0]
-        let modelDirectory = cacheDir
-            .appendingPathComponent("huggingface", isDirectory: true)
-            .appendingPathComponent("models", isDirectory: true)
-            .appendingPathComponent(modelID, isDirectory: true)
-
-        // Check that the model files are present. Required: config.json
-        // and model.safetensors (or an index for sharded variants).
-        let configURL = modelDirectory.appendingPathComponent("config.json")
-        guard FileManager.default.fileExists(atPath: configURL.path) else {
-            halLog("HALDEBUG-EMBEDDING: EmbeddingGemma model not present at \(modelDirectory.path) — user must download it via the Model Library first")
-            lock.lock(); gemmaLoadAttempted = false; lock.unlock()  // allow retry after download
-            return
-        }
-
-        halLog("HALDEBUG-EMBEDDING: Loading EmbeddingGemma from \(modelDirectory.path)...")
-        let sem = DispatchSemaphore(value: 0)
-        var loadedContainer: EmbedderModelContainer?
-        var loadError: Error?
-
-        Task.detached {
-            do {
-                loadedContainer = try await EmbedderModelFactory.shared.loadContainer(
-                    from: modelDirectory,
-                    using: #huggingFaceTokenizerLoader()
-                )
-            } catch {
-                loadError = error
-            }
-            sem.signal()
-        }
-        sem.wait()
-
-        if let e = loadError {
-            halLog("HALDEBUG-EMBEDDING: EmbeddingGemma load failed: \(e.localizedDescription) — semantic search unavailable on this backend until next attempt")
-            lock.lock(); gemmaLoadAttempted = false; lock.unlock()  // allow retry next call
-            return
-        }
-        guard let container = loadedContainer else {
-            halLog("HALDEBUG-EMBEDDING: EmbeddingGemma load returned nil container")
-            lock.lock(); gemmaLoadAttempted = false; lock.unlock()
-            return
-        }
-        lock.lock()
-        self.gemmaContainer = container
-        lock.unlock()
-        halLog("HALDEBUG-EMBEDDING: EmbeddingGemma container loaded (\(modelID)) — dimension=\(EmbeddingBackend.embeddingGemma.dimension)")
-    }
-}
-
-extension MemoryStore {
-
-    /// Returns the pooled sentence vector for `text`. Empty array if the
-    /// embedding model isn't loaded yet (first-launch download pending or
-    /// failed). Storage callers that get an empty array store NULL in the
-    /// embedding column; search callers that get an empty array return
-    /// zero semantic results (BM25 keyword path still applies).
-    ///
-    /// nonisolated: callable from background work like the embedding
-    /// migration (`reEmbedAllNullRows`). Underlying EmbeddingProvider.embed
-    /// is also nonisolated and thread-safe via NSLock + per-backend
-    /// serial containers.
-    nonisolated func generateEmbedding(for text: String) -> [Double] {
-        return EmbeddingProvider.shared.embed(text) ?? []
-    }
-
-    /// Standard cosine similarity. Rejects dimension mismatches (returns 0)
-    /// so embedding-system migrations can't silently produce noise.
-    func cosineSimilarity(_ v1: [Double], _ v2: [Double]) -> Double {
-        guard v1.count == v2.count && v1.count > 0 else { return 0 }
-        let dot = zip(v1, v2).map(*).reduce(0, +)
-        let norm1 = sqrt(v1.map { $0 * $0 }.reduce(0, +))
-        let norm2 = sqrt(v2.map { $0 * $0 }.reduce(0, +))
-        return norm1 == 0 || norm2 == 0 ? 0 : dot / (norm1 * norm2)
-    }
-}
+// EmbeddingBackend, EmbeddingProvider, and the MemoryStore embedding
+// helpers (generateEmbedding, cosineSimilarity) live in:
+//   - EmbeddingBackend.swift  — backend enum + system version + UI strings
+//   - EmbeddingProvider.swift — provider class + MemoryStore extension
+// Extracted 2026-05-17 afternoon as part of the standing refactor-as-
+// you-go directive (CLAUDE.md / Mark's directive).
 
 // MARK: - Entity-Enhanced Search Utilities (from Hal10000App.swift)
 extension MemoryStore {
@@ -4585,7 +5257,7 @@ extension MemoryStore {
             return UnifiedSearchContext(snippets: [], totalTokens: 0)
         }
 
-        let queryEmbedding = generateEmbedding(for: query)
+        let queryEmbedding = generateEmbedding(for: query, as: .query)
         guard !queryEmbedding.isEmpty else {
             print("HALDEBUG-SEARCH: Query embedding is empty, cannot perform semantic search.")
             return UnifiedSearchContext(snippets: [], totalTokens: 0)
@@ -5298,6 +5970,114 @@ extension MemoryStore {
     /// preview, the embedding length (0 if missing), and the key metadata
     /// fields. Used to verify write-side stored the planted turn with an
     /// embedding attached.
+    /// FTS5 diagnostic: row counts, sample MATCH, schema. Added
+    /// 2026-05-17 afternoon to investigate "BM25 returns 0 candidates"
+    /// regression on the iPhone after the morning's commits.
+    func debugFTSDiagnostic() -> String {
+        guard ensureHealthyConnection() else {
+            return "{\"status\":\"error\",\"message\":\"no DB\"}"
+        }
+        func count(_ sql: String) -> Int {
+            var stmt: OpaquePointer?
+            defer { sqlite3_finalize(stmt) }
+            guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else { return -1 }
+            return sqlite3_step(stmt) == SQLITE_ROW ? Int(sqlite3_column_int(stmt, 0)) : -1
+        }
+        let unifiedCount = count("SELECT count(*) FROM unified_content;")
+        let ftsCount = count("SELECT count(*) FROM unified_content_fts;")
+        let subaruMatches = count("SELECT count(*) FROM unified_content_fts WHERE unified_content_fts MATCH 'subaru';")
+        let doMatches = count("SELECT count(*) FROM unified_content_fts WHERE unified_content_fts MATCH 'do';")
+        // Test the same JOIN the search code uses to see if rowids align.
+        let joinMatches = count("SELECT count(*) FROM unified_content_fts JOIN unified_content u ON u.rowid = unified_content_fts.rowid WHERE unified_content_fts MATCH 'subaru';")
+        // Sample rowids from both
+        var sampleFTSRowids: [Int] = []
+        var sampleUnifiedRowids: [Int] = []
+        var stmt2: OpaquePointer?
+        if sqlite3_prepare_v2(db, "SELECT rowid FROM unified_content_fts WHERE unified_content_fts MATCH 'subaru' LIMIT 5;", -1, &stmt2, nil) == SQLITE_OK {
+            while sqlite3_step(stmt2) == SQLITE_ROW { sampleFTSRowids.append(Int(sqlite3_column_int(stmt2, 0))) }
+        }
+        sqlite3_finalize(stmt2)
+        if sqlite3_prepare_v2(db, "SELECT rowid FROM unified_content WHERE content LIKE '%Subaru%' LIMIT 5;", -1, &stmt2, nil) == SQLITE_OK {
+            while sqlite3_step(stmt2) == SQLITE_ROW { sampleUnifiedRowids.append(Int(sqlite3_column_int(stmt2, 0))) }
+        }
+        sqlite3_finalize(stmt2)
+        // Schema check
+        var schema = ""
+        var schemaStmt: OpaquePointer?
+        if sqlite3_prepare_v2(db, "SELECT sql FROM sqlite_master WHERE name = 'unified_content_fts';", -1, &schemaStmt, nil) == SQLITE_OK {
+            if sqlite3_step(schemaStmt) == SQLITE_ROW, let s = sqlite3_column_text(schemaStmt, 0) {
+                schema = String(cString: s)
+            }
+        }
+        sqlite3_finalize(schemaStmt)
+        // Trigger check
+        var triggers = ""
+        var trigStmt: OpaquePointer?
+        if sqlite3_prepare_v2(db, "SELECT name FROM sqlite_master WHERE type='trigger' AND tbl_name='unified_content';", -1, &trigStmt, nil) == SQLITE_OK {
+            var names: [String] = []
+            while sqlite3_step(trigStmt) == SQLITE_ROW {
+                if let s = sqlite3_column_text(trigStmt, 0) {
+                    names.append(String(cString: s))
+                }
+            }
+            triggers = names.joined(separator: ",")
+        }
+        sqlite3_finalize(trigStmt)
+        // Inline escape (avoid hopping to MainActor for dbgEscape).
+        let escSchema = schema
+            .replacingOccurrences(of: "\\", with: "\\\\")
+            .replacingOccurrences(of: "\"", with: "\\\"")
+            .replacingOccurrences(of: "\n", with: " ")
+        let escTriggers = triggers
+            .replacingOccurrences(of: "\\", with: "\\\\")
+            .replacingOccurrences(of: "\"", with: "\\\"")
+        let ftsRowidStr = sampleFTSRowids.map(String.init).joined(separator: ",")
+        let unifiedRowidStr = sampleUnifiedRowids.map(String.init).joined(separator: ",")
+
+        // Replicate the EXACT BM25 query the search code runs.
+        // sanitized = "subaru" (one token, lowercased, alphanumerics-only).
+        // exclusionClause = "" (empty corpus has no excludeTurns).
+        // bm25ExclusionClause = "" after replacements.
+        // Full SQL:
+        let exactBM25SQL = """
+        SELECT u.id, u.content, u.source_type, u.source_id, u.position, u.metadata_json, u.timestamp, u.recorded_by_model,
+               -bm25(unified_content_fts) AS bm25_score
+        FROM unified_content_fts
+        JOIN unified_content u ON u.rowid = unified_content_fts.rowid
+        WHERE unified_content_fts MATCH ?
+              AND u.source_type != 'source_code'
+        ORDER BY bm25_score DESC
+        LIMIT 50;
+        """
+        var exactRows = 0
+        var exactStmt: OpaquePointer?
+        if sqlite3_prepare_v2(db, exactBM25SQL, -1, &exactStmt, nil) == SQLITE_OK {
+            sqlite3_bind_text(exactStmt, 1, ("subaru" as NSString).utf8String, -1, nil)
+            while sqlite3_step(exactStmt) == SQLITE_ROW { exactRows += 1 }
+        }
+        sqlite3_finalize(exactStmt)
+
+        // Replicate the EXACT searchUnifiedContent path:
+        // sanitizeFTSQuery("Subaru") => "subaru" (single token).
+        // Then call into searchUnifiedContent itself, grab the rrf-fused
+        // count of BM25 contributions.
+        let sanitized = sanitizeFTSQuery("Subaru")
+        var sanitizedRows = 0
+        var sanitizedStmt: OpaquePointer?
+        if sqlite3_prepare_v2(db, exactBM25SQL, -1, &sanitizedStmt, nil) == SQLITE_OK {
+            sqlite3_bind_text(sanitizedStmt, 1, (sanitized as NSString).utf8String, -1, nil)
+            while sqlite3_step(sanitizedStmt) == SQLITE_ROW { sanitizedRows += 1 }
+        }
+        sqlite3_finalize(sanitizedStmt)
+        // Now call searchUnifiedContent the way debugSearchUnifiedContent does.
+        let searchResult = searchUnifiedContent(for: "Subaru", currentConversationId: "", excludeTurns: [], maxResults: 20, tokenBudget: 4000)
+        let bm25Count = searchResult.snippets.filter { $0.isEntityMatch }.count
+
+        return """
+        {"status":"ok","unifiedRows":\(unifiedCount),"ftsRows":\(ftsCount),"matchSubaru":\(subaruMatches),"matchDo":\(doMatches),"joinMatches":\(joinMatches),"exactBM25Rows":\(exactRows),"sanitizedRows":\(sanitizedRows),"sanitizedQuery":"\(sanitized)","searchSnippets":\(searchResult.snippets.count),"bm25SnippetsViaSearch":\(bm25Count),"ftsRowids":"\(ftsRowidStr)","unifiedRowids":"\(unifiedRowidStr)","schema":"\(escSchema)","triggers":"\(escTriggers)"}
+        """
+    }
+
     func debugDumpRecentUnifiedContent(limit: Int) -> String {
         guard ensureHealthyConnection() else {
             return "{\"status\":\"error\",\"message\":\"no database connection\"}"
@@ -5366,7 +6146,7 @@ extension MemoryStore {
         guard ensureHealthyConnection() else {
             return "{\"status\":\"error\",\"message\":\"no database connection\"}"
         }
-        let queryEmbedding = generateEmbedding(for: query)
+        let queryEmbedding = generateEmbedding(for: query, as: .query)
         guard !queryEmbedding.isEmpty else {
             return "{\"status\":\"error\",\"message\":\"empty query embedding\"}"
         }
@@ -7824,6 +8604,31 @@ final class HalAppDelegate: NSObject, UIApplicationDelegate {
 
     func application(_ application: UIApplication,
                      didFinishLaunchingWithOptions launchOptions: [UIApplication.LaunchOptionsKey: Any]? = nil) -> Bool {
+        // MLX_METAL_GPU_ARCH workaround (2026-05-17, EmbeddingGemma load
+        // crash on device + sim). MLX's `mlx::core::metal::Device::Device()`
+        // (device.cpp:328) calls `device_->architecture()->name()->utf8String()`
+        // and passes the result to `std::string()`. On iOS 26.5 the
+        // architecture name can be nil; libc++ Hardening aborts with
+        // "basic_string(const char*) detected nullptr" before the model
+        // load completes. Setting MLX_METAL_GPU_ARCH overrides the lookup
+        // (device.cpp:326): `arch_ = env::metal_gpu_arch()` — if non-empty,
+        // the crashing line is skipped. "apple9" matches the GPU
+        // generation of A17 Pro / A18 / M3+ devices and the iOS 26 sim;
+        // the value primarily affects kernel selection downstream, not the
+        // basic load path. Set early so MLX reads it before any other code
+        // touches Stream.gpu or Device.gpu.
+        setenv("MLX_METAL_GPU_ARCH", "apple9", 1)
+        halLog("HALDEBUG-EMBEDDING: Set MLX_METAL_GPU_ARCH=apple9 (libc++ string-nullptr workaround for iOS 26.5).")
+
+        // Crash guard: if the previous launch attempted a Gemma load and
+        // the process died before recordLoadSuccess cleared the flag, fall
+        // back to NLContextual on this launch. Re-enabling Gemma requires
+        // an explicit SET_EMBEDDING_BACKEND:embeddinggemma. Done once at
+        // launch (not on every embed() call) to avoid race-y intermediate
+        // states during warm-up.
+        let resolvedBackend = EmbeddingBackend.applyCrashGuardAtLaunch()
+        halLog("HALDEBUG-EMBEDDING: Crash guard resolved backend=\(resolvedBackend.rawValue).")
+
         // Build the bridge against the shared VM singleton. Touching
         // ChatViewModel.shared here triggers its lazy `static let` init —
         // happens once, on the main thread, exactly when we need it.
@@ -9815,367 +10620,8 @@ func modelStatusDot(
     // No dot when not downloaded.
 }
 
-// MARK: - Embedder Migration Coordinator (Proposal A, 2026-05-17)
-//
-// Drives the user-facing flow for upgrading the embedding backend:
-//   1. Download EmbeddingGemma (~210MB) via the existing
-//      MLXModelDownloader / BackgroundDownloadCoordinator pipeline.
-//   2. Switch the active backend (UserDefaults + wipe existing embeddings).
-//   3. Re-embed all stored rows in the background (the migration).
-//
-// Two-way: every step is reversible. Switching from Gemma back to
-// Apple NLContextual goes through the same wipe + re-embed flow.
-//
-// State is a single @Published `phase`. The UI observes it to render
-// the appropriate label + progress (download progress bar, then migration
-// row counter, then idle). Errors land as an .error phase that the user
-// dismisses to retry.
-@MainActor
-final class EmbedderMigrationCoordinator: ObservableObject {
-    static let shared = EmbedderMigrationCoordinator()
-
-    enum Phase: Equatable {
-        case idle
-        case downloading(progress: Double, message: String)
-        case switching(target: String)
-        case migrating(updated: Int, total: Int)
-        case done(message: String)
-        case error(String)
-    }
-
-    @Published var phase: Phase = .idle
-    @Published var activeBackend: EmbeddingBackend = EmbeddingBackend.current()
-
-    private var pollTask: Task<Void, Never>?
-
-    private init() {}
-
-    /// Refresh from UserDefaults — called when the view appears so we
-    /// don't drift if the backend was changed by an API caller.
-    func refresh() {
-        activeBackend = EmbeddingBackend.current()
-    }
-
-    /// Trigger the Gemma download via the existing catalog downloader.
-    /// Returns immediately; polls progress until done or error.
-    func startDownload() {
-        guard let modelID = EmbeddingBackend.embeddingGemma.modelID else { return }
-        if MLXModelDownloader.shared.isModelDownloaded(modelID) {
-            phase = .done(message: "EmbeddingGemma already downloaded.")
-            return
-        }
-        phase = .downloading(progress: 0, message: "Starting download…")
-        Task {
-            await MLXModelDownloader.shared.startDownload(modelID: modelID, repoID: modelID, sizeGB: 0.21)
-        }
-        // Poll the downloader state on the main actor so SwiftUI updates.
-        // Strong self capture (coordinator is a singleton; lifetime is the app).
-        pollTask?.cancel()
-        pollTask = Task { @MainActor in
-            while !Task.isCancelled {
-                try? await Task.sleep(nanoseconds: 500_000_000)  // 0.5s
-                let state = MLXModelDownloader.shared.downloadStates[modelID]
-                let downloaded = MLXModelDownloader.shared.isModelDownloaded(modelID)
-                if downloaded {
-                    self.phase = .done(message: "EmbeddingGemma downloaded.")
-                    return
-                }
-                if let s = state, let err = s.error, !err.isEmpty {
-                    self.phase = .error("Download failed: \(err)")
-                    return
-                }
-                if let s = state {
-                    self.phase = .downloading(progress: s.progress, message: s.message)
-                }
-            }
-        }
-    }
-
-    /// Switch the active embedding backend and re-embed every existing
-    /// row that has a NULL embedding. Runs on a background task and
-    /// publishes progress.
-    func switchAndMigrate(to target: EmbeddingBackend, memoryStore: MemoryStore) {
-        // Refuse if the target backend requires a download that hasn't
-        // happened yet. Belt + suspenders — UI should not offer the
-        // switch button in that case.
-        if let id = target.modelID, !MLXModelDownloader.shared.isModelDownloaded(id) {
-            phase = .error("\(target.displayName) is not downloaded yet.")
-            return
-        }
-
-        phase = .switching(target: target.displayName)
-        pollTask?.cancel()
-        let coordinator = self
-        let storeRef = memoryStore
-        pollTask = Task.detached(priority: .userInitiated) {
-            // Persist the new backend, wipe existing embeddings.
-            UserDefaults.standard.set(target.rawValue, forKey: EmbeddingBackend.defaultsKey)
-            UserDefaults.standard.removeObject(forKey: "embeddingSystemVersion")
-            storeRef.wipeStaleEmbeddingsIfNeeded()
-            // Kick off async warm-up; wait until loaded (cap at ~60s so
-            // a busted load doesn't hang the UI forever).
-            EmbeddingProvider.shared.warmUp()
-            let deadline = Date().addingTimeInterval(60)
-            while !EmbeddingProvider.shared.isLoaded {
-                if Date() > deadline {
-                    await MainActor.run {
-                        coordinator.phase = .error("\(target.displayName) failed to load within 60s. Try again.")
-                    }
-                    return
-                }
-                try? await Task.sleep(nanoseconds: 250_000_000)
-            }
-            await MainActor.run {
-                coordinator.activeBackend = target
-                coordinator.phase = .migrating(updated: 0, total: 0)
-            }
-            // Run the migration. Single synchronous call — total runtime
-            // depends on row count and backend speed. Future variant
-            // could batch and publish per-row progress.
-            let result = storeRef.reEmbedAllNullRows()
-            await MainActor.run {
-                coordinator.phase = .done(message: "Migrated \(result.updated) rows to \(target.displayName). (\(result.skipped) skipped, \(result.failed) failed.)")
-            }
-        }
-    }
-
-    /// Reset to idle so the user can try again or see fresh state.
-    func dismissResult() {
-        phase = .idle
-    }
-}
-
-extension EmbeddingBackend {
-    /// Display name for UI surfaces.
-    var displayName: String {
-        switch self {
-        case .nlContextual: return "Apple NLContextual"
-        case .embeddingGemma: return "EmbeddingGemma 300M"
-        }
-    }
-    /// Short description used in the embedder card.
-    var blurb: String {
-        switch self {
-        case .nlContextual:
-            return "Built into iOS 26+. Runs on the Neural Engine. 512-dim sentence vectors. No download, always available."
-        case .embeddingGemma:
-            return "Google's open embedding model, 308M params, MLX 4-bit quantized. 768-dim, state-of-the-art on MTEB Multilingual v2 among models under 500M. Adds ~210 MB on disk."
-        }
-    }
-    /// Size note for UI display.
-    var sizeBlurb: String? {
-        switch self {
-        case .nlContextual: return nil
-        case .embeddingGemma: return "~210 MB"
-        }
-    }
-}
-
-// MARK: - Embedder Backend Row + Migration Status (Proposal A, 2026-05-17)
-
-/// Row for a single embedding backend in the Model Library "Embedding (Memory)"
-/// section. Renders name + size + blurb + the appropriate action button
-/// (Download / Switch / Active).
-struct EmbedderBackendRow: View {
-    let backend: EmbeddingBackend
-    @ObservedObject private var coordinator = EmbedderMigrationCoordinator.shared
-    @ObservedObject private var downloader = MLXModelDownloader.shared
-    @EnvironmentObject var chatViewModel: ChatViewModel
-
-    @State private var isExpanded: Bool = false
-    @State private var showingConfirm: Bool = false
-
-    private var isActive: Bool { coordinator.activeBackend == backend }
-
-    private var isDownloaded: Bool {
-        guard let id = backend.modelID else { return true }  // NLContextual built-in
-        return downloader.isModelDownloaded(id)
-    }
-
-    private var isDownloading: Bool {
-        guard let id = backend.modelID else { return false }
-        return downloader.downloadStates[id]?.isDownloading == true
-    }
-
-    var body: some View {
-        VStack(alignment: .leading, spacing: 0) {
-            // Collapsed header
-            Button(action: { withAnimation(.easeInOut(duration: 0.18)) { isExpanded.toggle() } }) {
-                HStack(spacing: 10) {
-                    Text(backend.displayName)
-                        .font(.subheadline)
-                        .fontWeight(.medium)
-                        .foregroundColor(.primary)
-                        .lineLimit(1)
-                    Spacer(minLength: 8)
-                    if let size = backend.sizeBlurb {
-                        Text(size)
-                            .font(.caption)
-                            .foregroundColor(.secondary)
-                            .monospacedDigit()
-                    }
-                    // Status dot: green = active, grey = downloaded, none = not downloaded
-                    if isActive {
-                        Circle().fill(Color.green).frame(width: 8, height: 8)
-                            .accessibilityLabel("Active")
-                    } else if isDownloaded {
-                        Circle().fill(Color.gray.opacity(0.5)).frame(width: 8, height: 8)
-                            .accessibilityLabel("Downloaded")
-                    }
-                    Image(systemName: isExpanded ? "chevron.up" : "chevron.down")
-                        .font(.caption2)
-                        .foregroundColor(.secondary)
-                }
-                .contentShape(Rectangle())
-            }
-            .buttonStyle(.plain)
-
-            if isExpanded {
-                Divider().padding(.vertical, 8)
-                Text(backend.blurb)
-                    .font(.caption)
-                    .foregroundColor(.secondary)
-                    .fixedSize(horizontal: false, vertical: true)
-                    .padding(.bottom, 8)
-                Text("\(backend.dimension)-dim sentence vectors")
-                    .font(.caption)
-                    .foregroundColor(.secondary)
-                    .padding(.bottom, 8)
-                actionRow
-            }
-        }
-        .padding(.vertical, 4)
-        .onAppear { coordinator.refresh() }
-        .confirmationDialog(
-            "Switch to \(backend.displayName)?",
-            isPresented: $showingConfirm,
-            titleVisibility: .visible
-        ) {
-            Button("Switch and re-embed memories", role: .destructive) {
-                coordinator.switchAndMigrate(to: backend, memoryStore: chatViewModel.memoryStore)
-            }
-            Button("Cancel", role: .cancel) {}
-        } message: {
-            Text("Existing embeddings will be wiped and regenerated with \(backend.displayName). This may take a few minutes depending on your memory size.")
-        }
-    }
-
-    @ViewBuilder
-    private var actionRow: some View {
-        HStack(spacing: 12) {
-            if isActive {
-                Label("Active", systemImage: "checkmark.circle.fill")
-                    .font(.subheadline)
-                    .foregroundColor(.secondary)
-                Spacer()
-            } else if !isDownloaded {
-                if isDownloading {
-                    if let state = downloader.downloadStates[backend.modelID ?? ""] {
-                        VStack(alignment: .leading, spacing: 4) {
-                            ProgressView(value: state.progress).progressViewStyle(.linear)
-                            Text(state.message).font(.caption2).foregroundColor(.secondary)
-                        }
-                        .frame(maxWidth: .infinity, alignment: .leading)
-                    }
-                    Spacer()
-                    Button("Cancel", role: .destructive) {
-                        if let id = backend.modelID {
-                            downloader.cancelDownload(modelID: id)
-                        }
-                    }
-                    .font(.subheadline)
-                } else {
-                    Button(action: { coordinator.startDownload() }) {
-                        Label("Download \(backend.displayName)", systemImage: "arrow.down.circle")
-                            .font(.subheadline)
-                    }
-                    .buttonStyle(.borderedProminent)
-                    Spacer()
-                }
-            } else {
-                Button(action: { showingConfirm = true }) {
-                    Label("Switch to \(backend.displayName)", systemImage: "arrow.triangle.2.circlepath")
-                        .font(.subheadline)
-                }
-                .buttonStyle(.borderedProminent)
-                Spacer()
-                if backend.modelID != nil {
-                    Button(role: .destructive, action: {
-                        if let id = backend.modelID {
-                            Task { await downloader.deleteModel(modelID: id) }
-                        }
-                    }) {
-                        Image(systemName: "trash")
-                            .foregroundColor(.red)
-                    }
-                    .buttonStyle(.plain)
-                    .disabled(isActive)
-                }
-            }
-        }
-    }
-}
-
-/// Single-row status surface for the embedder migration. Renders nothing
-/// when the coordinator is idle so the section is quiet by default.
-struct EmbedderMigrationStatusRow: View {
-    @ObservedObject private var coordinator = EmbedderMigrationCoordinator.shared
-
-    var body: some View {
-        switch coordinator.phase {
-        case .idle:
-            EmptyView()
-        case .downloading(let progress, let message):
-            VStack(alignment: .leading, spacing: 4) {
-                Label("Downloading EmbeddingGemma…", systemImage: "arrow.down.circle")
-                    .font(.subheadline)
-                ProgressView(value: progress).progressViewStyle(.linear)
-                Text(message).font(.caption2).foregroundColor(.secondary)
-            }
-            .padding(.vertical, 4)
-        case .switching(let target):
-            HStack(spacing: 8) {
-                ProgressView().controlSize(.small)
-                Text("Switching to \(target)…")
-                    .font(.subheadline)
-            }
-            .padding(.vertical, 4)
-        case .migrating(let updated, let total):
-            VStack(alignment: .leading, spacing: 4) {
-                Label("Re-embedding memories…", systemImage: "brain")
-                    .font(.subheadline)
-                if total > 0 {
-                    ProgressView(value: Double(updated), total: Double(total))
-                        .progressViewStyle(.linear)
-                    Text("\(updated) / \(total) rows").font(.caption2).foregroundColor(.secondary)
-                } else {
-                    ProgressView().progressViewStyle(.linear)
-                }
-            }
-            .padding(.vertical, 4)
-        case .done(let message):
-            HStack(spacing: 8) {
-                Image(systemName: "checkmark.circle.fill").foregroundColor(.green)
-                Text(message).font(.caption)
-                Spacer()
-                Button("OK") { coordinator.dismissResult() }
-                    .font(.caption)
-                    .buttonStyle(.borderless)
-            }
-            .padding(.vertical, 4)
-        case .error(let message):
-            HStack(spacing: 8) {
-                Image(systemName: "exclamationmark.triangle.fill").foregroundColor(.orange)
-                Text(message).font(.caption).foregroundColor(.red)
-                Spacer()
-                Button("OK") { coordinator.dismissResult() }
-                    .font(.caption)
-                    .buttonStyle(.borderless)
-            }
-            .padding(.vertical, 4)
-        }
-    }
-}
+// EmbedderMigrationCoordinator + EmbedderBackendRow + EmbedderMigrationStatusRow
+// extracted to EmbedderMigrationCoordinator.swift on 2026-05-17.
 
 // MARK: - Model Library View
 //
@@ -10239,8 +10685,13 @@ struct ModelLibraryView: View {
                 // built-in default; EmbeddingGemma is an optional upgrade
                 // that downloads and migrates the user's stored memories.
                 Section {
-                    EmbedderBackendRow(backend: .nlContextual)
-                    EmbedderBackendRow(backend: .embeddingGemma)
+                    // Render one row per available backend. Backends with
+                    // isAvailableInThisBuild == false (e.g. Gemma in App
+                    // Store builds) are skipped so the user only sees
+                    // options that actually work.
+                    ForEach(EmbeddingBackend.allCases.filter { $0.isAvailableInThisBuild }, id: \.rawValue) { backend in
+                        EmbedderBackendRow(backend: backend)
+                    }
                     EmbedderMigrationStatusRow()
                 } header: {
                     Label("Embedding (Memory)", systemImage: "brain")
@@ -21003,31 +21454,75 @@ class HalTestConsole: ObservableObject {
             let result = vm.memoryStore.reEmbedAllNullRows()
             return "{\"status\":\"ok\",\"command\":\"MIGRATE_EMBEDDINGS_REEMBED\",\"backend\":\"\(backend.rawValue)\",\"updated\":\(result.updated),\"skipped\":\(result.skipped),\"failed\":\(result.failed)}"
 
-        } else if trimmed == "DOWNLOAD_EMBEDDING_MODEL" {
-            // Trigger download of the EmbeddingGemma model via the existing
-            // MLXModelDownloader / BackgroundDownloadCoordinator pipeline.
-            // Returns immediately; poll EMBEDDING_DOWNLOAD_STATUS for
-            // progress. Files end up at
+        } else if trimmed == "DOWNLOAD_EMBEDDING_MODEL" || trimmed.hasPrefix("DOWNLOAD_EMBEDDING_MODEL:") {
+            // DOWNLOAD_EMBEDDING_MODEL[:<backend>]
+            //
+            // Trigger download for the named embedding backend's model via
+            // the existing MLXModelDownloader / BackgroundDownloadCoordinator
+            // pipeline (same one that powers LLM downloads). Without the
+            // backend suffix, defaults to "nomicswift" since that's the
+            // primary downloadable embedder available today.
+            //
+            // Returns immediately; poll EMBEDDING_DOWNLOAD_STATUS:<backend>
+            // for progress. Files end up at:
             //   .cachesDirectory/huggingface/models/<repoID>/
-            // which is exactly the path EmbeddingProvider.ensureGemmaLoadedBlocking
-            // looks at. Idempotent — if already downloaded, returns ok with
-            // alreadyDownloaded=true.
-            guard let modelID = EmbeddingBackend.embeddingGemma.modelID else {
-                return "{\"status\":\"error\",\"message\":\"EmbeddingGemma has no modelID\"}"
+            // which is exactly the path each backend's ensure*Loaded path
+            // looks at. Idempotent — if already downloaded, returns ok
+            // with alreadyDownloaded=true.
+            let raw: String
+            if trimmed.hasPrefix("DOWNLOAD_EMBEDDING_MODEL:") {
+                raw = String(trimmed.dropFirst("DOWNLOAD_EMBEDDING_MODEL:".count)).trimmingCharacters(in: .whitespaces)
+            } else {
+                raw = EmbeddingBackend.nomicSwift.rawValue
+            }
+            guard let backend = EmbeddingBackend(rawValue: raw) else {
+                return "{\"status\":\"error\",\"message\":\"unknown backend '\(raw)'\"}"
+            }
+            guard backend.isAvailableInThisBuild else {
+                return "{\"status\":\"error\",\"message\":\"backend '\(backend.rawValue)' is not enabled in this build\"}"
+            }
+            guard let modelID = backend.modelID else {
+                return "{\"status\":\"error\",\"message\":\"backend '\(backend.rawValue)' has no downloadable model (built-in)\"}"
             }
             if MLXModelDownloader.shared.isModelDownloaded(modelID) {
-                return "{\"status\":\"ok\",\"command\":\"DOWNLOAD_EMBEDDING_MODEL\",\"modelID\":\"\(modelID)\",\"alreadyDownloaded\":true}"
+                return "{\"status\":\"ok\",\"command\":\"DOWNLOAD_EMBEDDING_MODEL\",\"backend\":\"\(backend.rawValue)\",\"modelID\":\"\(modelID)\",\"alreadyDownloaded\":true}"
             }
-            // Estimated size — model.safetensors 173MB + tokenizer 33MB ~ 0.21GB.
-            Task { await MLXModelDownloader.shared.startDownload(modelID: modelID, repoID: modelID, sizeGB: 0.21) }
-            return "{\"status\":\"ok\",\"command\":\"DOWNLOAD_EMBEDDING_MODEL\",\"modelID\":\"\(modelID)\",\"started\":true,\"note\":\"download running in background; poll EMBEDDING_DOWNLOAD_STATUS\"}"
+            // Size estimate — approximate, used for pre-flight disk space check.
+            let sizeGB: Double
+            switch backend {
+            case .embeddingGemma: sizeGB = 0.21
+            case .nomicSwift: sizeGB = 0.55
+            case .nlContextual: sizeGB = 0  // unreachable; built-in
+            }
+            Task { await MLXModelDownloader.shared.startDownload(modelID: modelID, repoID: modelID, sizeGB: sizeGB) }
+            return "{\"status\":\"ok\",\"command\":\"DOWNLOAD_EMBEDDING_MODEL\",\"backend\":\"\(backend.rawValue)\",\"modelID\":\"\(modelID)\",\"started\":true,\"note\":\"download running in background; poll EMBEDDING_DOWNLOAD_STATUS:\(backend.rawValue)\"}"
 
-        } else if trimmed == "EMBEDDING_DOWNLOAD_STATUS" {
-            // Read-only progress report on the EmbeddingGemma download.
-            // Reports isDownloading, progress (0..1), and whether the model
-            // files are present on disk.
-            guard let modelID = EmbeddingBackend.embeddingGemma.modelID else {
-                return "{\"status\":\"error\",\"message\":\"EmbeddingGemma has no modelID\"}"
+        } else if trimmed == "FTS_DIAG" {
+            // Read-only diagnostic for the FTS5 unified_content_fts index.
+            // Counts rows in unified_content vs the FTS shadow table; runs
+            // a literal `subaru` MATCH to verify the index contains injected
+            // content; reports the FTS5 schema (columns + tokenizer).
+            // Added 2026-05-17 afternoon to diagnose "BM25 returns 0 candidates"
+            // regression.
+            let counts = vm.memoryStore.debugFTSDiagnostic()
+            return counts
+
+        } else if trimmed == "EMBEDDING_DOWNLOAD_STATUS" || trimmed.hasPrefix("EMBEDDING_DOWNLOAD_STATUS:") {
+            // EMBEDDING_DOWNLOAD_STATUS[:<backend>]
+            //
+            // Read-only progress report for the named backend's download.
+            // Without a backend suffix, defaults to "nomicswift".
+            let raw: String
+            if trimmed.hasPrefix("EMBEDDING_DOWNLOAD_STATUS:") {
+                raw = String(trimmed.dropFirst("EMBEDDING_DOWNLOAD_STATUS:".count)).trimmingCharacters(in: .whitespaces)
+            } else {
+                raw = EmbeddingBackend.nomicSwift.rawValue
+            }
+            guard let backend = EmbeddingBackend(rawValue: raw) else {
+                return "{\"status\":\"error\",\"message\":\"unknown backend '\(raw)'\"}"
+            }
+            guard let modelID = backend.modelID else {
+                return "{\"status\":\"ok\",\"backend\":\"\(backend.rawValue)\",\"modelID\":\"\",\"isDownloaded\":true,\"isDownloading\":false,\"progress\":1.0,\"message\":\"built-in, no download required\",\"error\":\"\"}"
             }
             let isDownloaded = MLXModelDownloader.shared.isModelDownloaded(modelID)
             let state = MLXModelDownloader.shared.downloadStates[modelID]
@@ -21035,7 +21530,7 @@ class HalTestConsole: ObservableObject {
             let progress = state?.progress ?? (isDownloaded ? 1.0 : 0.0)
             let message = (state?.message ?? "").replacingOccurrences(of: "\"", with: "\\\"")
             let err = (state?.error ?? "").replacingOccurrences(of: "\"", with: "\\\"")
-            return "{\"status\":\"ok\",\"modelID\":\"\(modelID)\",\"isDownloaded\":\(isDownloaded),\"isDownloading\":\(isDownloading),\"progress\":\(progress),\"message\":\"\(message)\",\"error\":\"\(err)\"}"
+            return "{\"status\":\"ok\",\"backend\":\"\(backend.rawValue)\",\"modelID\":\"\(modelID)\",\"isDownloaded\":\(isDownloaded),\"isDownloading\":\(isDownloading),\"progress\":\(progress),\"message\":\"\(message)\",\"error\":\"\(err)\"}"
 
         } else if trimmed == "INJECT_REALISTIC_TEST_CORPUS" {
             // Inject ~70 rows of realistic conversational content into
@@ -21896,3 +22391,4 @@ class LocalAPIServer {
 }
 
 // ==== LEGO END: 32 HalTestConsole (macOS Test Harness) ====
+

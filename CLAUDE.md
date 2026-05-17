@@ -147,12 +147,21 @@ Full spec: `Docs/Hal_Persistent_Memory_Architecture.md`
 5. Explain your plan before writing any code
 6. Wait for explicit approval before implementing
 
-### When You End a Session (or after any code changes to Hal.swift)
-**Always sync Hal_Source.txt before finishing:**
+### When You End a Session (or after any code changes to Hal's source)
+**Always sync Hal_Source.txt before finishing.** As of 2026-05-17, Hal's
+source code has been split into multiple files under `Hal Universal/`, so
+`Hal_Source.txt` is a concatenation of all of them. Use the helper script
+which keeps the file list in one place:
 ```bash
-cp "Hal Universal/Hal.swift" "Hal Universal/Hal_Source.txt"
+./scripts/sync_hal_source.sh
 ```
-Hal_Source.txt is the copy of his own source code that gets bundled with the app and ingested into RAG — it's how Hal reads and understands his own architecture. If it's out of date, Hal is describing an older version of himself. Sync it any time Hal.swift changes.
+When you extract a new file from Hal.swift, update `scripts/sync_hal_source.sh`
+to include it.
+
+Hal_Source.txt is the copy of his own source code that gets bundled with
+the app and ingested into RAG — it's how Hal reads and understands his
+own architecture. If it's out of date, Hal is describing an older version
+of himself. Sync it any time any source file changes.
 
 ### When You Disagree
 Say so. Directly. We'd rather have your honest pushback than silent compliance followed by a solution that doesn't fit. Mark has final say on all decisions, but your judgment matters and will be considered.
