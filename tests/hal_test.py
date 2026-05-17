@@ -70,7 +70,9 @@ import urllib.error
 # ─── Config ─────────────────────────────────────────────────────────────────
 
 SCRIPT_DIR   = os.path.dirname(os.path.abspath(__file__))
-CONFIG_FILE  = os.path.join(SCRIPT_DIR, ".hal_api_config.json")
+# Allow override via env var for sim/secondary configs (e.g.
+# HAL_API_CONFIG=.hal_api_config_sim.json python3 hal_test.py ...).
+CONFIG_FILE  = os.environ.get("HAL_API_CONFIG_PATH") or os.path.join(SCRIPT_DIR, os.environ.get("HAL_API_CONFIG", ".hal_api_config.json"))
 
 HAL_TEST_DIR = os.path.expanduser("~/Library/Containers/68B65A35-9706-4B97-B34C-43E2F6C8DA20/Data/Documents/hal_test")
 OUTPUT_FILE  = os.path.join(HAL_TEST_DIR, "output_latest.json")

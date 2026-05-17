@@ -58,6 +58,7 @@ import NaturalLanguage // For entity extraction and NLEmbedding
 import PDFKit // For PDF document processing
 import MLX // Import MLX framework (conceptual, requires actual framework link)
 import MLXLLM
+import MLXEmbedders // EmbeddingGemma backend (Proposal A, 2026-05-17)
 import Hub
 import HuggingFace // For #hubDownloader macro (HubClient type)
 import MLXLMCommon // FIXED: Added missing import for proper MLX API access
@@ -626,14 +627,24 @@ class MemoryStore: ObservableObject {
     /// One-time wipe of embedding columns when the embedding system
     /// version changes. Idempotent — the persisted flag prevents repeated
     /// wipes on subsequent launches.
-    nonisolated private func wipeStaleEmbeddingsIfNeeded() {
-        let currentEmbeddingVersion = 2  // 1 = NLEmbedding.sentenceEmbedding; 2 = NLContextualEmbedding
+    ///
+    /// Versions:
+    ///   1 = NLEmbedding.sentenceEmbedding (deprecated)
+    ///   2 = NLContextualEmbedding (Apple transformer, 512-dim)
+    ///   3 = EmbeddingGemma (MLX, 768-dim, Proposal A)
+    ///
+    /// The version is sourced from the currently active EmbeddingBackend,
+    /// so switching backends triggers a fresh wipe on the next startup
+    /// after the change (since UserDefaults version won't match).
+    nonisolated func wipeStaleEmbeddingsIfNeeded() {
+        let currentEmbeddingVersion = EmbeddingBackend.current().systemVersion
+        let activeBackendName = EmbeddingBackend.current().rawValue
         let key = "embeddingSystemVersion"
         let stored = UserDefaults.standard.integer(forKey: key)  // returns 0 if missing
         if stored == currentEmbeddingVersion {
             return  // already on current system
         }
-        halLog("HALDEBUG-EMBEDDING: Embedding system version upgrade detected (stored=\(stored), current=\(currentEmbeddingVersion)) — NULLing existing embedding columns so rows re-embed with NLContextualEmbedding")
+        halLog("HALDEBUG-EMBEDDING: Embedding system version change detected (stored=\(stored), current=\(currentEmbeddingVersion), backend=\(activeBackendName)) — NULLing existing embedding columns so rows re-embed with the new backend")
         let wipeUnified = "UPDATE unified_content SET embedding = NULL;"
         let wipeSelf = "UPDATE self_knowledge SET embedding = NULL WHERE 1=1;"  // self_knowledge may not have an embedding column on all schemas; the WHERE clause is harmless and avoids accidental table-scan-with-side-effects
         var unifiedChanges = 0
@@ -3730,44 +3741,97 @@ extension MemoryStore {
     }
 }
 
-// MARK: - Embedding System (NLContextualEmbedding, 2026-05-17 architectural upgrade)
+// MARK: - Embedding System (NLContextualEmbedding + EmbeddingGemma, 2026-05-17)
 //
-// Single embedding system everywhere. Replaces the older
-// NLEmbedding.sentenceEmbedding API which had documented limitations:
-// no contextual understanding, clusters by grammatical shape rather than
-// semantic content, and on Hal's short-conversational-content workload
-// produced unusable similarity scores (related content ~0.27, unrelated
-// query-shape ~0.62 — the noise floor was higher than the plant signal).
+// Two switchable backends:
+//   - "nlcontextual" (default): NLContextualEmbedding, Apple's transformer-
+//     based replacement for the older NLEmbedding.sentenceEmbedding API.
+//     iOS 17+, on-device via Neural Engine, 512-dim, lazy asset download.
+//   - "embeddinggemma" (Proposal A, 2026-05-18): Google's EmbeddingGemma
+//     300M, MLX 4-bit quantized via `mlx-community/embeddinggemma-300m-4bit`.
+//     Loaded through MLXEmbedders (already linked via mlx-swift-lm). MTEB
+//     SOTA for open models under 500M; ~210 MB on disk after download.
+//     768-dim with optional Matryoshka truncation (we use full 768).
 //
-// NLContextualEmbedding is Apple's transformer-based replacement, available
-// on iOS 17+. It returns per-token vectors which we mean-pool to a single
-// sentence vector. The model assets may need a one-time download via
-// `requestEmbeddingAssets()` — done lazily on first use. Once loaded the
-// model stays resident for the app's lifetime.
+// The backend is selected via UserDefaults key "embeddingBackend"; default
+// is "nlcontextual". When the backend changes, `wipeStaleEmbeddingsIfNeeded`
+// detects the version mismatch and NULLs all stored embeddings — the
+// re-embed happens lazily on next write (test corpus injection or chat).
 //
-// There is no fallback. The old NLEmbedding path and the hash-based
-// emergency fallback are both removed. If NLContextualEmbedding fails to
-// load (no network for asset download on first launch, etc.), embed()
-// returns nil and the BM25 keyword path (Commit B) carries retrieval
-// until the model is available.
+// Sync API surface preserved. The Gemma path bridges async loading and
+// async inference to the sync `embed()` interface via DispatchSemaphore,
+// mirroring how the NLContextualEmbedding asset-download bridge works.
+// Callers see no API change; they continue to get a `[Double]?` per call.
+//
+// If a backend's model isn't loaded (download pending, failed, no network),
+// embed() returns nil and the BM25 keyword path carries retrieval. The
+// chat pipeline never crashes on a missing embedding.
 
-/// Single-instance wrapper around NLContextualEmbedding. Lazy-loaded on
-/// first use; subsequent calls are synchronous and fast.
+// Marked nonisolated/Sendable so EmbeddingProvider (which is nonisolated
+// to allow calls from any thread) can read backend identity without a
+// hop to MainActor. Project default isolation is MainActor; without these
+// annotations the enum members get inherited isolation and produce
+// warnings in nonisolated contexts.
+nonisolated enum EmbeddingBackend: String, Sendable {
+    case nlContextual = "nlcontextual"
+    case embeddingGemma = "embeddinggemma"
+
+    nonisolated static let defaultsKey = "embeddingBackend"
+
+    /// Reads current backend from UserDefaults. Defaults to NLContextual
+    /// when the key is unset or invalid.
+    nonisolated static func current() -> EmbeddingBackend {
+        let raw = UserDefaults.standard.string(forKey: defaultsKey) ?? Self.nlContextual.rawValue
+        return EmbeddingBackend(rawValue: raw) ?? .nlContextual
+    }
+
+    /// Integer used by `wipeStaleEmbeddingsIfNeeded` so a backend change
+    /// triggers wipe-and-re-embed. Bump this when adding a new backend.
+    nonisolated var systemVersion: Int {
+        switch self {
+        case .nlContextual: return 2  // matches original (post-NLEmbedding migration)
+        case .embeddingGemma: return 3
+        }
+    }
+
+    /// Sentence-vector dimension for this backend. Used by callers that
+    /// need to allocate buffers or check dimension consistency.
+    nonisolated var dimension: Int {
+        switch self {
+        case .nlContextual: return 512
+        case .embeddingGemma: return 768
+        }
+    }
+
+    /// HuggingFace model id for backends that load via MLX.
+    nonisolated var modelID: String? {
+        switch self {
+        case .nlContextual: return nil
+        case .embeddingGemma: return "mlx-community/embeddinggemma-300m-4bit"
+        }
+    }
+}
+
+/// Single-instance wrapper for whichever embedding backend is active.
+/// Lazy-loaded on first use; subsequent calls are synchronous and fast.
 ///
-/// Thread safety: `NLContextualEmbedding` documentation says model
-/// instances are safe to share across threads after `load()`. We guard
-/// the one-time load with an NSLock so concurrent first calls don't race.
+/// Thread safety: locked around the one-time backend load; subsequent
+/// embed() calls are reentrant and serialize through MLX's own
+/// `EmbedderModelContainer` (Gemma) or `NLContextualEmbedding`'s
+/// documented thread-safety (NLContextual).
 final class EmbeddingProvider: @unchecked Sendable {
     nonisolated static let shared = EmbeddingProvider()
 
     private let lock = NSLock()
-    nonisolated(unsafe) private var model: NLContextualEmbedding?
-    nonisolated(unsafe) private var loadAttempted: Bool = false
+    nonisolated(unsafe) private var nlModel: NLContextualEmbedding?
+    nonisolated(unsafe) private var nlLoadAttempted: Bool = false
+    nonisolated(unsafe) private var gemmaContainer: EmbedderModelContainer?
+    nonisolated(unsafe) private var gemmaLoadAttempted: Bool = false
 
     private init() {}
 
-    /// Pooled sentence-level vector for `text`, or nil if the model isn't
-    /// loaded (first-launch asset download in progress, or download
+    /// Pooled sentence-level vector for `text`, or nil if the active
+    /// backend isn't loaded (first-launch download in progress, or
     /// failed). Callers should treat nil as "semantic embedding currently
     /// unavailable" — the search pipeline must not crash; it just gets no
     /// semantic hit for that row/query.
@@ -3775,10 +3839,48 @@ final class EmbeddingProvider: @unchecked Sendable {
         let cleanText = text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !cleanText.isEmpty else { return nil }
 
-        ensureModelLoadedBlocking()
+        switch EmbeddingBackend.current() {
+        case .nlContextual:
+            return embedNLContextual(cleanText)
+        case .embeddingGemma:
+            return embedEmbeddingGemma(cleanText)
+        }
+    }
+
+    /// True if the *currently active* backend is loaded and ready.
+    nonisolated var isLoaded: Bool {
+        lock.lock(); defer { lock.unlock() }
+        switch EmbeddingBackend.current() {
+        case .nlContextual: return nlModel != nil
+        case .embeddingGemma: return gemmaContainer != nil
+        }
+    }
+
+    /// Currently active backend (for diagnostics).
+    nonisolated var activeBackend: EmbeddingBackend {
+        return EmbeddingBackend.current()
+    }
+
+    /// Trigger an async warm-up of the active backend — used from app
+    /// boot so the model loads (and downloads assets if needed) in the
+    /// background before any chat turn fires. Idempotent.
+    nonisolated func warmUp() {
+        Task.detached { [weak self] in
+            guard let self = self else { return }
+            switch EmbeddingBackend.current() {
+            case .nlContextual: self.ensureNLLoadedBlocking()
+            case .embeddingGemma: self.ensureGemmaLoadedBlocking()
+            }
+        }
+    }
+
+    // MARK: - NLContextualEmbedding path
+
+    private nonisolated func embedNLContextual(_ cleanText: String) -> [Double]? {
+        ensureNLLoadedBlocking()
 
         lock.lock()
-        let loaded = model
+        let loaded = nlModel
         lock.unlock()
 
         guard let model = loaded else { return nil }
@@ -3807,29 +3909,11 @@ final class EmbeddingProvider: @unchecked Sendable {
         }
     }
 
-    /// True if the model is loaded and ready. Used by diagnostic APIs and
-    /// for warm-up logging at app launch.
-    nonisolated var isLoaded: Bool {
-        lock.lock(); defer { lock.unlock() }
-        return model != nil
-    }
-
-    /// Trigger an async warm-up — used from app boot so the model loads
-    /// (and downloads assets if needed) in the background before any
-    /// chat turn fires. Idempotent.
-    nonisolated func warmUp() {
-        Task.detached { [weak self] in
-            self?.ensureModelLoadedBlocking()
-        }
-    }
-
-    /// Synchronous lazy-load. Blocks the calling thread on first use if
-    /// asset download is required. Subsequent calls return immediately.
-    private nonisolated func ensureModelLoadedBlocking() {
+    private nonisolated func ensureNLLoadedBlocking() {
         lock.lock()
-        if model != nil { lock.unlock(); return }
-        if loadAttempted { lock.unlock(); return }
-        loadAttempted = true
+        if nlModel != nil { lock.unlock(); return }
+        if nlLoadAttempted { lock.unlock(); return }
+        nlLoadAttempted = true
         lock.unlock()
 
         guard let candidate = NLContextualEmbedding(language: .english) else {
@@ -3848,7 +3932,7 @@ final class EmbeddingProvider: @unchecked Sendable {
             sem.wait()
             if let error = assetError {
                 halLog("HALDEBUG-EMBEDDING: Asset request failed: \(error.localizedDescription) — semantic search will be unavailable until next attempt")
-                lock.lock(); loadAttempted = false; lock.unlock()  // allow retry next call
+                lock.lock(); nlLoadAttempted = false; lock.unlock()  // allow retry next call
                 return
             }
         }
@@ -3856,13 +3940,145 @@ final class EmbeddingProvider: @unchecked Sendable {
         do {
             try candidate.load()
             lock.lock()
-            self.model = candidate
+            self.nlModel = candidate
             lock.unlock()
             halLog("HALDEBUG-EMBEDDING: NLContextualEmbedding loaded — dimension=\(candidate.dimension)")
         } catch {
             halLog("HALDEBUG-EMBEDDING: NLContextualEmbedding.load() failed: \(error.localizedDescription)")
-            lock.lock(); loadAttempted = false; lock.unlock()  // allow retry next call
+            lock.lock(); nlLoadAttempted = false; lock.unlock()  // allow retry next call
         }
+    }
+
+    // MARK: - EmbeddingGemma path (Proposal A, 2026-05-17)
+
+    private nonisolated func embedEmbeddingGemma(_ cleanText: String) -> [Double]? {
+        ensureGemmaLoadedBlocking()
+
+        lock.lock()
+        let loaded = gemmaContainer
+        lock.unlock()
+
+        guard let container = loaded else { return nil }
+
+        // Bridge async MLX inference to sync embed() API. Mirrors the
+        // semaphore pattern used elsewhere in the codebase (NLContextual
+        // asset download, LLMService generation). The closure runs on a
+        // background actor; we wait synchronously on the calling thread.
+        let sem = DispatchSemaphore(value: 0)
+        var resultVec: [Double]?
+
+        Task.detached {
+            // container.perform doesn't throw (rethrows from a non-throwing
+            // closure); MLX tokenizer/model/pooling calls don't throw either.
+            // Keep this as a non-throwing async pipeline.
+            let embedding: [Float]? = await container.perform { ctx in
+                let tokens = ctx.tokenizer.encode(text: cleanText, addSpecialTokens: true)
+                // EmbeddingGemma has a 2048 token context window. Long
+                // chat turns and source-code chunks may exceed this;
+                // truncate. Mean pooling makes truncation a graceful
+                // degradation rather than a hard fail.
+                let truncated = Array(tokens.prefix(2048))
+                guard !truncated.isEmpty else { return nil }
+
+                // Single-sentence batch of size 1.
+                let inputArray = MLXArray(truncated).reshaped(1, truncated.count)
+                let attentionMask = MLXArray.ones(like: inputArray)
+                let tokenTypeIds = MLXArray.zeros(like: inputArray)
+
+                let modelOutput = ctx.model(
+                    inputArray,
+                    positionIds: nil,
+                    tokenTypeIds: tokenTypeIds,
+                    attentionMask: attentionMask
+                )
+                // EmbeddingGemma's callAsFunction returns a
+                // pre-mean-pooled, L2-normalized pooledOutput. The
+                // Pooling layer with strategy .none returns that
+                // pooledOutput directly. Pass normalize=false to
+                // avoid double-normalizing.
+                let pooled = ctx.pooling(
+                    modelOutput,
+                    mask: attentionMask,
+                    normalize: false,
+                    applyLayerNorm: false
+                )
+                pooled.eval()
+                let asFloats: [Float] = pooled.asArray(Float.self)
+                return asFloats
+            }
+            if let asFloats = embedding {
+                resultVec = asFloats.map { Double($0) }
+            }
+            sem.signal()
+        }
+        sem.wait()
+        return resultVec
+    }
+
+    private nonisolated func ensureGemmaLoadedBlocking() {
+        lock.lock()
+        if gemmaContainer != nil { lock.unlock(); return }
+        if gemmaLoadAttempted { lock.unlock(); return }
+        gemmaLoadAttempted = true
+        lock.unlock()
+
+        guard let modelID = EmbeddingBackend.embeddingGemma.modelID else {
+            halLog("HALDEBUG-EMBEDDING: EmbeddingGemma has no modelID — programming error")
+            return
+        }
+
+        // We load from a local directory rather than via #hubDownloader().
+        // The catalog system (MLXModelDownloader / BackgroundDownloadCoordinator)
+        // owns the download; we just resolve the on-disk path.
+        // Cache layout follows the HubApi.default config (line ~73):
+        //   .cachesDirectory/huggingface/models/<orgId>/<modelName>/
+        let cacheDir = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask)[0]
+        let modelDirectory = cacheDir
+            .appendingPathComponent("huggingface", isDirectory: true)
+            .appendingPathComponent("models", isDirectory: true)
+            .appendingPathComponent(modelID, isDirectory: true)
+
+        // Check that the model files are present. Required: config.json
+        // and model.safetensors (or an index for sharded variants).
+        let configURL = modelDirectory.appendingPathComponent("config.json")
+        guard FileManager.default.fileExists(atPath: configURL.path) else {
+            halLog("HALDEBUG-EMBEDDING: EmbeddingGemma model not present at \(modelDirectory.path) — user must download it via the Model Library first")
+            lock.lock(); gemmaLoadAttempted = false; lock.unlock()  // allow retry after download
+            return
+        }
+
+        halLog("HALDEBUG-EMBEDDING: Loading EmbeddingGemma from \(modelDirectory.path)...")
+        let sem = DispatchSemaphore(value: 0)
+        var loadedContainer: EmbedderModelContainer?
+        var loadError: Error?
+
+        Task.detached {
+            do {
+                loadedContainer = try await EmbedderModelFactory.shared.loadContainer(
+                    from: modelDirectory,
+                    using: #huggingFaceTokenizerLoader()
+                )
+            } catch {
+                loadError = error
+            }
+            sem.signal()
+        }
+        sem.wait()
+
+        if let e = loadError {
+            halLog("HALDEBUG-EMBEDDING: EmbeddingGemma load failed: \(e.localizedDescription) — semantic search unavailable on this backend until next attempt")
+            lock.lock(); gemmaLoadAttempted = false; lock.unlock()  // allow retry next call
+            return
+        }
+        guard let container = loadedContainer else {
+            halLog("HALDEBUG-EMBEDDING: EmbeddingGemma load returned nil container")
+            lock.lock(); gemmaLoadAttempted = false; lock.unlock()
+            return
+        }
+        lock.lock()
+        self.gemmaContainer = container
+        lock.unlock()
+        halLog("HALDEBUG-EMBEDDING: EmbeddingGemma container loaded (\(modelID)) — dimension=\(EmbeddingBackend.embeddingGemma.dimension)")
     }
 }
 
@@ -7510,8 +7726,21 @@ final class HalAppDelegate: NSObject, UIApplicationDelegate {
         // need to download model files; doing it at launch (rather than
         // lazily on the first chat turn) keeps the first turn responsive
         // once the assets are in place.
-        EmbeddingProvider.shared.warmUp()
-        halLog("HALDEBUG-EMBEDDING: AppDelegate triggered EmbeddingProvider warm-up.")
+        //
+        // For Gemma backend we delay the warm-up by 2 seconds to avoid
+        // racing with MLXModelDownloader.init() and BackgroundDownloadCoordinator
+        // setup — both touch MLX/HuggingFace state at launch and we hit
+        // a libc++ string nullptr crash when they overlap (2026-05-17).
+        let backendAtBoot = EmbeddingBackend.current()
+        if backendAtBoot == .embeddingGemma {
+            halLog("HALDEBUG-EMBEDDING: AppDelegate scheduling delayed EmbeddingProvider warm-up (gemma, +2s).")
+            DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + 2.0) {
+                EmbeddingProvider.shared.warmUp()
+            }
+        } else {
+            EmbeddingProvider.shared.warmUp()
+            halLog("HALDEBUG-EMBEDDING: AppDelegate triggered EmbeddingProvider warm-up.")
+        }
 
         return true
     }
@@ -20217,13 +20446,51 @@ class HalTestConsole: ObservableObject {
             return "{\"status\":\"ok\",\"command\":\"CLEAR_TEST_DATA\",\"threadsDeleted\":\(threads),\"factsDeleted\":\(facts),\"messagesDeleted\":\(messages),\"newConversationId\":\"\(vm.conversationId)\"}"
 
         } else if trimmed == "EMBEDDING_STATUS" {
-            // Read-only diagnostic for the contextual embedding model.
-            // Returns whether NLContextualEmbedding has loaded yet, plus
-            // a sanity-check vector dim by embedding a short test string.
+            // Read-only diagnostic for the active embedding backend.
+            // Reports backend name and whether it's loaded yet. Only
+            // performs an actual embed (which can block for many seconds
+            // on Gemma first-call, or fail with no model loaded) when
+            // isLoaded is true — so this command returns promptly during
+            // first-launch download.
+            let backend = EmbeddingProvider.shared.activeBackend
             let isLoaded = EmbeddingProvider.shared.isLoaded
-            let testVec = EmbeddingProvider.shared.embed("test")
-            let dim = testVec?.count ?? 0
-            return "{\"status\":\"ok\",\"isLoaded\":\(isLoaded),\"sampleVectorDim\":\(dim)}"
+            var dim = 0
+            if isLoaded {
+                if let testVec = EmbeddingProvider.shared.embed("test") {
+                    dim = testVec.count
+                }
+            }
+            return "{\"status\":\"ok\",\"backend\":\"\(backend.rawValue)\",\"isLoaded\":\(isLoaded),\"sampleVectorDim\":\(dim),\"expectedDim\":\(backend.dimension)}"
+
+        } else if trimmed.hasPrefix("SET_EMBEDDING_BACKEND:") {
+            // SET_EMBEDDING_BACKEND:<nlcontextual|embeddinggemma>
+            //
+            // Switches the active embedding backend. Persists to
+            // UserDefaults("embeddingBackend"). Immediately wipes all
+            // stored embeddings so rows re-embed via the new backend on
+            // next write (or test corpus reinjection). The new model is
+            // lazily loaded on first call; for EmbeddingGemma this may
+            // require a ~210MB download on first launch.
+            //
+            // Added 2026-05-17 for Proposal A evaluation. Future versions
+            // may surface this in the settings UI.
+            let raw = String(trimmed.dropFirst("SET_EMBEDDING_BACKEND:".count))
+                .trimmingCharacters(in: .whitespaces)
+            guard let newBackend = EmbeddingBackend(rawValue: raw) else {
+                let valid = "nlcontextual, embeddinggemma"
+                return "{\"status\":\"error\",\"message\":\"unknown backend '\(raw)'; valid: \(valid)\"}"
+            }
+            UserDefaults.standard.set(newBackend.rawValue, forKey: EmbeddingBackend.defaultsKey)
+            // Drop the stored systemVersion so wipeStaleEmbeddingsIfNeeded
+            // triggers on next call. Then call it explicitly so the wipe
+            // happens before any further writes.
+            UserDefaults.standard.removeObject(forKey: "embeddingSystemVersion")
+            vm.memoryStore.wipeStaleEmbeddingsIfNeeded()
+            // Kick off async warm-up of the new backend so the (potentially
+            // multi-minute) HuggingFace download for EmbeddingGemma starts
+            // immediately rather than blocking the next embed() call.
+            EmbeddingProvider.shared.warmUp()
+            return "{\"status\":\"ok\",\"command\":\"SET_EMBEDDING_BACKEND\",\"backend\":\"\(newBackend.rawValue)\",\"expectedDim\":\(newBackend.dimension),\"note\":\"existing embeddings wiped; warm-up triggered; will re-embed on next write\"}"
 
         } else if trimmed == "INJECT_REALISTIC_TEST_CORPUS" {
             // Inject ~70 rows of realistic conversational content into

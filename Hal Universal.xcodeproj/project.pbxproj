@@ -23,6 +23,7 @@
 		858DA32C2EA956AC00A44B2F /* Hub in Frameworks */ = {isa = PBXBuildFile; productRef = 858DA32A2EA956AC00A44B2F /* Hub */; };
 		858DA32D2EA956AC00A44B2F /* Tokenizers in Frameworks */ = {isa = PBXBuildFile; productRef = 858DA32B2EA956AC00A44B2F /* Tokenizers */; };
 		858DA32E2EA956AC00A44B2F /* MLXHuggingFace in Frameworks */ = {isa = PBXBuildFile; productRef = 858DA32F2EA956AC00A44B2F /* MLXHuggingFace */; };
+		85ED7E1A2EA956AC00B40000 /* MLXEmbedders in Frameworks */ = {isa = PBXBuildFile; productRef = 85ED7E192EA956AC00B40000 /* MLXEmbedders */; };
 		85C74A1B2EC6EC4600C52EF5 /* README.md in Resources */ = {isa = PBXBuildFile; fileRef = 85C74A1A2EC6EC4500C52EF5 /* README.md */; };
 /* End PBXBuildFile section */
 
@@ -146,6 +147,7 @@
 				858DA32C2EA956AC00A44B2F /* Hub in Frameworks */,
 				858DA32D2EA956AC00A44B2F /* Tokenizers in Frameworks */,
 				858DA32E2EA956AC00A44B2F /* MLXHuggingFace in Frameworks */,
+				85ED7E1A2EA956AC00B40000 /* MLXEmbedders in Frameworks */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -265,6 +267,7 @@
 				858DA32A2EA956AC00A44B2F /* Hub */,
 				858DA32B2EA956AC00A44B2F /* Tokenizers */,
 				858DA32F2EA956AC00A44B2F /* MLXHuggingFace */,
+				85ED7E192EA956AC00B40000 /* MLXEmbedders */,
 			);
 			productName = "Hal Universal";
 			productReference = 85B3C57D2EA943560060BCEC /* Hal Universal.app */;
@@ -816,6 +819,11 @@
 			isa = XCSwiftPackageProductDependency;
 			package = 858DA3242EA956AC00A44B2F /* XCRemoteSwiftPackageReference "mlx-swift-lm" */;
 			productName = MLXHuggingFace;
+		};
+		85ED7E192EA956AC00B40000 /* MLXEmbedders */ = {
+			isa = XCSwiftPackageProductDependency;
+			package = 858DA3242EA956AC00A44B2F /* XCRemoteSwiftPackageReference "mlx-swift-lm" */;
+			productName = MLXEmbedders;
 		};
 /* End XCSwiftPackageProductDependency section */
 	};

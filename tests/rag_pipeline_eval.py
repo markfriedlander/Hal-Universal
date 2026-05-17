@@ -13,7 +13,9 @@ import json
 import urllib.request
 from pathlib import Path
 
-CONFIG_PATH = Path(__file__).parent / ".hal_api_config.json"
+import os
+_cfg_name = os.environ.get("HAL_API_CONFIG", ".hal_api_config.json")
+CONFIG_PATH = Path(os.environ.get("HAL_API_CONFIG_PATH") or (Path(__file__).parent / _cfg_name))
 with CONFIG_PATH.open() as f:
     cfg = json.load(f)
 HOST = cfg["host"]
