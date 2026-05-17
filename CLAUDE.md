@@ -131,6 +131,13 @@ Full spec: `Docs/Hal_Persistent_Memory_Architecture.md`
 5. **Ask rather than assume** — if something is unclear, ask Mark
 6. **Evidence over intuition** — use console logs and real device testing, not assumptions
 7. **Warnings are errors** — Swift compiler warnings get fixed in real time, in the same commit that introduced them, treated no differently than errors. We don't ship sloppy code. If a change generates a new warning, the change isn't done until the warning is resolved. The only exception is third-party code we don't own (e.g. mlx-swift, system tooling) — for those, leave them, but note them in the commit message if relevant.
+8. **Docs stay current as work happens** — four living docs, four distinct contracts. Update them as work lands, not at the end of a session:
+   - **`HISTORY.md`** (past) — append-only chronicle. Each session gets a dated entry; the entry is written narratively (what we set out to do, what landed, what we tried that failed, what we decided and why). **Earlier entries are never edited or removed**, even if later decisions reverse them — the reversal becomes its own entry. This is the source of truth for "how did we get here." Commit hashes are referenced but the narrative is the point.
+   - **`HANDOFF_BRIEF.md`** (present) — current snapshot. Always reflects "where Hal is right now." Gets rewritten as state changes. No history (that lives in HISTORY.md); no forward planning (that lives in NEXT.md).
+   - **`NEXT.md`** (future) — what we're planning to do in the next few steps. Forward-looking, narrow scope. As items complete, they move out of NEXT.md (the completion is captured in HISTORY.md's session entry). New agreed items get added.
+   - **`MEMORY.md`** (auto-memory at `~/.claude/projects/.../memory/MEMORY.md`) — short quick-orient for post-compaction CC. Points to HANDOFF_BRIEF, HISTORY, and NEXT for everything else.
+
+   After every meaningful change — a bug fix, an architectural decision, a finding worth carrying forward — the relevant docs are updated in the same exchange. If a change updates code AND introduces a finding worth remembering, the commit includes the code change AND the doc updates (HISTORY entry, HANDOFF state refresh, NEXT item completed/added) together. The same principle applies to `Docs/` design memos when an architectural decision changes them.
 
 ### When You Start a Session
 1. Read this file

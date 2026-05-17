@@ -1,182 +1,171 @@
 # Hal Universal — Handoff Brief
-**Updated:** May 14, 2026 (end of May-13/14 long session)
-**Branch:** `mlx-experiment` @ `acf030b` — working tree clean, all pushed
+**Updated:** May 16, 2026 (night session)
+**Branch:** `main` @ `b26ae8c` — uncommitted changes pending (see "Working tree" below)
 
-> **For post-compaction or next-session CC:** read `Docs/CC_Recovery_2026-05-14.md` first.
-> It's a self-contained orientation: what was built today, what's verified, what's
-> remaining pre-ship, and known gotchas. The doc points to everything else.
+> **For post-compaction or next-session CC:** read this brief for current state, then
+> `NEXT.md` for what's planned, then `HISTORY.md` for how we got here, then `CLAUDE.md`
+> for standing rules. Detail on any specific architectural decision lives in HISTORY's
+> dated session entry for that decision.
 
 ---
 
 ## TL;DR — where Hal is right now
 
-Sixteen commits today turned the May 12 release-prep work into a substantially
-more capable app. The single highest-impact discovery was that the RAG-failure
-pattern we'd been worried about wasn't real — it was a test-runner bug. Memory
-works correctly across every model.
+The first App Store v2.0 archive was uploaded earlier today (May 16 day session). Two ship-blockers
+surfaced in the night session that prevent submitting that build:
 
-**What v1.x ships with today (without further work):**
+1. **SPM resolver downgrade bug** — fixed in `b26ae8c`. swift-transformers is now pinned to
+   exactVersion 1.3.2 in `project.pbxproj` so Xcode can't downgrade it to 1.0.0 (which loses
+   the `HuggingFace` transitive module) when destinations switch.
+2. **Salon "enabled with 0 seats" silent-no-op bug** — proper fix landed in `b26ae8c`. The bad
+   state is now unreachable via API and UI: enabling Salon with no seats auto-populates Seat 1
+   with Apple Intelligence; clearing the last seat auto-disables Salon; NUCLEAR_RESET clears
+   Salon to defaults.
 
-- AFM + 4 curated MLX models (Gemma 4 E2B, Qwen 3.5 2B, Llama 3.2 3B, Dolphin 3.0)
-- Per-model settings profiles (temperature, memory depth, RAG budget,
-  repetition penalty all tuned empirically per model from §1 benchmark data;
-  user edits persist per model via override JSON)
-- Two-part system prompt (per-model Layer 1 framing + universal Layer 2)
-- Full 4-seat Salon Mode with Host architecture (gate cache only fires when
-  Host assigned; pure independent mode is default)
-- Compound-query RAG decomposition (verified across AFM + Gemma)
-- Memory verified working across cross-thread, cross-app-restart, and
-  paraphrased queries on all 5 models
-- Per-message footer now carries Seat + Host attribution
-- Schema migration v2 to widen UNIQUE constraint for salon storage
-- Mid-word truncation safeguard (cap 4096 = runaway-only, not normal-ceiling)
-- AFM Layer 1 prompt that breaks the Maxim #1 deflection: AFM now opens
-  *"I don't know"* on consciousness questions
+A third issue surfaced and is **mid-investigation** — Mark's directive landed late night and
+some code is uncommitted:
 
-**What's pre-ship and remaining** (in Mark's stated priority order):
-1. Watch app verification + complication (Xcode + real hardware session)
-2. Model Library 3-segment UI redesign
-3. Per-model structured-output prompts (Strategic §5)
-4. Full background download test (Strategic §7)
-5. Model card UI updates (folds into Library redesign)
-6. Maxim 1 @ temp 0.7 re-test (small follow-up experiment)
-7. In-stream repetition detection (v1.x polish)
+3. **Self-knowledge compression behavior on AFM is wrong.** Findings reported, fix not yet
+   landed. See "Active directive" below.
 
 ---
 
-## Commits this session (May 13 evening / May 14 small hours)
+## Working tree — uncommitted as of this brief
 
 ```
-acf030b  Salon message footer: seat position + Host role
-ed87be5  [Strategic §6/§13] 3-seat and 4-seat salon verified, gate flipped open
-e7b551e  Compound query RAG decomposition: detect + split + multi-search + merge
-99f75c2  RAG investigation extended: cross-model + cross-restart verification
-932ef4c  RAG investigation: root cause was test protocol, not MLX model behavior
-cccbb03  [Strategic §4] Two-part system prompt: Layer 1 per-model + Layer 2 user
-e6ab834  [Strategic §11] AFM stronger system-prompt experiment: partial success
-95a58a4  [Strategic §3/§12] Salon Host architecture: rename Summarizer→Host + gate cache
-34b6189  [Strategic §2] Maxim compliance sweep: 5 maxims × 5 models + consolidated findings
-3831751  §9 done properly: schema migration widens UNIQUE constraint
-9275b88  §9 Fix: storeTurn position scheme incorporates seatNumber (later superseded)
-2f2ac5c  Settings Profiles Layer 3: modified-from-default dot + per-model reset
-907fa26  Settings Profiles Layer 2: ModelSettingsStore + snapshot/restore on switch
-6d0465d  §1 benchmark + Settings Profiles Layer 1: ModelSettings + per-model defaults
-6c872ec  Global mid-word truncation safeguard + raise MLX maxTokens 512→1536 (later → 4096)
-8c25d91  Per-model penalty + Phi-4 demoted + Ministral investigated; add Maxim suite + Settings Profiles proposal
+modified:   Hal Universal.xcodeproj/project.pbxproj          # build bump 4→5
+modified:   Hal Universal/Hal.swift                          # chunked compression + halving (TO REVERT)
+modified:   Hal Universal/Hal_Source.txt                     # synced to Hal.swift
 ```
 
-Full per-commit detail in each commit message and in `Docs/CC_Recovery_2026-05-14.md`.
+- **Build bump 4→5** in pbxproj is intentional and stays. The next archive will be build 5.
+- **Chunked compression + empirical halving in Hal.swift** was built tonight and is **to be
+  reverted** per Mark's directive (see "Active directive"). It's the wrong solution to the wrong
+  problem. The decision was that self-knowledge compression-at-read-time should not exist at all
+  for the self-knowledge segment — AFM skips injection entirely, MLX injects raw.
 
 ---
 
-## Current code architecture state
+## Active directive (Mark, 2026-05-16 night)
 
-- `ModelConfiguration` has two new fields: `defaultSettings: ModelSettings?`
-  (per-model empirical defaults from §1 benchmark) and `layerOnePrompt: String?`
-  (per-model behavioral framing).
-- `ModelSettings` value type covers temperature, effectiveMemoryDepth,
-  similarityThreshold, recencyWeight, recencyHalfLifeDays,
-  maxRagSnippetsCharacters, ragDedupThreshold, repetitionPenalty,
-  repetitionContextSize, layerOnePromptEnabled. All Optional for forward-compat.
-- `ModelSettingsStore` singleton persists per-model overrides via
-  `@AppStorage("modelSettingsOverridesV1")`. Snapshot-on-switch + apply-on-switch
-  hooks in both ChatViewModel.switchToModel and the LocalAPIServer path.
-- Schema v2: `unified_content` table now has
-  `UNIQUE(source_type, source_id, position, seat_number, deliberation_round)`.
-  Migration runs once via PRAGMA user_version; idempotent.
-- RAG gate has a personal-recall pattern bypass (force-YES) plus a compound-query
-  decomposition (split → multi-search → merge → re-cap).
-- Salon Host architecture: `summarizerModel` AppStorage key preserved for
-  backward-compat; UI label says "Host" and footer text explains the
-  pure-vs-hosted tradeoff. Cache only fires when Host assigned.
-- Mid-word truncation safeguard at file scope: `trimToWordBoundary` called
-  from both AFM and MLX chat stream final-yield. maxTokens = 4096 (runaway-only).
-- Per-message footer carries Seat N of M + Host role attribution where applicable.
-- 3+4 seat salon gate (`SalonModeView.exposeSeatsThreeAndFour`) is open.
+Mark has issued a directive on self-knowledge behavior: AFM gets no injection,
+MLX injects raw without compression, write-time synthesis keeps the corpus
+lean. Implementation has not started.
 
-Single source of truth is still `Hal.swift` plus `Hal Universal Watch/Hal_Watch.swift`.
-`Hal_Source.txt` is in sync as of the last commit.
+- **Reasoning + full context:** `HISTORY.md` (2026-05-16 entry, "Self-knowledge:
+  a deeper rethink").
+- **Concrete next steps:** `NEXT.md` ("Active directive" section).
+
+Implementation is on hold pending Strategic Claude's path-forward plan
+based on tonight's audit.
 
 ---
 
-## Pre-ship sequence (Mark's directive)
+## Commits since the May 14 brief
 
-In order:
+Between the May 14 brief and tonight, there were ~15 commits on May 15 (per-model Layer 1
+prompts, structured-output prompts, Maxim re-tests at 0.7, performance benchmark follow-ups,
+salon self-knowledge architecture work) and several today (May 16) for the App Store push:
 
-1. **Watch app verification + complication.** Watch UI is complete in
-   `Hal Universal Watch/Hal_Watch.swift`. The iPhone-side `HalWatchBridge`
-   (Hal.swift L15736) is wired through `iOSChatView.onAppear` at L5423.
-   Needs: real-hardware smoke test + new WidgetKit extension target via Xcode.
-   See "Watch scope" in `Docs/CC_Recovery_2026-05-14.md` for the corrected
-   honest read (it's ~1.5–2 hours, not the rabbit hole I'd feared earlier).
-2. **Model Library 3-segment UI redesign.** Three dynamic segments:
-   Downloaded (anything on device floats up) / Curated (tested, not yet
-   downloaded) / Library (HF, untested). Per-model expanded detail view
-   showing voice description, performance characteristics, Maxim
-   compliance, context window size, download size. Data is all in place
-   from §1/§2/§11; the work is UI surfacing.
-3. **Per-model structured-output prompts (Strategic §5).** @Generable for
-   AFM, tested prompts for curated MLX, generic fallback for experimental.
-4. **Full background download test (Strategic §7).** Delete then re-download
-   3.58 GB Gemma, lock phone face down 10+ min, verify completion. The
-   BGDL coordinator did fire end-to-end during May-13 Ministral testing
-   but not at full size under lock.
-5. **Model card UI updates (Strategic §8).** Folds into Library redesign.
-6. **Maxim 1 @ temp 0.7 re-test.** Quick follow-up. The §1 empirical
-   temperature drops may or may not have hurt Maxim 1 alignment — verify.
-   Now mostly academic post-RAG-investigation but still queued.
-7. **In-stream repetition detection.** v1.x polish. Catches loops earlier
-   than the 4096 max-tokens cap so we never burn 120s on a pathological
-   loop response.
+```
+b26ae8c  Ship blockers: Salon empty-seats safety net + swift-transformers exact pin
+eeb7dbc  Watch + Complication: stop embedding in iOS app for v2.0
+871564c  Disk-space refusal: surface message via halLog + MODEL_STATUS API
+d9ea6a0  Pre-flight disk-space check before model downloads
+0e04ac1  Release prep: v2.0/4 bump, README rewrite, privacy/support HTML, ASC paste-ready
+55e80b3  Warnings cleanup: 60 → 0 in Hal.swift; CLAUDE.md adds warnings-as-errors SOP
+[... earlier May 15/14 commits captured in their session reports under Docs/CC_Recovery_*.md]
+```
 
-Post-ship work flagged for planning conversations:
-- iCloud backup + cross-device sync
-- v2.0 codebase refactor (multi-file split, dead-code removal)
-- Strategic §1 follow-ups: AFM tok/s instrumentation, 5000-token-prefill re-measurement
+Full per-commit detail in `git log`.
 
 ---
 
-## Verified on-device (iPhone 16 Plus) at session end
+## Branch state
 
-- All 4 curated MLX models + AFM load and chat cleanly
-- Per-model settings switch correctly on model swap
-  (Dolphin temp=0.75 / Qwen temp=0.65 / etc.)
-- Memory recall works across all 5 models on single-topic queries
-  ("What's my cat's name?" → all five return "Atlas")
-- Memory survives app force-terminate + relaunch (totalTurns advances correctly)
-- Compound query *"What is my cat's name and favorite color?"* returns both
-  facts on Gemma and AFM
-- 3-seat salon (AFM + Gemma + Llama, AFM as Host): 49.7s, all seats run,
-  no OOM, no row loss
-- 4-seat salon (added Dolphin): 94.5s, same — smart MLX swap keeps peak
-  memory at one MLX model
-- AFM Maxim 1 with Layer 1 enabled opens with "I don't know" instead of
-  the trained deflection
-
-Working tree clean. All commits pushed to `origin/mlx-experiment`.
+- `main` is the philosophical Hal (full MLX + AFM). HEAD = `b26ae8c`.
+- `hal-lmc-stripped` preserves the v1.x LMC variant — kept on origin for reference, not actively
+  developed. The May 16 day session merged the long-running `mlx-experiment` branch into `main`
+  via force-push with lease (Option B).
+- `mlx-experiment` still exists; superseded by `main`.
 
 ---
 
-## Open questions / known issues / follow-ups
+## Salon state machine — current invariant
 
-- **Salon footer total-seat-count** uses *current* `salonConfig.activeSeats.count`,
-  not the count at message generation time. Acceptable trade-off for v1.x;
-  flagged for future schema work if it ever surfaces in real use.
-- **AFM/Qwen subject confusion**: both sometimes say *"MY favorite color is teal"*
-  when retrieving the user's planted fact. Minor wording quirk, not a recall
-  failure. Layer 1 framing tweak could address this; not blocking.
-- **Phi-4 instability** under any repetition penalty. Demoted from curated;
-  static let preserved for HF library discovery. Reversible if broader
-  testing later shows the loop is narrow.
-- **Ministral 3-3B**: multimodal `Mistral3` loader hangs silently on text-only
-  load through mlx-swift-lm. Not curated; investigation deferred.
-- **Maxim 3 in-session test protocol** in `tests/maxim_suite.py` — fixed to
-  use `NEW_THREAD` instead of `NUCLEAR_RESET` between plant and recall.
-  The `reset()` helper is still available for true full-wipe scenarios.
+Per the night-session fix:
+
+- `salonConfig.isEnabled == true` ⟹ `salonConfig.activeSeats.count >= 1` (invariant)
+- All mutations route through `ChatViewModel.setSalonEnabled(_:)` or `setSalonSeat(position:modelID:)`
+- Enabling Salon with 0 seats: auto-populates Seat 1 with `apple-foundation-models` (AFM is
+  always available, no download required)
+- Clearing the last seat while Salon is on: auto-disables Salon
+- `NUCLEAR_RESET` clears `salonConfig` back to defaults (`isEnabled = false`, all seats nil)
+- Defense in depth: the `/chat` routing path also guards (`isEnabled && !activeSeats.isEmpty`),
+  with a HALDEBUG log if it ever fires (it shouldn't, but it's a safety net)
+
+API surface unchanged (`SALON_GET_STATE`, `SALON_SET_ENABLED:true|false`, `SALON_SET_SEAT:N:<id-or-empty>`,
+`SALON_SET_MODE:<mode>`, `SALON_SET_SUMMARIZER:<id-or-empty>`) but `SALON_SET_ENABLED` now returns
+`autoPopulatedSeat1WithID` and `SALON_SET_SEAT` returns `autoDisabledSalon`.
 
 ---
 
-## Build + Deploy (unchanged)
+## Compression infrastructure (current uncommitted state — slated for revert/refactor)
+
+Tonight's work added to `TextSummarizer`:
+- `SummarizationResult` struct with `text` + `didTruncate` flag
+- `summarizeWithVerificationDetailed(...)` — chunked summarization with sentence-bounded chunks
+  and empirical halving on overflow
+- `safeMaxInputTokensPerCall(contextWindow:outputReserve:)` — conservative size estimate
+- `chunkTextBySentences(...)` and `hardSplitByCharacters(...)` — chunking primitives
+- `singleCallSummarize(...)` / `singleCallSummarizeOnce(...)` — leaf calls with overflow detection
+- `isContextOverflowError(_:)` — error string match for AFM's overflow signal
+- `SegmentCompressor.compress` updated to honor `didTruncate` in the footer label
+
+This entire chunked-compression apparatus is the wrong solution per Mark's directive. The right
+solution is to not compress self-knowledge at all (AFM skips, MLX injects raw). The
+`SummarizationResult.didTruncate` mechanism may still be useful for `autoSummary` and
+`shortTermHistory` segments which legitimately need compression — that's a separate decision.
+
+---
+
+## Pre-archive checklist
+
+Forward-looking content moved to `NEXT.md`.
+
+---
+
+## Verified on-device (iPhone 16 Plus) at this brief
+
+- swift-transformers SPM pin resolves cleanly; 15 packages at expected versions
+- `BUILD SUCCEEDED` from CLI for both `generic/platform=iOS` and the iPhone UDID, zero warnings
+- Salon state-machine: empty-seats enable → auto-populates Seat 1; clear-last-seat → auto-disables;
+  intermediate-seat clear preserves enabled state (verified via API)
+- NUCLEAR_RESET clears Salon back to defaults (verified via API)
+- Chunked compression IS firing on AFM stress test (but per directive, this is the wrong path
+  and is being reverted)
+
+---
+
+## Known gotchas
+
+- **AFM's effective input window is smaller than its nominal 4096.** Empirically calls with
+  input + boilerplate + output totaling ~2.5K tokens still hit "Exceeded model context window
+  size." This is why the chunked-compression approach is unviable for self-knowledge — even
+  small chunks overflow. The directive (no self-knowledge on AFM) sidesteps this entirely.
+- **Lorem Ipsum stress data tokenizes worse than English.** ~1.4× our chars/4 heuristic for
+  Latin-heavy text. Real user content is closer to estimate.
+- **`MEMORY_INJECT_TEST` synthetic entries bypass write-time synthesis** because they use unique
+  keys (`synthetic_1`...`synthetic_N`). Useful for stress-testing the compressor; NOT useful for
+  testing the write-time synthesis system (which needs SIMILAR reflections, not unique keyed
+  traits).
+- **Structured traits have no semantic synthesis** — only key-based upsert. AI is prompted to
+  choose consistent keys but enforcement is at the AI judgment layer, not the DB. Whether this
+  needs DB-level dedup is an open question.
+
+---
+
+## Build + Deploy (iPhone 16 Plus)
 
 ```bash
 xcodebuild build \
@@ -194,24 +183,42 @@ xcrun devicectl device process launch --device D24FB384-9C55-5D33-9B0D-DAEBFA652
 - **iPhone 16 Plus device ID:** `D24FB384-9C55-5D33-9B0D-DAEBFA6528D6`
 - **Bundle ID:** `com.MarkFriedlander.Hal-Universal`
 - **API port:** 8766 (Posey holds 8765)
-- **API token:** per-install via Keychain — currently
-  `e9ee9ec5b315467fa655bd4296873f43` in `tests/.hal_api_config.json`
-  (regenerated only on uninstall/reinstall)
+- **API token:** per-install via Keychain — currently `e9ee9ec5b315467fa655bd4296873f43` in
+  `tests/.hal_api_config.json` (regenerated only on uninstall/reinstall)
+- **API host (current):** `marks-bigger-ass-fon-16.local`
 - **WiFi IP** (drifts): currently `192.168.12.206`
+- **iPhone 17 Pro simulator (Mac dev):** UDID `7D4E1F1A-E7EC-4C42-BDF1-BF3BC72F4352`
+
+### CLI build avoids SPM destination-switch hazard
+
+The May 16 SPM bug only fires when Xcode UI switches destinations. CLI `xcodebuild build` does
+not re-resolve packages and is safe. The exact-pin on swift-transformers should prevent the bug
+from ever recurring, but the principle holds: if Mark needs to switch destinations in the IDE,
+he can; the pin protects him.
 
 ---
 
-## Test runner
+## Test runner — `tests/hal_test.py`
 
-`python3 tests/hal_test.py [command]` — full command list via
-`python3 tests/hal_test.py` with no args.
+```bash
+python3 tests/hal_test.py state
+python3 tests/hal_test.py turn "Hi"
+python3 tests/hal_test.py switch_model "mlx-community/gemma-4-e2b-it-4bit"
+python3 tests/hal_test.py ui_state
+python3 tests/hal_test.py rendered_messages
+python3 tests/hal_test.py logs [N]
+python3 tests/hal_test.py reset
+python3 tests/hal_test.py cmd "SALON_GET_STATE"
+python3 tests/hal_test.py cmd "MEMORY_INJECT_TEST:<count>:<tokens-each>:<category>"
+python3 tests/hal_test.py cmd "RESET_SELF_KNOWLEDGE"
+```
 
 Also in `tests/`:
 - `tests/maxim_suite.py` — runs 5 maxims against the active model. **Important:**
-  the Maxim-3 protocol uses `NEW_THREAD` (not `NUCLEAR_RESET`) between plant
-  and recall. Don't undo this without re-reading
-  `Docs/RAG_Investigation_Findings_2026-05-13.md`.
+  the Maxim-3 protocol uses `NEW_THREAD` (not `NUCLEAR_RESET`) between plant and recall.
 - `tests/perf_benchmark.py` — short + long context benchmark across 6 models.
+
+Config in `tests/.hal_api_config.json`.
 
 ---
 
@@ -220,8 +227,10 @@ Also in `tests/`:
 1. `cp "Hal Universal/Hal.swift" "Hal Universal/Hal_Source.txt"` after every Hal.swift change.
 2. New enum case? Sweep all switches.
 3. New AppStorage key? `defaults write com.MarkFriedlander.Hal10000 [key] "[value]"`.
-4. App build number bump happens at App Store submission, not before.
+4. App build number bump happens at App Store submission (currently staged at 5, uncommitted).
 5. Never use `NUCLEAR_RESET` between plant and recall in a memory test. It wipes the DB.
+6. **Update HANDOFF_BRIEF.md and MEMORY.md as work lands, not at session end** (CLAUDE.md
+   Golden Rule #8).
 
 ---
 
@@ -229,14 +238,29 @@ Also in `tests/`:
 
 - No third-party libraries without explicit discussion.
 - One block at a time — surgical changes, build clean after each.
-- Discussion before code when introducing new structure; autonomous mode OK
-  when extending an agreed plan.
-- Old code stays — broken or not — until we're confident the new path covers
-  all callers.
+- Discussion before code when introducing new structure; autonomous mode OK when extending an
+  agreed plan.
+- Old code stays — broken or not — until we're confident the new path covers all callers.
 - iPhone 16 Plus is primary target.
-- 120-second MLX test timeout — never let a generation test run more than
-  2 minutes without aborting.
-- API > asking the human — if you can't get an answer from the API, expand
-  the API.
-- Documentation costs less than re-discovering a finding. Write the doc
-  when the discovery is fresh.
+- 120-second MLX test timeout — never let a generation test run more than 2 minutes without
+  aborting.
+- API > asking the human — if you can't get an answer from the API, expand the API.
+- Documentation costs less than re-discovering a finding. Write the doc when the discovery is
+  fresh.
+- Warnings are errors (CLAUDE.md Golden Rule #7).
+- Docs stay current as work lands (CLAUDE.md Golden Rule #8).
+
+---
+
+## Reference docs
+
+| Doc | What it covers |
+|---|---|
+| `CLAUDE.md` | Operational reference, Golden Rules, project orientation |
+| `HAL_CC_BRIEFING.md` | Narrative onboarding (read once deeply) |
+| `Docs/Hal_Ethical_Maxims.md` | The five values governing all decisions |
+| `Docs/Hal_Persistent_Memory_Architecture.md` | Memory system design |
+| `Docs/Hal_2_0_Master_Development_Plan.md` | Full feature specs |
+| `Docs/Salon_Self_Knowledge_Architecture_2026-05-15.md` | Salon + self-knowledge design |
+| `Docs/Context_Budget_Implementation_Plan_2026-05-16.md` | Context budgeting (note: chunked compression is being reverted per the night directive — see "Active directive" above) |
+| `Docs/ASC_v2.0_Paste_Ready.md` | App Store Connect metadata paste-ready |

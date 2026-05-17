@@ -4906,13 +4906,21 @@ actor SegmentCompressor {
         halLog("HALDEBUG-COMPRESS: \(segment.kind.displayName) starting (\(sourceTokens) → \(segment.budgetTokens) tokens, model: \(model.displayName))")
 
         let compressionStart = Date()
-        let llmResult = await TextSummarizer.summarizeWithVerification(
+        // Use the DETAILED API so we can distinguish "LLM honestly summarized"
+        // from "summarizer had to fall back to prefix-truncation internally".
+        // The latter case used to be silently re-labeled as compression here;
+        // now we propagate the truncation flag through to the UI footer so
+        // the user sees scissors (red) instead of compression (gray) when
+        // their content was actually just lopped off.
+        let summarizationResult = await TextSummarizer.summarizeWithVerificationDetailed(
             text: segment.rawContent,
             targetTokens: segment.budgetTokens,
             llmService: llmService,
             verificationThreshold: 0.72,
             useRecencyWeighting: (segment.kind == .shortTermHistory)
         )
+        let llmResult = summarizationResult.text
+        let summarizerTruncated = summarizationResult.didTruncate
         let compressionMs = Int(Date().timeIntervalSince(compressionStart) * 1000)
 
         // 3. Validate the compression result.
@@ -4924,7 +4932,8 @@ actor SegmentCompressor {
         let didTruncate: Bool
 
         if llmResult.isEmpty {
-            // LLM compression returned empty — fall back to raw truncation.
+            // Summarizer returned empty even after all internal fallbacks —
+            // last-resort raw prefix truncation.
             let maxChars = Int(Double(segment.budgetTokens) * 4.0)
             finalContent = String(segment.rawContent.prefix(maxChars))
             finalTokens = TokenEstimator.estimateTokens(from: finalContent)
@@ -4932,16 +4941,29 @@ actor SegmentCompressor {
             halLog("HALDEBUG-COMPRESS: \(segment.kind.displayName) compression returned empty after \(compressionMs)ms — fell back to truncation (\(finalTokens) tokens)")
 
         } else if resultTokens > overshootLimit {
-            // LLM compression overshot target by more than tolerance — fall back to raw truncation.
-            // Trusting an overshot output would defeat the purpose of having a budget.
+            // Result overshot target by more than tolerance — fall back to
+            // raw truncation. Trusting an overshot output would defeat the
+            // purpose of having a budget.
             let maxChars = Int(Double(segment.budgetTokens) * 4.0)
             finalContent = String(segment.rawContent.prefix(maxChars))
             finalTokens = TokenEstimator.estimateTokens(from: finalContent)
             didTruncate = true
             halLog("HALDEBUG-COMPRESS: \(segment.kind.displayName) compression overshot (\(resultTokens) > \(overshootLimit) tolerance) after \(compressionMs)ms — fell back to truncation (\(finalTokens) tokens)")
 
+        } else if summarizerTruncated {
+            // Summarizer DID produce non-empty output that fits the budget,
+            // but it internally had to fall back to prefix-truncation rather
+            // than summarizing intelligently (e.g., chunked path collapsed
+            // entirely or LLM rejected every chunk). Surface this honestly
+            // in the UI footer — gray "compressed" icon would be a lie.
+            finalContent = llmResult
+            finalTokens = resultTokens
+            didTruncate = true
+            halLog("HALDEBUG-COMPRESS: \(segment.kind.displayName) summarizer reported truncation (\(sourceTokens) → \(finalTokens) tokens, budget: \(segment.budgetTokens)) in \(compressionMs)ms — labeling honestly")
+
         } else {
-            // Compression succeeded within tolerance.
+            // Genuine intelligent compression — within tolerance, summarizer
+            // succeeded without falling back internally.
             finalContent = llmResult
             finalTokens = resultTokens
             didTruncate = false
@@ -5916,6 +5938,11 @@ class LLMService: ObservableObject {
     private var currentModel: ModelConfiguration
     /// Exposes the model ID currently loaded in LLMService (for diagnostic use by HalTestConsole).
     var activeModelID: String { currentModel.id }
+    /// Context window (in tokens) for the model currently loaded. Used by
+    /// TextSummarizer to decide whether to single-call or chunk-and-summarize
+    /// when compressing a segment whose raw size approaches or exceeds the
+    /// active model's limit (notably AFM's 4K window).
+    var activeContextWindow: Int { currentModel.contextWindow }
 
     // MARK: - AFM-only structured generation
     //
@@ -6275,20 +6302,83 @@ class LLMService: ObservableObject {
 // Uses Apple NaturalLanguage embeddings with TF-IDF fallback for robust verification
 // NOTE: Foundation and NaturalLanguage are imported in Block 1
 
+/// Result of a summarization attempt. The `didTruncate` flag tells callers
+/// (notably `SegmentCompressor`) whether the summarizer was forced to fall
+/// back to raw prefix-truncation because intelligent summarization failed
+/// — letting them surface honest "truncated" vs "compressed" status in
+/// the UI footer instead of silently labeling a truncation as a smart
+/// compression.
+struct SummarizationResult: Sendable {
+    let text: String
+    let didTruncate: Bool
+
+    static let empty: SummarizationResult = .init(text: "", didTruncate: false)
+}
+
 /// Main summarization utility for Hal
 /// Use this anywhere you need to compress text: RAG snippets, conversation history, documents, etc.
 struct TextSummarizer {
-    
+
     // MARK: - Public API
-    
-    /// Summarize text with LLM and verify against source to prevent hallucinations
-    /// - Parameters:
-    ///   - text: Source text to summarize
-    ///   - targetTokens: Desired token count for summary
-    ///   - llmService: LLMService instance for generating summary
-    ///   - verificationThreshold: Minimum similarity score (0.0-1.0) for verification (default: 0.72)
-    ///   - useRecencyWeighting: If true, uses Salon Mode prompt with recency weighting (default: false)
-    /// - Returns: Verified summary text
+
+    /// Summarize text with LLM and verify against source to prevent hallucinations.
+    /// Returns a `SummarizationResult` that flags whether the summarizer had to
+    /// fall back to raw truncation — callers that label compression status in
+    /// the UI use that flag to differentiate honest summarization from forced
+    /// truncation. For callers that just want a string, the convenience
+    /// overload `summarizeWithVerification(...) async -> String` is provided
+    /// below.
+    ///
+    /// Self-knowledge no longer flows through this path (per Mark's 2026-05-16
+    /// directive — AFM gets no self-knowledge injection, MLX injects raw).
+    /// What remains uses this summarizer is `autoSummary` (conversation
+    /// summarization at turn-rollover time) and `shortTermHistory` (rarely,
+    /// when history exceeds budget). Both of those segments are designed to
+    /// fit in a single LLM call for the active model; chunking is not needed.
+    /// If the underlying LLM call rejects the input as too large, we surface
+    /// that honestly via `didTruncate=true` so the UI footer can render the
+    /// scissors icon (red) rather than the compression icon (gray).
+    static func summarizeWithVerificationDetailed(
+        text: String,
+        targetTokens: Int,
+        llmService: LLMService,
+        verificationThreshold: Double = 0.72,
+        useRecencyWeighting: Bool = false
+    ) async -> SummarizationResult {
+        print("HALDEBUG-SUMMARIZER: Starting summarization - source: \(text.count) chars, target: \(targetTokens) tokens, recency weighting: \(useRecencyWeighting), active model context window: \(llmService.activeContextWindow)")
+
+        // Stage 1: LLM summarize (chunked when needed)
+        let stage1 = await llmSummarize(
+            text: text,
+            targetTokens: targetTokens,
+            llmService: llmService,
+            useRecencyWeighting: useRecencyWeighting
+        )
+
+        guard !stage1.text.isEmpty else {
+            // Every chunk failed (or single-call path returned empty). Fall
+            // back to raw prefix-truncation and SURFACE that truncation
+            // happened so the UI can render the scissors icon honestly.
+            print("HALDEBUG-SUMMARIZER: LLM returned empty summary after \(stage1.didTruncate ? "chunked" : "single-call") attempt — falling back to truncation")
+            let truncated = String(text.prefix(TokenEstimator.estimateChars(from: targetTokens)))
+            return SummarizationResult(text: truncated, didTruncate: true)
+        }
+
+        print("HALDEBUG-SUMMARIZER: LLM summary generated: \(stage1.text.count) chars (didTruncate=\(stage1.didTruncate))")
+
+        // Stage 2: Verify against source (prevent hallucinations)
+        let sourceSentences = sentenceSplit(text)
+        let verified = await verifyNarrative(stage1.text, against: sourceSentences, threshold: verificationThreshold)
+
+        print("HALDEBUG-SUMMARIZER: Verification complete: \(verified.count) chars")
+
+        return SummarizationResult(text: verified, didTruncate: stage1.didTruncate)
+    }
+
+    /// String-only convenience overload. Use this for callers that don't need
+    /// the truncation flag (e.g., document-import summaries, auto-summary).
+    /// Internally calls `summarizeWithVerificationDetailed` and returns the
+    /// `.text` field.
     static func summarizeWithVerification(
         text: String,
         targetTokens: Int,
@@ -6296,58 +6386,67 @@ struct TextSummarizer {
         verificationThreshold: Double = 0.72,
         useRecencyWeighting: Bool = false
     ) async -> String {
-        print("HALDEBUG-SUMMARIZER: Starting summarization - source: \(text.count) chars, target: \(targetTokens) tokens, recency weighting: \(useRecencyWeighting)")
-        
-        // Stage 1: LLM summarize
-        let summary = await llmSummarize(text: text, targetTokens: targetTokens, llmService: llmService, useRecencyWeighting: useRecencyWeighting)
-        
-        guard !summary.isEmpty else {
-            print("HALDEBUG-SUMMARIZER: LLM returned empty summary, falling back to truncation")
-            return String(text.prefix(TokenEstimator.estimateChars(from: targetTokens)))
-        }
-        
-        print("HALDEBUG-SUMMARIZER: LLM summary generated: \(summary.count) chars")
-        
-        // Stage 2: Verify against source (prevent hallucinations)
-        let sourceSentences = sentenceSplit(text)
-        let verified = await verifyNarrative(summary, against: sourceSentences, threshold: verificationThreshold)
-        
-        print("HALDEBUG-SUMMARIZER: Verification complete: \(verified.count) chars")
-        
-        return verified
+        let result = await summarizeWithVerificationDetailed(
+            text: text,
+            targetTokens: targetTokens,
+            llmService: llmService,
+            verificationThreshold: verificationThreshold,
+            useRecencyWeighting: useRecencyWeighting
+        )
+        return result.text
     }
-    
-    // MARK: - Stage 1: LLM Summarization
-    
-    /// Use LLM to compress text while preserving factual claims
-    private static func llmSummarize(text: String, targetTokens: Int, llmService: LLMService, useRecencyWeighting: Bool) async -> String {
+
+    // MARK: - Stage 1: LLM Summarization (single-call)
+
+    /// Single-call LLM summarization. Builds the appropriate prompt
+    /// (standard or recency-weighted for Salon), invokes the active model
+    /// once, returns the result wrapped in a `SummarizationResult`.
+    ///
+    /// On any LLM error — including context-window overflow — returns an
+    /// empty result with `didTruncate: true` so the caller can surface
+    /// honest truncation in the UI footer. This summarizer used to attempt
+    /// chunked summarization with empirical halving on AFM overflow; that
+    /// approach was removed (per Mark's 2026-05-16 directive) because:
+    ///   - The remaining callers (`autoSummary`, `shortTermHistory`) have
+    ///     segment budgets that comfortably fit a single LLM call on the
+    ///     active model.
+    ///   - Self-knowledge no longer flows through this path at all.
+    ///   - When an LLM call legitimately can't handle the input, the right
+    ///     behavior is to surface the failure (didTruncate=true → scissors
+    ///     icon in the footer), not to silently chunk-and-stitch.
+    private static func llmSummarize(
+        text: String,
+        targetTokens: Int,
+        llmService: LLMService,
+        useRecencyWeighting: Bool
+    ) async -> SummarizationResult {
         let prompt: String
-        
+
         if useRecencyWeighting {
             // Salon Mode prompt with recency weighting and information density
             prompt = """
             Summarize this conversation in approximately \(targetTokens) tokens.
-            
+
             CRITICAL INSTRUCTIONS:
             1. Allocate summary space based on INFORMATION DENSITY - brief exchanges (like "what time is it") deserve minimal space, substantive discussions deserve proportional detail
             2. Preserve attribution (which model/seat said what)
-            
+
             WEIGHTING STRATEGY:
             - If there are fewer than 10 turns: Weight all turns roughly equally
             - If there are 10 or more turns: Weight recent turns MORE HEAVILY than older turns as follows:
               * Most recent 20% of turns: approximately 40% of summary space
               * Middle 60% of turns: approximately 40% of summary space
               * Oldest 20% of turns: approximately 20% of summary space
-            
+
             Adjust dynamically based on content density regardless of turn count.
-            
+
             Do not add interpretation or commentary. Extract and compress only.
             Do not include citations, footnote markers, or reference numbers.
             Write clear, complete sentences.
-            
+
             Text to summarize:
             \(text)
-            
+
             Summary (approximately \(targetTokens) tokens):
             """
         } else {
@@ -6358,34 +6457,37 @@ struct TextSummarizer {
             2. The logical flow of ideas
             3. Key entities and relationships
             4. The original intent
-            
+
             Do not add interpretation or commentary. Extract and compress only.
             Do not include citations, footnote markers, or reference numbers.
             Write clear, complete sentences.
-            
+
             The text below may contain contributions from a human and one or more AI models.
             Preserve attribution where it is explicit.
-            
+
             Text to compress:
             \(text)
-            
+
             Compressed version (approximately \(targetTokens) tokens):
             """
         }
-        
+
         do {
             // Chat-message path so chat-template models (Gemma 4, etc.) work.
             let result = try await llmService.generateChatResponse(
                 messages: [.system("You compress text faithfully while preserving meaning and attribution."), .user(prompt)],
                 temperature: 0.3
             )
-            return result.trimmingCharacters(in: .whitespacesAndNewlines)
+            return SummarizationResult(
+                text: result.trimmingCharacters(in: .whitespacesAndNewlines),
+                didTruncate: false
+            )
         } catch {
-            print("HALDEBUG-SUMMARIZER: LLM summarization failed: \(error.localizedDescription)")
-            return ""
+            halLog("HALDEBUG-SUMMARIZER: LLM summarization failed: \(error.localizedDescription)")
+            return SummarizationResult(text: "", didTruncate: true)
         }
     }
-    
+
     // MARK: - Stage 2: Verification Against Source
     
     /// Verify each sentence in summary is grounded in source text
@@ -7704,10 +7806,14 @@ struct ActionsView: View {
                         get: { powerUserMode },
                         set: { newMode in
                             powerUserMode = newMode
-                            var config = chatViewModel.salonConfig
-                            config.isEnabled = (newMode == .multi)
-                            chatViewModel.salonConfig = config
-                            print("HALDEBUG-SALON: Mode changed to \(newMode.rawValue), isEnabled = \(config.isEnabled)")
+                            // Route through `setSalonEnabled` so the
+                            // invariant is preserved. When the user switches
+                            // to Multi LLM (Salon) with 0 seats, Seat 1 is
+                            // auto-populated with Apple Intelligence rather
+                            // than leaving the user in a state where chat
+                            // would silently no-op.
+                            let result = chatViewModel.setSalonEnabled(newMode == .multi)
+                            print("HALDEBUG-SALON: Mode changed to \(newMode.rawValue), isEnabled = \(result.isEnabled), autoPopulated = \(result.autoPopulatedSeat1WithID ?? "nil")")
                         }
                     )) {
                         ForEach(PowerUserMode.allCases, id: \.self) { mode in
@@ -8570,16 +8676,27 @@ struct SalonModeView: View {
             Form {
                 // Section 1: Active Seats
                 Section {
+                    // Seat pickers route through `setSalonSeat` so clearing
+                    // the last active seat while Salon is enabled auto-
+                    // disables Salon (preserving the state-machine invariant
+                    // that Salon enabled ⇒ at least one seat configured).
+
                     // Seat 1
-                    Picker("Seat 1 (First)", selection: $chatViewModel.salonConfig.seat1) {
+                    Picker("Seat 1 (First)", selection: Binding(
+                        get: { chatViewModel.salonConfig.seat1 },
+                        set: { newID in chatViewModel.setSalonSeat(position: 1, modelID: newID) }
+                    )) {
                         Text("Empty").tag(nil as String?)
                         ForEach(chatViewModel.usableModels, id: \.id) { model in
                             Text(model.displayName).tag(model.id as String?)
                         }
                     }
-                    
+
                     // Seat 2
-                    Picker("Seat 2 (Second)", selection: $chatViewModel.salonConfig.seat2) {
+                    Picker("Seat 2 (Second)", selection: Binding(
+                        get: { chatViewModel.salonConfig.seat2 },
+                        set: { newID in chatViewModel.setSalonSeat(position: 2, modelID: newID) }
+                    )) {
                         Text("Empty").tag(nil as String?)
                         ForEach(chatViewModel.usableModels, id: \.id) { model in
                             Text(model.displayName).tag(model.id as String?)
@@ -8597,13 +8714,19 @@ struct SalonModeView: View {
                     // place. Until then we cap salon at 2 seats — verified
                     // safe with AFM + Gemma in earlier testing.
                     if Self.exposeSeatsThreeAndFour {
-                        Picker("Seat 3 (Third)", selection: $chatViewModel.salonConfig.seat3) {
+                        Picker("Seat 3 (Third)", selection: Binding(
+                            get: { chatViewModel.salonConfig.seat3 },
+                            set: { newID in chatViewModel.setSalonSeat(position: 3, modelID: newID) }
+                        )) {
                             Text("Empty").tag(nil as String?)
                             ForEach(chatViewModel.usableModels, id: \.id) { model in
                                 Text(model.displayName).tag(model.id as String?)
                             }
                         }
-                        Picker("Seat 4 (Fourth)", selection: $chatViewModel.salonConfig.seat4) {
+                        Picker("Seat 4 (Fourth)", selection: Binding(
+                            get: { chatViewModel.salonConfig.seat4 },
+                            set: { newID in chatViewModel.setSalonSeat(position: 4, modelID: newID) }
+                        )) {
                             Text("Empty").tag(nil as String?)
                             ForEach(chatViewModel.usableModels, id: \.id) { model in
                                 Text(model.displayName).tag(model.id as String?)
@@ -12117,15 +12240,101 @@ class ChatViewModel: ObservableObject {
         // and returns behavioralMode + summarizer to defaults.
         salonConfig = SalonConfiguration()
 
+        // ---- Salon Mode state-machine helpers -----------------------------
+        // These intentionally live near `resetSettingsToDefaults` because all
+        // three (reset + helpers below) are the only places that mutate
+        // `salonConfig` while enforcing the invariant:
+        //
+        //     salonConfig.isEnabled  ==>  salonConfig.activeSeats.count >= 1
+        //
+        // The invariant matters because every /chat turn dispatches on
+        // `salonConfig.isEnabled` — and `runSalonTurn` with zero seats is a
+        // silent no-op. Rather than guarding the dispatch site (which only
+        // hides the problem), we make the bad state unreachable from any
+        // mutation path: the API, the UI Pickers, and the Mode picker all
+        // route through these helpers.
+        //
+        // Defense-in-depth — the routing guard in `sendMessage` and the
+        // Salon reset above both stay in place, but the primary fix is here.
+        // -------------------------------------------------------------------
+
         // Generate reset dialogue (creates bilateral messages in chat)
         let userMsg = "Hal, I reset all your settings to factory defaults."
         let halMsg = "All settings reset to defaults! I'm back to 5-turn memory, 0.75 similarity threshold, 30% recency weight, 90-day half-life, and self-knowledge enabled. Everything should work smoothly now."
         
         injectSettingsChangeDialogue(userMessage: userMsg, halResponse: halMsg)
-        
+
         print("HALDEBUG-SETTINGS: Settings reset complete")
     }
-    
+
+    /// Apple Foundation Models is the auto-populated default for Seat 1
+    /// when the user enables Salon Mode without configuring any seats.
+    /// AFM is always available on iOS 26+ (no download required), which
+    /// makes it the only safe choice — picking a curated MLX model would
+    /// fail for users who haven't downloaded that model yet.
+    private static let salonAutoPopulateModelID: String = "apple-foundation-models"
+
+    /// Toggle Salon Mode on or off while preserving the invariant that
+    /// Salon-enabled requires at least one configured seat.
+    ///
+    /// - Enabling with 0 active seats: auto-populates Seat 1 with
+    ///   `salonAutoPopulateModelID` (Apple Intelligence) so the user
+    ///   immediately has a working Salon configuration. The user can
+    ///   change Seat 1 to any other downloaded model afterward.
+    /// - Disabling: leaves seats in place (so the user can re-enable
+    ///   without reconfiguring), but turns off the Salon flag.
+    ///
+    /// Returns the resolved state — useful for UI callers that want to
+    /// surface "Seat 1 auto-populated" feedback to the user.
+    @discardableResult
+    func setSalonEnabled(_ enabled: Bool) -> (isEnabled: Bool, autoPopulatedSeat1WithID: String?) {
+        var cfg = salonConfig
+        var autoPopulated: String? = nil
+        if enabled && cfg.activeSeats.isEmpty {
+            cfg.seat1 = Self.salonAutoPopulateModelID
+            autoPopulated = cfg.seat1
+            halLog("HALDEBUG-SALON: setSalonEnabled(true) with 0 seats — auto-populating Seat 1 with \(Self.salonAutoPopulateModelID)")
+        }
+        cfg.isEnabled = enabled
+        salonConfig = cfg
+        if !enabled {
+            halLog("HALDEBUG-SALON: setSalonEnabled(false) — Salon disabled (seats preserved)")
+        }
+        return (enabled, autoPopulated)
+    }
+
+    /// Assign or clear a Salon seat while preserving the invariant.
+    ///
+    /// - Position must be 1...4. Pass `modelID == nil` (or empty in the
+    ///   API parser) to clear the seat.
+    /// - If clearing a seat empties out the last active seat while Salon
+    ///   is currently enabled, this auto-disables Salon Mode. The user
+    ///   explicitly removed every voice — we infer they're done with
+    ///   Salon for now. They can re-enable later (which will re-populate
+    ///   Seat 1 with AFM via `setSalonEnabled`).
+    ///
+    /// Returns whether Salon was auto-disabled as a side-effect.
+    @discardableResult
+    func setSalonSeat(position: Int, modelID: String?) -> Bool {
+        guard (1...4).contains(position) else { return false }
+        var cfg = salonConfig
+        switch position {
+        case 1: cfg.seat1 = modelID
+        case 2: cfg.seat2 = modelID
+        case 3: cfg.seat3 = modelID
+        case 4: cfg.seat4 = modelID
+        default: break
+        }
+        var autoDisabled = false
+        if cfg.isEnabled && cfg.activeSeats.isEmpty {
+            cfg.isEnabled = false
+            autoDisabled = true
+            halLog("HALDEBUG-SALON: setSalonSeat cleared last seat while Salon enabled — auto-disabling Salon")
+        }
+        salonConfig = cfg
+        return autoDisabled
+    }
+
 // ==== LEGO END: 17 ChatViewModel (Core Properties & Init) ====
     
     
@@ -12917,6 +13126,25 @@ class ChatViewModel: ObservableObject {
                                                                                 guard !rawContent.isEmpty else { return rawContent }
                                                                                 let segment = PromptSegment(kind: kind, rawContent: rawContent, budgetTokens: budgetTokens)
                                                                                 let eval = PromptBudgetEvaluator.evaluate(segment)
+
+                                                                                // Self-knowledge bypass (per Mark's 2026-05-16 directive).
+                                                                                // Self-knowledge is injected RAW for MLX models — no compression,
+                                                                                // no chunking, no LLM calls, no embedding selection. The corpus is
+                                                                                // kept bounded at write time by `storeReflectionWithSynthesis`
+                                                                                // (depth, not volume). If the raw corpus ever exceeds the budget,
+                                                                                // that's a write-time-synthesis failure signal, not a runtime
+                                                                                // concern to compensate for at read time. We log it loudly so the
+                                                                                // synthesis layer can be inspected, then inject raw anyway —
+                                                                                // truncation is not acceptable as a design choice.
+                                                                                if kind == .selfKnowledge {
+                                                                                    if case .overBudgetCompressible(let actual, let budget) = eval.status {
+                                                                                        halLog("HALDEBUG-SELF-KNOWLEDGE: Corpus over budget (\(actual) > \(budget) tokens) — injecting RAW. This indicates write-time synthesis isn't keeping the corpus lean enough; inspect storeReflectionWithSynthesis threshold and behavior.")
+                                                                                    } else if case .overBudgetHardCap(let actual, let budget) = eval.status {
+                                                                                        halLog("HALDEBUG-SELF-KNOWLEDGE: Corpus over hard-cap (\(actual) > \(budget) tokens) — injecting RAW (per directive: no truncation as design choice).")
+                                                                                    }
+                                                                                    return rawContent
+                                                                                }
+
                                                                                 switch eval.status {
                                                                                 case .withinBudget:
                                                                                     return rawContent
@@ -12971,6 +13199,18 @@ class ChatViewModel: ObservableObject {
                                                                             // Mapping: old SELF_AWARENESS + SELF_KNOWLEDGE marker sections fold into
                                                                             // the same CURRENT CONTEXT block. Only included when the user has
                                                                             // enableSelfKnowledge turned on.
+                                                                            //
+                                                                            // Per Mark's 2026-05-16 directive: persistent self-knowledge is NOT
+                                                                            // injected when the active model is Apple Intelligence (AFM). AFM's
+                                                                            // 4K context window can't hold the corpus once it grows past a
+                                                                            // small threshold, and lossy compression isn't acceptable as a
+                                                                            // design choice. AFM users get no persistent self-knowledge in the
+                                                                            // prompt; the model card states this clearly. Self-awareness (the
+                                                                            // small runtime-stats block: turn count, uptime, etc.) is still
+                                                                            // injected on AFM — it's structurally different from persistent
+                                                                            // identity and small enough to never overflow.
+                                                                            let isActiveAFM = (llmService.activeModelID == ModelConfiguration.appleFoundation.id)
+
                                                                             if enableSelfKnowledge {
                                                                                 let selfAwarenessRaw = buildSelfAwarenessContext()
                                                                                 let selfAwarenessBody = selfAwarenessRaw
@@ -12981,14 +13221,18 @@ class ChatViewModel: ObservableObject {
                                                                                     contextSections.append(selfAwarenessBody)
                                                                                 }
 
-                                                                                let selfKnowledgeRaw = buildSelfKnowledgeContext()
-                                                                                let selfKnowledgeBody = selfKnowledgeRaw
-                                                                                    .replacingOccurrences(of: "#=== BEGIN SELF_KNOWLEDGE ===#", with: "")
-                                                                                    .replacingOccurrences(of: "#=== END SELF_KNOWLEDGE ===#", with: "")
-                                                                                    .trimmingCharacters(in: .whitespacesAndNewlines)
-                                                                                if !selfKnowledgeBody.isEmpty {
-                                                                                    let resolvedSelfKnowledge = await resolveSegment(.selfKnowledge, rawContent: selfKnowledgeBody, budgetTokens: selfKnowledgeBudgetTokens)
-                                                                                    contextSections.append(resolvedSelfKnowledge)
+                                                                                if isActiveAFM {
+                                                                                    halLog("HALDEBUG-SELF-KNOWLEDGE: Skipping persistent self-knowledge injection — active model is Apple Intelligence (per 2026-05-16 directive: AFM gets no self-knowledge)")
+                                                                                } else {
+                                                                                    let selfKnowledgeRaw = buildSelfKnowledgeContext()
+                                                                                    let selfKnowledgeBody = selfKnowledgeRaw
+                                                                                        .replacingOccurrences(of: "#=== BEGIN SELF_KNOWLEDGE ===#", with: "")
+                                                                                        .replacingOccurrences(of: "#=== END SELF_KNOWLEDGE ===#", with: "")
+                                                                                        .trimmingCharacters(in: .whitespacesAndNewlines)
+                                                                                    if !selfKnowledgeBody.isEmpty {
+                                                                                        let resolvedSelfKnowledge = await resolveSegment(.selfKnowledge, rawContent: selfKnowledgeBody, budgetTokens: selfKnowledgeBudgetTokens)
+                                                                                        contextSections.append(resolvedSelfKnowledge)
+                                                                                    }
                                                                                 }
                                                                             }
 
@@ -17708,7 +17952,7 @@ struct ModelConfiguration: Identifiable, Codable, Equatable, Hashable {
         sizeGB: nil,
         contextWindow: 4_096,
         license: nil,
-        description: "Always available, no download required",
+        description: "Always available, no download required. Note: Apple Intelligence does not receive Hal's persistent self-knowledge in prompts — its context window is too small to host the full corpus, and we will not ship lossy compression. For continuous self-knowledge across turns, use a curated MLX model.",
         isDownloaded: true,
         localPath: nil,
         // AFM has the tightest context window of any model in the catalog
@@ -19282,15 +19526,19 @@ class HalTestConsole: ObservableObject {
             return "{\"status\":\"ok\",\"isEnabled\":\(cfg.isEnabled),\"seat1\":\"\(jsonStringEscape(seat1))\",\"seat2\":\"\(jsonStringEscape(seat2))\",\"seat3\":\"\(jsonStringEscape(seat3))\",\"seat4\":\"\(jsonStringEscape(seat4))\",\"behavioralMode\":\"\(cfg.behavioralMode.rawValue)\",\"summarizerModel\":\"\(jsonStringEscape(summarizer))\",\"activeSeatCount\":\(cfg.activeSeats.count)}"
 
         } else if trimmed.hasPrefix("SALON_SET_ENABLED:") {
+            // Routes through `setSalonEnabled` so the state-machine invariant
+            // is enforced — enabling with 0 seats auto-populates Seat 1 with
+            // AFM rather than leaving Salon in a degenerate state.
             let raw = String(trimmed.dropFirst("SALON_SET_ENABLED:".count)).trimmingCharacters(in: .whitespaces).lowercased()
             let on = (raw == "true" || raw == "1" || raw == "yes")
-            var cfg = vm.salonConfig
-            cfg.isEnabled = on
-            vm.salonConfig = cfg
-            return "{\"status\":\"ok\",\"command\":\"SALON_SET_ENABLED\",\"isEnabled\":\(on)}"
+            let result = vm.setSalonEnabled(on)
+            let autoStr = result.autoPopulatedSeat1WithID.map { jsonStringEscape($0) } ?? ""
+            return "{\"status\":\"ok\",\"command\":\"SALON_SET_ENABLED\",\"isEnabled\":\(result.isEnabled),\"autoPopulatedSeat1WithID\":\"\(autoStr)\"}"
 
         } else if trimmed.hasPrefix("SALON_SET_SEAT:") {
             // Format: SALON_SET_SEAT:<position>:<modelID>  (modelID may be empty to clear the seat)
+            // Routes through `setSalonSeat` so clearing the last seat while
+            // Salon is enabled auto-disables Salon (preserving the invariant).
             let body = String(trimmed.dropFirst("SALON_SET_SEAT:".count))
             let parts = body.split(separator: ":", maxSplits: 1, omittingEmptySubsequences: false).map(String.init)
             guard parts.count == 2, let position = Int(parts[0].trimmingCharacters(in: .whitespaces)), (1...4).contains(position) else {
@@ -19298,16 +19546,8 @@ class HalTestConsole: ObservableObject {
             }
             let modelID = parts[1].trimmingCharacters(in: .whitespaces)
             let assigned: String? = modelID.isEmpty ? nil : modelID
-            var cfg = vm.salonConfig
-            switch position {
-            case 1: cfg.seat1 = assigned
-            case 2: cfg.seat2 = assigned
-            case 3: cfg.seat3 = assigned
-            case 4: cfg.seat4 = assigned
-            default: break
-            }
-            vm.salonConfig = cfg
-            return "{\"status\":\"ok\",\"command\":\"SALON_SET_SEAT\",\"position\":\(position),\"modelID\":\"\(jsonStringEscape(assigned ?? ""))\"}"
+            let autoDisabled = vm.setSalonSeat(position: position, modelID: assigned)
+            return "{\"status\":\"ok\",\"command\":\"SALON_SET_SEAT\",\"position\":\(position),\"modelID\":\"\(jsonStringEscape(assigned ?? ""))\",\"autoDisabledSalon\":\(autoDisabled)}"
 
         } else if trimmed.hasPrefix("SALON_SET_MODE:") {
             let raw = String(trimmed.dropFirst("SALON_SET_MODE:".count)).trimmingCharacters(in: .whitespaces)
