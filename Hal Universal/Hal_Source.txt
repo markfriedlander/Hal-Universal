@@ -4271,94 +4271,106 @@ extension MemoryStore {
             return UnifiedSearchContext(snippets: [], totalTokens: 0)
         }
 
-        var allResults: [UnifiedSearchResult] = []
-        var totalTokens = 0
+        // Hybrid retrieval with Reciprocal Rank Fusion (Commit C, 2026-05-17).
+        //
+        // Each retriever (semantic + BM25) produces its OWN ranked list of
+        // candidate row IDs. RRF combines them by RANK, not score —
+        // documents that rank highly in BOTH lists win, regardless of
+        // raw score scale. Industry standard (Elasticsearch, OpenSearch,
+        // Weaviate). Sidesteps the threshold problem entirely.
+        //
+        // RRF formula: rrf(d) = sum over each list L of 1 / (k + rank_L(d))
+        // where k = 60 (canonical default; controls how steeply higher
+        // ranks dominate). Rank is 1-indexed.
 
-        // --- 1. Semantic Search (using embeddings) with SQL-level exclusion ---
-        print("HALDEBUG-SEARCH: Performing semantic search...")
-        
-        // Build exclusion clause for SQL query
         let exclusionClause = buildExclusionClause(conversationId: currentConversationId, excludeTurns: excludeTurns)
-        
+
+        // Row metadata captured per id during retrieval, then reattached
+        // to the RRF-fused result list. Keyed by `id` (TEXT PRIMARY KEY
+        // on unified_content). The map values stay opaque until we know
+        // which ids actually win the RRF.
+        struct RowSlot {
+            let id: String
+            let content: String
+            let sourceType: String
+            let filePath: String?
+            let timestamp: Date
+            let recordedByModel: String?
+        }
+        var slotById: [String: RowSlot] = [:]
+        var semanticRanks: [String: Int] = [:]  // id -> 1-indexed rank
+        var bm25Ranks: [String: Int] = [:]
+
+        // --- 1. Semantic retrieval — pure cosine similarity, no threshold ---
+        print("HALDEBUG-SEARCH: Performing semantic retrieval (RRF-style, no threshold)...")
         let semanticSQL = """
-        SELECT id, content, embedding, source_type, source_id, position, metadata_json, timestamp
+        SELECT id, content, embedding, source_type, source_id, position, metadata_json, timestamp, recorded_by_model
         FROM unified_content
         WHERE embedding IS NOT NULL\(exclusionClause);
         """
-        
+
+        var semanticScored: [(id: String, score: Double)] = []
         var stmt: OpaquePointer?
         if sqlite3_prepare_v2(db, semanticSQL, -1, &stmt, nil) == SQLITE_OK {
             while sqlite3_step(stmt) == SQLITE_ROW {
-                guard let contentCString = sqlite3_column_text(stmt, 1),
+                guard let idCString = sqlite3_column_text(stmt, 0),
+                      let contentCString = sqlite3_column_text(stmt, 1),
                       let embeddingBlobPtr = sqlite3_column_blob(stmt, 2) else { continue }
-
+                let rowId = String(cString: idCString)
                 let content = String(cString: contentCString)
                 let blobSize = sqlite3_column_bytes(stmt, 2)
                 let embeddingData = Data(bytes: embeddingBlobPtr, count: Int(blobSize))
                 let storedEmbedding = embeddingData.withUnsafeBytes { (ptr: UnsafeRawBufferPointer) -> [Double] in
                     Array(ptr.bindMemory(to: Double.self))
                 }
-
                 let sourceTypeRaw = sqlite3_column_text(stmt, 3).map { String(cString: $0) } ?? ""
-                _ = sqlite3_column_text(stmt, 4) // sourceId - not needed (excluded at SQL level)
-                _ = sqlite3_column_int(stmt, 5) // position - not needed (excluded at SQL level)
-                
-                // Extract filePath from metadata_json for document snippets
+
                 var filePath: String? = nil
-                if let metadataCString = sqlite3_column_text(stmt, 6) { // metadata_json is column 6
+                if let metadataCString = sqlite3_column_text(stmt, 6) {
                     let metadataJsonString = String(cString: metadataCString)
                     if let metadataData = Data(base64Encoded: metadataJsonString),
                        let metadataDict = (try? JSONSerialization.jsonObject(with: metadataData, options: []) as? [String: Any]) {
                         filePath = metadataDict["filePath"] as? String
                     }
                 }
-
-                // Extract timestamp for recency scoring
-                let timestampValue = sqlite3_column_int64(stmt, 7) // timestamp is column 7 (after metadata_json)
+                let timestampValue = sqlite3_column_int64(stmt, 7)
                 let timestamp = Date(timeIntervalSince1970: TimeInterval(timestampValue))
+                let recordedByModel = sqlite3_column_text(stmt, 8).map { String(cString: $0) }
 
                 let similarity = cosineSimilarity(queryEmbedding, storedEmbedding)
-                if similarity >= relevanceThreshold {
-                    // Apply recency boosting to combine semantic and temporal scores
-                    let recencyScore = calculateRecencyScore(timestamp: timestamp)
-                    // Source code doesn't age — skip recency decay for static architecture content
-                    let finalScore = sourceTypeRaw == "source_code"
-                        ? similarity
-                        : (similarity * (1.0 - recencyWeight)) + (recencyScore * recencyWeight)
-                    
-                    // Add age label to content for LLM context
-                    let ageLabel = formatAgeLabel(timestamp: timestamp)
-                    let labeledContent = "[\(ageLabel)]: \(content)"
-                    
-                    allResults.append(UnifiedSearchResult(content: labeledContent, relevance: finalScore, source: sourceTypeRaw, isEntityMatch: false, filePath: filePath))
+                // No threshold — RRF will handle the ranking. We still
+                // skip negative-similarity rows (genuinely orthogonal
+                // or anti-correlated content) since they would add
+                // noise to RRF without contributing signal.
+                if similarity > 0 {
+                    semanticScored.append((rowId, similarity))
+                    slotById[rowId] = RowSlot(
+                        id: rowId, content: content, sourceType: sourceTypeRaw,
+                        filePath: filePath, timestamp: timestamp, recordedByModel: recordedByModel
+                    )
                 }
             }
         }
         sqlite3_finalize(stmt)
-        print("HALDEBUG-SEARCH: Semantic search completed. Found \(allResults.count) initial matches.")
 
-        // --- 2. BM25 Keyword Search via FTS5 (Commit B, 2026-05-17) ---
-        // Replaces the prior hand-rolled LIKE substring expansion with a
-        // single FTS5 MATCH query against `unified_content_fts`. The
-        // tokenizer (Porter + Unicode61) handles stemming so "dogs" matches
-        // "dog's" and "running" matches "run". `bm25()` returns the standard
-        // BM25 score (lower is more relevant in FTS5 — we negate it so
-        // higher is better, matching the semantic-search convention).
-        //
-        // The FTS table is contentless (`content=''`) so we JOIN back to
-        // `unified_content` for the row fields the snippet builder needs.
-        halLog("HALDEBUG-SEARCH: Performing FTS5 BM25 keyword search...")
-        let bm25ExclusionClause = buildExclusionClause(conversationId: currentConversationId, excludeTurns: excludeTurns)
+        // Sort semantic candidates desc by score; record 1-indexed rank
+        semanticScored.sort { $0.score > $1.score }
+        // Cap each retriever's list at 50 candidates — RRF only sees this
+        // many; the constant k=60 makes rank>60 contribute little anyway.
+        let semanticCapped = Array(semanticScored.prefix(50))
+        for (i, hit) in semanticCapped.enumerated() {
+            semanticRanks[hit.id] = i + 1
+        }
+        print("HALDEBUG-SEARCH: Semantic retrieved \(semanticCapped.count) ranked candidates")
+
+        // --- 2. BM25 retrieval via FTS5 ---
+        halLog("HALDEBUG-SEARCH: Performing FTS5 BM25 retrieval (RRF-style)...")
+        let bm25ExclusionClause = exclusionClause
             .replacingOccurrences(of: " AND source_type", with: " AND u.source_type")
             .replacingOccurrences(of: " AND source_id", with: " AND u.source_id")
             .replacingOccurrences(of: " AND turn_number", with: " AND u.turn_number")
-        // Exclude source_code rows from BM25 — Hal's own source code is in
-        // unified_content for self-knowledge access, but it's a million-char
-        // blob that matches every common word (BM25 OR semantics) and would
-        // dominate ranking on every query. Source-code retrieval has its own
-        // path; conversational and document RAG live here.
         let bm25SQL = """
-        SELECT u.id, u.content, u.source_type, u.source_id, u.position, u.metadata_json, u.timestamp,
+        SELECT u.id, u.content, u.source_type, u.source_id, u.position, u.metadata_json, u.timestamp, u.recorded_by_model,
                -bm25(unified_content_fts) AS bm25_score
         FROM unified_content_fts
         JOIN unified_content u ON u.rowid = unified_content_fts.rowid
@@ -4368,24 +4380,18 @@ extension MemoryStore {
         LIMIT 50;
         """
         var bm25Stmt: OpaquePointer?
+        var bm25Ordered: [String] = []  // ids in rank order
         if sqlite3_prepare_v2(db, bm25SQL, -1, &bm25Stmt, nil) == SQLITE_OK {
-            // FTS5 MATCH treats unquoted multi-word input as an AND query
-            // by default. We want OR semantics (any-word match) plus
-            // tolerance for special characters, so we sanitize the query:
-            // strip punctuation, lowercase, join with OR.
             let sanitized = sanitizeFTSQuery(query)
             sqlite3_bind_text(bm25Stmt, 1, (sanitized as NSString).utf8String, -1, nil)
 
-            var bm25Hits = 0
             while sqlite3_step(bm25Stmt) == SQLITE_ROW {
-                guard let contentCString = sqlite3_column_text(bm25Stmt, 1) else { continue }
+                guard let idCString = sqlite3_column_text(bm25Stmt, 0),
+                      let contentCString = sqlite3_column_text(bm25Stmt, 1) else { continue }
+                let rowId = String(cString: idCString)
                 let content = String(cString: contentCString)
                 let sourceTypeRaw = sqlite3_column_text(bm25Stmt, 2).map { String(cString: $0) } ?? ""
-                let timestampValue = sqlite3_column_int64(bm25Stmt, 6)
-                let timestamp = Date(timeIntervalSince1970: TimeInterval(timestampValue))
-                let bm25NegScore = sqlite3_column_double(bm25Stmt, 7)  // already negated, so higher = better
 
-                // Extract filePath from metadata_json
                 var filePath: String? = nil
                 if let metadataCString = sqlite3_column_text(bm25Stmt, 5) {
                     let metadataJsonString = String(cString: metadataCString)
@@ -4394,36 +4400,60 @@ extension MemoryStore {
                         filePath = metadataDict["filePath"] as? String
                     }
                 }
+                let timestampValue = sqlite3_column_int64(bm25Stmt, 6)
+                let timestamp = Date(timeIntervalSince1970: TimeInterval(timestampValue))
+                let recordedByModel = sqlite3_column_text(bm25Stmt, 7).map { String(cString: $0) }
 
-                // Recency boost on top of BM25 score (the BM25 magnitude
-                // varies with query/corpus stats; recency normalizes to
-                // a comparable scale and prefers fresh content).
-                let recencyScore = calculateRecencyScore(timestamp: timestamp)
-                let finalScore = sourceTypeRaw == "source_code"
-                    ? bm25NegScore
-                    : (bm25NegScore * (1.0 - recencyWeight)) + (recencyScore * recencyWeight)
-
-                let ageLabel = formatAgeLabel(timestamp: timestamp)
-                let labeledContent = "[\(ageLabel)]: \(content)"
-
-                if let existingIndex = allResults.firstIndex(where: { $0.content.contains(content) }) {
-                    // Same row found via semantic search — mark as also-matched
-                    allResults[existingIndex].isEntityMatch = true
-                } else {
-                    allResults.append(UnifiedSearchResult(content: labeledContent, relevance: finalScore, source: sourceTypeRaw, isEntityMatch: true, filePath: filePath))
+                bm25Ordered.append(rowId)
+                if slotById[rowId] == nil {
+                    slotById[rowId] = RowSlot(
+                        id: rowId, content: content, sourceType: sourceTypeRaw,
+                        filePath: filePath, timestamp: timestamp, recordedByModel: recordedByModel
+                    )
                 }
-                bm25Hits += 1
             }
-            halLog("HALDEBUG-SEARCH: FTS5 BM25 found \(bm25Hits) matches for sanitized query: '\(sanitized.prefix(60))'")
+            halLog("HALDEBUG-SEARCH: FTS5 BM25 retrieved \(bm25Ordered.count) ranked candidates for query: '\(sanitized.prefix(60))'")
         } else {
             let err = String(cString: sqlite3_errmsg(db))
             halLog("HALDEBUG-SEARCH: FTS5 BM25 prepare failed: \(err)")
         }
         sqlite3_finalize(bm25Stmt)
-        halLog("HALDEBUG-SEARCH: Combined semantic + BM25 results: \(allResults.count)")
 
-        // --- 3. Sort by Relevance ---
-        allResults.sort { $0.relevance > $1.relevance }
+        for (i, rowId) in bm25Ordered.enumerated() {
+            bm25Ranks[rowId] = i + 1
+        }
+
+        // --- 3. RRF fusion ---
+        // rrf(d) = sum over retrievers L of 1 / (k + rank_L(d)), k=60
+        let rrfK: Double = 60.0
+        var rrfScored: [(id: String, score: Double, inSemantic: Bool, inBM25: Bool)] = []
+        let unionIds = Set(semanticRanks.keys).union(Set(bm25Ranks.keys))
+        for rowId in unionIds {
+            var rrf = 0.0
+            let sRank = semanticRanks[rowId]
+            let bRank = bm25Ranks[rowId]
+            if let r = sRank { rrf += 1.0 / (rrfK + Double(r)) }
+            if let r = bRank { rrf += 1.0 / (rrfK + Double(r)) }
+            rrfScored.append((rowId, rrf, sRank != nil, bRank != nil))
+        }
+        rrfScored.sort { $0.score > $1.score }
+        halLog("HALDEBUG-SEARCH: RRF fused \(unionIds.count) unique rows (\(semanticRanks.count) semantic + \(bm25Ranks.count) BM25, k=\(Int(rrfK)))")
+
+        // --- 4. Build UnifiedSearchResult list from RRF order ---
+        var allResults: [UnifiedSearchResult] = []
+        var totalTokens = 0
+        for fused in rrfScored {
+            guard let slot = slotById[fused.id] else { continue }
+            let ageLabel = formatAgeLabel(timestamp: slot.timestamp)
+            let labeledContent = "[\(ageLabel)]: \(slot.content)"
+            allResults.append(UnifiedSearchResult(
+                content: labeledContent,
+                relevance: fused.score,
+                source: slot.sourceType,
+                isEntityMatch: fused.inBM25,  // tagged "entity" if BM25 contributed
+                filePath: slot.filePath
+            ))
+        }
 
         // --- 4. Build RAGSnippet Objects with Full Metadata ---
         var ragSnippets: [RAGSnippet] = []
@@ -8618,25 +8648,14 @@ struct PowerUserView: View {
                 
                 SectionHeaderText(text: "LONG-TERM MEMORY")
                 
-                LabeledSliderControl(
-                    label: "Similarity Threshold",
-                    value: $chatViewModel.memoryStore.relevanceThreshold,
-                    range: 0.0...1.0,
-                    step: 0.05,
-                    valueFormatter: { String(format: "%.2f", $0) },
-                    minLabel: "0.0",
-                    maxLabel: "1.0",
-                    helperText: "Minimum similarity for memory retrieval (higher = stricter matching)",
-                    onEditingChanged: { editing in
-                        if editing {
-                            sliderStartValues["threshold"] = chatViewModel.memoryStore.relevanceThreshold
-                        } else {
-                            sliderStartValues.removeValue(forKey: "threshold")
-                        }
-                    },
-                    isModified: abs(chatViewModel.memoryStore.relevanceThreshold - (chatViewModel.selectedModel.defaultSettings?.similarityThreshold ?? 0.75)) > 0.001
-                )
-                
+                // Similarity Threshold slider removed (2026-05-17, Commit C).
+                // Retrieval now uses RRF (Reciprocal Rank Fusion) over
+                // semantic + BM25 — rank-based, threshold-free. The
+                // `relevanceThreshold` variable is retained in AppStorage
+                // and per-model settings for backward compat but no
+                // longer affects retrieval. See HISTORY.md 2026-05-17
+                // for the architectural rationale.
+
                 LabeledSliderControl(
                     label: "Recency Weight",
                     value: $chatViewModel.memoryStore.recencyWeight,
