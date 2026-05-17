@@ -22,6 +22,7 @@ FILES=(
   "Hal Universal/EmbeddingBackend.swift"
   "Hal Universal/EmbeddingProvider.swift"
   "Hal Universal/EmbedderMigrationCoordinator.swift"
+  "Hal Universal/QueryExpansion.swift"
   "Hal Universal/Hal.swift"
 )
 

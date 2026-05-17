@@ -1028,6 +1028,281 @@ struct EmbedderMigrationStatusRow: View {
     }
 }
 
+// ==== FILE: QueryExpansion.swift ====
+// QueryExpansion.swift
+// Hal Universal
+//
+// LLM-driven query expansion for weak RAG retrieval. Created
+// 2026-05-17 afternoon. Design lives in NEXT.md (2026-05-17 entry).
+//
+// The premise: hybrid retrieval (semantic + BM25 + RRF) does well when
+// the query shares either content words or concept-level meaning with
+// stored memories. It fails when both signals are weak — e.g. "Where do
+// I live now?" against "house in Berkeley". Even Nomic Embed v1.5
+// (asymmetric-retrieval tuned) still misses "What kind of car?" → "Subaru
+// Outback" because neither side of the relationship has lexical overlap
+// or sufficient semantic proximity in the embedding space.
+//
+// Fix: when the initial retrieval comes back weak, ask the active LLM
+// to extract 5-10 related concept terms for the query, then re-run the
+// BM25 side of the hybrid pipeline with `(original-tokens) OR (expansion-
+// tokens)`. Cache results in SQLite so repeated queries don't re-call
+// the LLM. AFM-safe — prompt + response budget is < 200 tokens total.
+//
+// Trigger: top-1 RRF score < 0.020 AND top-1.isEntityMatch == false.
+// RRF max single-list score is 1/(60+1) ≈ 0.0164; both lists agreeing
+// yields ≈ 0.0328. Queries that fail consistently sit at ≈ 0.0164 with
+// isEntityMatch=false (semantic only, no BM25 contribution at all).
+// Working queries top out at ≈ 0.0323 with isEntityMatch=true.
+//
+// Cache invalidation: clear on model switch (different models extract
+// different concepts) or on user request. The cache is keyed by
+// SHA-256 of the normalized (lowercased + trimmed) query.
+
+import Foundation
+import CryptoKit
+import SQLite3
+
+@MainActor
+enum QueryExpansion {
+
+    // MARK: - Trigger condition (calibrated, see file header)
+
+    /// Threshold for "the initial retrieval is weak enough to warrant
+    /// an LLM expansion call." Documented in NEXT.md. Adjust based on
+    /// real usage data, but don't set higher than ≈ 0.025 or this
+    /// triggers on healthy retrievals.
+    static let triggerRRFScoreUpperBound: Double = 0.020
+
+    /// Pure predicate — given the initial top-1 result, decide whether
+    /// expansion is worth running. No side effects.
+    static func shouldExpand(top1Score: Double, top1IsEntityMatch: Bool) -> Bool {
+        // Diagnostic override: setting UserDefaults("forceQueryExpansion")
+        // to true forces expansion on EVERY query. Used by
+        // tests/rag_expanded_eval.py to measure expansion's impact
+        // independent of the trigger predicate. Production callers
+        // should leave this off.
+        if UserDefaults.standard.bool(forKey: "forceQueryExpansion") {
+            return true
+        }
+        return top1Score < triggerRRFScoreUpperBound && !top1IsEntityMatch
+    }
+
+    // MARK: - LLM prompt (kept under 200 tokens total incl. response)
+
+    /// One system prompt for all backends. Lowercased terms-only output
+    /// keeps tokenization compact (10 short terms ≈ 30 tokens). The
+    /// instruction is deliberately concrete — "might appear in stored
+    /// memories" — so models extract concept synonyms instead of
+    /// definitions or commentary.
+    nonisolated static let systemPrompt: String = "Extract 5-10 short related terms that might appear in stored memories related to the user's question. One term per line, lowercase, no punctuation, no explanation. Just the terms."
+
+    // MARK: - Entry point
+
+    /// Sync wrapper around the async LLM call. Caller checks
+    /// `shouldExpand` first and only invokes this on a cache miss path
+    /// (the cache lookup is also here, so callers can simply call this
+    /// and it does the right thing).
+    ///
+    /// Returns the list of expansion terms (may be empty if the LLM
+    /// returns nothing useful or the call fails). On cache hit, returns
+    /// immediately without an LLM call. On cache miss, blocks for the
+    /// LLM round-trip (~0.5–2s on AFM for a 200-token prompt).
+    static func expand(
+        query: String,
+        memoryStore: MemoryStore,
+        llmService: LLMService
+    ) -> [String] {
+        let normalized = normalizeQuery(query)
+        guard !normalized.isEmpty else { return [] }
+        let hash = sha256(normalized)
+        let activeModel = llmService.activeModelID
+
+        // Cache hit? Only honor the cache entry if it was produced by
+        // the currently active model — different models extract
+        // different concepts.
+        if let cached = memoryStore.queryExpansionCacheLookup(hash: hash, modelID: activeModel) {
+            halLog("HALDEBUG-EXPANSION: cache hit query='\(normalized.prefix(60))' terms=\(cached.count)")
+            return cached
+        }
+
+        halLog("HALDEBUG-EXPANSION: cache miss query='\(normalized.prefix(60))' — calling LLM (\(activeModel))…")
+        let start = Date()
+        let terms = callLLMSync(for: query, service: llmService)
+        let elapsedMs = Int(Date().timeIntervalSince(start) * 1000)
+        let sample = terms.prefix(8).joined(separator: ", ")
+        halLog("HALDEBUG-EXPANSION: LLM returned \(terms.count) terms in \(elapsedMs)ms: \(sample)")
+
+        if !terms.isEmpty {
+            memoryStore.queryExpansionCacheStore(
+                hash: hash,
+                normalized: normalized,
+                terms: terms,
+                modelID: activeModel
+            )
+        }
+        return terms
+    }
+
+    // MARK: - Internals
+
+    private static func normalizeQuery(_ q: String) -> String {
+        return q.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+    }
+
+    private static func sha256(_ s: String) -> String {
+        let digest = SHA256.hash(data: Data(s.utf8))
+        return digest.map { String(format: "%02x", $0) }.joined()
+    }
+
+    /// Call the active LLM via a DispatchSemaphore bridge. **NOTE on
+    /// concurrency:** `expand()` is `@MainActor`-annotated and is called
+    /// from the MainActor-isolated chat tool path. If the inner Task
+    /// also targets MainActor, `sem.wait()` deadlocks the actor — the
+    /// LLM Task can never run because we're holding the MainActor's
+    /// thread inside `sem.wait()`. So we drop the LLM call into a
+    /// detached, non-MainActor Task. `LLMService.generateChatResponse`
+    /// is `async throws` and hops to whichever actor it needs internally;
+    /// it does not require MainActor at call time.
+    nonisolated private static func callLLMSync(for query: String, service: LLMService) -> [String] {
+        let sem = DispatchSemaphore(value: 0)
+        nonisolated(unsafe) var result: [String] = []
+        // Compact two-message prompt — system instruction + user query.
+        // Token budget (rough): system ≈ 35 tokens, query ≈ 5–15 tokens,
+        // response capped at 10 short terms ≈ 30 tokens. Total under
+        // 100 tokens — well within AFM's 4K window.
+        let messages: [HalChatMessage] = [
+            .system(systemPrompt),
+            .user(query)
+        ]
+        Task.detached(priority: .userInitiated) {
+            do {
+                let response = try await service.generateChatResponse(
+                    messages: messages,
+                    temperature: 0.0
+                )
+                result = parseTerms(from: response)
+            } catch {
+                halLog("HALDEBUG-EXPANSION: LLM call failed: \(error.localizedDescription)")
+            }
+            sem.signal()
+        }
+        sem.wait()
+        return result
+    }
+
+    /// Parse the LLM's free-form text output into a list of clean terms.
+    /// Tolerant of bullets, numbering, mixed case, trailing punctuation,
+    /// and incidental commentary. Caps at 10 terms.
+    nonisolated private static func parseTerms(from response: String) -> [String] {
+        let lines = response.components(separatedBy: .newlines)
+        var terms: [String] = []
+        var seen = Set<String>()
+        for line in lines {
+            // Strip leading bullets, numbering, dashes, commentary.
+            var s = line.trimmingCharacters(in: .whitespaces)
+            // Remove leading "- ", "* ", "1. ", "1) ", etc.
+            while let first = s.first, first.isPunctuation || first.isNumber || first == "•" {
+                s.removeFirst()
+                s = s.trimmingCharacters(in: .whitespaces)
+            }
+            // Lowercase + keep letters, digits, spaces, hyphens.
+            let clean = s.lowercased().filter { c in
+                c.isLetter || c.isNumber || c == " " || c == "-"
+            }.trimmingCharacters(in: .whitespaces)
+            // Multi-word phrases up to 30 chars are fine — Nomic and FTS5
+            // both handle multi-word tokens (FTS5 will tokenize internally).
+            guard clean.count >= 2 && clean.count <= 30 else { continue }
+            // Skip obvious sentence fragments (commas, periods inside).
+            guard !clean.contains("  ") else { continue }
+            // Dedupe.
+            guard !seen.contains(clean) else { continue }
+            seen.insert(clean)
+            terms.append(clean)
+            if terms.count >= 10 { break }
+        }
+        return terms
+    }
+}
+
+// MARK: - MemoryStore cache extension
+
+extension MemoryStore {
+
+    /// Create the query_expansion_cache table if it doesn't exist. The
+    /// table is small (a few hundred bytes per row at most) and the
+    /// schema is stable; no migration needed.
+    nonisolated func ensureQueryExpansionCacheSchema() {
+        let sql = """
+        CREATE TABLE IF NOT EXISTS query_expansion_cache (
+            query_hash TEXT NOT NULL,
+            model_id TEXT NOT NULL,
+            query_normalized TEXT NOT NULL,
+            terms TEXT NOT NULL,
+            created_at INTEGER NOT NULL,
+            PRIMARY KEY (query_hash, model_id)
+        );
+        """
+        _ = sqlite3_exec(db, sql, nil, nil, nil)
+    }
+
+    /// Look up a cached expansion. The model_id is part of the key —
+    /// different LLMs extract different concept sets so we can't share
+    /// the cache across models.
+    nonisolated func queryExpansionCacheLookup(hash: String, modelID: String) -> [String]? {
+        ensureQueryExpansionCacheSchema()
+        let sql = "SELECT terms FROM query_expansion_cache WHERE query_hash = ? AND model_id = ?;"
+        var stmt: OpaquePointer?
+        defer { sqlite3_finalize(stmt) }
+        guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else { return nil }
+        sqlite3_bind_text(stmt, 1, (hash as NSString).utf8String, -1, nil)
+        sqlite3_bind_text(stmt, 2, (modelID as NSString).utf8String, -1, nil)
+        guard sqlite3_step(stmt) == SQLITE_ROW else { return nil }
+        guard let raw = sqlite3_column_text(stmt, 0) else { return nil }
+        let joined = String(cString: raw)
+        return joined.split(separator: "\n").map(String.init).filter { !$0.isEmpty }
+    }
+
+    /// Store a cached expansion. INSERT OR REPLACE so re-running an
+    /// expansion (e.g. after a deliberate cache invalidation) overwrites.
+    nonisolated func queryExpansionCacheStore(hash: String, normalized: String, terms: [String], modelID: String) {
+        ensureQueryExpansionCacheSchema()
+        let joined = terms.joined(separator: "\n")
+        let sql = "INSERT OR REPLACE INTO query_expansion_cache (query_hash, model_id, query_normalized, terms, created_at) VALUES (?, ?, ?, ?, ?);"
+        var stmt: OpaquePointer?
+        defer { sqlite3_finalize(stmt) }
+        guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else { return }
+        sqlite3_bind_text(stmt, 1, (hash as NSString).utf8String, -1, nil)
+        sqlite3_bind_text(stmt, 2, (modelID as NSString).utf8String, -1, nil)
+        sqlite3_bind_text(stmt, 3, (normalized as NSString).utf8String, -1, nil)
+        sqlite3_bind_text(stmt, 4, (joined as NSString).utf8String, -1, nil)
+        sqlite3_bind_int64(stmt, 5, Int64(Date().timeIntervalSince1970))
+        _ = sqlite3_step(stmt)
+    }
+
+    /// Clear all cached expansions. Called by SET_LLM (model switch) and
+    /// the API command CLEAR_QUERY_EXPANSION_CACHE for diagnostics.
+    /// Returns the number of rows deleted.
+    @discardableResult
+    nonisolated func queryExpansionCacheClear() -> Int {
+        ensureQueryExpansionCacheSchema()
+        if sqlite3_exec(db, "DELETE FROM query_expansion_cache;", nil, nil, nil) == SQLITE_OK {
+            return Int(sqlite3_changes(db))
+        }
+        return 0
+    }
+
+    /// Count cached entries — used by EMBEDDING_STATUS-style diagnostics
+    /// and the API.
+    nonisolated func queryExpansionCacheCount() -> Int {
+        ensureQueryExpansionCacheSchema()
+        var stmt: OpaquePointer?
+        defer { sqlite3_finalize(stmt) }
+        guard sqlite3_prepare_v2(db, "SELECT count(*) FROM query_expansion_cache;", -1, &stmt, nil) == SQLITE_OK else { return 0 }
+        return sqlite3_step(stmt) == SQLITE_ROW ? Int(sqlite3_column_int(stmt, 0)) : 0
+    }
+}
+
 // ==== FILE: Hal.swift ====
 // ==== LEGO START: 01 Imports & App Entry & Environment Wiring ====
 //
@@ -1501,7 +1776,11 @@ class MemoryStore: ObservableObject {
     // is what allows the Phase 5 compression cache methods on this class
     // to be `nonisolated` and callable from SegmentCompressor's actor
     // context without warning.
-    nonisolated(unsafe) private var db: OpaquePointer?
+    // Internal (not private) so MemoryStore extensions in other Swift
+    // files in this module — like QueryExpansion.swift's cache extension —
+    // can issue SQLite calls. Single-app module; internal access doesn't
+    // meaningfully broaden the surface.
+    nonisolated(unsafe) var db: OpaquePointer?
     nonisolated(unsafe) private var isConnected: Bool = false
 
     // Private initializer for singleton
@@ -5248,9 +5527,28 @@ extension MemoryStore {
     // MARK: - Unified Search Function with Full Attribution Metadata
     // This function performs both semantic and entity-based search to retrieve relevant context.
     // Returns RAGSnippet objects with complete metadata for transparency.
-    func searchUnifiedContent(for query: String, currentConversationId: String, excludeTurns: [Int], maxResults: Int, tokenBudget: Int) -> UnifiedSearchContext {
+    //
+    // `expansionTerms` (added 2026-05-17 for LLM-driven query expansion):
+    // an optional list of additional FTS5 terms to OR into the BM25 query.
+    // Used by the two-pass chat search path — pass 1 runs without
+    // expansion; if the result is weak (low RRF top-1, no entity match),
+    // the caller asks the active LLM for related terms and re-runs with
+    // those terms here. Semantic side is unchanged — embeddings don't
+    // benefit from word expansion. Empty list = no behavior change.
+    func searchUnifiedContent(
+        for query: String,
+        currentConversationId: String,
+        excludeTurns: [Int],
+        maxResults: Int,
+        tokenBudget: Int,
+        expansionTerms: [String] = []
+    ) -> UnifiedSearchContext {
         print("HALDEBUG-SEARCH: Starting unified content search for query: '\(query.prefix(50))....'")
         print("HALDEBUG-SEARCH: Excluding turns: \(excludeTurns)")
+        if !expansionTerms.isEmpty {
+            let sample = expansionTerms.prefix(8).joined(separator: ", ")
+            halLog("HALDEBUG-SEARCH: Query expansion active — \(expansionTerms.count) extra terms: \(sample)")
+        }
 
         guard ensureHealthyConnection() else {
             print("HALDEBUG-SEARCH: Cannot perform search - no database connection")
@@ -5374,7 +5672,30 @@ extension MemoryStore {
         var bm25Stmt: OpaquePointer?
         var bm25Ordered: [String] = []  // ids in rank order
         if sqlite3_prepare_v2(db, bm25SQL, -1, &bm25Stmt, nil) == SQLITE_OK {
-            let sanitized = sanitizeFTSQuery(query)
+            let originalSanitized = sanitizeFTSQuery(query)
+            // Merge LLM-supplied expansion terms (if any) with the
+            // original query tokens, ORed together at the FTS5 level so
+            // a match on EITHER set surfaces the row.
+            let sanitized: String
+            if expansionTerms.isEmpty {
+                sanitized = originalSanitized
+            } else {
+                // Re-sanitize each expansion term so spaces / weird
+                // chars get tokenized the same way as the original
+                // query. Drop empties. Join everything with OR.
+                let cleanedExtras = expansionTerms
+                    .map { sanitizeFTSQuery($0) }
+                    .filter { !$0.isEmpty && $0 != "\"\"" }
+                if cleanedExtras.isEmpty {
+                    sanitized = originalSanitized
+                } else {
+                    let originalIsEmpty = (originalSanitized.isEmpty || originalSanitized == "\"\"")
+                    sanitized = originalIsEmpty
+                        ? cleanedExtras.joined(separator: " OR ")
+                        : (originalSanitized + " OR " + cleanedExtras.joined(separator: " OR "))
+                    halLog("HALDEBUG-SEARCH: BM25 MATCH expression (with expansion): '\(sanitized.prefix(160))'")
+                }
+            }
             sqlite3_bind_text(bm25Stmt, 1, (sanitized as NSString).utf8String, -1, nil)
 
             while sqlite3_step(bm25Stmt) == SQLITE_ROW {
@@ -6212,6 +6533,64 @@ extension MemoryStore {
         }
         return """
         {"status":"ok","query":"\(dbgEscape(query))","conversationId":"\(dbgEscape(currentConversationId))","resultCount":\(result.snippets.count),"totalTokens":\(result.totalTokens),"recencyWeight":\(String(format: "%.3f", recencyWeight)),"entries":[\(entries.joined(separator: ","))]}
+        """
+    }
+
+    /// Diagnostic: run the full two-pass search-with-expansion path the
+    /// chat tool uses. First pass without expansion; if the trigger
+    /// fires, asks the active LLM for related terms via QueryExpansion;
+    /// second pass with those terms appended to the BM25 MATCH.
+    /// Returns the same JSON shape as debugSearchUnifiedContent plus an
+    /// `expansion` object describing what happened (terms used,
+    /// triggered, whether the expansion improved the top-1 score).
+    /// Added 2026-05-17 for measuring expansion against the eval corpus.
+    func debugSearchUnifiedContentWithExpansion(
+        query: String,
+        currentConversationId: String,
+        llmService: LLMService
+    ) -> String {
+        let first = searchUnifiedContent(
+            for: query,
+            currentConversationId: currentConversationId,
+            excludeTurns: [],
+            maxResults: 20,
+            tokenBudget: 4000
+        )
+        var triggered = false
+        var terms: [String] = []
+        var used: UnifiedSearchContext = first
+        var improved = false
+        if let top1 = first.snippets.first,
+           QueryExpansion.shouldExpand(top1Score: top1.relevanceScore, top1IsEntityMatch: top1.isEntityMatch) {
+            triggered = true
+            terms = QueryExpansion.expand(query: query, memoryStore: self, llmService: llmService)
+            if !terms.isEmpty {
+                let expanded = searchUnifiedContent(
+                    for: query,
+                    currentConversationId: currentConversationId,
+                    excludeTurns: [],
+                    maxResults: 20,
+                    tokenBudget: 4000,
+                    expansionTerms: terms
+                )
+                if let newTop = expanded.snippets.first, newTop.relevanceScore >= top1.relevanceScore {
+                    used = expanded
+                    improved = true
+                }
+            }
+        }
+        var entries: [String] = []
+        for snippet in used.snippets {
+            let preview = String(snippet.content.prefix(200))
+            let entry = """
+            {"relevanceScore":\(String(format: "%.4f", snippet.relevanceScore)),"sourceType":"\(dbgEscape(snippet.sourceType.rawValue))","sourceName":"\(dbgEscape(snippet.sourceName))","isEntityMatch":\(snippet.isEntityMatch),"recordedByModel":"\(dbgEscape(snippet.recordedByModel ?? ""))","contentPreview":"\(dbgEscape(preview))","contentLength":\(snippet.content.count)}
+            """
+            entries.append(entry)
+        }
+        let termsJson = "[" + terms.map { "\"\(dbgEscape($0))\"" }.joined(separator: ",") + "]"
+        let expansion = "{\"triggered\":\(triggered),\"terms\":\(termsJson),\"improved\":\(improved)}"
+        return """
+        {"status":"ok","query":"\(dbgEscape(query))","conversationId":"\(dbgEscape(currentConversationId))","resultCount":\(used.snippets.count),"totalTokens":\(used.totalTokens),"recencyWeight":\(String(format: "%.3f", recencyWeight)),"expansion":\(expansion),"entries":[\(entries.joined(separator: ","))]}
         """
     }
 }
@@ -7766,6 +8145,17 @@ class LLMService: ObservableObject {
     // the loaded MLX wrapper stays warm so seat 2 generation is instant.
     func setupLLM(for model: ModelConfiguration, keepMlxResident: Bool = false) {
         halLog("HALDEBUG-LLM: setupLLM called for model: \(model.displayName) (source: \(model.source), keepMlxResident: \(keepMlxResident))")
+        // If the LLM is actually changing identity (not a same-model
+        // re-setup), invalidate the query expansion cache — different
+        // models extract different concept sets, so stale entries from a
+        // prior model would be misleading. The cache key already mixes
+        // in model_id, so cross-model contamination is impossible, but
+        // wiping keeps the table small and predictable.
+        let previousModelID = self.currentModel.id
+        if previousModelID != model.id {
+            ChatViewModel.shared.memoryStore.queryExpansionCacheClear()
+            halLog("HALDEBUG-LLM: model id changed (\(previousModelID) → \(model.id)); cleared query expansion cache.")
+        }
         self.currentModel = model
         halLog("HALDEBUG-LLM: currentModel updated to: \(self.currentModel.displayName) (source: \(self.currentModel.source))")
         self.initializationError = nil // Clear previous errors
@@ -13304,14 +13694,14 @@ struct SalonConfiguration: Codable, Equatable {
 // string-prompt design (which chat-template models mirror back instead of
 // answering). Each ChatViewModel.buildChatMessages() turn produces a sequence
 // of these that flows uniformly through LLMService.generateChatResponse(...).
-struct HalChatMessage {
-    enum Role: String { case system, user, assistant }
-    let role: Role
-    let content: String
+nonisolated struct HalChatMessage: Sendable {
+    nonisolated enum Role: String, Sendable { case system, user, assistant }
+    nonisolated let role: Role
+    nonisolated let content: String
 
-    static func system(_ s: String) -> HalChatMessage { .init(role: .system, content: s) }
-    static func user(_ s: String) -> HalChatMessage { .init(role: .user, content: s) }
-    static func assistant(_ s: String) -> HalChatMessage { .init(role: .assistant, content: s) }
+    nonisolated static func system(_ s: String) -> HalChatMessage { .init(role: .system, content: s) }
+    nonisolated static func user(_ s: String) -> HalChatMessage { .init(role: .user, content: s) }
+    nonisolated static func assistant(_ s: String) -> HalChatMessage { .init(role: .assistant, content: s) }
 }
 
 @MainActor
@@ -14793,13 +15183,50 @@ class ChatViewModel: ObservableObject {
                                                                                 if subQueries.count == 1 {
                                                                                     // Original single-search path. No behavior change.
                                                                                     halLog("HALDEBUG-TOOLS: memory_search START (budget=\(tokenBudget) tokens, excludeTurns=\(excludeTurns.count))")
-                                                                                    let searchContext = memoryStore.searchUnifiedContent(
+                                                                                    var searchContext = memoryStore.searchUnifiedContent(
                                                                                         for: userInput,
                                                                                         currentConversationId: conversationId,
                                                                                         excludeTurns: excludeTurns,
                                                                                         maxResults: 10,
                                                                                         tokenBudget: tokenBudget
                                                                                     )
+                                                                                    // LLM-driven query expansion (2026-05-17). When
+                                                                                    // the initial retrieval is weak (top-1 RRF below
+                                                                                    // the calibrated threshold AND no BM25 hit),
+                                                                                    // ask the active LLM for related terms and
+                                                                                    // re-run BM25 with them. The semantic side is
+                                                                                    // unchanged — embeddings don't benefit from
+                                                                                    // word expansion. Cached by query hash in
+                                                                                    // SQLite so repeated queries don't re-call.
+                                                                                    let firstAll = searchContext.conversationSnippets + searchContext.documentSnippets
+                                                                                    if let top1 = firstAll.first,
+                                                                                       QueryExpansion.shouldExpand(top1Score: top1.relevanceScore, top1IsEntityMatch: top1.isEntityMatch) {
+                                                                                        let beforeScoreStr = String(format: "%.4f", top1.relevanceScore)
+                                                                                        halLog("HALDEBUG-EXPANSION: trigger fired — top1Score=\(beforeScoreStr) isEntityMatch=\(top1.isEntityMatch)")
+                                                                                        let terms = QueryExpansion.expand(
+                                                                                            query: userInput,
+                                                                                            memoryStore: memoryStore,
+                                                                                            llmService: llmService
+                                                                                        )
+                                                                                        if !terms.isEmpty {
+                                                                                            let expanded = memoryStore.searchUnifiedContent(
+                                                                                                for: userInput,
+                                                                                                currentConversationId: conversationId,
+                                                                                                excludeTurns: excludeTurns,
+                                                                                                maxResults: 10,
+                                                                                                tokenBudget: tokenBudget,
+                                                                                                expansionTerms: terms
+                                                                                            )
+                                                                                            let expandedAll = expanded.conversationSnippets + expanded.documentSnippets
+                                                                                            if let newTop = expandedAll.first, newTop.relevanceScore >= top1.relevanceScore {
+                                                                                                let afterScoreStr = String(format: "%.4f", newTop.relevanceScore)
+                                                                                                halLog("HALDEBUG-EXPANSION: expanded search wins (top1 \(beforeScoreStr) → \(afterScoreStr)). Using expanded results.")
+                                                                                                searchContext = expanded
+                                                                                            } else {
+                                                                                                halLog("HALDEBUG-EXPANSION: expanded search did not improve top1. Keeping original results.")
+                                                                                            }
+                                                                                        }
+                                                                                    }
                                                                                     let allSnippets = searchContext.conversationSnippets + searchContext.documentSnippets
                                                                                     memoryResults = allSnippets.map { ragSnippet in
                                                                                         UnifiedSearchResult(
@@ -21567,6 +21994,52 @@ class HalTestConsole: ObservableObject {
             // Added 2026-05-16 night for RAG regression diagnosis.
             let query = String(trimmed.dropFirst("MEMORY_SIMILARITY_DEBUG:".count))
             return vm.memoryStore.debugSemanticSimilarity(query: query)
+
+        } else if trimmed.hasPrefix("MEMORY_SEARCH_EXPANDED:") {
+            // MEMORY_SEARCH_EXPANDED:<query>
+            //
+            // Like MEMORY_SEARCH_DEBUG but runs the full two-pass
+            // search-with-expansion flow the chat tool uses (first pass
+            // without expansion, trigger check on top-1, second pass with
+            // LLM-supplied expansion terms if tripped). Returns the same
+            // shape plus an `expansion` object with triggered/terms/improved.
+            // Used by the eval harness to measure expansion's recall lift.
+            // Added 2026-05-17.
+            let query = String(trimmed.dropFirst("MEMORY_SEARCH_EXPANDED:".count))
+            return vm.memoryStore.debugSearchUnifiedContentWithExpansion(
+                query: query,
+                currentConversationId: vm.conversationId,
+                llmService: vm.llmService
+            )
+
+        } else if trimmed.hasPrefix("SET_FORCE_EXPANSION:") {
+            // SET_FORCE_EXPANSION:<true|false>
+            //
+            // Diagnostic: force LLM query expansion to fire on every
+            // query regardless of the normal trigger predicate. Used by
+            // the eval harness to measure expansion's impact under the
+            // Nomic pipeline (the original trigger was calibrated against
+            // NLContextual). Production should leave this off.
+            let raw = String(trimmed.dropFirst("SET_FORCE_EXPANSION:".count))
+                .trimmingCharacters(in: .whitespaces)
+                .lowercased()
+            let value = (raw == "true" || raw == "1" || raw == "yes")
+            UserDefaults.standard.set(value, forKey: "forceQueryExpansion")
+            return "{\"status\":\"ok\",\"command\":\"SET_FORCE_EXPANSION\",\"value\":\(value)}"
+
+        } else if trimmed == "CLEAR_QUERY_EXPANSION_CACHE" {
+            // Clear all cached LLM expansion results. Called by the API
+            // for diagnostics and (internally) when the active LLM
+            // changes, since different models extract different concept
+            // sets. Returns the number of rows deleted.
+            let deleted = vm.memoryStore.queryExpansionCacheClear()
+            return "{\"status\":\"ok\",\"command\":\"CLEAR_QUERY_EXPANSION_CACHE\",\"deleted\":\(deleted)}"
+
+        } else if trimmed == "QUERY_EXPANSION_CACHE_STATUS" {
+            // Read-only count of cached expansions. Useful for verifying
+            // the cache is actually being populated/hit.
+            let count = vm.memoryStore.queryExpansionCacheCount()
+            return "{\"status\":\"ok\",\"command\":\"QUERY_EXPANSION_CACHE_STATUS\",\"cachedEntries\":\(count)}"
 
         } else if trimmed.hasPrefix("MEMORY_SEARCH_DEBUG:") {
             // MEMORY_SEARCH_DEBUG:<query>
