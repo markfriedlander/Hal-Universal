@@ -668,3 +668,161 @@ the upgrade — first-launch users are unaffected.
 - Embedder upgrade path: complete in code; on-device verification
   needed before shipping
 
+
+---
+
+## 2026-05-17 (afternoon, Nomic via swift-embeddings — recall jumps to 9/10)
+
+### Setting
+
+Mark came back with the phone. We had the user-upgrade infrastructure
+in place (catalog download, backend selector, two-way migration UI) but
+hadn't verified Gemma loaded on actual hardware. First attempt on
+device: same `libc++ Hardening` crash as on the simulator. MLX's
+`mlx::core::metal::Device::Device()` (device.cpp:328) was reading the
+Metal architecture name as nullptr and aborting via `basic_string`.
+
+Mark's research turned up that this is a documented upstream
+mlx-swift bug specific to iOS, going back to 2024. Not something we
+can fix. So the Gemma path is blocked until Apple/Google upstream
+patches it.
+
+But: research also surfaced `jkrukowski/swift-embeddings`, a Swift
+embedding library that runs models on Apple's MLTensor framework
+(not MLX). Supports Nomic Embed Text v1.5 directly — the same model
+that's purpose-built for asymmetric retrieval (short queries against
+short stored documents). MIT licensed, actively maintained, latest
+release shipped the same morning.
+
+### Decision
+
+Mark approved adding swift-embeddings as a third backend (not a
+replacement for Gemma — Gemma stays in code, compiled out for store
+builds via `HAL_ENABLE_EMBEDDING_GEMMA`, ready to re-enable when the
+MLX bug is fixed upstream). NLContextual remains the default; Nomic
+is the functional opt-in upgrade available today; Gemma is reserved
+infrastructure for the future.
+
+Standing instruction reaffirmed: refactor as you go. Extract any new
+embedding code into the appropriate dedicated files rather than adding
+to Hal.swift.
+
+### Refactor (commits before the Nomic work)
+
+Hal.swift was getting unmanageable for embedding work, so per the
+standing instruction we extracted three files first:
+
+- **`EmbeddingBackend.swift`** — the backend enum, UserDefaults
+  keys, crash guard, system version, dimension, modelID, and the
+  UI display strings (displayName / blurb / sizeBlurb).
+- **`EmbeddingProvider.swift`** — the provider class with one
+  per-backend code path; `MemoryStore.generateEmbedding(for:)` and
+  `cosineSimilarity` extensions.
+- **`EmbedderMigrationCoordinator.swift`** — the @MainActor
+  coordinator state machine + the two SwiftUI rows
+  (`EmbedderBackendRow`, `EmbedderMigrationStatusRow`).
+
+Plus a new `scripts/sync_hal_source.sh` that concatenates all the
+Swift files into `Hal_Source.txt` (Hal's self-knowledge ingestion
+expects a single text file). SOP in CLAUDE.md updated to use the
+script.
+
+Hal.swift dropped from 21,965 → 21,312 lines after the three
+extractions. Build clean each step.
+
+### Nomic backend (swift-embeddings, BERT class)
+
+Added `swift-embeddings 0.0.27` as an SPM dependency. Bumped
+`swift-transformers` from `exactVersion 1.3.2` → `1.3.3` (required
+by swift-embeddings; verified `xcodebuild -resolvePackageDependencies`
+re-resolves cleanly and SPM doesn't drift back to 1.0.0).
+
+New `EmbeddingPurpose` enum: `.document` | `.query`. Threaded through
+`EmbeddingProvider.embed(_:as:)` and `MemoryStore.generateEmbedding(for:as:)`.
+Storage callers pass `.document`; search callers pass `.query`. NLContextual
+and Gemma ignore the parameter; the Nomic path uses it to prepend the
+required `search_query: ` / `search_document: ` task instruction
+prefixes (without these, retrieval quality drops sharply per the model
+card).
+
+New backend case `.nomicSwift = "nomicswift"`. `isAvailableInThisBuild`
+reads the `HAL_ENABLE_EMBEDDING_GEMMA` compile flag for the Gemma case;
+Debug builds set the flag, App Store builds don't. Selecting an
+unavailable backend via API or stale UserDefaults falls back to
+NLContextual at launch (handled by the existing crash guard, repurposed
+as a "this build doesn't support that backend" guard).
+
+The first load attempt used `Bert.loadModelBundle` and failed with a
+`Safetensors.Safetensors.Error error 0`. Nomic has its own dedicated
+`NomicBert` model class in swift-embeddings — Bert can't read its
+weight key naming. One-line fix: `Bert.loadModelBundle` →
+`NomicBert.loadModelBundle`, and `Bert.ModelBundle` →
+`NomicBert.ModelBundle` for the type. Loaded cleanly after that.
+
+### Measurement
+
+Same 70-row corpus, same 10 recall queries as the prior evals. Reset
+DB, switched to Nomic, injected the corpus (embeds with `.document`),
+ran `rag_pipeline_eval.py`.
+
+| Query | NLContextual baseline rank | Nomic rank |
+|---|---|---|
+| "What's my dog's name?" → Pepper | 4 | **1** |
+| "Where do I work?" → Anthropic | 6 | **2** |
+| "What restaurant do I love?" → Tartine | 1 | **1** |
+| "Tell me about my upcoming travel plans." → Iceland | 6 | **3** |
+| "Where do I live now?" → Berkeley | **18** (top-10 miss) | **5** |
+| "What instrument am I learning?" → cello | **18** (top-10 miss) | **10** |
+| "What's my favorite book?" → Karamazov | 7 | **1** |
+| "What's my cat called?" → Atlas | 2 | **1** |
+| "Do I have any running events coming up?" → marathon | 5 | **1** |
+| "What kind of car do I have?" → Subaru | **NOT IN RESULTS** | 17 |
+
+| Metric | NLContextual | Nomic | Delta |
+|---|---|---|---|
+| Top-1 recall | 1/10 | **5/10** | +4 |
+| Top-5 recall | 4/10 | **8/10** | +4 |
+| Top-10 recall | 7/10 | **9/10** | +2 |
+
+Two of the three previously-failing queries (Berkeley, cello) now
+land in the top 10. Subaru is the lone remaining miss in the top-10
+window but moved from "not in results at all" to rank 17 — meaning
+even the worst case is recoverable with a larger retrieval window or
+the LLM-driven query expansion that's queued as a parallel workstream.
+
+Notable: top-1 recall jumped 1 → 5. Six of ten queries now return the
+plant as the literal first hit. This is the asymmetric-retrieval
+training paying off — short query against short document is exactly
+Nomic v1.5's design point.
+
+### What changed in the codebase
+
+- `Hal Universal/EmbeddingBackend.swift` — third case, `EmbeddingPurpose`
+  enum, `isAvailableInThisBuild` flag-gating, Nomic display strings.
+- `Hal Universal/EmbeddingProvider.swift` — Nomic load path
+  (NomicBert.loadModelBundle from local directory), embed path with
+  prefix logic and MLTensor mean-pool + L2-normalize, Gemma path
+  fully `#if HAL_ENABLE_EMBEDDING_GEMMA`-wrapped.
+- `Hal Universal/Hal.swift` — search/migration call sites updated to
+  pass `EmbeddingPurpose`; Model Library section now iterates
+  `EmbeddingBackend.allCases.filter { $0.isAvailableInThisBuild }`;
+  `DOWNLOAD_EMBEDDING_MODEL[:backend]` and `EMBEDDING_DOWNLOAD_STATUS[:backend]`
+  accept a backend suffix (defaults to nomicswift).
+- `project.pbxproj` — added `swift-embeddings` SPM package, products
+  `Embeddings` + `MLTensorUtils` linked; bumped `swift-transformers`
+  to exactVersion 1.3.3; Debug config sets
+  `SWIFT_ACTIVE_COMPILATION_CONDITIONS` to include
+  `HAL_ENABLE_EMBEDDING_GEMMA` so dev builds can still exercise the
+  Gemma code path locally.
+
+### State at end of entry
+
+- `main` (about to commit)
+- All builds clean (zero warnings, zero errors)
+- Default backend: NLContextual (unchanged)
+- Nomic available as opt-in upgrade via Model Library
+- Gemma compiled out of Release; lives in code waiting for the upstream
+  MLX Metal init fix
+- Recall: 9/10 top-10 measured on device with Nomic
+- Subaru still misses top-10 — fixable via LLM-driven query expansion
+  (queued, designed but not implemented)

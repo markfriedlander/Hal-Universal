@@ -1,94 +1,90 @@
 # Hal Universal — Handoff Brief
-**Updated:** May 17, 2026 (morning, post-EmbeddingGemma-scaffolding)
-**Branch:** `main` @ `2237e2a` — in sync with `origin/main` (everything pushed)
-**Working tree:** clean (only untracked: `Docs/SC_Release_Materials/`, pre-existing)
+**Updated:** May 17, 2026 (afternoon, post-Nomic-shipped)
+**Branch:** `main` (about to commit Nomic backend work)
+**Working tree:** uncommitted Nomic implementation + refactor
 
-> **For the next CC session:** read this brief, then `NEXT.md` for what to do first,
-> then the 2026-05-17 morning entry of `HISTORY.md` for how we got here, then
-> `CLAUDE.md` for standing rules.
+> **For the next CC session:** read this brief, then `NEXT.md` for what to
+> do next, then the 2026-05-17 afternoon entry in `HISTORY.md` for the
+> Nomic story, then `CLAUDE.md` for standing rules.
 
 ---
 
 ## TL;DR — where Hal is right now
 
-The RAG memory pipeline shipped last night (NLContextualEmbedding + FTS5 BM25 +
-RRF fusion) is unchanged at the algorithm level. Today's work added the **second
-embedding backend** as an opt-in user upgrade:
+Three switchable embedding backends:
 
-- **EmbeddingProvider** now dispatches on `UserDefaults("embeddingBackend")`:
-  `nlcontextual` (default, NLContextualEmbedding, 512-dim) or `embeddinggemma`
-  (EmbeddingGemma 300M MLX 4-bit, 768-dim).
-- **MLXEmbedders** is linked from `mlx-swift-lm 3.31.3` (already a transitive
-  checkout; just added the framework reference to the Hal Universal target).
-- **Catalog-driven download**: a new "Embedding (Memory)" section in Model
-  Library, modeled on "Hal's Picks", offers a one-tap download (uses the
-  existing `MLXModelDownloader` / `BackgroundDownloadCoordinator` pipeline that
-  powers the LLM downloads).
-- **Two-way migration**: switching backends wipes the embedding column on every
-  stored row and re-embeds them via the new backend
-  (`MemoryStore.reEmbedAllNullRows`). Forward and back. Driven by
-  `EmbedderMigrationCoordinator` (state machine: idle → downloading → switching
-  → migrating → done | error).
+- **NLContextual** (default, built-in, 512-dim) — ships with iOS, no download.
+- **EmbeddingGemma 300M** (768-dim, ~210 MB) — compiled out for App Store
+  builds via `HAL_ENABLE_EMBEDDING_GEMMA` (Debug-only). Blocked by an
+  upstream `mlx-swift` Metal init crash on iOS 26.5; infrastructure stays
+  in place ready to flip on when Apple/the MLX team fixes
+  `mlx::core::metal::Device::Device()` at `device.cpp:328`.
+- **Nomic Embed Text v1.5** (768-dim, ~522 MB) — **available now**, opt-in
+  via Model Library. Uses Apple's MLTensor framework via
+  `jkrukowski/swift-embeddings` (MIT). No MLX dependency → no Metal
+  crash. Purpose-built for asymmetric retrieval (short queries against
+  short stored documents) with `search_query:` / `search_document:`
+  task instruction prefixes handled inside `EmbeddingProvider`.
 
-Default behavior unchanged: NLContextual is still the active embedder. Users
-have to opt in to upgrade, and they can switch back at any time.
+**Recall measured on device** with the 70-row eval corpus + 10 ground-truth
+queries:
 
-**Known unknown:** EmbeddingGemma's load path crashes on the iOS 26.5 simulator
-(libc++ Hardening string-nullptr inside MLXEmbedders.loadContainer). Likely
-sim-only — the device may not enforce that hardening — but **on-device
-verification is pending**. See NEXT.md for the test plan.
+| Metric | NLContextual | Nomic | Δ |
+|---|---|---|---|
+| Top-1 | 1/10 | **5/10** | +4 |
+| Top-5 | 4/10 | **8/10** | +4 |
+| Top-10 | 7/10 | **9/10** | +2 |
+
+The three previously-failing queries:
+- Berkeley: rank 18 → **5**
+- cello: rank 18 → **10**
+- Subaru: not in results → 17 (still misses top-10)
+
+Subaru is the only remaining miss. LLM-driven query expansion is queued
+as the next layer to address it.
 
 ---
 
 ## What's in the code right now
 
-### Embedding system (`EmbeddingProvider`, Hal.swift around line 3754)
+### Embedding system (extracted from Hal.swift on 2026-05-17)
 
-Two paths through `embed(_:)`:
-- **NLContextual path**: `embeddingResult(for:language:)` per token, mean-pool
-  to 512-dim. Same as yesterday. Lazy-load + asset download via DispatchSemaphore.
-- **EmbeddingGemma path**: `EmbedderModelFactory.shared.loadContainer(from:
-  directory, using: tokenizerLoader)` (load-from-local-directory, the catalog
-  downloader handles the actual download). Per-call inference runs in a
-  Task.detached → container.perform → mean-pool inside the model →
-  `pooled.asArray(Float.self)` → bridged back to `[Double]` via DispatchSemaphore.
+```
+Hal Universal/
+├── EmbeddingBackend.swift              — enum + UserDefaults + crash guard
+├── EmbeddingProvider.swift             — provider class + MemoryStore ext
+├── EmbedderMigrationCoordinator.swift  — @MainActor state machine + UI
+└── Hal.swift                           — everything else
+```
 
-Backend is selected via `EmbeddingBackend.current()` which reads UserDefaults
-each call. Changing the backend bumps `EmbeddingBackend.systemVersion`, so
-`wipeStaleEmbeddingsIfNeeded` triggers a wipe on next call.
+`EmbeddingPurpose` enum (`.document` | `.query`) threaded through
+`EmbeddingProvider.embed(_:as:)` and `MemoryStore.generateEmbedding(for:as:)`.
+Retrieval-asymmetric backends (Nomic) use it; NLContextual/Gemma ignore it.
 
-`EmbeddingBackend` enum is nonisolated + Sendable (project default isolation
-is MainActor; without the explicit annotations, the enum members would inherit
-MainActor and produce warnings in nonisolated contexts).
+`EmbeddingBackend.isAvailableInThisBuild` gates the Gemma case on the
+`HAL_ENABLE_EMBEDDING_GEMMA` compile flag (Debug only). The UI iterates
+`allCases.filter { $0.isAvailableInThisBuild }` so store builds only show
+NLContextual + Nomic.
 
-### Migration (`MemoryStore.reEmbedAllNullRows`, around line 678)
+### Nomic load + embed path (`EmbeddingProvider.embedNomicSwift`)
 
-Two-pass migration over `unified_content`:
-  1. SELECT id, content WHERE embedding IS NULL → collect candidates
-  2. UPDATE embedding = ? WHERE id = ? for each, calling
-     `generateEmbedding(for: content)` (dispatches to current backend)
+1. Local-directory load via `NomicBert.loadModelBundle(from: URL)`
+   (the dedicated NomicBERT loader — Bert's loader chokes on Nomic's
+   weight key naming, learned the hard way today).
+2. `nomicPrefixed(text, purpose:)` prepends `"search_query: "` /
+   `"search_document: "` per Nomic's required task instruction format.
+3. `bundle.encode(prefixed, maxLength: 512)` → MLTensor [1, seqLen, hidden].
+4. Mean-pool over seqLen, L2-normalize, return `[Double]`.
 
-Logs decile progress. Returns (updated, skipped, failed). Single-row (not
-batched) — keeps the code simple; batching can come later if real-world
-corpora prove slow.
+### Migration + download
 
-`generateEmbedding` is now nonisolated so the migration can run from any
-queue. EmbeddingProvider.embed is already nonisolated + thread-safe.
+`MemoryStore.reEmbedAllNullRows()` re-embeds every NULL-embedding row
+using the active backend; passes `.document`. `EmbedderMigrationCoordinator`
+orchestrates wipe → warm-up wait → migration on a background task and
+publishes phase updates to the UI.
 
-### User upgrade UI (Model Library section, around line 9837)
-
-Between "Hal's Picks" and "Community Models":
-
-- `EmbedderBackendRow` per backend, with accordion expand and the existing
-  status-dot vocabulary (green = active, grey = downloaded, none = not
-  downloaded).
-- Confirmation dialog before switching, warning about the re-embed step.
-- `EmbedderMigrationStatusRow` renders inline during downloading / migrating /
-  done / error phases.
-
-Coordinator: `EmbedderMigrationCoordinator.shared` (`@MainActor` singleton,
-ObservableObject). Phase enum drives the UI; `switchAndMigrate` orchestrates
-wipe → warm-up → migration in a single background task.
+Download flows through `MLXModelDownloader` / `BackgroundDownloadCoordinator`
+(same path the LLM models use).
 
 ---
 
@@ -96,70 +92,36 @@ wipe → warm-up → migration in a single background task.
 
 | Command | Purpose |
 |---|---|
-| `EMBEDDING_STATUS` | Backend name, `isLoaded`, sample vector dim, expected dim |
-| `SET_EMBEDDING_BACKEND:<name>` | Switch backend, wipe embeddings, warm up new backend |
-| `MIGRATE_EMBEDDINGS_REEMBED` | Run `reEmbedAllNullRows` synchronously (returns counts) |
-| `DOWNLOAD_EMBEDDING_MODEL` | Kick off Gemma download (~210 MB) via BGDL pipeline |
-| `EMBEDDING_DOWNLOAD_STATUS` | Read-only progress poll for the Gemma download |
-| `MEMORY_DUMP:<limit>` | Recent rows; now includes `entityKeywords` per row |
-| `MEMORY_SEARCH_DEBUG:<query>` | Full hybrid retrieval trace |
-| `MEMORY_SIMILARITY_DEBUG:<query>` | Raw cosine per row (used by `rag_threshold_eval.py`) |
-| `INJECT_REALISTIC_TEST_CORPUS` | 70-row corpus, now with entity_keywords populated |
+| `EMBEDDING_STATUS` | backend name, isLoaded, sample dim, expected dim |
+| `SET_EMBEDDING_BACKEND:<name>` | switch backend (nlcontextual / nomicswift / embeddinggemma) |
+| `MIGRATE_EMBEDDINGS_REEMBED` | run reEmbedAllNullRows synchronously |
+| `DOWNLOAD_EMBEDDING_MODEL[:<backend>]` | start download (defaults to nomicswift) |
+| `EMBEDDING_DOWNLOAD_STATUS[:<backend>]` | progress poll |
+| `FTS_DIAG` | FTS5 row counts + sample MATCH + schema (for the BM25-zero regression) |
+| `MEMORY_DUMP:<limit>` | row dump incl. entity_keywords + embedding dim |
+| `MEMORY_SEARCH_DEBUG:<q>` | full RRF pipeline trace |
+| `MEMORY_SIMILARITY_DEBUG:<q>` | raw cosine per row |
+| `INJECT_REALISTIC_TEST_CORPUS` | 70-row eval corpus, entity_keywords populated |
 
 ---
 
-## Eval harnesses
+## Build flags
 
-- **`tests/rag_threshold_eval.py`** — raw cosine per query, baseline behavior
-  unchanged.
-- **`tests/rag_pipeline_eval.py`** — full RRF pipeline via `MEMORY_SEARCH_DEBUG`,
-  reports plant rank in top-N. **New as of this session.**
+- `HAL_ENABLE_EMBEDDING_GEMMA` — Debug only. Gates the Gemma backend's
+  code path (load + embed). When unset, selecting Gemma falls back to
+  NLContextual at launch and the Model Library hides the Gemma row.
 
-Both harnesses honor an `HAL_API_CONFIG` env var so sim configs work without
-editing the device config (`tests/.hal_api_config_sim.json` is checked in for
-the iPhone 17 Pro sim).
-
-**Current measured baseline (NLContextual, post-Proposal-B):**
-- Plant scores mean 0.83, top-noise mean 0.88 (raw cosine).
-- Full-pipeline RRF: top-10 7/10, top-5 4/10, top-1 1/10. Berkeley/cello/Subaru
-  ranked 13–18 of 20.
-
-**Gemma baseline:** not yet measured (sim crash blocks; device pending).
-
----
-
-## Known caveats
-
-- **iOS Simulator can't run EmbeddingGemma's load.** MLXEmbedders'
-  `loadContainer(from: directory, ...)` crashes in libc++ Hardening with a
-  string-nullptr. Reproduces with `#hubDownloader()` too. Likely sim-only —
-  hardening is enabled in `iPhoneSimulator26.5.sdk/usr/include/c++/v1/string`.
-  Device behavior pending.
-- **NLContextual still has the narrow-band discrimination problem** described
-  yesterday. Until Gemma is tested on device, the 7/10 top-10 baseline stands.
-- **`entity_keywords` only catches person/place/organization** (NLTagger's three
-  categories). Common nouns like "cello", "marathon", "Subaru" don't get
-  extracted on plants. Real-world impact: BM25 helps for queries that share
-  proper-noun terms, doesn't help for natural-language recall like
-  "What instrument am I learning?".
-
----
-
-## Recent commits (since last brief)
+## Dependencies
 
 ```
-2237e2a  Embedder upgrade UI in Model Library (Proposal A user flow)
-77df7ae  Embedding migration + download API commands
-8823a65  Proposal A scaffolding: EmbeddingGemma backend (load-from-directory)
-07cfe3a  Proposal B: populate entity_keywords in test corpus; add pipeline eval harness
-c93b17f  Docs: handoff brief for next session — RAG state + 3 proposals + how to start
-2e1bd26  tests: rag_threshold_eval.py — 10-query ground-truth eval harness for RAG
-9712a87  Delete relevanceThreshold/similarityThreshold entirely
+mlx-swift 0.31.3
+mlx-swift-lm 3.31.3        (MLXLLM + MLXLMCommon + MLXHuggingFace + MLXEmbedders)
+swift-transformers 1.3.3   (exactVersion pin, bumped from 1.3.2 today)
+swift-embeddings 0.0.27    (exactVersion pin, new today — Nomic backend)
+  → swift-safetensors 0.1.1
+  → swift-sentencepiece 0.0.6
+  → swift-numerics 1.1.1
 ```
-
-`origin/main` is at `2237e2a`. Local matches. Everything pushed.
-
----
 
 ## Build + Deploy (iPhone 16 Plus)
 
@@ -177,7 +139,6 @@ xcrun devicectl device process launch --device D24FB384-9C55-5D33-9B0D-DAEBFA652
 ```
 
 - iPhone 16 Plus: `D24FB384-9C55-5D33-9B0D-DAEBFA6528D6`
-- Bundle ID: `com.MarkFriedlander.Hal-Universal`
 - API host: `marks-bigger-ass-fon-16.local` (mDNS — phone must be awake + on WiFi)
 - API port: 8766
 - API token: `e9ee9ec5b315467fa655bd4296873f43` (in `tests/.hal_api_config.json`)
@@ -188,13 +149,53 @@ For sim runs: `HAL_API_CONFIG=.hal_api_config_sim.json python3 tests/hal_test.py
 
 ---
 
-## SOP
+## SOP (refactor-as-you-go is now mandatory)
 
-1. `cp "Hal Universal/Hal.swift" "Hal Universal/Hal_Source.txt"` after every Hal.swift change.
-2. New enum case? Sweep all switches.
-3. New AppStorage key? `defaults write com.MarkFriedlander.Hal10000 [key] "[value]"`.
-4. App build number bump happens at App Store submission (currently at 5).
-5. Never use `NUCLEAR_RESET` between plant and recall in a memory test.
-6. **Update HISTORY/HANDOFF/NEXT as work lands** (CLAUDE.md Golden Rule #8).
-7. **Warnings = errors** (CLAUDE.md Golden Rule #7).
-8. **API > asking the human** — expand the API if a question can't be answered through it.
+1. **After any change to Hal's source files, sync `Hal_Source.txt`:**
+   ```bash
+   ./scripts/sync_hal_source.sh
+   ```
+   The script concatenates all of `Hal Universal/*.swift` in a stable
+   order. When you extract a new file from Hal.swift, add it to the
+   `FILES` array inside `scripts/sync_hal_source.sh`.
+
+2. **Significant changes to a section of Hal.swift → extract into a
+   dedicated file** (per Mark's 2026-05-17 standing instruction).
+   Use the existing files (`EmbeddingBackend.swift`,
+   `EmbeddingProvider.swift`, `EmbedderMigrationCoordinator.swift`)
+   as the template.
+
+3. New enum case → sweep all switches.
+
+4. New AppStorage key → `defaults write com.MarkFriedlander.Hal10000 [key] "[value]"`.
+
+5. App build number bump happens at App Store submission (currently at 5).
+
+6. Never `NUCLEAR_RESET` between plant and recall in a memory test.
+
+7. **Update HISTORY/HANDOFF/NEXT as work lands** (CLAUDE.md Golden Rule #8).
+
+8. **Warnings = errors** (CLAUDE.md Golden Rule #7).
+
+9. **API > asking the human** — expand the API if a question can't be
+   answered through it.
+
+---
+
+## Known caveats
+
+- **EmbeddingGemma is unavailable in this build configuration** because
+  the underlying MLX-swift Metal init crashes on iOS 26.5
+  (`mlx::core::metal::Device::Device()` at `device.cpp:328` — libc++
+  `basic_string(const char*) detected nullptr` from a Metal architecture
+  name that returns nil on iOS 26+). Documented upstream issue. Code
+  stays in place behind `HAL_ENABLE_EMBEDDING_GEMMA` flag.
+- **Nomic adds ~522 MB on disk.** Same mental model as downloading a
+  local LLM — user opts in.
+- **Nomic load takes ~10–15 s on the iPhone 16 Plus** (MMAP-loading 546 MB
+  safetensors + tokenizer JSON parse). Subsequent embeds are fast (~80 ms
+  per text on this hardware, including the prefix prepend).
+- **FTS5 first-inject-after-install glitch** (documented 2026-05-17
+  morning): a fresh install with an immediate inject sees BM25 return 0
+  candidates until a NUCLEAR_RESET + re-inject. Minor; the test corpus
+  workflow already does the reset.
