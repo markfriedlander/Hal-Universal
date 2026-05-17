@@ -12108,7 +12108,15 @@ class ChatViewModel: ObservableObject {
         memoryStore.selfKnowledgeHalfLifeDays = 365.0
         memoryStore.selfKnowledgeFloor = 0.3
         enableSelfKnowledge = DefaultSettings.enableSelfKnowledge
-        
+
+        // Reset Salon (Multi-LLM) back to single-model defaults.
+        // Without this, persisted AppStorage `salonConfigData` survives the
+        // Nuclear Reset and can leave the user in a "Salon enabled, 0 seats"
+        // state where every /chat turn silently no-ops. Resetting to a fresh
+        // `SalonConfiguration()` restores `isEnabled=false`, clears all seats,
+        // and returns behavioralMode + summarizer to defaults.
+        salonConfig = SalonConfiguration()
+
         // Generate reset dialogue (creates bilateral messages in chat)
         let userMsg = "Hal, I reset all your settings to factory defaults."
         let halMsg = "All settings reset to defaults! I'm back to 5-turn memory, 0.75 similarity threshold, 30% recency weight, 90-day half-life, and self-knowledge enabled. Everything should work smoothly now."
@@ -13555,10 +13563,20 @@ class ChatViewModel: ObservableObject {
                                                                     // assistant reply for external callers afterwards.
                                                                     let startingCount = messages.count
 
-                                                                    // Branch based on Salon Mode
-                                                                    if salonConfig.isEnabled {
+                                                                    // Branch based on Salon Mode.
+                                                                    // Guard: Salon "enabled but no seats" is a degenerate
+                                                                    // state (reachable when a user enables Salon then clears
+                                                                    // all seats without disabling, or when persisted
+                                                                    // AppStorage survives a Nuclear Reset). Routing there
+                                                                    // would silently no-op the turn. Fall through to
+                                                                    // single-model in that case and log so the bad state
+                                                                    // is visible in diagnostics.
+                                                                    if salonConfig.isEnabled && !salonConfig.activeSeats.isEmpty {
                                                                         await runSalonTurn(userInput: trimmed)
                                                                     } else {
+                                                                        if salonConfig.isEnabled {
+                                                                            halLog("HALDEBUG-SALON: Routing to single-model — Salon enabled but no seats configured (state guard)")
+                                                                        }
                                                                         await runSingleModelTurn(userInput: trimmed)
                                                                     }
 
