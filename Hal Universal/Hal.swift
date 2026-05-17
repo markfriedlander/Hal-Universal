@@ -674,8 +674,115 @@ class MemoryStore: ObservableObject {
         halLog("HALDEBUG-EMBEDDING: Wiped embeddings — unified_content: \(unifiedChanges) rows, self_knowledge: \(selfChanges) rows. Embeddings regenerate on next access.")
         UserDefaults.standard.set(currentEmbeddingVersion, forKey: key)
     }
-    
-    
+
+    // MARK: - Embedding Migration (Proposal A user upgrade path, 2026-05-17)
+    //
+    // When the user switches embedding backend, existing rows have their
+    // embedding column NULLed via `wipeStaleEmbeddingsIfNeeded`. New rows
+    // re-embed lazily through the new backend, but already-stored content
+    // (the bulk of a real user's database after weeks of conversation)
+    // stays semantically dark until each row is explicitly re-embedded.
+    //
+    // `reEmbedAllNullRows` walks every row with NULL embedding, calls
+    // `generateEmbedding` (which dispatches to the current backend), and
+    // UPDATEs the row. Progress is logged at decile boundaries. Returns
+    // (updated, skipped, failed) counts.
+    //
+    // Intentionally synchronous and chunked-by-row rather than batched.
+    // EmbeddingGemma on iPhone 16+ produces ~1 embedding per ~50ms; for
+    // a thousand-row corpus that's under a minute. For larger corpora a
+    // future variant could batch via MLX padded inputs — landing this in
+    // single-row mode first keeps the code simple and the failure surface
+    // small.
+    nonisolated func reEmbedAllNullRows() -> (updated: Int, skipped: Int, failed: Int) {
+        guard ensureHealthyConnection() else {
+            halLog("HALDEBUG-EMBEDDING: reEmbedAllNullRows aborted — no DB connection")
+            return (0, 0, 0)
+        }
+        // Count total candidates first so we can log decile progress.
+        var totalCandidates = 0
+        var countStmt: OpaquePointer?
+        if sqlite3_prepare_v2(db, "SELECT count(*) FROM unified_content WHERE embedding IS NULL;", -1, &countStmt, nil) == SQLITE_OK {
+            if sqlite3_step(countStmt) == SQLITE_ROW {
+                totalCandidates = Int(sqlite3_column_int(countStmt, 0))
+            }
+        }
+        sqlite3_finalize(countStmt)
+        halLog("HALDEBUG-EMBEDDING: reEmbedAllNullRows starting — \(totalCandidates) candidate rows with NULL embedding")
+        guard totalCandidates > 0 else { return (0, 0, 0) }
+
+        // Pull ids + content in one pass; UPDATE in a second pass via
+        // prepared statement. Reading + writing in the same step would
+        // require recursive SQL or a held-cursor write, both of which
+        // surprise SQLite locking. Two passes is cleaner.
+        let selectSQL = "SELECT id, content FROM unified_content WHERE embedding IS NULL ORDER BY rowid ASC;"
+        var selStmt: OpaquePointer?
+        guard sqlite3_prepare_v2(db, selectSQL, -1, &selStmt, nil) == SQLITE_OK else {
+            halLog("HALDEBUG-EMBEDDING: reEmbedAllNullRows — failed to prepare SELECT")
+            return (0, 0, 0)
+        }
+        var pairs: [(id: String, content: String)] = []
+        while sqlite3_step(selStmt) == SQLITE_ROW {
+            let id = sqlite3_column_text(selStmt, 0).map { String(cString: $0) } ?? ""
+            let content = sqlite3_column_text(selStmt, 1).map { String(cString: $0) } ?? ""
+            if !id.isEmpty {
+                pairs.append((id: id, content: content))
+            }
+        }
+        sqlite3_finalize(selStmt)
+
+        let updateSQL = "UPDATE unified_content SET embedding = ? WHERE id = ?;"
+        var updStmt: OpaquePointer?
+        guard sqlite3_prepare_v2(db, updateSQL, -1, &updStmt, nil) == SQLITE_OK else {
+            halLog("HALDEBUG-EMBEDDING: reEmbedAllNullRows — failed to prepare UPDATE")
+            return (0, 0, 0)
+        }
+        defer { sqlite3_finalize(updStmt) }
+
+        var updated = 0
+        var skipped = 0
+        var failed = 0
+        let progressStep = max(1, totalCandidates / 10)
+
+        for (index, pair) in pairs.enumerated() {
+            let trimmed = pair.content.trimmingCharacters(in: .whitespacesAndNewlines)
+            if trimmed.isEmpty {
+                skipped += 1
+                continue
+            }
+            let vector = generateEmbedding(for: trimmed)
+            if vector.isEmpty {
+                // Backend not ready or embed returned nil. Leave embedding
+                // NULL and try again later. Don't count as failure if the
+                // backend just isn't loaded yet.
+                failed += 1
+                continue
+            }
+            let bytes = vector.withUnsafeBufferPointer { Data(buffer: $0) }
+            sqlite3_reset(updStmt)
+            sqlite3_clear_bindings(updStmt)
+            _ = bytes.withUnsafeBytes { rawBuf in
+                sqlite3_bind_blob(updStmt, 1, rawBuf.baseAddress, Int32(bytes.count), nil)
+            }
+            sqlite3_bind_text(updStmt, 2, (pair.id as NSString).utf8String, -1, nil)
+            let stepResult = sqlite3_step(updStmt)
+            if stepResult == SQLITE_DONE {
+                updated += 1
+            } else {
+                failed += 1
+                halLog("HALDEBUG-EMBEDDING: reEmbedAllNullRows — UPDATE failed for id=\(pair.id.prefix(8)) result=\(stepResult)")
+            }
+
+            if (index + 1) % progressStep == 0 || index == pairs.count - 1 {
+                let pct = Int(Double(index + 1) / Double(pairs.count) * 100)
+                halLog("HALDEBUG-EMBEDDING: reEmbedAllNullRows progress \(pct)% (\(index + 1)/\(pairs.count)) updated=\(updated) skipped=\(skipped) failed=\(failed)")
+            }
+        }
+        halLog("HALDEBUG-EMBEDDING: reEmbedAllNullRows complete — updated=\(updated) skipped=\(skipped) failed=\(failed)")
+        return (updated, skipped, failed)
+    }
+
+
 // ==== LEGO END: 02 ChatMessage, UnifiedSearchContext, MemoryStore (Part 1) ====
     
     
@@ -4089,7 +4196,12 @@ extension MemoryStore {
     /// failed). Storage callers that get an empty array store NULL in the
     /// embedding column; search callers that get an empty array return
     /// zero semantic results (BM25 keyword path still applies).
-    func generateEmbedding(for text: String) -> [Double] {
+    ///
+    /// nonisolated: callable from background work like the embedding
+    /// migration (`reEmbedAllNullRows`). Underlying EmbeddingProvider.embed
+    /// is also nonisolated and thread-safe via NSLock + per-backend
+    /// serial containers.
+    nonisolated func generateEmbedding(for text: String) -> [Double] {
         return EmbeddingProvider.shared.embed(text) ?? []
     }
 
@@ -20467,13 +20579,16 @@ class HalTestConsole: ObservableObject {
             //
             // Switches the active embedding backend. Persists to
             // UserDefaults("embeddingBackend"). Immediately wipes all
-            // stored embeddings so rows re-embed via the new backend on
-            // next write (or test corpus reinjection). The new model is
-            // lazily loaded on first call; for EmbeddingGemma this may
-            // require a ~210MB download on first launch.
+            // stored embeddings so rows re-embed via the new backend.
+            // New rows re-embed lazily on next write; existing rows are
+            // backfilled by the separate MIGRATE_EMBEDDINGS_REEMBED command.
             //
-            // Added 2026-05-17 for Proposal A evaluation. Future versions
-            // may surface this in the settings UI.
+            // Note: this command does NOT run the migration synchronously,
+            // because EmbeddingGemma may not be downloaded yet (or may
+            // still be loading its weights). The catalog-driven UI is
+            // responsible for ordering: download → switch → migrate.
+            //
+            // Added 2026-05-17 for Proposal A.
             let raw = String(trimmed.dropFirst("SET_EMBEDDING_BACKEND:".count))
                 .trimmingCharacters(in: .whitespaces)
             guard let newBackend = EmbeddingBackend(rawValue: raw) else {
@@ -20486,11 +20601,64 @@ class HalTestConsole: ObservableObject {
             // happens before any further writes.
             UserDefaults.standard.removeObject(forKey: "embeddingSystemVersion")
             vm.memoryStore.wipeStaleEmbeddingsIfNeeded()
-            // Kick off async warm-up of the new backend so the (potentially
-            // multi-minute) HuggingFace download for EmbeddingGemma starts
-            // immediately rather than blocking the next embed() call.
+            // Kick off async warm-up of the new backend so the load
+            // starts immediately rather than blocking the next embed() call.
             EmbeddingProvider.shared.warmUp()
-            return "{\"status\":\"ok\",\"command\":\"SET_EMBEDDING_BACKEND\",\"backend\":\"\(newBackend.rawValue)\",\"expectedDim\":\(newBackend.dimension),\"note\":\"existing embeddings wiped; warm-up triggered; will re-embed on next write\"}"
+            return "{\"status\":\"ok\",\"command\":\"SET_EMBEDDING_BACKEND\",\"backend\":\"\(newBackend.rawValue)\",\"expectedDim\":\(newBackend.dimension),\"note\":\"existing embeddings wiped; warm-up triggered; new rows re-embed on next write; call MIGRATE_EMBEDDINGS_REEMBED to backfill existing rows\"}"
+
+        } else if trimmed == "MIGRATE_EMBEDDINGS_REEMBED" {
+            // Re-embed every unified_content row with NULL embedding using
+            // the currently-active backend. Use this after SET_EMBEDDING_BACKEND
+            // (or whenever rows with missing embeddings need to be backfilled).
+            //
+            // Runs synchronously on the API thread — the caller controls
+            // pacing. For large corpora the call may block for tens of
+            // seconds; the UI flow surfaces progress via background polling
+            // of the same `reEmbedAllNullRows` log line.
+            //
+            // No-op if the active backend isn't loaded — failures are counted
+            // but the rows stay NULL for a future retry.
+            let backend = EmbeddingProvider.shared.activeBackend
+            let loaded = EmbeddingProvider.shared.isLoaded
+            if !loaded {
+                return "{\"status\":\"error\",\"message\":\"active backend '\(backend.rawValue)' is not loaded; cannot re-embed. For EmbeddingGemma, ensure the model is downloaded.\"}"
+            }
+            let result = vm.memoryStore.reEmbedAllNullRows()
+            return "{\"status\":\"ok\",\"command\":\"MIGRATE_EMBEDDINGS_REEMBED\",\"backend\":\"\(backend.rawValue)\",\"updated\":\(result.updated),\"skipped\":\(result.skipped),\"failed\":\(result.failed)}"
+
+        } else if trimmed == "DOWNLOAD_EMBEDDING_MODEL" {
+            // Trigger download of the EmbeddingGemma model via the existing
+            // MLXModelDownloader / BackgroundDownloadCoordinator pipeline.
+            // Returns immediately; poll EMBEDDING_DOWNLOAD_STATUS for
+            // progress. Files end up at
+            //   .cachesDirectory/huggingface/models/<repoID>/
+            // which is exactly the path EmbeddingProvider.ensureGemmaLoadedBlocking
+            // looks at. Idempotent — if already downloaded, returns ok with
+            // alreadyDownloaded=true.
+            guard let modelID = EmbeddingBackend.embeddingGemma.modelID else {
+                return "{\"status\":\"error\",\"message\":\"EmbeddingGemma has no modelID\"}"
+            }
+            if MLXModelDownloader.shared.isModelDownloaded(modelID) {
+                return "{\"status\":\"ok\",\"command\":\"DOWNLOAD_EMBEDDING_MODEL\",\"modelID\":\"\(modelID)\",\"alreadyDownloaded\":true}"
+            }
+            // Estimated size — model.safetensors 173MB + tokenizer 33MB ~ 0.21GB.
+            Task { await MLXModelDownloader.shared.startDownload(modelID: modelID, repoID: modelID, sizeGB: 0.21) }
+            return "{\"status\":\"ok\",\"command\":\"DOWNLOAD_EMBEDDING_MODEL\",\"modelID\":\"\(modelID)\",\"started\":true,\"note\":\"download running in background; poll EMBEDDING_DOWNLOAD_STATUS\"}"
+
+        } else if trimmed == "EMBEDDING_DOWNLOAD_STATUS" {
+            // Read-only progress report on the EmbeddingGemma download.
+            // Reports isDownloading, progress (0..1), and whether the model
+            // files are present on disk.
+            guard let modelID = EmbeddingBackend.embeddingGemma.modelID else {
+                return "{\"status\":\"error\",\"message\":\"EmbeddingGemma has no modelID\"}"
+            }
+            let isDownloaded = MLXModelDownloader.shared.isModelDownloaded(modelID)
+            let state = MLXModelDownloader.shared.downloadStates[modelID]
+            let isDownloading = state?.isDownloading ?? false
+            let progress = state?.progress ?? (isDownloaded ? 1.0 : 0.0)
+            let message = (state?.message ?? "").replacingOccurrences(of: "\"", with: "\\\"")
+            let err = (state?.error ?? "").replacingOccurrences(of: "\"", with: "\\\"")
+            return "{\"status\":\"ok\",\"modelID\":\"\(modelID)\",\"isDownloaded\":\(isDownloaded),\"isDownloading\":\(isDownloading),\"progress\":\(progress),\"message\":\"\(message)\",\"error\":\"\(err)\"}"
 
         } else if trimmed == "INJECT_REALISTIC_TEST_CORPUS" {
             // Inject ~70 rows of realistic conversational content into
