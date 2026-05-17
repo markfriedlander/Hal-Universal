@@ -1,6 +1,6 @@
 # Hal Universal — Handoff Brief
-**Updated:** May 16, 2026 (night session)
-**Branch:** `main` @ `b26ae8c` — uncommitted changes pending (see "Working tree" below)
+**Updated:** May 16, 2026 (night session, post-Cluster-A commit)
+**Branch:** `main` @ `f43b1e2` — working tree clean
 
 > **For post-compaction or next-session CC:** read this brief for current state, then
 > `NEXT.md` for what's planned, then `HISTORY.md` for how we got here, then `CLAUDE.md`
@@ -11,53 +11,39 @@
 
 ## TL;DR — where Hal is right now
 
-The first App Store v2.0 archive was uploaded earlier today (May 16 day session). Two ship-blockers
-surfaced in the night session that prevent submitting that build:
+Three landed commits tonight:
 
-1. **SPM resolver downgrade bug** — fixed in `b26ae8c`. swift-transformers is now pinned to
-   exactVersion 1.3.2 in `project.pbxproj` so Xcode can't downgrade it to 1.0.0 (which loses
-   the `HuggingFace` transitive module) when destinations switch.
-2. **Salon "enabled with 0 seats" silent-no-op bug** — proper fix landed in `b26ae8c`. The bad
-   state is now unreachable via API and UI: enabling Salon with no seats auto-populates Seat 1
-   with Apple Intelligence; clearing the last seat auto-disables Salon; NUCLEAR_RESET clears
-   Salon to defaults.
+1. **`b26ae8c`** — SPM resolver downgrade fix (swift-transformers pinned to exactVersion 1.3.2)
+   plus Salon empty-seats state-machine fix. The Salon bad-state is now unreachable via API and
+   UI (enabling with 0 seats auto-populates Seat 1 with AFM; clearing the last seat auto-disables;
+   NUCLEAR_RESET clears Salon to defaults).
 
-A third issue surfaced and is **mid-investigation** — Mark's directive landed late night and
-some code is uncommitted:
+2. **`f43b1e2`** — Cluster A directive: AFM gets no self-knowledge injection (gated in
+   `buildChatMessages`); MLX injects raw without compression (gated in `resolveSegment`);
+   chunked compression infrastructure stripped from `TextSummarizer`; AFM model card text
+   updated to state the behavior clearly. Build bumped 4→5. Verified on iPhone 16 Plus
+   (AFM 4.3s vs prior 187–279s; Gemma 10.6s with raw injection, no compression activity).
 
-3. **Self-knowledge compression behavior on AFM is wrong.** Findings reported, fix not yet
-   landed. See "Active directive" below.
+3. New doc structure landed: `HISTORY.md` (append-only chronicle) and `NEXT.md` (forward planning)
+   created. `HANDOFF_BRIEF.md` and `MEMORY.md` slimmed to their respective contracts. CLAUDE.md
+   Golden Rule #8 specifies all four.
 
----
-
-## Working tree — uncommitted as of this brief
-
-```
-modified:   Hal Universal.xcodeproj/project.pbxproj          # build bump 4→5
-modified:   Hal Universal/Hal.swift                          # chunked compression + halving (TO REVERT)
-modified:   Hal Universal/Hal_Source.txt                     # synced to Hal.swift
-```
-
-- **Build bump 4→5** in pbxproj is intentional and stays. The next archive will be build 5.
-- **Chunked compression + empirical halving in Hal.swift** was built tonight and is **to be
-  reverted** per Mark's directive (see "Active directive"). It's the wrong solution to the wrong
-  problem. The decision was that self-knowledge compression-at-read-time should not exist at all
-  for the self-knowledge segment — AFM skips injection entirely, MLX injects raw.
+Local `main` is **ahead of `origin/main` by 3 commits** (`b26ae8c`, `f43b1e2`, and the rewrites of
+the doc structure). Push is queued in NEXT.md.
 
 ---
 
-## Active directive (Mark, 2026-05-16 night)
+## Working tree
 
-Mark has issued a directive on self-knowledge behavior: AFM gets no injection,
-MLX injects raw without compression, write-time synthesis keeps the corpus
-lean. Implementation has not started.
+Clean. All changes committed.
 
-- **Reasoning + full context:** `HISTORY.md` (2026-05-16 entry, "Self-knowledge:
-  a deeper rethink").
-- **Concrete next steps:** `NEXT.md` ("Active directive" section).
+---
 
-Implementation is on hold pending Strategic Claude's path-forward plan
-based on tonight's audit.
+## Active work — Cluster B verification
+
+Strategic Claude's plan ordered: Cluster A (self-knowledge fixes) → Cluster B (verification
+testing) → Cluster C (structured-trait synthesis + scroll behavior). Cluster A landed in
+`f43b1e2`. Cluster B is next. Concrete items in `NEXT.md`.
 
 ---
 
@@ -110,22 +96,16 @@ API surface unchanged (`SALON_GET_STATE`, `SALON_SET_ENABLED:true|false`, `SALON
 
 ---
 
-## Compression infrastructure (current uncommitted state — slated for revert/refactor)
+## Compression infrastructure (current state, post-Cluster-A)
 
-Tonight's work added to `TextSummarizer`:
-- `SummarizationResult` struct with `text` + `didTruncate` flag
-- `summarizeWithVerificationDetailed(...)` — chunked summarization with sentence-bounded chunks
-  and empirical halving on overflow
-- `safeMaxInputTokensPerCall(contextWindow:outputReserve:)` — conservative size estimate
-- `chunkTextBySentences(...)` and `hardSplitByCharacters(...)` — chunking primitives
-- `singleCallSummarize(...)` / `singleCallSummarizeOnce(...)` — leaf calls with overflow detection
-- `isContextOverflowError(_:)` — error string match for AFM's overflow signal
-- `SegmentCompressor.compress` updated to honor `didTruncate` in the footer label
-
-This entire chunked-compression apparatus is the wrong solution per Mark's directive. The right
-solution is to not compress self-knowledge at all (AFM skips, MLX injects raw). The
-`SummarizationResult.didTruncate` mechanism may still be useful for `autoSummary` and
-`shortTermHistory` segments which legitimately need compression — that's a separate decision.
+- `SegmentCompressor.compress` exists and is called for `autoSummary` and `shortTermHistory`
+  segments only. The `selfKnowledge` segment bypasses it (per Cluster A directive in `f43b1e2`).
+- `TextSummarizer.llmSummarize` is single-call. Chunking apparatus stripped in `f43b1e2`.
+- `SummarizationResult` struct with `didTruncate` flag is kept. The remaining callers
+  (`autoSummary`, `shortTermHistory`) use it to surface honest scissors-icon truncation when
+  an LLM call legitimately fails.
+- `LLMService.activeContextWindow` accessor kept (one-line addition from tonight); currently
+  unused after chunking removal but harmless and potentially useful for future diagnostics.
 
 ---
 
@@ -142,8 +122,11 @@ Forward-looking content moved to `NEXT.md`.
 - Salon state-machine: empty-seats enable → auto-populates Seat 1; clear-last-seat → auto-disables;
   intermediate-seat clear preserves enabled state (verified via API)
 - NUCLEAR_RESET clears Salon back to defaults (verified via API)
-- Chunked compression IS firing on AFM stress test (but per directive, this is the wrong path
-  and is being reverted)
+- AFM self-knowledge skip: 4K of synthetic self-knowledge in DB; AFM turn 4.3s with
+  `Skipping persistent self-knowledge injection` log firing; no compression activity
+- MLX (Gemma) raw injection: same 4K of synthetic data; turn 10.6s; no `HALDEBUG-COMPRESS`
+  or `HALDEBUG-SUMMARIZER` logs (raw injection bypassed compression cleanly)
+- AFM model card text updated to state the no-injection behavior
 
 ---
 
