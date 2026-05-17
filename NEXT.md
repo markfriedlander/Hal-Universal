@@ -3,136 +3,126 @@
 What we're planning to do next. Forward-looking, narrow scope.
 
 For where Hal is right now: `HANDOFF_BRIEF.md`.
-For how we got here: `HISTORY.md` (especially the 2026-05-17 entry).
+For how we got here: `HISTORY.md` (especially the 2026-05-17 morning entry).
 
 ---
 
 ## What the next session should do first
 
-1. **Read this file, then `HANDOFF_BRIEF.md`, then the 2026-05-17 entry of `HISTORY.md`.**
-   That's the full context for the RAG work and the three proposals below.
+1. **Read this file, then `HANDOFF_BRIEF.md`, then the 2026-05-17 morning
+   entry of `HISTORY.md`.** That's the full context for the embedder
+   upgrade work and what's still untested.
 2. **Verify the live state on the iPhone is what the docs claim:**
    ```bash
-   python3 tests/hal_test.py state                         # should respond
-   python3 tests/hal_test.py cmd "EMBEDDING_STATUS"        # isLoaded: true, dim: 512
-   python3 tests/hal_test.py cmd "SALON_GET_STATE"         # should be disabled
+   python3 tests/hal_test.py state                          # should respond
+   python3 tests/hal_test.py cmd "EMBEDDING_STATUS"         # backend=nlcontextual, isLoaded:true
+   python3 tests/hal_test.py cmd "EMBEDDING_DOWNLOAD_STATUS"  # isDownloaded:false initially
    ```
-   If anything fails, the phone may be asleep/off WiFi — Mark should wake it.
-3. **Run the eval to establish baseline before any new work:**
+3. **Verify Proposal A on actual device** (sim is documented as not
+   supported for MLXEmbedders/Gemma load). The sim doesn't get past the
+   libc++ Hardening string-nullptr crash in the load path; the device
+   may. We need real measurement.
+
+---
+
+## On-device test plan for EmbeddingGemma (Proposal A)
+
+The full upgrade flow is wired through the Model Library UI. Test order:
+
+1. **Boot Hal on the phone fresh, confirm baseline.**
+   ```bash
+   python3 tests/hal_test.py cmd "EMBEDDING_STATUS"
+   # Expect: backend=nlcontextual, isLoaded=true, dim=512
+   ```
+
+2. **Open Model Library, scroll to the new "Embedding (Memory)" section.**
+   - Apple NLContextual row should show "Active".
+   - EmbeddingGemma 300M row should offer "Download EmbeddingGemma".
+3. **Tap Download. Wait for the progress bar to complete (~210 MB).**
+   The download uses the same BGDL coordinator the LLM downloads use, so
+   it survives backgrounding. Verify on-device files end up at
+   `.cachesDirectory/huggingface/models/mlx-community/embeddinggemma-300m-4bit/`.
+4. **Inject the eval corpus, baseline the full pipeline against the new
+   backend NOT loaded yet:**
    ```bash
    python3 tests/hal_test.py reset
    python3 tests/hal_test.py cmd "INJECT_REALISTIC_TEST_CORPUS"
-   python3 tests/rag_threshold_eval.py
+   python3 tests/rag_pipeline_eval.py
+   # Expect: same 7/10 top-10 baseline (NLContextual still active)
    ```
-   Expected: plant scores mean ~0.83, top-noise mean ~0.88, plants reachable
-   via semantic but rank-buried under question-shape rows.
-4. **Start with Proposal B** (cheapest, sharpens our measurement before any
-   architectural change).
+5. **In the Model Library, tap "Switch to EmbeddingGemma" on the
+   downloaded backend row. Confirm the migration dialog.**
+   The flow:
+   - wipes existing embeddings
+   - warms up the new backend (this is where the load happens — if the
+     libc++ crash reproduces on device, capture the log lines from
+     `python3 tests/hal_test.py logs`)
+   - re-embeds the corpus rows via Gemma (~1s/row at ~50ms per embed)
+   - reports updated/skipped/failed counts inline
+6. **Re-run both evals against the Gemma-embedded corpus:**
+   ```bash
+   python3 tests/rag_threshold_eval.py    # raw cosine
+   python3 tests/rag_pipeline_eval.py     # full RRF
+   ```
+   Compare to the previous baseline. Key questions:
+   - Do plant scores rise relative to noise scores? (NLContextual's
+     0.69–0.91 band was the problem.)
+   - Do the 3 misses (Berkeley/Subaru/cello) close to top-10?
+   - Does top-1 recall improve?
+7. **Switch back to Apple NLContextual via the Model Library** to
+   verify the downgrade path also re-embeds correctly (proves the
+   two-way migration story).
 
 ---
 
-## RAG work — three proposals in order
+## What happens if EmbeddingGemma improves recall
 
-These came out of the 2026-05-17 investigation. SC and Mark received the
-proposals; no implementation decision was made before context ran low.
-Recommended order is **B → A → C** — establishes a fair baseline first,
-then tries the bigger embedding, then layers entity-aware expansion if
-still needed.
+Per Mark's directive: ship with NLContextual as default, expose
+EmbeddingGemma as an opt-in upgrade. The Model Library UI is already
+built. The remaining work is:
+  - Confirm download UX on device (BGDL backgrounding, locked-phone
+    survival — already field-tested for LLMs, should generalize)
+  - Capture migration timing on a realistic corpus (a 500-row chat
+    history at ~50ms/row is ~25s — UI may want a more detailed progress
+    indicator if real-world numbers run higher)
+  - Decide what happens on first launch if a user opens settings before
+    NLContextual finishes loading (current UX: section renders with
+    NLContextual showing Active but isLoaded would be false — likely
+    fine, but worth a check)
 
-### Proposal B — Fix eval methodology (do this first)
+## What happens if EmbeddingGemma does NOT improve recall on device
 
-**Why first.** Our current eval corpus has empty `entity_keywords` for all
-70 rows because `INJECT_REALISTIC_TEST_CORPUS` calls
-`storeUnifiedContentWithEntities` with `entityKeywords: ""`. Real chat data
-goes through `storeTurn` → `extractNamedEntities` (Hal.swift:1597) and
-DOES populate entity_keywords. So today's eval understates BM25's real-
-world contribution. Without a fair baseline we can't tell whether
-Proposal A or C actually helps.
+Proposal C is still on deck:
+  - NLTagger over the recall query at query time
+  - Hand-curated synonym dictionary (vehicle: car/drive/Subaru/Honda/…)
+  - Expand the FTS5 query with the synonyms before BM25 ranks
 
-**What to do.** Modify `injectRealisticTestCorpus` (in MemoryStore around
-the new diagnostic section) so that each row's `entityKeywords` is
-populated via `extractNamedEntities(from: text)` (mirroring the real
-chat-store flow at Hal.swift:1597). Then re-run
-`tests/rag_threshold_eval.py` and the full-pipeline check via
-`MEMORY_SEARCH_DEBUG` on the 10 ground-truth queries.
-
-**What this should reveal.** Likely that BM25-via-entity_keywords lifts
-recall on queries that share entity-shape but not surface words. May or
-may not bridge the 3 specific misses (Berkeley / Subaru / cello) — those
-queries contain none of the entities NLTagger would extract from the
-plants. Measurement will tell.
-
-### Proposal A — Try EmbeddingGemma as alternative embedding backend
-
-**Context.** NLContextualEmbedding compresses cosine scores into a narrow
-band (0.69–0.91 across all short-text pairs) which limits discrimination.
-EmbeddingGemma is 308M parameters (vs ~50M for NLContextualEmbedding),
-trained explicitly for retrieval/semantic similarity, state-of-the-art on
-MTEB Multilingual v2 for open models under 500M. Should produce wider
-dynamic range. Already shipping in our deps via
-`mlx-swift-lm 3.31.3 → MLXEmbedders`.
-
-**What to do.**
-1. Register a curated EmbeddingGemma model in the catalog (e.g.,
-   `mlx-community/embeddinggemma-300m-4bit` if available, else research
-   the right HuggingFace ID). May need a separate "embedding model"
-   category vs the LLM model catalog.
-2. Add a runtime selector — could be `@AppStorage("embeddingBackend")` with
-   values `"nlcontextual"` / `"embeddinggemma"`, or just compile-time
-   choice for the A/B run.
-3. Modify `EmbeddingProvider.embed(_:)` to dispatch to the chosen backend.
-   EmbeddingGemma path loads via `MLXEmbedders` and returns its vector
-   (likely 768-dim default, or smaller via Matryoshka).
-4. Wipe + re-embed all stored rows when backend changes (the existing
-   `wipeStaleEmbeddingsIfNeeded` pattern, version bumped). Or use a
-   separate UserDefaults flag per backend.
-5. Re-run `tests/rag_threshold_eval.py` with each backend. Compare:
-   plant scores, top-noise scores, plant ranks. If EmbeddingGemma
-   meaningfully separates signal from noise, make it the default.
-
-**Open question for Mark.** EmbeddingGemma adds ~200MB to model storage.
-Worth the trade for better RAG quality? Probably yes — Hal already ships
-multi-GB MLX models — but flag for explicit approval before adding it
-to the curated catalog.
-
-### Proposal C — Entity-aware query expansion (if A doesn't close the gap)
-
-**Why this is here.** Bridges the specific failure mode the other two
-don't directly address: queries with zero surface-term overlap to the
-plant ("What kind of car?" → "Subaru Outback"). Independent of A and B —
-could land alongside either.
-
-**What to do.**
-1. At query time, run NLTagger over the recall query to extract entity-
-   type intent. "What kind of car?" → infer concept `vehicle`.
-2. Expand the FTS5 query to include common synonyms for that concept
-   (mini synonym dictionary, hand-curated for common categories: car/
-   vehicle/auto/drive, instrument/cello/guitar/piano, live/home/house/
-   reside, etc.).
-3. BM25 then matches the plant via the expanded terms (Subaru is a car,
-   cello is an instrument, Berkeley is a place where someone lives).
-
-**Trade-off.** Synonym dictionaries are brittle and English-specific. An
-LLM-based query rewriter would be more flexible but adds latency. Start
-with a small hand-curated dictionary for the categories the eval queries
-exercise; expand based on real-world miss patterns.
+Pairs naturally with the Proposal B groundwork (entity_keywords now
+populated on stored rows). Independent of Proposal A — could land
+alongside either or both.
 
 ---
 
-## Other work queued (deferred to make room for RAG)
+## Cluster B remaining (visual + long-duration)
 
 These were paused when the RAG question came up on May 16. Still relevant.
 
-- **Cluster B remaining (visual)**: Salon UI Pickers, System prompt counter,
-  Model Library UI, App icon — visual verification on device or simulator.
-- **Cluster B remaining (long duration)**: Background downloads long-lock test
-  — delete Gemma (3.6 GB), start fresh download, lock phone face-down 10+
-  minutes, verify BGDL coordinator handles iOS suspension.
-- **Cluster C from May 16** (orthogonal to the RAG proposals above):
-  - Structured-trait synthesis (Mark's decision: implement, design for
-    inspectability so it can surface in a future Evolutionary Salon)
-  - Scroll behavior (Mark's decision: requirement — search SwiftUI examples
-    on the web first, find a working pattern, adapt it)
+- **Salon UI Pickers**: visual verification on device or simulator.
+- **System prompt counter**: visual verification.
+- **Model Library UI**: visual verification of new embedder section (test
+  plan above covers it).
+- **App icon**: visual verification.
+- **Background downloads long-lock test**: delete Gemma (3.6 GB), start
+  fresh download, lock phone face-down 10+ minutes, verify BGDL coordinator
+  handles iOS suspension. The same flow now covers the EmbeddingGemma
+  download — both use BGDL.
+
+## Cluster C from May 16 (orthogonal to the RAG proposals)
+
+- Structured-trait synthesis (Mark's decision: implement, design for
+  inspectability so it can surface in a future Evolutionary Salon)
+- Scroll behavior (Mark's decision: requirement — search SwiftUI examples
+  on the web first, find a working pattern, adapt it)
 
 ## On deck
 

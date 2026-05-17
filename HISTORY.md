@@ -494,3 +494,177 @@ Recommended order: B → A → C.
 - Eval harness committed and pushed
 - threshold sites: zero remaining in code
 - Context low — next session needed for implementation work
+
+---
+
+## 2026-05-17 (morning session, EmbeddingGemma scaffolding)
+
+### Setting
+
+Mark woke CC up: "Good morning CC. Verify the live state and run the
+baseline eval. Then proceed through the three proposals in order — B,
+then A, then C if needed. Work autonomously and report back when you
+have meaningful findings." Mid-session he had to leave with the phone
+and directed CC to keep working on the simulator. Asked CC to **build
+the user upgrade UI for the embedder** if the Gemma test panned out —
+modeled on the existing Model Library download flow, with a two-way
+migration (forward and back).
+
+### Proposal B: methodology fix, no recall change (commit `07cfe3a`)
+
+`INJECT_REALISTIC_TEST_CORPUS` now mirrors the real chat-store flow at
+`Hal.swift:1597`: each (user, assistant) pair runs through
+`extractNamedEntities`, the union is lowercased and joined with spaces,
+and the resulting string is written to both rows' `entity_keywords`
+column. Adjacent entries in the `general` array are paired the same way
+since they alternate question / answer.
+
+Also added `entity_keywords` to the `MEMORY_DUMP` JSON output (was
+missing — the data was inserted but invisible to inspection) and added
+`tests/rag_pipeline_eval.py` — a full-pipeline eval that calls
+`MEMORY_SEARCH_DEBUG` (the production search) and reports plant rank in
+the top-N RRF results, complementing the existing raw-cosine harness.
+
+**Measurement.** Plants like Berkeley, Iceland, Karamazov, Atlas now
+carry proper entity_keywords (NLTagger picks up persons, places, orgs).
+Plants like cello, Subaru/Outback, Pepper, marathon remain empty — they
+aren't person/place/org under NLTagger's three categories. Recall numbers
+on the full pipeline: **identical to the previous run** (top-10 7/10,
+top-5 4/10, top-1 1/10; Berkeley/cello/Subaru still missing).
+
+NEXT.md predicted this exactly: the recall queries are designed not to
+echo the plants, so adding entities to the plants doesn't help queries
+that share no tokens with them. The value of Proposal B was fixing the
+methodology — we now have an honest baseline showing BM25 has its fair
+shot via entity_keywords, and that the remaining gap is not a write-side
+problem.
+
+Inspection of "Where do I live now?" top results revealed the actual
+issue: BM25 in this 70-row corpus is dominated by common-word matches
+(`do`, `I`, `live`→`lives` via Porter stemming) on noise rows like
+"How do passwords actually get stored?" — these score higher in BM25
+than the plant. Combined with NLContextualEmbedding's narrow-band
+discrimination problem, the RRF fusion can't surface the plant.
+
+### Pivot: Mark wants Gemma tried, with a user-facing upgrade path
+
+CC reported the findings, flagged the 210 MB storage decision in
+Proposal A. Mark said "try adding Gemma and see if we get better
+results", and right after: ship with Apple NLContextual as default,
+give users the chance to download EmbeddingGemma if they want. Model
+Library pattern. Two-way migration so a user can also downgrade.
+
+### Proposal A scaffolding (commit `8823a65`)
+
+EmbeddingProvider gained a second backend slot. New `EmbeddingBackend`
+enum (nonisolated + Sendable to bridge MainActor default isolation)
+keys off UserDefaults("embeddingBackend"); EmbeddingProvider.embed
+dispatches by backend; the Gemma path bridges async MLX inference to
+the sync `embed()` API via DispatchSemaphore (mirrors the existing
+NLContextual asset-download bridge).
+
+`wipeStaleEmbeddingsIfNeeded` now uses the active backend's
+`systemVersion` so switching backends triggers wipe-and-re-embed.
+
+Linked MLXEmbedders product (already a transitive checkout via
+`mlx-swift-lm 3.31.3`; just needed the framework reference on the
+Hal Universal target). Project change: one new XCSwiftPackageProductDependency
+plus the corresponding Frameworks build phase entry. CLI builds resolve
+clean; no SPM resolver drift.
+
+Load strategy is "from a local directory" rather than
+`#hubDownloader()`. The downloader flow is the existing
+BackgroundDownloadCoordinator one — Hal already has a robust catalog
+download pipeline; the embedder reuses it.
+
+API commands added:
+  - `SET_EMBEDDING_BACKEND:<name>` — switch backend, wipe, trigger warm-up
+  - `EMBEDDING_STATUS` now returns backend + expected dim, and only
+    embeds when `isLoaded` (so it doesn't block during first-launch loads)
+  - `MEMORY_DUMP` now returns `entity_keywords` per row
+
+### Migration + download API (commit `77df7ae`)
+
+`MemoryStore.reEmbedAllNullRows` walks every row with NULL embedding
+and backfills via the active backend. Two-pass (SELECT then UPDATE)
+to avoid SQLite's held-cursor write quirks. Logs decile progress;
+returns (updated, skipped, failed). `generateEmbedding` marked
+nonisolated so the migration can call it from any queue.
+
+Three new API commands:
+  - `DOWNLOAD_EMBEDDING_MODEL` — kicks off the EmbeddingGemma download
+    via `MLXModelDownloader.shared.startDownload` (~210 MB). Returns
+    immediately; poll for progress.
+  - `EMBEDDING_DOWNLOAD_STATUS` — read-only progress poll.
+  - `MIGRATE_EMBEDDINGS_REEMBED` — runs the re-embed migration
+    synchronously using the active backend. Refuses if the backend
+    isn't loaded.
+
+### User upgrade UI in Model Library (commit `2237e2a`)
+
+New section between "Hal's Picks" and "Community Models": **Embedding
+(Memory)**. Same row styling, accordion-expand, status dot vocabulary
+(green = active, grey = downloaded, none = not downloaded).
+
+Two backend rows:
+  - **Apple NLContextual** — always downloaded; "Active" or "Switch
+    to Apple NLContextual" button.
+  - **EmbeddingGemma 300M** — "Download EmbeddingGemma (~210 MB)" /
+    progress bar during download / "Switch to EmbeddingGemma" once
+    downloaded / "Active" when in use.
+
+`EmbedderMigrationCoordinator` (@MainActor singleton) drives the flow.
+State machine: idle → downloading → switching → migrating → done|error.
+SwiftUI observes `phase`; an `EmbedderMigrationStatusRow` renders the
+matching status inline (progress bar during download, row counter
+during migration, success message at the end).
+
+`EmbedderBackendRow.switchAndMigrate` does the proper sequence:
+  1. Persist new backend, wipe all existing embeddings.
+  2. Trigger warm-up, wait up to 60s for `isLoaded == true` (caps the
+     spinner so a busted load doesn't hang the UI forever).
+  3. Run `reEmbedAllNullRows` on the background task.
+  4. Report (updated, skipped, failed) in the done message.
+
+A confirmation dialog warns about the re-embed step before switching:
+"Existing embeddings will be wiped and regenerated with [Backend].
+This may take a few minutes depending on your memory size."
+
+Two-way: switching from EmbeddingGemma back to Apple NLContextual
+goes through the same flow.
+
+### Sim limitation discovered: MLXEmbedders won't load on iOS 26.5 sim
+
+Three load attempts (with `#hubDownloader()`, then with
+`load(from: directory)`, then with a delayed warm-up to avoid racing
+MLXModelDownloader.init) all crash the simulator with:
+
+  `libc++ Hardening assertion __s != nullptr failed:
+   basic_string(const char*) detected nullptr`
+
+The crash fires inside `EmbedderModelFactory.shared.loadContainer`
+after the config.json was read and before any further log line —
+the load path is hitting a Swift-to-C++ string bridge with a nil
+char*, which the iOS Simulator's libc++ Hardening enforces.
+
+This is sim-specific (libc++ Hardening is enabled in the simulator
+SDK and may not be on the device). Verifying on actual iPhone is
+pending — Mark has the phone. Until then we know:
+  - The download pipeline (catalog → BGDL → on-disk cache) works.
+  - The backend selector, version bump, wipe, and migration code
+    paths all compile clean and exercise correctly on the sim with
+    NLContextual; the Gemma path is unreachable without the device.
+
+This is documented in the commit log and NEXT.md. Default backend is
+NLContextual, so a user only hits this code if they explicitly toggle
+the upgrade — first-launch users are unaffected.
+
+### State at end of entry
+
+- `main` at `2237e2a`, in sync with `origin/main`
+- Working tree: clean (only untracked: `Docs/SC_Release_Materials/`)
+- All builds clean, zero warnings, zero errors
+- Default behavior unchanged: NLContextual is the active embedder
+- Embedder upgrade path: complete in code; on-device verification
+  needed before shipping
+
