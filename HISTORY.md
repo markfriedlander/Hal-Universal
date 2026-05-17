@@ -270,3 +270,147 @@ curated MLX model for continuous self-knowledge across turns.
 Build clean (zero warnings, zero errors). Deployed and ran tonight as
 build 5. The pbxproj build bump from 4 to 5 (uncommitted from earlier
 tonight) goes with this commit.
+
+---
+
+## 2026-05-17 (RAG architectural rebuild — Commits A/B/C)
+
+### Setting
+
+Cluster B verification on May 16 night surfaced that RAG planted-fact
+recall was failing on AFM and Gemma. The first instinct was to chase
+the relevance threshold. Several rounds of diagnosis ruled that out:
+
+- Built `MEMORY_DUMP`, `MEMORY_SEARCH_DEBUG`, `MEMORY_SIMILARITY_DEBUG`
+  diagnostic APIs to see exactly what the pipeline was doing.
+- Found that `NLEmbedding.sentenceEmbedding` produced cosine similarity
+  scores in the 0.2–0.5 range for related content but 0.5–0.7 for
+  question-shape false positives ("What kind of car do I have?" ↔
+  "What's the deal with sourdough starter?" = 0.68). Noise floor was
+  HIGHER than plant signal.
+- Built `INJECT_REALISTIC_TEST_CORPUS` (70 rows: 10 planted facts + 50
+  general turns) and `tests/rag_threshold_eval.py` (10 ground-truth
+  recall queries, precision/recall at multiple thresholds).
+- Confirmed: no threshold value works. At 0.25, 7/10 plants pass but
+  with avg 26 noise rows passing too. At 0.50, zero plants pass.
+- The historical "May 14 RAG verified" test only worked because the
+  query happened to share a literal substring with the plant ("cat's
+  name") — the LIKE keyword path carried recall; semantic was
+  effectively dead since March (when the 0.75 threshold landed).
+
+### Research before redesign
+
+Rather than tune the wrong knob further, did systematic research on how
+production conversational AI systems handle this problem. Findings:
+
+- Apple's `NLContextualEmbedding` (iOS 17+, transformer-based, on
+  Neural Engine) is the documented replacement for the older
+  `NLEmbedding.sentenceEmbedding`. Was never used in Hal.
+- Hybrid retrieval (BM25 + dense vector) with Reciprocal Rank Fusion
+  is the industry-standard architecture (Elasticsearch, OpenSearch,
+  Weaviate all ship it by default; Mem0 uses it). Dense-only: ~78%
+  recall@10. Sparse-only: ~65%. Hybrid: ~91%.
+- SQLite FTS5 ships on iOS with the `porter` tokenizer (English
+  stemming) and built-in `bm25()` scoring. The current LIKE substring
+  approach is a deliberate-rejection-less oversight, not a considered
+  choice.
+
+Strategic Claude approved the three-commit plan with simplifications:
+- No migration infrastructure — wipe and start fresh
+- No hash fallback — gone
+- Remove the threshold UI entirely
+- Move `verifyNarrative` to NLContextualEmbedding too (one system)
+
+### Commit A — `67efc30` — NLContextualEmbedding everywhere
+
+- New `EmbeddingProvider` singleton wraps `NLContextualEmbedding`,
+  lazy-loaded on first use (asset download via `requestAssets` with
+  DispatchSemaphore for synchronous first-call), warm-up triggered
+  at app launch.
+- `MemoryStore.generateEmbedding` delegates to the provider; returns
+  empty array when model isn't loaded (callers tolerate it).
+- `TextSummarizer.verifyNarrative` also moved to the provider; TF-IDF
+  fallback retained for the case where the model fails to load.
+- Removed `generateHashEmbedding` and the NLEmbedding revision-loop
+  fallback. One embedding system, no junk fallbacks.
+- `wipeStaleEmbeddingsIfNeeded` in `setupPersistentDatabase` checks
+  `UserDefaults["embeddingSystemVersion"]`; if not 2, NULLs all
+  embedding BLOBs on `unified_content` and `self_knowledge`. The
+  next access re-embeds with the new model.
+- New `EMBEDDING_STATUS` diagnostic API.
+
+Result: plant scores jumped from mean 0.27 → 0.83. Plant recall
+@ threshold 0.50 went 0/10 → 10/10. BUT noise also climbed to mean
+0.88, so threshold-based filtering still doesn't separate signal
+from noise; many plants still bury below question-shape false
+positives.
+
+### Commit B — `1550325` — FTS5 BM25 + Porter stemming
+
+- New `unified_content_fts` virtual table (FTS5, `porter unicode61
+  remove_diacritics 2` tokenizer).
+- Triggers keep FTS in sync with `unified_content` on INSERT /
+  DELETE / UPDATE. Backfill on first launch.
+- `searchUnifiedContent` keyword path replaced: LIKE substring loop
+  removed; FTS5 MATCH with `bm25()` scoring used instead.
+- New `sanitizeFTSQuery` helper strips punctuation, lowercases, joins
+  tokens with OR (FTS5 default is AND, which is too restrictive).
+- Source_code rows excluded from BM25 path — Hal's source code is in
+  `unified_content` for self-knowledge access, but its million-char
+  size matches every common word under BM25 OR semantics and would
+  dominate ranking on every query.
+- Token-budget loop changed from `break` to `continue` on too-large
+  snippets — prior behavior killed ALL retrieval if the top-ranked
+  snippet was a big document.
+
+Result: keyword matching now stems correctly ("dogs" → "dog", "running"
+→ "run"). BM25 produces meaningful rankings. But the simple
+score-combine path (still summing semantic + BM25 with recency boost)
+doesn't separate signal cleanly because the scoring systems live on
+incompatible scales.
+
+### Commit C — `b6f964b` — RRF fusion + remove threshold UI
+
+- `searchUnifiedContent` rewritten around two ranked candidate lists
+  keyed by row id. Each retriever (semantic + BM25) returns its top
+  50; their RANKS in those lists are what feed RRF.
+- Reciprocal Rank Fusion: `rrf(d) = sum over each list L of 1/(60 +
+  rank_L(d))`, k=60 (canonical). Documents that rank highly in BOTH
+  lists win. Score scale becomes irrelevant.
+- The `relevanceThreshold` filter in semantic loop removed — RRF
+  doesn't need it.
+- Settings UI "Similarity Threshold" slider deleted (replaced with a
+  comment explaining the threshold-free retrieval).
+- `relevanceThreshold` @AppStorage var retained for backward compat
+  with per-model settings infrastructure; no longer affects retrieval.
+
+Verified on 10 ground-truth natural-language queries against 70-row
+realistic corpus:
+
+  Plant in top 10 retrieved snippets: **7/10**
+    Pepper #1, Anthropic #6, Atlas #2, marathon #5, Tartine #1,
+    Iceland #5, Karamazov #7
+  Misses: Subaru, Berkeley, cello — queries with zero surface-term
+    overlap to the plant ("Where do I live now?" vs "house in Berkeley
+    on Vine Street"). Pure semantic + BM25 can't bridge "live" →
+    "Berkeley" without entity-aware indexing or a stronger embedding.
+
+This is a massive improvement from the prior architecture where
+semantic search was effectively dead and recall was carried by
+literal-substring keyword matches.
+
+### State at end of entry
+
+- `main` ahead of `origin/main` by 6 commits (`67efc30`, `1550325`,
+  `b6f964b` for the RAG rebuild; `f43b1e2`, `158dc15`, `b26ae8c` from
+  prior work)
+- All builds clean (zero warnings, zero errors)
+- App on iPhone 16 Plus running build 5 with NLContextualEmbedding
+  loaded (512-dim vectors)
+- Three new diagnostic APIs: `EMBEDDING_STATUS`, `MEMORY_DUMP`,
+  `MEMORY_SEARCH_DEBUG`, `MEMORY_SIMILARITY_DEBUG`,
+  `INJECT_REALISTIC_TEST_CORPUS`
+- New test harness: `tests/rag_threshold_eval.py`
+- 3 plants out of 10 still don't reach top-10 for the harder queries
+  ("Where do I live now?" needs entity bridging; that's follow-up
+  work, not blocking)
