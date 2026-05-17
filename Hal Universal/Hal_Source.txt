@@ -413,15 +413,8 @@ class MemoryStore: ObservableObject {
     static let shared = MemoryStore() // Singleton pattern
 
     @Published var isEnabled: Bool = true
-    @AppStorage("relevanceThreshold") var relevanceThreshold: Double = 0.25 {
-        didSet {
-            // Notify other parts of the app that the threshold has changed
-            NotificationCenter.default.post(name: .relevanceThresholdDidChange, object: nil)
-            print("HALDEBUG-THRESHOLD: Relevance threshold updated to \(relevanceThreshold)")
-        }
-    }
-    
-    // NEW: Recency boosting parameters for time-aware RAG
+
+    // Recency boosting parameters for time-aware RAG
     @AppStorage("recencyWeight") var recencyWeight: Double = 0.3 {
         didSet {
             print("HALDEBUG-RECENCY: Recency weight updated to \(recencyWeight)")
@@ -3678,7 +3671,6 @@ class MemoryStore: ObservableObject {
 // MARK: - Enhanced Notification Extensions (from Hal10000App.swift)
 extension Notification.Name {
     static let databaseUpdated = Notification.Name("databaseUpdated")
-    static let relevanceThresholdDidChange = Notification.Name("relevanceThresholdDidChange")
     static let showDocumentImport = Notification.Name("showDocumentImport")
     static let didUpdateMessageContent = Notification.Name("didUpdateMessageContent") // Keep this for streaming scroll
     static let keyboardWillChangeFrame = Notification.Name("keyboardWillChangeFrame") // NEW: Custom notification for keyboard
@@ -4994,12 +4986,9 @@ extension MemoryStore {
     /// query and at what score.
     /// Read-only diagnostic: compute cosine similarity between the query
     /// embedding and every row in `unified_content` that has an embedding.
-    /// Returns the raw scores WITHOUT applying any threshold or recency
-    /// boost. Used to diagnose why high-confidence matches (like the query
-    /// "Pepper" against stored "Pepper is my dog.") fail the production
-    /// semantic-search filter — if scores here are all below the
-    /// `relevanceThreshold`, the threshold is the problem; if they're
-    /// near-zero, the embeddings themselves are broken.
+    /// Returns the raw scores WITHOUT recency boost or RRF fusion. Used to
+    /// inspect the embedding model's behavior in isolation — see whether
+    /// a plant turn is semantically close to a recall query.
     func debugSemanticSimilarity(query: String) -> String {
         guard ensureHealthyConnection() else {
             return "{\"status\":\"error\",\"message\":\"no database connection\"}"
@@ -5048,7 +5037,7 @@ extension MemoryStore {
         }
 
         return """
-        {"status":"ok","query":"\(dbgEscape(query))","queryEmbeddingDoubles":\(queryEmbedding.count),"relevanceThreshold":\(String(format: "%.3f", relevanceThreshold)),"rowsScored":\(entries.count),"entries":[\(entryStrs.joined(separator: ","))]}
+        {"status":"ok","query":"\(dbgEscape(query))","queryEmbeddingDoubles":\(queryEmbedding.count),"rowsScored":\(entries.count),"entries":[\(entryStrs.joined(separator: ","))]}
         """
     }
 
@@ -5069,7 +5058,7 @@ extension MemoryStore {
             entries.append(entry)
         }
         return """
-        {"status":"ok","query":"\(dbgEscape(query))","conversationId":"\(dbgEscape(currentConversationId))","resultCount":\(result.snippets.count),"totalTokens":\(result.totalTokens),"relevanceThreshold":\(String(format: "%.3f", relevanceThreshold)),"recencyWeight":\(String(format: "%.3f", recencyWeight)),"entries":[\(entries.joined(separator: ","))]}
+        {"status":"ok","query":"\(dbgEscape(query))","conversationId":"\(dbgEscape(currentConversationId))","resultCount":\(result.snippets.count),"totalTokens":\(result.totalTokens),"recencyWeight":\(String(format: "%.3f", recencyWeight)),"entries":[\(entries.joined(separator: ","))]}
         """
     }
 }
@@ -8068,7 +8057,6 @@ struct ActionsView: View {
                 "memoryDepth": chatViewModel.memoryDepth,
                 "temperature": chatViewModel.temperature,
                 "enableSelfKnowledge": chatViewModel.enableSelfKnowledge,
-                "relevanceThreshold": chatViewModel.memoryStore.relevanceThreshold,
                 "recencyWeight": chatViewModel.memoryStore.recencyWeight,
                 "recencyHalfLifeDays": chatViewModel.memoryStore.recencyHalfLifeDays,
                 "maxRagSnippetsCharacters": chatViewModel.maxRagSnippetsCharacters,
@@ -8107,15 +8095,6 @@ struct ActionsView: View {
                 let halMsg = chatViewModel.enableSelfKnowledge ?
                     "Self-knowledge enabled! I'll now include my persistent identity (core values, learned preferences, conversation history, and temporal awareness) in my responses." :
                     "Self-knowledge disabled. I'll use a simpler prompt without persistent identity context."
-                chatViewModel.pendingSettingsChanges.append((userMsg, halMsg))
-            }
-            
-            if let initThreshold = initialSettingsSnapshot["relevanceThreshold"] as? Double,
-               abs(initThreshold - chatViewModel.memoryStore.relevanceThreshold) > 0.01 {
-                let newValue = chatViewModel.memoryStore.relevanceThreshold
-                let userMsg = "Hal, I adjusted your similarity threshold from \(String(format: "%.2f", initThreshold)) to \(String(format: "%.2f", newValue))."
-                let direction = newValue > initThreshold ? "tightened" : "loosened"
-                let halMsg = "Got it! I've \(direction) my memory matching to \(String(format: "%.2f", newValue)). \(newValue > initThreshold ? "I'll be more selective about matches." : "I'll retrieve more memories now.")"
                 chatViewModel.pendingSettingsChanges.append((userMsg, halMsg))
             }
             
@@ -8648,14 +8627,6 @@ struct PowerUserView: View {
                 
                 SectionHeaderText(text: "LONG-TERM MEMORY")
                 
-                // Similarity Threshold slider removed (2026-05-17, Commit C).
-                // Retrieval now uses RRF (Reciprocal Rank Fusion) over
-                // semantic + BM25 — rank-based, threshold-free. The
-                // `relevanceThreshold` variable is retained in AppStorage
-                // and per-model settings for backward compat but no
-                // longer affects retrieval. See HISTORY.md 2026-05-17
-                // for the architectural rationale.
-
                 LabeledSliderControl(
                     label: "Recency Weight",
                     value: $chatViewModel.memoryStore.recencyWeight,
@@ -12245,7 +12216,6 @@ class ChatViewModel: ObservableObject {
             if let v = effective.effectiveMemoryDepth     { self.memoryDepth = v }
             if let v = effective.maxRagSnippetsCharacters { self.maxRagSnippetsCharacters = Double(v) }
             if let v = effective.ragDedupThreshold        { self.ragDedupSimilarityThreshold = v }
-            if let v = effective.similarityThreshold      { self.memoryStore.relevanceThreshold = v }
             if let v = effective.recencyWeight            { self.memoryStore.recencyWeight = v }
             if let v = effective.recencyHalfLifeDays      { self.memoryStore.recencyHalfLifeDays = v }
             halLog("HALDEBUG-SETTINGS: Applied effective settings for \(newModel.displayName) via VM props: temp=\(effective.temperature.map { "\($0)" } ?? "—"), depth=\(effective.effectiveMemoryDepth.map { "\($0)" } ?? "—"), maxRag=\(effective.maxRagSnippetsCharacters.map { "\($0)" } ?? "—")")
@@ -12726,7 +12696,6 @@ class ChatViewModel: ObservableObject {
         static let memoryDepth = 5
         static let maxRagSnippetsCharacters: Double = 800
         static let temperature: Double = 0.7
-        static let relevanceThreshold: Double = 0.25
         static let recencyWeight: Double = 0.30
         static let recencyHalfLifeDays: Double = 90
         static let enableSelfKnowledge: Bool = true
@@ -12831,7 +12800,6 @@ class ChatViewModel: ObservableObject {
         if let v = effective.effectiveMemoryDepth     { self.memoryDepth = v }
         if let v = effective.maxRagSnippetsCharacters { self.maxRagSnippetsCharacters = Double(v) }
         if let v = effective.ragDedupThreshold        { self.ragDedupSimilarityThreshold = v }
-        if let v = effective.similarityThreshold      { self.memoryStore.relevanceThreshold = v }
         if let v = effective.recencyWeight            { self.memoryStore.recencyWeight = v }
         if let v = effective.recencyHalfLifeDays      { self.memoryStore.recencyHalfLifeDays = v }
     }
@@ -12851,7 +12819,6 @@ class ChatViewModel: ObservableObject {
         memoryDepth = DefaultSettings.memoryDepth
         
         // Reset Long-Term Memory (RAG)
-        memoryStore.relevanceThreshold = DefaultSettings.relevanceThreshold
         memoryStore.recencyWeight = DefaultSettings.recencyWeight
         memoryStore.recencyHalfLifeDays = DefaultSettings.recencyHalfLifeDays
         maxRagSnippetsCharacters = DefaultSettings.maxRagSnippetsCharacters
@@ -18221,7 +18188,6 @@ struct MaximScorecard: Codable, Equatable {
 struct ModelSettings: Codable, Equatable {
     var temperature: Double?
     var effectiveMemoryDepth: Int?
-    var similarityThreshold: Double?
     var recencyWeight: Double?
     var recencyHalfLifeDays: Double?
     var maxRagSnippetsCharacters: Int?
@@ -18237,7 +18203,6 @@ struct ModelSettings: Codable, Equatable {
     init(
         temperature: Double? = nil,
         effectiveMemoryDepth: Int? = nil,
-        similarityThreshold: Double? = nil,
         recencyWeight: Double? = nil,
         recencyHalfLifeDays: Double? = nil,
         maxRagSnippetsCharacters: Int? = nil,
@@ -18248,7 +18213,6 @@ struct ModelSettings: Codable, Equatable {
     ) {
         self.temperature = temperature
         self.effectiveMemoryDepth = effectiveMemoryDepth
-        self.similarityThreshold = similarityThreshold
         self.recencyWeight = recencyWeight
         self.recencyHalfLifeDays = recencyHalfLifeDays
         self.maxRagSnippetsCharacters = maxRagSnippetsCharacters
@@ -18265,7 +18229,6 @@ struct ModelSettings: Codable, Equatable {
         ModelSettings(
             temperature: overrides.temperature ?? self.temperature,
             effectiveMemoryDepth: overrides.effectiveMemoryDepth ?? self.effectiveMemoryDepth,
-            similarityThreshold: overrides.similarityThreshold ?? self.similarityThreshold,
             recencyWeight: overrides.recencyWeight ?? self.recencyWeight,
             recencyHalfLifeDays: overrides.recencyHalfLifeDays ?? self.recencyHalfLifeDays,
             maxRagSnippetsCharacters: overrides.maxRagSnippetsCharacters ?? self.maxRagSnippetsCharacters,
@@ -18300,11 +18263,10 @@ struct ModelSettings: Codable, Equatable {
 // by the active model's defaults on first launch. Users can re-customize from
 // there; their changes are then captured per-model on switch.
 //
-// The seven settings keys this manages map onto ModelSettings fields like so:
+// The settings keys this manages map onto ModelSettings fields like so:
 //
 //     temperature                "temperature"               → temperature
 //     memoryDepth                "memoryDepth"               → effectiveMemoryDepth
-//     similarityThreshold        "relevanceThreshold"        → similarityThreshold
 //     recencyWeight              "recencyWeight"             → recencyWeight
 //     recencyHalfLifeDays        "recencyHalfLifeDays"       → recencyHalfLifeDays
 //     maxRagSnippetsCharacters   "maxRagSnippetsCharacters"  → maxRagSnippetsCharacters
@@ -18317,11 +18279,10 @@ final class ModelSettingsStore {
 
     private let userDefaultsKey = "modelSettingsOverridesV1"
 
-    // The seven @AppStorage keys this store reads from and writes to.
+    // The @AppStorage keys this store reads from and writes to.
     enum K {
         static let temperature = "temperature"
         static let memoryDepth = "memoryDepth"
-        static let similarityThreshold = "relevanceThreshold"
         static let recencyWeight = "recencyWeight"
         static let recencyHalfLifeDays = "recencyHalfLifeDays"
         static let maxRagSnippetsCharacters = "maxRagSnippetsCharacters"
@@ -18393,7 +18354,6 @@ final class ModelSettingsStore {
         let d = UserDefaults.standard
         if let v = effective.temperature                { d.set(v, forKey: K.temperature) }
         if let v = effective.effectiveMemoryDepth       { d.set(v, forKey: K.memoryDepth) }
-        if let v = effective.similarityThreshold        { d.set(v, forKey: K.similarityThreshold) }
         if let v = effective.recencyWeight              { d.set(v, forKey: K.recencyWeight) }
         if let v = effective.recencyHalfLifeDays        { d.set(v, forKey: K.recencyHalfLifeDays) }
         if let v = effective.maxRagSnippetsCharacters   { d.set(Double(v), forKey: K.maxRagSnippetsCharacters) }
@@ -18447,7 +18407,6 @@ final class ModelSettingsStore {
         return ModelSettings(
             temperature: dbl(K.temperature),
             effectiveMemoryDepth: int(K.memoryDepth),
-            similarityThreshold: dbl(K.similarityThreshold),
             recencyWeight: dbl(K.recencyWeight),
             recencyHalfLifeDays: dbl(K.recencyHalfLifeDays),
             maxRagSnippetsCharacters: dbl(K.maxRagSnippetsCharacters).map { Int($0) },
@@ -18592,7 +18551,6 @@ struct ModelConfiguration: Identifiable, Codable, Equatable, Hashable {
         defaultSettings: ModelSettings(
             temperature: 0.7,
             effectiveMemoryDepth: 4,
-            similarityThreshold: 0.25,
             recencyWeight: 0.3,
             recencyHalfLifeDays: 90,
             maxRagSnippetsCharacters: 600,
@@ -18659,7 +18617,6 @@ struct ModelConfiguration: Identifiable, Codable, Equatable, Hashable {
         defaultSettings: ModelSettings(
             temperature: 0.7,
             effectiveMemoryDepth: 8,
-            similarityThreshold: 0.25,
             recencyWeight: 0.3,
             recencyHalfLifeDays: 90,
             maxRagSnippetsCharacters: 1400,
@@ -18707,7 +18664,6 @@ struct ModelConfiguration: Identifiable, Codable, Equatable, Hashable {
         defaultSettings: ModelSettings(
             temperature: 0.7,
             effectiveMemoryDepth: 6,
-            similarityThreshold: 0.25,
             recencyWeight: 0.3,
             recencyHalfLifeDays: 90,
             maxRagSnippetsCharacters: 1000,
@@ -18742,7 +18698,6 @@ struct ModelConfiguration: Identifiable, Codable, Equatable, Hashable {
         defaultSettings: ModelSettings(
             temperature: 0.7,
             effectiveMemoryDepth: 6,
-            similarityThreshold: 0.25,
             recencyWeight: 0.3,
             recencyHalfLifeDays: 90,
             maxRagSnippetsCharacters: 1400,
@@ -18802,7 +18757,6 @@ struct ModelConfiguration: Identifiable, Codable, Equatable, Hashable {
         defaultSettings: ModelSettings(
             temperature: 0.7,
             effectiveMemoryDepth: 8,
-            similarityThreshold: 0.25,
             recencyWeight: 0.3,
             recencyHalfLifeDays: 90,
             maxRagSnippetsCharacters: 1000,
@@ -18858,7 +18812,6 @@ struct ModelConfiguration: Identifiable, Codable, Equatable, Hashable {
         defaultSettings: ModelSettings(
             temperature: 0.7,
             effectiveMemoryDepth: 8,
-            similarityThreshold: 0.25,
             recencyWeight: 0.3,
             recencyHalfLifeDays: 90,
             maxRagSnippetsCharacters: 1000,
@@ -19987,15 +19940,6 @@ class HalTestConsole: ObservableObject {
             }
             return "{\"status\":\"error\",\"message\":\"SET_SELF_KNOWLEDGE: must be true or false\"}"
 
-        } else if trimmed.hasPrefix("SET_SIMILARITY_THRESHOLD:") {
-            let valStr = String(trimmed.dropFirst("SET_SIMILARITY_THRESHOLD:".count)).trimmingCharacters(in: .whitespaces)
-            if let val = Double(valStr), val >= 0.0, val <= 1.0 {
-                vm.memoryStore.relevanceThreshold = val
-                writeStateJSON(vm: vm)
-                return "{\"status\":\"ok\",\"relevanceThreshold\":\(val)}"
-            }
-            return "{\"status\":\"error\",\"message\":\"SET_SIMILARITY_THRESHOLD: must be 0.0–1.0\"}"
-
         } else if trimmed.hasPrefix("SET_MAX_RAG_CHARS:") {
             let valStr = String(trimmed.dropFirst("SET_MAX_RAG_CHARS:".count)).trimmingCharacters(in: .whitespaces)
             if let val = Double(valStr), val >= 200 {
@@ -20407,7 +20351,6 @@ class HalTestConsole: ObservableObject {
             if let v = effective.effectiveMemoryDepth     { vm.memoryDepth = v }
             if let v = effective.maxRagSnippetsCharacters { vm.maxRagSnippetsCharacters = Double(v) }
             if let v = effective.ragDedupThreshold        { vm.ragDedupSimilarityThreshold = v }
-            if let v = effective.similarityThreshold      { vm.memoryStore.relevanceThreshold = v }
             if let v = effective.recencyWeight            { vm.memoryStore.recencyWeight = v }
             if let v = effective.recencyHalfLifeDays      { vm.memoryStore.recencyHalfLifeDays = v }
             halLog("HALDEBUG-SETTINGS: Applied effective settings for \(newModel.displayName) via VM props: temp=\(effective.temperature.map { "\($0)" } ?? "—"), depth=\(effective.effectiveMemoryDepth.map { "\($0)" } ?? "—"), maxRag=\(effective.maxRagSnippetsCharacters.map { "\($0)" } ?? "—")")
@@ -20501,7 +20444,6 @@ class HalTestConsole: ObservableObject {
           "maxMemoryDepth": \(vm.maxMemoryDepth),
           "temperature": \(String(format: "%.2f", vm.temperature)),
           "selfKnowledgeEnabled": \(vm.enableSelfKnowledge),
-          "similarityThreshold": \(String(format: "%.2f", ms.relevanceThreshold)),
           "recencyWeight": \(String(format: "%.2f", ms.recencyWeight)),
           "recencyHalfLifeDays": \(String(format: "%.1f", ms.recencyHalfLifeDays)),
           "maxRagSnippetsCharacters": \(Int(vm.maxRagSnippetsCharacters)),
