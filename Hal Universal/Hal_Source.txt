@@ -873,6 +873,85 @@ class MemoryStore: ObservableObject {
                                             }
                                         }
 
+                                        // FTS5 virtual table for BM25-ranked keyword search over
+                                        // unified_content (Commit B, 2026-05-17). Replaces the
+                                        // hand-rolled LIKE substring expansion. The `porter`
+                                        // tokenizer applies English stemming so "dogs" matches
+                                        // "dog's" and "running" matches "run". Triggers below
+                                        // keep the FTS table in sync on INSERT/UPDATE/DELETE.
+                                        //
+                                        // We index `content` and `entity_keywords`; the rowid
+                                        // is the FTS row identifier that maps back to the source
+                                        // table via JOIN. UNINDEXED columns ride along so we
+                                        // can read source_id/position back from FTS results
+                                        // without a join when convenient.
+                                        let ftsTableSQL = """
+                                        CREATE VIRTUAL TABLE IF NOT EXISTS unified_content_fts USING fts5(
+                                            content,
+                                            entity_keywords,
+                                            source_type UNINDEXED,
+                                            source_id UNINDEXED,
+                                            position UNINDEXED,
+                                            content='',
+                                            tokenize='porter unicode61 remove_diacritics 2'
+                                        );
+                                        """
+                                        if sqlite3_exec(db, ftsTableSQL, nil, nil, nil) == SQLITE_OK {
+                                            print("HALDEBUG-DATABASE: Created unified_content_fts (FTS5, porter+unicode61 tokenizer)")
+                                        } else {
+                                            let errorMessage = String(cString: sqlite3_errmsg(db))
+                                            print("HALDEBUG-DATABASE: ERROR: Failed to create unified_content_fts: \(errorMessage)")
+                                        }
+
+                                        // Triggers — keep FTS in sync with unified_content.
+                                        // We use rowid linkage so INSERT/DELETE/UPDATE flow
+                                        // through automatically. The `content=''` declaration on
+                                        // the FTS table makes it contentless (we own the index
+                                        // explicitly, no shadow-table content storage).
+                                        let ftsTriggersSQL = [
+                                            """
+                                            CREATE TRIGGER IF NOT EXISTS unified_content_fts_ai AFTER INSERT ON unified_content BEGIN
+                                                INSERT INTO unified_content_fts(rowid, content, entity_keywords, source_type, source_id, position)
+                                                VALUES (new.rowid, new.content, new.entity_keywords, new.source_type, new.source_id, new.position);
+                                            END;
+                                            """,
+                                            """
+                                            CREATE TRIGGER IF NOT EXISTS unified_content_fts_ad AFTER DELETE ON unified_content BEGIN
+                                                INSERT INTO unified_content_fts(unified_content_fts, rowid, content, entity_keywords, source_type, source_id, position)
+                                                VALUES ('delete', old.rowid, old.content, old.entity_keywords, old.source_type, old.source_id, old.position);
+                                            END;
+                                            """,
+                                            """
+                                            CREATE TRIGGER IF NOT EXISTS unified_content_fts_au AFTER UPDATE ON unified_content BEGIN
+                                                INSERT INTO unified_content_fts(unified_content_fts, rowid, content, entity_keywords, source_type, source_id, position)
+                                                VALUES ('delete', old.rowid, old.content, old.entity_keywords, old.source_type, old.source_id, old.position);
+                                                INSERT INTO unified_content_fts(rowid, content, entity_keywords, source_type, source_id, position)
+                                                VALUES (new.rowid, new.content, new.entity_keywords, new.source_type, new.source_id, new.position);
+                                            END;
+                                            """
+                                        ]
+                                        for triggerSQL in ftsTriggersSQL {
+                                            if sqlite3_exec(db, triggerSQL, nil, nil, nil) != SQLITE_OK {
+                                                let errorMessage = String(cString: sqlite3_errmsg(db))
+                                                print("HALDEBUG-DATABASE: ERROR: Failed to create FTS trigger: \(errorMessage)")
+                                            }
+                                        }
+                                        // Backfill FTS for any pre-existing rows that aren't in
+                                        // the FTS table yet (handles first-launch-after-upgrade
+                                        // and any rows added before triggers existed).
+                                        let backfillSQL = """
+                                        INSERT INTO unified_content_fts(rowid, content, entity_keywords, source_type, source_id, position)
+                                        SELECT u.rowid, u.content, u.entity_keywords, u.source_type, u.source_id, u.position
+                                        FROM unified_content u
+                                        WHERE u.rowid NOT IN (SELECT rowid FROM unified_content_fts);
+                                        """
+                                        if sqlite3_exec(db, backfillSQL, nil, nil, nil) == SQLITE_OK {
+                                            let backfilled = Int(sqlite3_changes(db))
+                                            if backfilled > 0 {
+                                                halLog("HALDEBUG-DATABASE: Backfilled FTS for \(backfilled) pre-existing unified_content rows")
+                                            }
+                                        }
+
                                         // Create enhanced performance indexes including entity_keywords and self-knowledge
                                         let unifiedIndexes = [
                                             "CREATE INDEX IF NOT EXISTS idx_unified_content_source ON unified_content(source_type, source_id);",
@@ -3820,6 +3899,24 @@ extension MemoryStore {
 // MARK: - Entity-Enhanced Search Utilities (from Hal10000App.swift)
 extension MemoryStore {
 
+    /// Sanitize a free-form natural-language query into a safe FTS5 MATCH
+    /// expression. FTS5 syntax treats punctuation, quotes, and operators
+    /// specially; raw user input would either fail to parse or produce
+    /// wrong AND semantics. We tokenize on whitespace, strip non-alphanum
+    /// characters from each token, drop short/empty tokens, lowercase the
+    /// rest, and join with OR so any-word match returns a hit.
+    func sanitizeFTSQuery(_ query: String) -> String {
+        let raw = query.lowercased()
+        let allowed = CharacterSet.alphanumerics.union(.whitespaces)
+        let cleaned = String(raw.unicodeScalars.filter { allowed.contains($0) })
+        let tokens = cleaned
+            .components(separatedBy: .whitespaces)
+            .map { $0.trimmingCharacters(in: .whitespaces) }
+            .filter { $0.count >= 2 }  // drop "a", "i", noise
+        guard !tokens.isEmpty else { return "\"\"" }  // empty match — returns nothing
+        return tokens.joined(separator: " OR ")
+    }
+
     // ENHANCED: Flexible search with entity-based expansion
     func expandQueryWithEntityVariations(_ query: String) -> [String] {
         var variations = [query]
@@ -4240,70 +4337,90 @@ extension MemoryStore {
         sqlite3_finalize(stmt)
         print("HALDEBUG-SEARCH: Semantic search completed. Found \(allResults.count) initial matches.")
 
-        // --- 2. Entity-Based Keyword Search with SQL-level exclusion ---
-        print("HALDEBUG-SEARCH: Performing entity-based keyword search...")
-        let expandedQueries = expandQueryWithEntityVariations(query)
-        for expandedQuery in expandedQueries {
-            let keywordSQL = """
-            SELECT id, content, source_type, source_id, position, metadata_json, timestamp
-            FROM unified_content
-            WHERE (entity_keywords LIKE ? OR content LIKE ?)\(exclusionClause);
-            """
-            var keywordStmt: OpaquePointer?
-            if sqlite3_prepare_v2(db, keywordSQL, -1, &keywordStmt, nil) == SQLITE_OK {
-                let likeQuery = "%\(expandedQuery.lowercased())%"
-                sqlite3_bind_text(keywordStmt, 1, (likeQuery as NSString).utf8String, -1, nil)
-                sqlite3_bind_text(keywordStmt, 2, (likeQuery as NSString).utf8String, -1, nil)
+        // --- 2. BM25 Keyword Search via FTS5 (Commit B, 2026-05-17) ---
+        // Replaces the prior hand-rolled LIKE substring expansion with a
+        // single FTS5 MATCH query against `unified_content_fts`. The
+        // tokenizer (Porter + Unicode61) handles stemming so "dogs" matches
+        // "dog's" and "running" matches "run". `bm25()` returns the standard
+        // BM25 score (lower is more relevant in FTS5 — we negate it so
+        // higher is better, matching the semantic-search convention).
+        //
+        // The FTS table is contentless (`content=''`) so we JOIN back to
+        // `unified_content` for the row fields the snippet builder needs.
+        halLog("HALDEBUG-SEARCH: Performing FTS5 BM25 keyword search...")
+        let bm25ExclusionClause = buildExclusionClause(conversationId: currentConversationId, excludeTurns: excludeTurns)
+            .replacingOccurrences(of: " AND source_type", with: " AND u.source_type")
+            .replacingOccurrences(of: " AND source_id", with: " AND u.source_id")
+            .replacingOccurrences(of: " AND turn_number", with: " AND u.turn_number")
+        // Exclude source_code rows from BM25 — Hal's own source code is in
+        // unified_content for self-knowledge access, but it's a million-char
+        // blob that matches every common word (BM25 OR semantics) and would
+        // dominate ranking on every query. Source-code retrieval has its own
+        // path; conversational and document RAG live here.
+        let bm25SQL = """
+        SELECT u.id, u.content, u.source_type, u.source_id, u.position, u.metadata_json, u.timestamp,
+               -bm25(unified_content_fts) AS bm25_score
+        FROM unified_content_fts
+        JOIN unified_content u ON u.rowid = unified_content_fts.rowid
+        WHERE unified_content_fts MATCH ?
+              AND u.source_type != 'source_code'\(bm25ExclusionClause)
+        ORDER BY bm25_score DESC
+        LIMIT 50;
+        """
+        var bm25Stmt: OpaquePointer?
+        if sqlite3_prepare_v2(db, bm25SQL, -1, &bm25Stmt, nil) == SQLITE_OK {
+            // FTS5 MATCH treats unquoted multi-word input as an AND query
+            // by default. We want OR semantics (any-word match) plus
+            // tolerance for special characters, so we sanitize the query:
+            // strip punctuation, lowercase, join with OR.
+            let sanitized = sanitizeFTSQuery(query)
+            sqlite3_bind_text(bm25Stmt, 1, (sanitized as NSString).utf8String, -1, nil)
 
-                while sqlite3_step(keywordStmt) == SQLITE_ROW {
-                    guard let contentCString = sqlite3_column_text(keywordStmt, 1) else { continue }
-                    let content = String(cString: contentCString)
+            var bm25Hits = 0
+            while sqlite3_step(bm25Stmt) == SQLITE_ROW {
+                guard let contentCString = sqlite3_column_text(bm25Stmt, 1) else { continue }
+                let content = String(cString: contentCString)
+                let sourceTypeRaw = sqlite3_column_text(bm25Stmt, 2).map { String(cString: $0) } ?? ""
+                let timestampValue = sqlite3_column_int64(bm25Stmt, 6)
+                let timestamp = Date(timeIntervalSince1970: TimeInterval(timestampValue))
+                let bm25NegScore = sqlite3_column_double(bm25Stmt, 7)  // already negated, so higher = better
 
-                    let sourceTypeRaw = sqlite3_column_text(keywordStmt, 2).map { String(cString: $0) } ?? ""
-                    _ = sqlite3_column_text(keywordStmt, 3) // sourceId - not needed (excluded at SQL level)
-                    _ = sqlite3_column_int(keywordStmt, 4) // position - not needed (excluded at SQL level)
-
-                    // Extract filePath from metadata_json for document snippets
-                    var filePath: String? = nil
-                    if let metadataCString = sqlite3_column_text(keywordStmt, 5) { // metadata_json is column 5
-                        let metadataJsonString = String(cString: metadataCString)
-                        if let metadataData = Data(base64Encoded: metadataJsonString),
-                           let metadataDict = (try? JSONSerialization.jsonObject(with: metadataData, options: []) as? [String: Any]) {
-                            filePath = metadataDict["filePath"] as? String
-                        }
-                    }
-                    
-                    // Extract timestamp for recency scoring
-                    let timestampValue = sqlite3_column_int64(keywordStmt, 6) // timestamp is column 6
-                    let timestamp = Date(timeIntervalSince1970: TimeInterval(timestampValue))
-
-                    // Apply recency boosting to keyword matches too
-                    // Base relevance set below semantic threshold (0.75) so keyword-only matches
-                    // don't compete with strong semantic matches and introduce noise
-                    let recencyScore = calculateRecencyScore(timestamp: timestamp)
-                    let baseRelevance = 0.60 // Keyword-only match: lower than semantic threshold
-                    // Source code doesn't age — skip recency decay for static architecture content
-                    let finalScore = sourceTypeRaw == "source_code"
-                        ? baseRelevance
-                        : (baseRelevance * (1.0 - recencyWeight)) + (recencyScore * recencyWeight)
-                    
-                    // Add age label to content
-                    let ageLabel = formatAgeLabel(timestamp: timestamp)
-                    let labeledContent = "[\(ageLabel)]: \(content)"
-
-                    // Add a default relevance for keyword matches, or enhance if already a semantic match
-                    if let existingIndex = allResults.firstIndex(where: { $0.content.contains(content) }) {
-                        // If already found by semantic search, just mark as entity match
-                        allResults[existingIndex].isEntityMatch = true
-                    } else {
-                        // Add as a new result with recency-adjusted relevance
-                        allResults.append(UnifiedSearchResult(content: labeledContent, relevance: finalScore, source: sourceTypeRaw, isEntityMatch: true, filePath: filePath))
+                // Extract filePath from metadata_json
+                var filePath: String? = nil
+                if let metadataCString = sqlite3_column_text(bm25Stmt, 5) {
+                    let metadataJsonString = String(cString: metadataCString)
+                    if let metadataData = Data(base64Encoded: metadataJsonString),
+                       let metadataDict = (try? JSONSerialization.jsonObject(with: metadataData, options: []) as? [String: Any]) {
+                        filePath = metadataDict["filePath"] as? String
                     }
                 }
+
+                // Recency boost on top of BM25 score (the BM25 magnitude
+                // varies with query/corpus stats; recency normalizes to
+                // a comparable scale and prefers fresh content).
+                let recencyScore = calculateRecencyScore(timestamp: timestamp)
+                let finalScore = sourceTypeRaw == "source_code"
+                    ? bm25NegScore
+                    : (bm25NegScore * (1.0 - recencyWeight)) + (recencyScore * recencyWeight)
+
+                let ageLabel = formatAgeLabel(timestamp: timestamp)
+                let labeledContent = "[\(ageLabel)]: \(content)"
+
+                if let existingIndex = allResults.firstIndex(where: { $0.content.contains(content) }) {
+                    // Same row found via semantic search — mark as also-matched
+                    allResults[existingIndex].isEntityMatch = true
+                } else {
+                    allResults.append(UnifiedSearchResult(content: labeledContent, relevance: finalScore, source: sourceTypeRaw, isEntityMatch: true, filePath: filePath))
+                }
+                bm25Hits += 1
             }
-            sqlite3_finalize(keywordStmt)
+            halLog("HALDEBUG-SEARCH: FTS5 BM25 found \(bm25Hits) matches for sanitized query: '\(sanitized.prefix(60))'")
+        } else {
+            let err = String(cString: sqlite3_errmsg(db))
+            halLog("HALDEBUG-SEARCH: FTS5 BM25 prepare failed: \(err)")
         }
-        print("HALDEBUG-SEARCH: Entity keyword search completed. Total matches: \(allResults.count)")
+        sqlite3_finalize(bm25Stmt)
+        halLog("HALDEBUG-SEARCH: Combined semantic + BM25 results: \(allResults.count)")
 
         // --- 3. Sort by Relevance ---
         allResults.sort { $0.relevance > $1.relevance }
@@ -4346,11 +4463,24 @@ extension MemoryStore {
         if allResults.count > maxResults {
             halLog("HALDEBUG-SEARCH: Capped to top \(maxResults) of \(allResults.count) candidate matches before token-budget pass")
         }
+        if let first = cappedResults.first {
+            halLog("HALDEBUG-SEARCH: Top candidate — score=\(String(format: "%.4f", first.relevance)), entity=\(first.isEntityMatch), contentLen=\(first.content.count) chars, preview='\(first.content.prefix(80))'")
+        }
         for result in cappedResults {
             // Estimate tokens for this snippet
             let snippetTokens = TokenEstimator.estimateTokens(from: result.content)
 
-            // Stop adding if we exceed the budget
+            // If THIS snippet alone is larger than the entire budget, skip
+            // it (no point in trying) and move on — there may be smaller
+            // snippets later in the list that DO fit. The prior behavior
+            // (break) lost ALL retrieval if the top-ranked snippet was a
+            // big document.
+            if snippetTokens > tokenBudget {
+                halLog("HALDEBUG-SEARCH: Snippet \(snippetTokens) tokens > budget \(tokenBudget); skipping and trying next candidate")
+                continue
+            }
+
+            // Stop adding if THIS snippet would push the running total over budget
             if totalTokens + snippetTokens > tokenBudget {
                 halLog("HALDEBUG-SEARCH: Token budget reached. Stopping at \(totalTokens) tokens.")
                 break
