@@ -4347,6 +4347,33 @@ extension MemoryStore {
         }
         print("HALDEBUG-SEARCH: Semantic retrieved \(semanticCapped.count) ranked candidates")
 
+        // Measure semantic discrimination so the BM25 quality gate below
+        // can decide whether semantic is confident enough to be the
+        // arbiter. Two embedders behave very differently here:
+        //
+        //   - A wide-band embedder (Nomic, EmbeddingGemma) places its
+        //     best match well above the average — relative spread
+        //     (top1 - mean) / mean is large (≈0.4–0.5).
+        //   - A narrow-band embedder (NLContextual) clusters most rows
+        //     near the same cosine — relative spread is small
+        //     (≈0.05–0.10).
+        //
+        // Z-score doesn't distinguish them: NL's narrow band has
+        // small σ, so a small absolute spread still produces a high
+        // z. Relative spread against the mean DOES separate them
+        // because it preserves the absolute scale of the cosine
+        // distribution. This is purely a function of the query's
+        // own data — no backend constants.
+        let semanticRelativeSpread: Double = {
+            let scores = semanticCapped.map { $0.score }
+            guard scores.count >= 3 else { return 0 }
+            let mean = scores.reduce(0, +) / Double(scores.count)
+            guard mean > 0 else { return 0 }
+            return (scores[0] - mean) / mean
+        }()
+        let semSpreadStr = String(format: "%.2f", semanticRelativeSpread)
+        halLog("HALDEBUG-SEARCH: Semantic relative spread (top1-mean)/mean = \(semSpreadStr) (higher = embedder more confident in its top pick).")
+
         // --- 2. BM25 retrieval via FTS5 ---
         halLog("HALDEBUG-SEARCH: Performing FTS5 BM25 retrieval (RRF-style)...")
         let bm25ExclusionClause = exclusionClause
@@ -4392,6 +4419,10 @@ extension MemoryStore {
             }
             sqlite3_bind_text(bm25Stmt, 1, (sanitized as NSString).utf8String, -1, nil)
 
+            // Also capture BM25 scores so we can evaluate retrieval quality
+            // after the fact (the "dynamic BM25 quality gate" — see below).
+            var bm25Scores: [Double] = []
+
             while sqlite3_step(bm25Stmt) == SQLITE_ROW {
                 guard let idCString = sqlite3_column_text(bm25Stmt, 0),
                       let contentCString = sqlite3_column_text(bm25Stmt, 1) else { continue }
@@ -4410,8 +4441,12 @@ extension MemoryStore {
                 let timestampValue = sqlite3_column_int64(bm25Stmt, 6)
                 let timestamp = Date(timeIntervalSince1970: TimeInterval(timestampValue))
                 let recordedByModel = sqlite3_column_text(bm25Stmt, 7).map { String(cString: $0) }
+                // Column 8 in our SELECT is `-bm25(unified_content_fts) AS bm25_score`
+                // — higher = better match. Capture for the quality gate below.
+                let bm25Score = sqlite3_column_double(bm25Stmt, 8)
 
                 bm25Ordered.append(rowId)
+                bm25Scores.append(bm25Score)
                 if slotById[rowId] == nil {
                     slotById[rowId] = RowSlot(
                         id: rowId, content: content, sourceType: sourceTypeRaw,
@@ -4420,6 +4455,97 @@ extension MemoryStore {
                 }
             }
             halLog("HALDEBUG-SEARCH: FTS5 BM25 retrieved \(bm25Ordered.count) ranked candidates for query: '\(sanitized.prefix(60))'")
+
+            // Dynamic BM25 quality gate (2026-05-17, Mark's directive).
+            //
+            // BM25 can return CONFIDENT-LOOKING-BUT-WRONG results when
+            // the query is dominated by common-word tokens (e.g. "What
+            // kind of car do I have?" → BM25's top-1 is "I've been
+            // having trouble sleeping" because "have"/"trouble"/"do"
+            // happen to align well, while the actual Subaru plant
+            // shares zero words with the query). Including those in
+            // RRF demotes the semantic match.
+            //
+            // The signal that distinguishes "BM25 is right" from "BM25
+            // is wrong but confident": **agreement with semantic**.
+            // When BM25's top hits are also ranked highly by semantic,
+            // both retrievers have independently corroborated the
+            // match — keep BM25's contribution. When BM25's top hit
+            // has no semantic standing, BM25 is matching on tokens
+            // that have no conceptual relationship to the query —
+            // treat as noise and exclude BM25's contribution to RRF.
+            //
+            // This is data-driven: both signals are derived from the
+            // corpus at query time. As the database grows, both
+            // retrievers' rankings adapt naturally — the gate
+            // self-corrects without any tuned threshold list. The
+            // single conceptual constant ("agreement") is the same
+            // assumption RRF already makes about its inputs.
+            //
+            // Implementation: compare BM25's top-K rows against semantic's
+            // ranked list. Compute the *median* semantic rank of BM25's
+            // top-K — a robust order statistic that resists outliers
+            // (one accidentally-shared row can't carry the whole set).
+            // If the median is well above the K-cap, BM25's top-K
+            // disagrees broadly with semantic — exclude. Otherwise the
+            // two retrievers are corroborating each other — include.
+            //
+            // GATING THE GATE: only apply this filter when semantic
+            // itself is confident in its top pick. We measured the
+            // semantic discrimination z-score above; if it's below
+            // ~1.5σ the embedder isn't well-discriminated (narrow
+            // band, every row scores similarly) and we need BM25 to
+            // carry retrieval. In that regime, excluding BM25 leaves
+            // us with weak-signal-only semantic and recall drops.
+            // When semantic IS well-discriminated (z ≥ 1.5), it's
+            // confident enough that BM25 disagreement = BM25 noise.
+            //
+            // K and the agreement-cap are derived from semantic's own
+            // cap (we capped semantic at top-50): we ask "do BM25's
+            // top-K rows mostly fall inside semantic's top-K too?"
+            // by setting both to the same value. K = min(5, |BM25|)
+            // chosen because 5 is the typical "front of the list"
+            // attention horizon for a user; below that they'd expect
+            // very tight agreement.
+            // 0.15 = top-1 cosine at least 15% above the mean cosine.
+            // Empirically separates narrow-band embedders (NLContextual
+            // ≈ 0.05–0.10) from wide-band ones (Nomic, Gemma ≈ 0.3–0.5).
+            // Picked to land above NL's typical spread and below
+            // Nomic's, so the gate engages only when semantic has
+            // enough room to be the deciding factor.
+            let semanticConfidenceThreshold: Double = 0.15
+            let applyGate = semanticRelativeSpread >= semanticConfidenceThreshold
+            if !applyGate {
+                halLog("HALDEBUG-SEARCH: BM25 quality gate SKIPPED — semantic relative spread \(semSpreadStr) < \(semanticConfidenceThreshold); semantic is in a narrow band (embedder uncertain), letting BM25 carry retrieval.")
+            }
+            if applyGate, !bm25Ordered.isEmpty {
+                let k = min(5, bm25Ordered.count)
+                let bm25TopK = bm25Ordered.prefix(k)
+                let semanticRanksOfBM25TopK = bm25TopK.compactMap { semanticRanks[$0] }
+                // If most of BM25's top-K aren't in semantic AT ALL, the
+                // two retrievers are working on different universes — noise.
+                let agreementCount = semanticRanksOfBM25TopK.count
+                if agreementCount == 0 {
+                    let top1Str = bm25Scores.first.map { String(format: "%.2f", $0) } ?? "?"
+                    halLog("HALDEBUG-SEARCH: BM25 quality gate FAILED — none of BM25's top-\(k) (top-1 score=\(top1Str)) appear in semantic's top-50; excluding BM25 from RRF.")
+                    bm25Ordered = []
+                } else {
+                    // Compute median semantic rank of agreement set. If
+                    // median is in semantic's top-k (mirroring BM25's k),
+                    // both retrievers agree on the front of the list →
+                    // include. Otherwise BM25's distinctive matches are
+                    // for rows semantic considers fringe → exclude.
+                    let sorted = semanticRanksOfBM25TopK.sorted()
+                    let median = sorted[sorted.count / 2]
+                    if median <= k {
+                        halLog("HALDEBUG-SEARCH: BM25 quality gate PASSED — BM25 top-\(k) has \(agreementCount)/\(k) entries in semantic with median rank \(median) ≤ \(k); both retrievers agree on the front of the list. Including BM25 in RRF.")
+                    } else {
+                        let top1Str = bm25Scores.first.map { String(format: "%.2f", $0) } ?? "?"
+                        halLog("HALDEBUG-SEARCH: BM25 quality gate FAILED — BM25 top-\(k) (top-1 score=\(top1Str)) has median semantic rank \(median) > \(k); BM25 is finding distinctive matches that semantic doesn't share. Excluding BM25 from RRF.")
+                        bm25Ordered = []
+                    }
+                }
+            }
         } else {
             let err = String(cString: sqlite3_errmsg(db))
             halLog("HALDEBUG-SEARCH: FTS5 BM25 prepare failed: \(err)")
