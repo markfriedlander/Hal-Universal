@@ -7078,9 +7078,16 @@ struct ActionsView: View {
                         Image(systemName: "person.2.fill")
                             .foregroundColor(.accentColor)
                             .imageScale(.small)
-                        Text("\(chatViewModel.salonConfig.activeSeats.count) voices")
+                        // Show the actual seat names ("Gemma · Llama · Qwen
+                        // · Dolphin") so the user can see which models are
+                        // in the active configuration without opening the
+                        // salon picker. Previously this was "N voices",
+                        // which obscured the configuration. 2026-05-18.
+                        Text(chatViewModel.salonSeatSummary)
                             .font(.subheadline)
                             .foregroundColor(.secondary)
+                            .lineLimit(1)
+                            .truncationMode(.tail)
                     }
                 } else {
                     Text("Active Model")
@@ -12022,16 +12029,45 @@ class ChatViewModel: ObservableObject {
                     return ModelCatalogService.shared.availableModels
                 }
                 
-                /// Gets all downloaded MLX models
-                /// - Returns: Array of ModelConfigurations that are downloaded and ready to use
+                /// Gets all downloaded MLX models (excludes AFM — AFM is bundled,
+                /// not downloaded, and `usableModels` prepends it explicitly).
+                /// Excluding AFM here prevents the "Apple Intelligence appearing
+                /// twice in Salon picker" bug, where the catalog's seed already
+                /// marks AFM as `isDownloaded == true` and a naive
+                /// `[AFM] + filter(isDownloaded)` would include it twice. Fixed
+                /// 2026-05-18.
+                /// - Returns: Array of ModelConfigurations that are downloaded MLX models
                 var downloadedModels: [ModelConfiguration] {
-                    return availableModels.filter { $0.isDownloaded }
+                    return availableModels.filter {
+                        $0.source == .mlx && $0.isDownloaded
+                    }
                 }
-                
+
                 /// Gets all models ready for use (Apple Foundation + Downloaded MLX)
                 /// - Returns: Array of ModelConfigurations that can be used right now
                 var usableModels: [ModelConfiguration] {
                     return [ModelConfiguration.appleFoundation] + downloadedModels
+                }
+
+                /// Compact dot-separated display of the active salon seats'
+                /// model names. Used by the Settings sheet's Salon Mode row
+                /// so the user sees "Gemma · Llama · Qwen · Dolphin" instead
+                /// of "4 voices". Falls back to a short modelID suffix if a
+                /// seat's model isn't in the catalog (shouldn't happen in
+                /// practice, but defensive). 2026-05-18.
+                var salonSeatSummary: String {
+                    let names: [String] = salonConfig.activeSeats.map { (_, modelID) in
+                        if let model = ModelCatalogService.shared.getModel(byID: modelID) {
+                            return model.displayName
+                        }
+                        // Fallback: derive a friendly name from the modelID
+                        // (e.g. "mlx-community/gemma-4-e2b-it-4bit" → "gemma-4-e2b").
+                        return modelID.split(separator: "/").last.map(String.init) ?? modelID
+                    }
+                    if names.isEmpty {
+                        return "no seats configured"
+                    }
+                    return names.joined(separator: " · ")
                 }
                 
                 /// Refreshes the model catalog from Hugging Face
@@ -12576,7 +12612,14 @@ class ChatViewModel: ObservableObject {
                                                                             let summaryBudgetTokens = max(dynamicPromptRoom * 30 / 100, 150)
                                                                             let selfKnowledgeBudgetTokens = max(dynamicPromptRoom - summaryBudgetTokens, 150)
 
-                                                                            halLog("HALDEBUG-BUDGET: \(selectedModel.displayName) prompt=\(limits.maxPromptTokens) sys=\(sysPromptActualTokens) summary=\(summaryBudgetTokens) selfKnowledge=\(selfKnowledgeBudgetTokens) RAG=\(limits.maxRagTokens) shortTerm=\(limits.shortTermMemoryTokens)")
+                                                                            // Label clarification (2026-05-18): the "selfKnowledge=" value
+                                                                            // here is the ALLOCATION CEILING, not the actual tokens injected.
+                                                                            // Previous label confused live-test reviewers into thinking 44K
+                                                                            // of self-knowledge was being shoved into the prompt. Renamed to
+                                                                            // `selfKnowledgeBudget=` for clarity; the actual usage is logged
+                                                                            // separately as `selfKnowledgeUsed=` immediately after
+                                                                            // resolveSegment returns.
+                                                                            halLog("HALDEBUG-BUDGET: \(selectedModel.displayName) prompt=\(limits.maxPromptTokens) sys=\(sysPromptActualTokens) summaryBudget=\(summaryBudgetTokens) selfKnowledgeBudget=\(selfKnowledgeBudgetTokens) RAGBudget=\(limits.maxRagTokens) shortTerm=\(limits.shortTermMemoryTokens)")
 
                                                                             // Local helper: pre-flight evaluate a segment, compress if over
                                                                             // budget, and update the tracking sets in this scope.
@@ -12692,6 +12735,12 @@ class ChatViewModel: ObservableObject {
                                                                                         .trimmingCharacters(in: .whitespacesAndNewlines)
                                                                                     if !selfKnowledgeBody.isEmpty {
                                                                                         let resolvedSelfKnowledge = await resolveSegment(.selfKnowledge, rawContent: selfKnowledgeBody, budgetTokens: selfKnowledgeBudgetTokens)
+                                                                                        // Log the actual injection size for transparency.
+                                                                                        // Pairs with `selfKnowledgeBudget=` in HALDEBUG-BUDGET
+                                                                                        // above. Token estimate uses the same 4-chars-per-token
+                                                                                        // heuristic as PromptBudgetEvaluator. 2026-05-18.
+                                                                                        let usedTokensEstimate = resolvedSelfKnowledge.count / 4
+                                                                                        halLog("HALDEBUG-SELF-KNOWLEDGE: selfKnowledgeUsed=\(usedTokensEstimate) tokens (\(resolvedSelfKnowledge.count) chars) of selfKnowledgeBudget=\(selfKnowledgeBudgetTokens)")
                                                                                         contextSections.append(resolvedSelfKnowledge)
                                                                                     }
                                                                                 }
@@ -17800,7 +17849,12 @@ struct ModelConfiguration: Identifiable, Codable, Equatable, Hashable {
     /// conscious' without being overridden."
     static let dolphin3Llama32_3B4bit = ModelConfiguration(
         id: "mlx-community/dolphin3.0-llama3.2-3B-4Bit",
-        displayName: "Dolphin 3.0 (Llama 3.2 3B)",
+        // Display name kept short to match the rest of the catalog
+        // ("Gemma 4 E2B", "Qwen 3.5 2B", etc.) — the parenthetical base
+        // model "(Llama 3.2 3B)" cluttered model pickers and the salon
+        // seat summary. The full lineage stays visible in the Model
+        // Library description. 2026-05-18.
+        displayName: "Dolphin 3.0",
         source: .mlx,
         sizeGB: 2.0,
         contextWindow: 128_000,
