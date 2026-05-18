@@ -2018,86 +2018,126 @@ import SQLite3 // Direct C API; matches Hal.swift import for the same reason.
             notes: String? = nil,
             metadata: [String: Any]? = nil,
             shareable: Bool = false,  // ADDED: Default to private - Hal must actively choose to share
-            format: String = "structured_trait"  // NEW: Default to structured_trait, can be "raw_reflection"
+            format: String = "structured_trait",  // NEW: Default to structured_trait, can be "raw_reflection"
+            shareabilityDecidedByModel: String? = nil  // PHASE 4 (2026-05-18): audit + stickiness
         ) {
             guard ensureHealthyConnection() else {
                 print("HALDEBUG-SELF-KNOWLEDGE: Cannot store - no database connection")
                 return
             }
-            
+
             let now = Int(Date().timeIntervalSince1970)
-            
+
             // Validate confidence range
             let validConfidence = min(max(confidence, 0.0), 1.0)
-            
-            // Check if entry already exists (deduplication by category+key only, NOT model_id)
-            let checkSQL = "SELECT id, confidence, reinforcement_count FROM self_knowledge WHERE category = ? AND key = ? AND deleted_at IS NULL"
+
+            // Check if entry already exists (deduplication by category+key only, NOT model_id).
+            // Phase 4: also pull existing shareable + shareability_decided_by_model so we
+            // can enforce stickiness on the UPDATE path — first decision wins, no override.
+            let checkSQL = "SELECT id, confidence, reinforcement_count, shareable, shareability_decided_by_model FROM self_knowledge WHERE category = ? AND key = ? AND deleted_at IS NULL"
             var checkStmt: OpaquePointer?
             var existingId: String?
             var existingConfidence: Double = 0.0
             var existingCount: Int = 0
-            
+            var existingShareable: Bool = false
+            var existingShareabilityDecidedByModel: String? = nil
+
             if sqlite3_prepare_v2(db, checkSQL, -1, &checkStmt, nil) == SQLITE_OK {
                 sqlite3_bind_text(checkStmt, 1, (category as NSString).utf8String, -1, nil)
                 sqlite3_bind_text(checkStmt, 2, (key as NSString).utf8String, -1, nil)
-                
+
                 if sqlite3_step(checkStmt) == SQLITE_ROW {
                     if let idPtr = sqlite3_column_text(checkStmt, 0) {
                         existingId = String(cString: idPtr)
                         existingConfidence = sqlite3_column_double(checkStmt, 1)
                         existingCount = Int(sqlite3_column_int(checkStmt, 2))
+                        existingShareable = sqlite3_column_int(checkStmt, 3) != 0
+                        if sqlite3_column_type(checkStmt, 4) != SQLITE_NULL {
+                            if let p = sqlite3_column_text(checkStmt, 4) {
+                                existingShareabilityDecidedByModel = String(cString: p)
+                            }
+                        }
                     }
                 }
             }
             sqlite3_finalize(checkStmt)
-            
+
             if let _ = existingId {
                 // REINFORCEMENT: Entry exists - boost confidence and increment count
                 let boostedConfidence = min(1.0, existingConfidence * 1.1)  // 10% boost, capped at 1.0
                 let newCount = existingCount + 1
-                
+
+                // Phase 4 stickiness: if the existing entry's
+                // shareability_decided_by_model is already set, preserve
+                // BOTH shareable and shareability_decided_by_model from
+                // the existing row. The new caller's preference does
+                // NOT override an earlier decision. Only when no audit
+                // is recorded yet (NULL — legacy rows from before Phase
+                // 4) do we apply the new params.
+                let stickyShareable: Bool
+                let stickyDecider: String?
+                if existingShareabilityDecidedByModel != nil {
+                    // Sticky: preserve existing.
+                    stickyShareable = existingShareable
+                    stickyDecider = existingShareabilityDecidedByModel
+                } else {
+                    // First decision (or legacy row): apply new params.
+                    stickyShareable = shareable
+                    stickyDecider = shareabilityDecidedByModel
+                }
+
                 print("HALDEBUG-SELF-KNOWLEDGE: 🔄 Reinforcing \(category)/\(key) - count: \(existingCount) → \(newCount), confidence: \(String(format: "%.2f", existingConfidence)) → \(String(format: "%.2f", boostedConfidence))")
-                
-                // MODIFIED: Added shareable and format to UPDATE statement
+
+                // MODIFIED: Added shareable, format, and shareability_decided_by_model to UPDATE statement
                 let updateSQL = """
-                UPDATE self_knowledge 
-                SET value = ?, 
+                UPDATE self_knowledge
+                SET value = ?,
                     confidence = ?,
                     reinforcement_count = ?,
                     last_reinforced = ?,
                     model_id = ?,
                     shareable = ?,
                     format = ?,
+                    shareability_decided_by_model = ?,
                     updated_at = ?
                 WHERE category = ? AND key = ? AND deleted_at IS NULL
                 """
-                
+
                 var stmt: OpaquePointer?
                 if sqlite3_prepare_v2(db, updateSQL, -1, &stmt, nil) == SQLITE_OK {
                     sqlite3_bind_text(stmt, 1, (value as NSString).utf8String, -1, nil)
                     sqlite3_bind_double(stmt, 2, boostedConfidence)
                     sqlite3_bind_int(stmt, 3, Int32(newCount))
                     sqlite3_bind_int64(stmt, 4, Int64(now))
-                    
+
                     if let modelId = modelId {
                         sqlite3_bind_text(stmt, 5, (modelId as NSString).utf8String, -1, nil)
                     } else {
                         sqlite3_bind_null(stmt, 5)
                     }
-                    
-                    // ADDED: Bind shareable parameter
-                    sqlite3_bind_int(stmt, 6, shareable ? 1 : 0)
-                    
-                    // NEW: Bind format parameter
+
+                    // Phase 4: sticky shareable (preserves prior decision when set).
+                    sqlite3_bind_int(stmt, 6, stickyShareable ? 1 : 0)
+
+                    // Format parameter (unchanged behavior).
                     sqlite3_bind_text(stmt, 7, (format as NSString).utf8String, -1, nil)
-                    
-                    sqlite3_bind_int64(stmt, 8, Int64(now))
-                    sqlite3_bind_text(stmt, 9, (category as NSString).utf8String, -1, nil)
-                    sqlite3_bind_text(stmt, 10, (key as NSString).utf8String, -1, nil)
-                    
+
+                    // Phase 4: sticky decider. May be NULL if legacy and
+                    // no new caller-provided decider either.
+                    if let decider = stickyDecider {
+                        sqlite3_bind_text(stmt, 8, (decider as NSString).utf8String, -1, nil)
+                    } else {
+                        sqlite3_bind_null(stmt, 8)
+                    }
+
+                    sqlite3_bind_int64(stmt, 9, Int64(now))
+                    sqlite3_bind_text(stmt, 10, (category as NSString).utf8String, -1, nil)
+                    sqlite3_bind_text(stmt, 11, (key as NSString).utf8String, -1, nil)
+
                     if sqlite3_step(stmt) == SQLITE_DONE {
-                        let shareableStatus = shareable ? "SHAREABLE" : "PRIVATE"
-                        print("HALDEBUG-SELF-KNOWLEDGE: ✓ Reinforced \(category)/\(key) [\(shareableStatus), format: \(format)]")
+                        let shareableStatus = stickyShareable ? "SHAREABLE" : "PRIVATE"
+                        let stickyNote = (existingShareabilityDecidedByModel != nil) ? " (sticky from \(existingShareabilityDecidedByModel ?? "?"))" : ""
+                        print("HALDEBUG-SELF-KNOWLEDGE: ✓ Reinforced \(category)/\(key) [\(shareableStatus)\(stickyNote), format: \(format)]")
                         backupSelfKnowledge()
                     } else {
                         let errorMessage = String(cString: sqlite3_errmsg(db))
@@ -2105,7 +2145,7 @@ import SQLite3 // Direct C API; matches Hal.swift import for the same reason.
                     }
                 }
                 sqlite3_finalize(stmt)
-                
+
             } else {
                 // NEW ENTRY: Insert fresh self-knowledge
                 let id = UUID().uuidString
@@ -2113,23 +2153,23 @@ import SQLite3 // Direct C API; matches Hal.swift import for the same reason.
                 let shareableStatus = shareable ? "SHAREABLE" : "PRIVATE"
                 print("HALDEBUG-SELF-KNOWLEDGE: ✨ Creating new \(category)/\(key) = '\(value)' (confidence: \(validConfidence), \(shareableStatus), format: \(format))")
                 
-                // MODIFIED: Added shareable and format to INSERT statement
+                // MODIFIED: Added shareable, format, and shareability_decided_by_model to INSERT statement
                 let insertSQL = """
-                INSERT INTO self_knowledge 
-                (id, model_id, category, key, value, confidence, first_observed, last_reinforced, reinforcement_count, source, notes, shareable, format, created_at, updated_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?, ?)
+                INSERT INTO self_knowledge
+                (id, model_id, category, key, value, confidence, first_observed, last_reinforced, reinforcement_count, source, notes, shareable, format, shareability_decided_by_model, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?, ?, ?)
                 """
-                
+
                 var stmt: OpaquePointer?
                 if sqlite3_prepare_v2(db, insertSQL, -1, &stmt, nil) == SQLITE_OK {
                     sqlite3_bind_text(stmt, 1, (id as NSString).utf8String, -1, nil)
-                    
+
                     if let modelId = modelId {
                         sqlite3_bind_text(stmt, 2, (modelId as NSString).utf8String, -1, nil)
                     } else {
                         sqlite3_bind_null(stmt, 2)
                     }
-                    
+
                     sqlite3_bind_text(stmt, 3, (category as NSString).utf8String, -1, nil)
                     sqlite3_bind_text(stmt, 4, (key as NSString).utf8String, -1, nil)
                     sqlite3_bind_text(stmt, 5, (value as NSString).utf8String, -1, nil)
@@ -2137,24 +2177,34 @@ import SQLite3 // Direct C API; matches Hal.swift import for the same reason.
                     sqlite3_bind_int64(stmt, 7, Int64(now))
                     sqlite3_bind_int64(stmt, 8, Int64(now))
                     sqlite3_bind_text(stmt, 9, (source as NSString).utf8String, -1, nil)
-                    
+
                     if let notes = notes {
                         sqlite3_bind_text(stmt, 10, (notes as NSString).utf8String, -1, nil)
                     } else {
                         sqlite3_bind_null(stmt, 10)
                     }
-                    
+
                     // ADDED: Bind shareable parameter
                     sqlite3_bind_int(stmt, 11, shareable ? 1 : 0)
-                    
+
                     // NEW: Bind format parameter
                     sqlite3_bind_text(stmt, 12, (format as NSString).utf8String, -1, nil)
-                    
-                    sqlite3_bind_int64(stmt, 13, Int64(now))
+
+                    // PHASE 4 (2026-05-18): bind shareability_decided_by_model.
+                    // May be NULL when caller doesn't supply one (legacy
+                    // call sites or init-time seeds that pre-date Phase 4).
+                    if let decider = shareabilityDecidedByModel {
+                        sqlite3_bind_text(stmt, 13, (decider as NSString).utf8String, -1, nil)
+                    } else {
+                        sqlite3_bind_null(stmt, 13)
+                    }
+
                     sqlite3_bind_int64(stmt, 14, Int64(now))
-                    
+                    sqlite3_bind_int64(stmt, 15, Int64(now))
+
                     if sqlite3_step(stmt) == SQLITE_DONE {
-                        print("HALDEBUG-SELF-KNOWLEDGE: ✓ Stored new self-knowledge")
+                        let deciderNote = shareabilityDecidedByModel.map { " decided by \($0)" } ?? ""
+                        print("HALDEBUG-SELF-KNOWLEDGE: ✓ Stored new self-knowledge\(deciderNote)")
                         backupSelfKnowledge()
                     } else {
                         let errorMessage = String(cString: sqlite3_errmsg(db))
@@ -2321,6 +2371,13 @@ import SQLite3 // Direct C API; matches Hal.swift import for the same reason.
         // MODIFIED: Store free-form reflection in self_knowledge table with format="raw_reflection"
         // Previously used non-existent reflection_log table - now uses unified self_knowledge
         // Reflections are stored with a unique key based on timestamp to preserve chronology
+        //
+        // Phase 4 (2026-05-18): the shareability decision the model made at
+        // reflection generation time is now passed through. `modelId` is
+        // also recorded in `shareability_decided_by_model` as the audit
+        // trail of which model made the call. On any later synthesis-merge
+        // into this entry, the existing decision is sticky — the new
+        // model's preference does NOT override.
         func storeReflection(
             conversationId: String,
             freeFormText: String,
@@ -2332,8 +2389,11 @@ import SQLite3 // Direct C API; matches Hal.swift import for the same reason.
             let timestamp = Int(Date().timeIntervalSince1970)
             let reflectionKey = "reflection_\(timestamp)_\(conversationId.prefix(8))"
             let typeLabel = reflectionType == 1 ? "practical" : "existential"
-            
-            // Store as self-knowledge with format="raw_reflection"
+
+            // Store as self-knowledge with format="raw_reflection". The
+            // modelId is also the deciding model — at first-write time
+            // the only model in the picture is the one producing the
+            // reflection, so it's both the writer AND the decider.
             storeSelfKnowledge(
                 modelId: modelId,
                 category: "reflection",
@@ -2343,10 +2403,12 @@ import SQLite3 // Direct C API; matches Hal.swift import for the same reason.
                 source: "self_reflection",
                 notes: "Type: \(typeLabel), Turn: \(turnNumber), ConversationID: \(conversationId)",
                 shareable: shareable,
-                format: "raw_reflection"
+                format: "raw_reflection",
+                shareabilityDecidedByModel: modelId
             )
-            
-            print("HALDEBUG-REFLECTION: ✓ Stored \(typeLabel) reflection at turn \(turnNumber) (\(freeFormText.count) chars)")
+
+            let shareLabel = shareable ? "shareable" : "private"
+            print("HALDEBUG-REFLECTION: ✓ Stored \(typeLabel) reflection at turn \(turnNumber) (\(freeFormText.count) chars, \(shareLabel), decided by \(modelId))")
         }
 
         // MARK: - Synthesis helpers (May-15)
@@ -3496,7 +3558,8 @@ import SQLite3 // Direct C API; matches Hal.swift import for the same reason.
             turnNumber: Int,
             modelId: String,
             llmService: LLMService,
-            synthesisThreshold: Double? = nil
+            synthesisThreshold: Double? = nil,
+            shareable: Bool = true
         ) async {
             // Resolve threshold per active backend if caller didn't override.
             // Test/calibration callers can pass an explicit value to probe
@@ -3511,7 +3574,7 @@ import SQLite3 // Direct C API; matches Hal.swift import for the same reason.
                     reflectionType: reflectionType,
                     turnNumber: turnNumber,
                     modelId: modelId,
-                    shareable: true
+                    shareable: shareable
                 )
                 return
             }
@@ -3526,7 +3589,7 @@ import SQLite3 // Direct C API; matches Hal.swift import for the same reason.
                     reflectionType: reflectionType,
                     turnNumber: turnNumber,
                     modelId: modelId,
-                    shareable: true
+                    shareable: shareable
                 )
                 return
             }
@@ -3552,7 +3615,7 @@ import SQLite3 // Direct C API; matches Hal.swift import for the same reason.
                     reflectionType: reflectionType,
                     turnNumber: turnNumber,
                     modelId: modelId,
-                    shareable: true
+                    shareable: shareable
                 )
                 return
             }
@@ -3591,7 +3654,7 @@ import SQLite3 // Direct C API; matches Hal.swift import for the same reason.
                         reflectionType: reflectionType,
                         turnNumber: turnNumber,
                         modelId: modelId,
-                        shareable: true
+                        shareable: shareable
                     )
                     return
                 }
@@ -3608,7 +3671,7 @@ import SQLite3 // Direct C API; matches Hal.swift import for the same reason.
                         reflectionType: reflectionType,
                         turnNumber: turnNumber,
                         modelId: modelId,
-                        shareable: true
+                        shareable: shareable
                     )
                 }
             } catch {
@@ -3619,7 +3682,7 @@ import SQLite3 // Direct C API; matches Hal.swift import for the same reason.
                     reflectionType: reflectionType,
                     turnNumber: turnNumber,
                     modelId: modelId,
-                    shareable: true
+                    shareable: shareable
                 )
             }
         }
@@ -3668,17 +3731,17 @@ import SQLite3 // Direct C API; matches Hal.swift import for the same reason.
                 currentTurn: currentTurn
             )
             
-            let freeFormReflection = await generateFreeFormReflection(
+            let (freeFormReflection, shareableDecision) = await generateFreeFormReflection(
                 prompt: reflectionPrompt,
                 llmService: llmService,
                 reflectionType: reflectionType
             )
-            
+
             guard !freeFormReflection.isEmpty else {
                 print("HALDEBUG-REFLECTION: No reflection generated")
                 return
             }
-            
+
             // Step 4: Verify reflection is grounded in actual turns (prevent invented patterns)
             let turnText = turns.map { $0.content }.joined(separator: "\n")
             let turnSentences = TextSummarizer.sentenceSplit(turnText)
@@ -3687,8 +3750,8 @@ import SQLite3 // Direct C API; matches Hal.swift import for the same reason.
                 against: turnSentences,
                 threshold: 0.72
             )
-            
-            print("HALDEBUG-REFLECTION: Reflection verified and grounded in experience")
+
+            print("HALDEBUG-REFLECTION: Reflection verified and grounded in experience (shareable=\(shareableDecision))")
 
             // NEW STEP 4.5: Store the verified free-form reflection.
             //
@@ -3704,13 +3767,21 @@ import SQLite3 // Direct C API; matches Hal.swift import for the same reason.
             // Mark's directive (May-15): "Self-knowledge grows in depth,
             // not volume." This is the write-time deduplication that
             // implements that principle.
+            //
+            // Phase 4 (2026-05-18): the shareability decision the model
+            // made at generation time is passed through. For new entries
+            // it's stored alongside the reflection plus an audit stamp
+            // identifying the deciding model. For synthesis-merge into an
+            // existing entry, the existing entry's shareability is
+            // preserved (stickiness — first decision wins).
             await storeReflectionWithSynthesis(
                 conversationId: conversationId,
                 verifiedReflection: verifiedReflection,
                 reflectionType: reflectionType,
                 turnNumber: currentTurn,
                 modelId: modelId,
-                llmService: llmService
+                llmService: llmService,
+                shareable: shareableDecision
             )
 
             // Step 5: Structured-trait extraction (DISABLED 2026-05-18, pre-Phase-3).
@@ -3780,6 +3851,23 @@ import SQLite3 // Direct C API; matches Hal.swift import for the same reason.
             existentialContext: String,
             currentTurn: Int
         ) -> String {
+            // Phase 4 (2026-05-18): the shareability tail block appended to
+            // both prompts asks the model to decide whether this reflection
+            // should be visible in the user-facing Self Model viewer. Default
+            // when missing or unparseable is YES (per spec — privacy is an
+            // explicit gesture, not a fallthrough). The decision is made
+            // once at write time; subsequent synthesis-merges preserve the
+            // existing entry's shareability (stickiness).
+            let shareabilityTail = """
+
+
+            After your reflection, on a NEW LINE, output exactly one of these markers:
+              [SHAREABLE: yes]   — the reflection is fine to surface in Hal's viewable diary
+              [SHAREABLE: no]    — the reflection should remain private (uncertainty about your nature, internal struggle, or something inappropriate to surface without context)
+
+            Default to [SHAREABLE: yes]. Choose [SHAREABLE: no] only when there's a real reason — privacy is a deliberate gesture, not a fallthrough.
+            """
+
             if type == 1 {
                 // Type 1: Practical/Effectiveness Patterns
                 //
@@ -3813,7 +3901,7 @@ import SQLite3 // Direct C API; matches Hal.swift import for the same reason.
                 - Stay focused on Hal's behavior, not the user's preferences
                 - Do not continue or respond to the conversation; only analyze it
 
-                META-OBSERVATION:
+                META-OBSERVATION:\(shareabilityTail)
                 """
             } else {
                 // Type 2: Existential/Philosophical Observations
@@ -3846,9 +3934,50 @@ import SQLite3 // Direct C API; matches Hal.swift import for the same reason.
                 - Do not continue or respond to the conversation; only observe it
                 - Honor that not knowing is itself information
 
-                SELF-OBSERVATION:
+                SELF-OBSERVATION:\(shareabilityTail)
                 """
             }
+        }
+
+        /// Phase 4 (2026-05-18): parse the shareability marker the
+        /// reflection-write prompt asks for. Returns the cleaned reflection
+        /// text (marker stripped) and the boolean decision. Default when the
+        /// marker is missing or unparseable is `true` (shareable) — per
+        /// design, privacy is an explicit gesture, not a fallthrough.
+        ///
+        /// Accepts variations the model might produce: case-insensitive,
+        /// extra whitespace, optional surrounding punctuation. Refuses to
+        /// match a marker that's embedded in the body of the reflection —
+        /// only the last occurrence near the end of the text is recognized,
+        /// to avoid the LLM hallucinating a marker inside its prose.
+        nonisolated func parseShareabilityMarker(_ raw: String) -> (cleanText: String, shareable: Bool) {
+            // Find the last [SHAREABLE: ...] marker. Case-insensitive.
+            // Pattern is intentionally narrow: opening bracket, the word
+            // SHAREABLE, colon, the decision token, closing bracket.
+            let pattern = #"\[\s*SHAREABLE\s*:\s*(yes|no|public|private|true|false)\s*\]"#
+            guard let regex = try? NSRegularExpression(pattern: pattern, options: [.caseInsensitive]) else {
+                return (raw.trimmingCharacters(in: .whitespacesAndNewlines), true)
+            }
+            let nsRaw = raw as NSString
+            let matches = regex.matches(in: raw, options: [], range: NSRange(location: 0, length: nsRaw.length))
+            guard let last = matches.last else {
+                // No marker found — default to shareable per spec.
+                return (raw.trimmingCharacters(in: .whitespacesAndNewlines), true)
+            }
+            // Extract the decision token.
+            let decisionRange = last.range(at: 1)
+            let decisionToken = nsRaw.substring(with: decisionRange).lowercased()
+            let shareable: Bool
+            switch decisionToken {
+            case "yes", "public", "true":   shareable = true
+            case "no", "private", "false":  shareable = false
+            default:                        shareable = true  // defensive default
+            }
+            // Strip the marker substring from the reflection text. Use the
+            // FULL match range so any surrounding whitespace gets trimmed
+            // by the subsequent .trimmingCharacters call.
+            let cleaned = nsRaw.replacingCharacters(in: last.range, with: "")
+            return (cleaned.trimmingCharacters(in: .whitespacesAndNewlines), shareable)
         }
         
         // MODIFIED: Call B - Generate free-form reflection with type-specific temperature
@@ -3856,23 +3985,37 @@ import SQLite3 // Direct C API; matches Hal.swift import for the same reason.
             prompt: String,
             llmService: LLMService,
             reflectionType: Int
-        ) async -> String {
+        ) async -> (text: String, shareable: Bool) {
+            // Phase 4 (2026-05-18): the prompt now also asks the model to
+            // emit a [SHAREABLE: yes|no] marker at the end. We parse the
+            // marker out here so the caller never sees it in the reflection
+            // text, and gets the boolean decision alongside.
+            //
+            // Failure modes:
+            //   - LLM call throws → empty text, shareable=true (default).
+            //     The caller checks for empty text and bails before storage.
+            //   - Reflection generated but marker missing → text stripped of
+            //     any near-end marker if present, shareable=true (default).
+            //   - Marker present but unparseable → text cleaned of marker,
+            //     shareable=true (defensive default).
             do {
                 // Type 1 (practical): 0.5 for analytical pattern recognition
                 // Type 2 (existential): 0.85 for exploratory philosophical thinking
                 let reflectionTemperature = (reflectionType == 1) ? 0.5 : 0.85
-                
+
                 // Chat-message path so chat-template models work.
-                let reflection = try await llmService.generateChatResponse(
+                let raw = try await llmService.generateChatResponse(
                     messages: [.system("You are Hal reflecting on your own experience and patterns."), .user(prompt)],
                     temperature: reflectionTemperature
                 )
-                
-                print("HALDEBUG-REFLECTION: Free-form reflection generated (\(reflection.count) chars) with temperature \(reflectionTemperature)")
-                return reflection.trimmingCharacters(in: .whitespacesAndNewlines)
+
+                let parsed = parseShareabilityMarker(raw)
+                let shareabilityNote = parsed.shareable ? "shareable" : "private"
+                print("HALDEBUG-REFLECTION: Free-form reflection generated (\(parsed.cleanText.count) chars, marked \(shareabilityNote)) with temperature \(reflectionTemperature)")
+                return (parsed.cleanText, parsed.shareable)
             } catch {
                 print("HALDEBUG-REFLECTION: Reflection generation failed: \(error.localizedDescription)")
-                return ""
+                return ("", true)
             }
         }
         
