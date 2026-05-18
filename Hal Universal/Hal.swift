@@ -10359,20 +10359,28 @@ struct WidgetTestView: View {
                                 Label("Copy Thread Detailed", systemImage: "doc.text.fill")
                             }
                             Divider()
+                            // "View Details Inline" toggles the per-bubble
+                            // inline detail expansion (footer metadata).
+                            // The trailing "Inline" is the distinguishing
+                            // word from "Prompt Details Viewer" below;
+                            // pre-rename, the two items were "View Details"
+                            // and "View Prompt Details" which read as
+                            // near-duplicates in the menu. 2026-05-18.
                             Button {
                                 chatViewModel.showInlineDetails.toggle()
                             } label: {
-                                Label("View Details", systemImage: "info.circle")
+                                Label("View Details Inline", systemImage: "info.circle")
                             }
-                            // Item 4 (2026-05-17): the new color-coded,
-                            // collapsible prompt detail view. Lives in its
-                            // own Swift file (PromptDetailView.swift). The
-                            // legacy single-blob viewer that used to live in
-                            // LEGO 14 of Hal.swift has been removed.
+                            // "Prompt Details Viewer" opens the new
+                            // color-coded, collapsible sheet
+                            // (PromptDetailView.swift, Item 4 / 2026-05-17,
+                            // parser collapse landed in e8ce4f4 /
+                            // 2026-05-18). Distinct from inline details
+                            // — this is the full sheet experience.
                             Button {
                                 showingPromptDetail = true
                             } label: {
-                                Label("View Prompt Details", systemImage: "doc.text.magnifyingglass")
+                                Label("Prompt Details Viewer", systemImage: "doc.text.magnifyingglass")
                             }
                         }
                         .sheet(isPresented: $showingPromptDetail) {
