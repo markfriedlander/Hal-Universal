@@ -9230,24 +9230,21 @@ struct iOSChatView: View {
     // watchBridge previously lived here as @State; moved to HalAppDelegate
     // so it survives the case where iOSChatView never appears (background
     // cold-launch via Watch message).
-    @State private var userHasScrolled = false
-
-    // Outgoing-message scroll anchor (May-16 scroll-anchor UX work).
+    // Scroll behavior (2026-05-17, Mark's directive):
     //
-    // When the user sends a message and the assistant begins streaming a
-    // response, the view scrolls so the user's outgoing message sits just
-    // below the nav chrome (anchor: .top of the visible area) and HOLDS
-    // there. The assistant's reply unfolds downward from a fixed reading
-    // origin — like reading a page — rather than the previous behavior
-    // which chased the bottom of the stream and made the early tokens of
-    // a response disappear above the fold at 30+ tok/s.
+    // Single rule: when the user sends a message, that message scrolls
+    // to the top of the visible area. ONCE. After that, the user is in
+    // complete control — no automatic repositioning, no percentage
+    // calculations, no anchor reapplication mid-stream, no
+    // bottom-follow. Hal's response naturally appears below the user's
+    // message as it streams in; if the response grows beyond the visible
+    // area, the user scrolls themselves to see more.
     //
-    // pinnedExchangeID: the id of the user message we anchored to at send
-    // time. nil = no anchor currently engaged (initial state, or user
-    // scrolled manually mid-stream and disengaged).
-    //
-    // Spec: Docs/UX_Scroll_Anchor_Spec.md
-    @State private var pinnedExchangeID: UUID? = nil
+    // The previous implementation (May 16, scroll-anchor spec) maintained
+    // a pinned exchange ID, character-count heuristics, drag-disengage
+    // logic, and bottom-follow fallbacks. All removed. This is simpler
+    // and matches the ChatGPT/Claude.ai web pattern: scrollTo(userMessage,
+    // anchor: .top) on send, then nothing.
 
     var body: some View {
         NavigationStack {
@@ -9275,48 +9272,26 @@ struct iOSChatView: View {
                             .listRowBackground(Color.clear)
                             .id(message.id)
                         }
-                        // Invisible anchor: auto-scroll target + bottom-detection for resume/pause.
-                        // onAppear/onDisappear fire reliably on both iOS and Mac Catalyst,
-                        // unlike DragGesture which doesn't fire on Mac trackpad/mouse scroll.
+                        // Bottom sentinel kept as a scroll target for app-
+                        // launch positioning. No auto-scroll handlers
+                        // attached — the user is in complete control after
+                        // the initial launch placement.
                         Color.clear
                             .frame(height: 1)
                             .id("bottom")
                             .listRowSeparator(.hidden)
-                            .onAppear {
-                                // Sentinel entered view — user is at the bottom, resume auto-scroll
-                                userHasScrolled = false
-                            }
-                            .onDisappear {
-                                // Sentinel left view — user scrolled up, pause auto-scroll
-                                userHasScrolled = true
-                            }
                     }
                     .listStyle(.plain)
                     .id(chatViewModel.messagesVersion)
                     .onTapGesture {
-                        // NEW: Dismiss keyboard when tapping message area
+                        // Dismiss keyboard when tapping message area.
                         dismissKeyboard()
                     }
                     .gesture(
-                        // Pause auto-scroll on upward drag (user reading history).
-                        // Downward drags dismiss the keyboard but don't pause auto-scroll.
-                        //
-                        // Also disengage the outgoing-message anchor on ANY
-                        // user drag during streaming — once the user has
-                        // chosen a scroll position, we don't fight them
-                        // (spec point 6).
+                        // Downward drag dismisses the keyboard. No scroll
+                        // state tracking — the user's scrolling stands on
+                        // its own and we don't intervene.
                         DragGesture(minimumDistance: 20)
-                            .onChanged { value in
-                                if value.translation.height < -20 {
-                                    // Scrolling up — pause auto-scroll
-                                    userHasScrolled = true
-                                }
-                                // Any non-trivial drag disengages the anchor.
-                                if abs(value.translation.height) > 20 && pinnedExchangeID != nil {
-                                    halLog("HALDEBUG-SCROLL: Anchor disengaged by user drag (dy=\(Int(value.translation.height)))")
-                                    pinnedExchangeID = nil
-                                }
-                            }
                             .onEnded { value in
                                 if value.translation.height > 50 {
                                     dismissKeyboard()
@@ -9324,105 +9299,32 @@ struct iOSChatView: View {
                             }
                     )
                     .onAppear {
-                        // Scroll to bottom on app launch
+                        // App launch — position at the most recent activity
+                        // so the user sees their latest exchange when the
+                        // chat opens. This is the only "automatic" scroll
+                        // that happens outside of send-start, and it only
+                        // fires once when the view first appears.
                         DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
                             withAnimation {
                                 proxy.scrollTo("bottom", anchor: .bottom)
                             }
                         }
-                        // NOTE (May-14): HalWatchBridge is now bootstrapped
-                        // in HalAppDelegate.didFinishLaunchingWithOptions —
-                        // it's wired even when iOS cold-launches the app in
-                        // the background in response to a Watch message.
-                        // Previously this onAppear was the bridge's only
-                        // init site, which broke the actual Watch use case
-                        // (iPhone in pocket, chat view never appears).
-                    }
-                    .onChange(of: chatViewModel.messages.count) { oldValue, newValue in
-                        // Auto-scroll to bottom when new messages arrive ONLY when:
-                        //   - The anchor isn't engaged (we're not mid-stream-following-anchor)
-                        //   - The user hasn't manually scrolled up
-                        //
-                        // During anchored streaming we leave scroll alone — the
-                        // user's outgoing message is pinned to the top and the
-                        // response unfolds downward from there. The previous
-                        // bottom-follow behavior was the "firehose" failure mode
-                        // the scroll-anchor spec was written to fix.
-                        if pinnedExchangeID == nil && !userHasScrolled {
-                            DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) {
-                                withAnimation(.easeOut(duration: 0.3)) {
-                                    proxy.scrollTo("bottom", anchor: .bottom)
-                                }
-                            }
-                        }
-                    }
-                    .onChange(of: chatViewModel.messages.last?.content) { oldValue, newValue in
-                        // Token-by-token streaming updates fire here. During
-                        // anchored streaming we DELIBERATELY do nothing — the
-                        // anchor was set on send and the response grows below
-                        // it naturally. Auto-scrolling on every token was the
-                        // firehose problem.
-                        //
-                        // When no anchor is engaged AND the user hasn't
-                        // scrolled away, fall through to the bottom-follow
-                        // behavior (used for late-arriving Watch replies,
-                        // post-anchor-disengage streams, etc.).
-                        if pinnedExchangeID == nil && !userHasScrolled {
-                            DispatchQueue.main.async {
-                                withAnimation(.easeOut(duration: 0.2)) {
-                                    proxy.scrollTo("bottom", anchor: .bottom)
-                                }
-                            }
-                        }
                     }
                     .onChange(of: chatViewModel.isSendingMessage) { oldValue, newValue in
-                        if newValue == true {
-                            // Send-start: engage the outgoing-message anchor.
-                            // Find the most recent user message, pin it as
-                            // the exchange anchor, and scroll it to the top
-                            // of the visible area (just below nav chrome).
-                            // The assistant's response will unfold below it
-                            // without dragging the anchor away.
-                            //
-                            // Spec: Docs/UX_Scroll_Anchor_Spec.md — "the user
-                            // has a fixed reading origin (their question) and
-                            // the answer unfolds below it naturally."
-                            userHasScrolled = false
-                            if let latestUser = chatViewModel.messages.last(where: { $0.isFromUser }) {
-                                pinnedExchangeID = latestUser.id
-                                // Long-user-message heuristic (per Mark 5/16):
-                                // when the user's message is taller than ~half
-                                // the visible area, anchor to .bottom of the
-                                // user message so the END of their question
-                                // sits at the top of the visible area and
-                                // Hal's response begins right below — visible
-                                // without scrolling. For shorter messages,
-                                // anchor to .top so the user can re-read their
-                                // question + see the response in the same view.
-                                //
-                                // Character count is a rough proxy for height.
-                                // ~400 chars at default font on iPhone 16 Plus
-                                // is roughly half the visible chat area.
-                                // Tunable based on hand-test feedback.
-                                let useBottomAnchor = latestUser.content.count > 400
-                                let anchor: UnitPoint = useBottomAnchor ? .bottom : .top
-                                halLog("HALDEBUG-SCROLL: Anchor engaged on user message \(latestUser.id.uuidString.prefix(8)) (\(latestUser.content.count) chars, anchor: \(useBottomAnchor ? "bottom" : "top"))")
-                                DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
-                                    withAnimation(.easeOut(duration: 0.3)) {
-                                        proxy.scrollTo(latestUser.id, anchor: anchor)
-                                    }
-                                }
+                        // Single rule: on send-start, scroll the user's
+                        // new message to the top of the visible area.
+                        // ONCE. After that, no further auto-scrolling —
+                        // the user is in complete control. Hal's response
+                        // streams in below the user's message naturally;
+                        // if it grows beyond the visible area, the user
+                        // scrolls themselves to keep reading.
+                        guard newValue == true else { return }
+                        guard let latestUser = chatViewModel.messages.last(where: { $0.isFromUser }) else { return }
+                        halLog("HALDEBUG-SCROLL: Send-start — scrolling user message \(latestUser.id.uuidString.prefix(8)) to top, then yielding control to user.")
+                        DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
+                            withAnimation(.easeOut(duration: 0.3)) {
+                                proxy.scrollTo(latestUser.id, anchor: .top)
                             }
-                        } else {
-                            // Send-end: turn completed. No forced scroll —
-                            // the user keeps whatever position they chose.
-                            // Disengage the anchor so a future non-send
-                            // update (e.g. a late Watch reply) can use the
-                            // bottom-follow fallback.
-                            if pinnedExchangeID != nil {
-                                halLog("HALDEBUG-SCROLL: Anchor disengaged on generation complete")
-                            }
-                            pinnedExchangeID = nil
                         }
                     }
                 }
@@ -14275,8 +14177,40 @@ class ChatViewModel: ObservableObject {
                 UserDefaults.standard.set(reencoded, forKey: "salonConfigData")
             }
         }
+
+        // Salon cold-launch guard (2026-05-17, Mark's directive). Seat 1
+        // must always be filled — Salon with zero participants is the
+        // failure mode we never want to hit, even if the user toggled it
+        // on in a prior session and then deleted the seated model. Worst
+        // case Salon runs with a single participant; that's acceptable
+        // and recoverable. Zero is not.
+        //
+        // Policy: if seat1 is empty at cold launch, populate it with
+        // the active model when that model is available, otherwise
+        // fall back to Apple Foundation Models (always installed on
+        // any iOS-26-capable device — the only safe universal default).
+        if decodedSalon.seat1 == nil || decodedSalon.seat1?.isEmpty == true {
+            let seat1ID: String
+            if initialModel.source == .appleFoundation {
+                seat1ID = ModelConfiguration.appleFoundation.id
+            } else if initialModel.isDownloaded {
+                seat1ID = initialModel.id
+            } else {
+                // Active model is MLX but not present on disk
+                // (deleted by the user mid-session, or never finished
+                // downloading). AFM is the safe fallback.
+                seat1ID = ModelConfiguration.appleFoundation.id
+            }
+            halLog("HALDEBUG-SALON: Cold-launch guard tripped — seat1 was empty; populating with \(seat1ID).")
+            decodedSalon.seat1 = seat1ID
+            if let reencoded = try? JSONEncoder().encode(decodedSalon) {
+                UserDefaults.standard.set(reencoded, forKey: "salonConfigData")
+            }
+        }
+
         self.salonConfig = decodedSalon
-        halLog("HALDEBUG-SALON: Salon configuration initialized (isEnabled=\(decodedSalon.isEnabled))")
+        let seat1Display = decodedSalon.seat1 ?? "<empty>"
+        halLog("HALDEBUG-SALON: Salon configuration initialized (isEnabled=\(decodedSalon.isEnabled), seat1=\(seat1Display))")
         
         // REFACTORED: Set up observer for any model state changes
         self.modelStateObserver = NotificationCenter.default.publisher(for: .mlxModelDidDownload)
