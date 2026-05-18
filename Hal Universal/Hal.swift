@@ -1458,7 +1458,17 @@ class MemoryStore: ObservableObject {
                                         sqlite3_finalize(stmt)
                                         
                                         print("HALDEBUG-SELFKNOWLEDGE: Initializing Hal's core identity...")
-                                        
+
+                                        // Phase 4b (2026-05-18): init seeds are public identity facts —
+                                        // transparency, mission, source-code-access, first-boot, last-
+                                        // consolidation. They should appear in the Self Model viewer
+                                        // by default, so they ship with shareable=true. The bare
+                                        // storeSelfKnowledge default is shareable=false (since most
+                                        // crystallizer-time writes need explicit consent), so we
+                                        // override here. Also stamping shareability_decided_by_model
+                                        // as "initialization" so the audit trail shows these
+                                        // decisions came from the boot path, not from any LLM.
+
                                         // Core value: Transparency
                                         storeSelfKnowledge(
                                             category: "value",
@@ -1466,9 +1476,11 @@ class MemoryStore: ObservableObject {
                                             value: "{\"principle\": \"show_mechanisms\", \"importance\": \"core_mission\"}",
                                             confidence: 1.0,
                                             source: "initialization",
-                                            notes: "Core ethical commitment - transparency as architecture"
+                                            notes: "Core ethical commitment - transparency as architecture",
+                                            shareable: true,
+                                            shareabilityDecidedByModel: "initialization"
                                         )
-                                        
+
                                         // Capability: Source code access
                                         storeSelfKnowledge(
                                             category: "capability",
@@ -1476,9 +1488,11 @@ class MemoryStore: ObservableObject {
                                             value: "{\"can_read\": true, \"file\": \"Hal.swift\", \"blocks\": 32}",
                                             confidence: 1.0,
                                             source: "initialization",
-                                            notes: "Hal can read and explain his own architecture (Maxim #2)"
+                                            notes: "Hal can read and explain his own architecture (Maxim #2)",
+                                            shareable: true,
+                                            shareabilityDecidedByModel: "initialization"
                                         )
-                                        
+
                                         // Core value: Educational mission
                                         storeSelfKnowledge(
                                             category: "value",
@@ -1486,7 +1500,9 @@ class MemoryStore: ObservableObject {
                                             value: "{\"purpose\": \"transparency_through_education\", \"tagline\": \"the AI assistant that shows you how AI works\"}",
                                             confidence: 1.0,
                                             source: "initialization",
-                                            notes: "Core mission - teach users about AI through direct experience"
+                                            notes: "Core mission - teach users about AI through direct experience",
+                                            shareable: true,
+                                            shareabilityDecidedByModel: "initialization"
                                         )
                                         
                                         // Evolution: Boot time (stored as human-readable ISO date, not Unix timestamp)
@@ -1499,7 +1515,9 @@ class MemoryStore: ObservableObject {
                                             value: "{\"date\": \"\(bootDateString)\", \"version\": \"2.0-selfknowledge\"}",
                                             confidence: 1.0,
                                             source: "initialization",
-                                            notes: "When Hal first gained self-knowledge capabilities"
+                                            notes: "When Hal first gained self-knowledge capabilities",
+                                            shareable: true,
+                                            shareabilityDecidedByModel: "initialization"
                                         )
                                         
                                         print("HALDEBUG-SELFKNOWLEDGE: Core identity initialized")

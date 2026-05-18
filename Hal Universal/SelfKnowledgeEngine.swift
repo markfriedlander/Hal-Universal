@@ -1174,14 +1174,19 @@ import SQLite3 // Direct C API; matches Hal.swift import for the same reason.
             let duration = now.timeIntervalSince(startTime)
             print("HALDEBUG-SELF-KNOWLEDGE: âœ… Maintenance complete in \(String(format: "%.1f", duration))s")
             
-            // Log consolidation event
+            // Log consolidation event. Phase 4b (2026-05-18): public
+            // identity fact — shareable=true with system-stamped audit.
+            // Stickiness will preserve this on subsequent consolidations
+            // since the audit field gets set on the first write.
             storeSelfKnowledge(
                 category: "evolution",
                 key: "last_consolidation",
                 value: ISO8601DateFormatter().string(from: now),
                 confidence: 1.0,
                 source: "system",
-                notes: "Maintenance cycle completed"
+                notes: "Maintenance cycle completed",
+                shareable: true,
+                shareabilityDecidedByModel: "system"
             )
         }
         
