@@ -1,220 +1,195 @@
 # Hal Universal — Next
 
-What we're planning to do next. Forward-looking, narrow scope.
+Forward-looking work, organized by category. As items are resolved, they move out of NEXT.md and the completion lands in HISTORY.md.
 
 For where Hal is right now: `HANDOFF_BRIEF.md`.
-For how we got here: `HISTORY.md` (especially the 2026-05-17 evening entry).
+For how we got here: `HISTORY.md` (especially the 2026-05-18 late-afternoon entry for Phase 4).
+For the v1 self-knowledge spec: `Docs/v1_Build_Spec_Self_Knowledge_2026-05-18.md`.
 
 ---
 
 ## What the next session should do first
 
-1. **Read this file, then `HANDOFF_BRIEF.md`, then the 2026-05-18
-   morning entry of `HISTORY.md`** (covers Phase 1 of v1 crystallization,
-   the salon chronicle, and yesterday's late-evening deferred work),
-   then `Docs/v1_Build_Spec_Self_Knowledge_2026-05-18.md` for the
-   full spec.
+1. **Read this file**, then `HANDOFF_BRIEF.md`, then the most recent `HISTORY.md` entry, then `CLAUDE.md` for standing rules.
 2. **Verify the live state:**
    ```bash
    python3 tests/hal_test.py state                       # responds
    python3 tests/hal_test.py cmd "SALON_GET_STATE"       # seat1 filled
    python3 tests/hal_test.py cmd "EMBEDDING_STATUS"      # backend loaded
-   curl ... DB_SCHEMA:self_knowledge                     # 22 columns including
-                                                         # promoted_to_trait_id +
-                                                         # shareability_decided_by_model
+   curl ... DB_SCHEMA:self_knowledge                     # 22 columns
+   curl ... SELF_KNOWLEDGE_AUDIT:30                      # corpus snapshot
    ```
-3. **Pick up Phase 2 of the v1 crystallization build (below).**
+3. **Pick up the next item below** — bugs first, then stress test, then App Store ship prep.
 
 ---
 
-## Open work — in order
+## Bugs to fix before ship
 
-### Item 11 (resume here) — Gemma jetsam crash investigation
+### Item 11 — Gemma jetsam crash investigation
 
-During the Phase 2 live test, switching to Gemma 4 E2B with the
-prior salon's heavy context jetsam-killed Hal during model load.
-The test continued with Qwen 3.5 2B instead, but that's not an
-acceptable resolution for a real user.
+During the Phase 2 live test (2026-05-18), switching to Gemma 4 E2B with the prior salon's heavy context jetsam-killed Hal during model load. Workaround was switching to Qwen 3.5 2B, but that's not acceptable for real users.
 
 Investigation plan:
-  - Reproduce the failure mode on device (load Gemma after a heavy
-    chat context).
-  - Measure memory pressure at swap points (Xcode → Debug Navigator
-    → Memory, or log via `os_proc_available_memory()`).
-  - Check whether `MLXWrapper.unloadModel` is firing before the new
-    model loads. Commit `750f487` added a lifecycle handler that
-    unloads on background; verify the equivalent runs on model
-    swap.
-  - Consider: eager release of inactive chat history before swap?
-    Per-model context budgeting that's aware of pending swap?
-  - If structural fix isn't tractable: surface a "won't fit" error
-    to the user with guidance, rather than letting iOS kill the
-    process.
+  - Reproduce on device (load Gemma after a heavy chat context).
+  - Measure memory pressure at swap points (Xcode → Debug Navigator → Memory, or log via `os_proc_available_memory()`).
+  - Check whether `MLXWrapper.unloadModel` fires before the new model loads. Commit `750f487` added a background-lifecycle unloader; verify the model-swap path runs the equivalent.
+  - Consider: eager release of inactive chat history before swap? Per-model context budgeting aware of pending swap?
+  - If structural fix isn't tractable: surface a "won't fit" error to the user rather than letting iOS kill the process.
 
-Not blocking other work but needs to be resolved before App Store
-ship — a memory crash from a normal model switch is a real user
-issue.
+Real user issue. Needs to land before ship.
 
-### Stress test — full unscripted walkthrough
+### Memory Depth display mismatch
 
-After Item 11 (or in parallel if it gets complicated): real-use
-end-to-end test, not scripted API batches. Coverage:
+The Memory Depth setting display doesn't match the actual stored value (observed by Mark). Reproduce, identify whether it's a read-side (display) or write-side (storage) discrepancy, fix.
 
-  - Long conversations across multiple models (AFM ↔ MLX switches,
-    multiple MLX-to-MLX swaps)
-  - Salon mode with the four-seat setup
-  - Settings changes (temperature, memory depth, RAG threshold,
-    etc.) during conversation
-  - Document import + a follow-up conversation that uses it via RAG
-  - Export thread (verify the format reads cleanly)
-  - Self Model viewer (especially the new privacy toggle once
-    there's organic content to gate)
-  - General feature tour — see if anything obvious is broken
+### Apple Intelligence appearing twice in Salon picker
 
-Goal: signal on how everything holds together with all the recent
-changes in place (per-backend thresholds, SelfKnowledgeEngine
-extraction, AFM gate audit, four-phase crystallization, viewer
-privacy). The stress test will also exercise the [SHAREABLE: yes|no]
-marker round-trip that Phase 4d couldn't directly verify (requires
-sustained MLX conversation generating reflections).
+In the Salon seat-assignment picker, "Apple Intelligence" shows up as two separate options. Probably a duplicate-source bug in the picker's data assembly — `[ModelConfiguration.appleFoundation] + downloadedModels` accidentally including AFM in `downloadedModels` too. Audit the salon picker construction.
 
-### Phase 2 (formerly the in-progress section, now retained for reference) — Live-test the crystallizer
+### Salon toggle scroll/flash behavior
 
-Phase 2 code complete and committed. The reflection-to-trait
-promotion engine is wired: `TraitCrystallizer.swift` + helpers
-in `SelfKnowledgeEngine.swift` + chat-path wiring under the AFM
-gate. Build clean, schema verified.
+When toggling Salon mode on/off, the chat surface scrolls or flashes in a distracting way. Trace whether `ChatViewModel.salonConfig.isEnabled` change triggers an unintended layout pass or scroll event.
 
-What's NOT yet verified end-to-end (deferred to organic use):
+### Salon mode should show model names not just "4 voices"
 
-  - The full promotion path requires Hal on MLX with sustained
-    conversation generating real reflections that accumulate to
-    reinforcement_count >= 2. That happens during normal use, not
-    synthetically.
-  - JSON adherence from each of the four MLX models when prompted
-    with the Qwen-derived template. We know Qwen wrote clean JSON.
-    Gemma's salon answer used JSON-friendly output. Llama was more
-    conversational — may need a follow-up prompt nudge.
+Current display: "Salon Mode: 4 voices". Should show the actual model names (Gemma, Llama, Qwen, Dolphin) so the user knows which models are in the active configuration without opening Settings.
 
-**Live-test path:**
-  1. Switch Hal to an MLX model (Gemma is the workhorse).
-  2. Send conversation that produces 5+ user/assistant exchanges
-     about a recurring topic (so reflection synthesis trips and
-     reinforcement_count climbs).
-  3. Watch logs for `HALDEBUG-CRYSTALLIZER` lines:
-     - "No trait candidates this cycle" → nothing eligible yet
-     - "Evaluating reflection X..." → candidate found
-     - "Crystallized reflection X... → trait 'category/key'" →
-       success path
-     - "LLM proposed unknown category 'X'" → prompt may need nudge
-     - "Could not parse trait-generator response" → JSON format
-       failure (model-specific issue)
-  4. After a successful crystallization, query the trait via
-     `DB_SCHEMA:self_knowledge` + a SELECT for traits with
-     promoted_to_trait_id NOT NULL (reverse lineage).
+### Dolphin display name in pickers
 
-Once live-tested at least once, move on to Phase 3.
+The Dolphin display name in model pickers is awkward (likely too long, or shows the underlying llama base in a confusing way). Cleanup pass on `ModelConfiguration.displayName` for `mlx-community/dolphin3.0-llama3.2-3B-4Bit`.
 
-### Phase 3 — Trait evolution + contradiction handling
+### Prompt detail viewer segment labels
 
-### Phase 3 — Trait evolution + contradiction handling
+In `PromptDetailView`, several segments render with the generic "Context" label (seen in Phase 4 screenshots — multiple "Context" entries). Should be more descriptive (e.g. "Self-Knowledge", "Memory Snippets", "Summary"). Audit the segment-kind classification in `PromptDetailView.swift`'s parser and add explicit cases where they currently fall to the generic bucket.
 
-Spec: same doc, section "Trait evolution mechanism". The
-mid-similarity / contradiction path is the architectural novelty.
-Multi-valued JSON storage in the existing `value` TEXT column with
-`primary` + `tensions[]`. `recommendedContradictionThreshold` on
-`EmbeddingBackend` (NLContextual start 0.6, Nomic needs-calibration).
+### Settings audit after RAG and embedding changes
 
-### Phase 4 — Reflection privacy + viewer UI
+Walk through every Settings panel control and verify it still works correctly given the RAG/embedding architectural changes since v1.6:
+  - Temperature
+  - Memory depth
+  - RAG dedup threshold
+  - RAG snippet character budget
+  - Recency weight / half-life
+  - Self-knowledge toggle
+  - Embedding backend selection
+  - System prompt editor
+Each should reflect actual current state on read and persist correctly on write.
 
-Spec: same doc. Write-time shareability decision via LLM, stickiness
-enforcement via `shareability_decided_by_model`, "show private
-reflections" toggle in viewer, one-time popup with the explanatory
-copy from the spec.
+### selfKnowledge log labels — budget vs actual used
+
+The `HALDEBUG-BUDGET` log line includes `selfKnowledge=44493` which is the *allocation ceiling*, not actual usage. This caused confusion during the salon (interpreted as "44K of self-knowledge being injected"). Fix: clarify the log labels — `selfKnowledgeBudget=X` for the ceiling, plus an `selfKnowledgeUsed=Y` line after `resolveSegment` for what actually got injected. Lives in `buildChatMessages` around the HALDEBUG-BUDGET log.
+
+### Prompt detail viewer wiring — confirm whether done or not
+
+Item 4 from 2026-05-17 was the PromptDetailView wiring. Committed at `97c8a7a` with `View Prompt Details` added to ChatBubbleView's assistant-side contextMenu. Visual verification on sim confirmed it opens, the legend renders, segments expand. Confirm one more time on phone with real conversation content that everything works end-to-end and the segments classify correctly.
 
 ---
 
-## Other open items
+## Stress test — full unscripted walkthrough
 
-### Item 6 — UI consistency sweep (deferred from yesterday)
+Real-use end-to-end test, NOT scripted API batches. Coverage:
 
-Mark caught the Model Library mismatch (LLM rows vs embedding rows
-— now fixed). The broader work is a sweep of the rest of the app
-for similar mismatches. Concrete places to check:
+  - **Long conversations across multiple models** — AFM ↔ MLX switches, multiple MLX-to-MLX swaps (this also covers Item 11 verification once that's fixed).
+  - **Salon mode** with the four-seat setup (Gemma, Llama, Qwen, Dolphin).
+  - **Settings changes** (temperature, memory depth, RAG threshold, embedding backend) during a live conversation.
+  - **Document import** + a follow-up conversation that uses the imported content via RAG.
+  - **Export thread** — verify the format reads cleanly.
+  - **Self Model viewer** — once there's organic content, exercise the privacy toggle with real private/public reflections.
+  - **`[SHAREABLE: yes|no]` marker round-trip** — sustained MLX conversation should generate reflections that include the marker; verify the parser handles all four MLX models' output correctly.
+  - **General feature tour** — see if anything obvious is broken.
 
-  - **Settings sheet**: action buttons (Export Thread, Upload
-    Document, etc.) vs. inline toggles vs. nav links — are they
-    visually consistent?
-  - **Salon panel**: seat picker buttons, model selection chrome.
-    Different style from Model Library?
-  - **Reflections viewer** (Power User): list row treatment.
-  - **System prompt editor** sheet: button placement, save/cancel
-    affordance.
-  - **Document import flow**: progress indicators, success/error
-    states.
-  - **Compression-explanation popover**: visual weight relative to
-    other in-chat affordances.
-  - **NUCLEAR_RESET confirmation**: matches other destructive
-    confirmations?
-
-Approach: screenshot each surface, list mismatches, propose unified
-targets (probably matching the plain-icon-+-text-+-color style the
-Model Library now uses), get Mark's sign-off per surface, implement
-surgically.
-
-### Item 9 — Serial download queue indicator (flagged 2026-05-17 night)
-
-When multiple downloads are tapped in succession, no UI indicator
-that the additional taps registered. Looks broken. Adjacent to but
-distinct from the Item-5-followup-a fix (single-download state
-recovery after jetsam). Approach: investigate how `MLXModelDownloader`
-queue is exposed to the UI; add a queue-position indicator or
-"queued" pill on rows where `isDownloading` is false but the model
-is awaiting its turn.
-
-### Item 10 — Self-knowledge corpus visibility discrepancy (flagged 2026-05-17 night)
-
-During the salon, the prompt budget log showed `selfKnowledge=44493`
-tokens of corpus injected, but Mark reports Hal's UI shows no
-self-knowledge entries. We've been nuking the DB during testing,
-which makes this curious. Possible causes:
-  (a) UI filter is `shareable=1` and the corpus is mostly non-shareable
-  (b) The corpus includes ingested `Hal_Source.txt` self-knowledge that
-      isn't surfaced in the user-facing viewer
-  (c) Two different categories are getting injected vs. viewed
-  (d) Something else
-
-Approach: query `DB_SCHEMA:self_knowledge` + a SELECT-with-counts
-query to see what's actually in the table by category and format.
+Goal: signal on how everything holds together with all the recent changes in place. Bugs found during the stress test get filed and prioritized vs ship-blockers.
 
 ---
 
-## Workstreams from earlier sessions still ready to pick up
+## App Store ship items
 
-### A. Default-on Nomic for new installs (product decision, pending Mark)
+These are mechanical / process work, not architectural.
 
-Question raised after the gate landed: should Nomic be the default
-embedder for new installs, or stay opt-in via Model Library? Per
-Mark's earlier directive ("default stays as NLContextual. Nomic
-remains opt-in via the Model Library. The 522 MB makes it unreasonable
-as a forced default for new users") this is settled — Nomic stays
-opt-in. Mark may revisit later.
+### Screenshots — 6 iPhone screenshots
 
-### B. Re-enable EmbeddingGemma when MLX-swift ships a fix
+Required: 6.7" display screenshots (iPhone 16 Plus or 17 Pro). Subjects per the existing draft:
+  - Main chat with AFM
+  - Main chat with an MLX model
+  - Self Model viewer
+  - Model Library
+  - Settings (Power User)
+  - Salon mode (or PromptDetailView)
 
-Track [mlx-swift issues](https://github.com/ml-explore/mlx-swift/issues)
-for the iOS Metal device init nullptr crash. When fixed: bump mlx-swift,
-flip `HAL_ENABLE_EMBEDDING_GEMMA` into Release config, verify on device.
+`Docs/SC_Release_Materials/` may already have placeholders. Verify what's there.
 
-### C. Cluster C from May 16 (orthogonal to RAG)
+### ASC metadata
 
-- Structured-trait synthesis (implement with inspectability for the
-  Evolutionary Salon)
-- Scroll behavior refinement based on real-world usage of the new
-  send-start-only rule
+Description, keywords, what's-new, support URL, privacy URL, category, age rating. Draft is in `Docs/ASC_v2.0_Paste_Ready.md`. Apply mechanically once the v2.0 draft exists in App Store Connect. CC can do this via Chrome MCP if needed.
 
-### D. On deck
+### README, privacy.html, support.html
 
-- Screenshots × 6 for App Store
-- ASC metadata fills using `Docs/ASC_v2.0_Paste_Ready.md`
-- `Docs/` consolidation (many per-session recovery/finding docs)
+`README.md` got a v1.6 rewrite (commit `9db3a32` from May 15) and was later locked in for v2.0. Verify it's current with the Phase 1-4 v1-crystallization work. `privacy.html` and `support.html` need to live on a public URL (likely GitHub Pages) that the ASC submission references.
+
+### GitHub Pages verified
+
+The `privacy.html` and `support.html` URLs in the ASC submission must resolve publicly. Confirm GitHub Pages is enabled on the repo, the files are at the expected paths, and the URLs return 200.
+
+### Version bump, fresh archive, upload, submit
+
+Mechanical sequence:
+  1. Bump `CFBundleShortVersionString` to 2.0 and `CFBundleVersion` to 5 (or next) in `project.pbxproj`.
+  2. Build clean for Release configuration.
+  3. Archive in Xcode.
+  4. Upload to ASC.
+  5. Apply metadata to the v2.0 draft.
+  6. Submit for review.
+
+Do NOT do this until: Item 11 is resolved AND stress test passes AND screenshots are captured AND ASC metadata is staged.
+
+---
+
+## Side work (earlier-session items, not blocking)
+
+### Item 6 — UI consistency sweep
+
+Mark caught the Model Library mismatch (LLM rows vs embedding rows — fixed in `Item 5 follow-up B`, commit `1849f72`). Broader sweep of the rest of the app for similar mismatches:
+
+  - Settings sheet action buttons vs toggles vs nav links
+  - Salon panel chrome
+  - Reflections viewer list row treatment
+  - System prompt editor button placement
+  - Document import progress indicators
+  - Compression-explanation popover visual weight
+  - NUCLEAR_RESET confirmation styling
+
+Approach: screenshot each surface, list mismatches, propose unified targets matching the plain-icon-+-text-+-color style now in Model Library, get sign-off per surface, implement surgically.
+
+### Item 9 — Serial download queue indicator
+
+When multiple downloads are tapped in succession, no UI indicator that the additional taps registered. Looks broken. Add a queue-position indicator or "queued" pill on rows where `isDownloading` is false but the model is in the queue.
+
+### Item 10 — Self-knowledge corpus visibility discrepancy ✓ RESOLVED
+
+Audited via the new `SELF_KNOWLEDGE_AUDIT` command. The "44K vs empty UI" mystery was not a bug — `selfKnowledge=44493` in the budget log is the allocation ceiling, not actual content; the UI was correctly filtering on `shareable=1`. Follow-up "selfKnowledge log labels" is in the bug list above and addresses the source of the confusion.
+
+### A. Default-on Nomic for new installs ✓ SETTLED
+
+Mark's directive: "default stays as NLContextual. Nomic remains opt-in via the Model Library. The 522 MB makes it unreasonable as a forced default for new users." May revisit later.
+
+### B. Re-enable EmbeddingGemma when MLX-swift ships fix
+
+Track [mlx-swift issues](https://github.com/ml-explore/mlx-swift/issues) for the iOS Metal device init nullptr crash. When fixed: bump mlx-swift, flip `HAL_ENABLE_EMBEDDING_GEMMA` into Release config, verify on device.
+
+### C. Cluster C from May 16 — partially done
+
+  - ~~Structured-trait synthesis~~ ✓ DONE via v1 crystallization (Phases 1-4).
+  - **Scroll behavior refinement** based on real-world usage of the new send-start-only rule — still open as feedback accumulates.
+
+### D. Docs/ consolidation
+
+Many per-session recovery / finding docs accumulated under `Docs/`. Worth a pass to consolidate or move historical recovery docs into an archive subfolder, leaving the current architectural docs (build spec, salon archive, ASC paste-ready) at the top level.
+
+---
+
+## Notes on shape of the remaining work
+
+- **Most of the bug list is small or medium surgical work** — none are architectural rewrites. A focused session could close 3-5 of them.
+- **Item 11 is the only one with real diagnostic uncertainty.** The rest are "find the code, fix it, verify." Item 11 might be a one-line fix (model unload not firing on swap) or a deeper memory-management change.
+- **The stress test is the gating event** between bug-fix work and App Store prep. Bugs found in the stress test get added to the list and prioritized.
+- **App Store ship items are mechanical** once the bugs are clean and screenshots are captured.

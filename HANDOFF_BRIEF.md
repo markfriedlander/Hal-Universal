@@ -3,11 +3,17 @@
 **Branch:** `main` @ `34c78ba` (Phase 4c, with 4a and 4b committed before it)
 **Working tree:** clean (only Xcode user state + untracked Docs/SC_Release_Materials/)
 
-> **For the next CC session:** read this brief, then `NEXT.md` for next
-> steps (Item 11 Gemma jetsam investigation + the full unscripted stress
-> test), then the 2026-05-18 late-afternoon entry of `HISTORY.md` for the
+> **For the next CC session:** read this brief, then `NEXT.md` for the
+> full remaining backlog — bugs, stress test, App Store ship items —
+> then the 2026-05-18 late-afternoon entry of `HISTORY.md` for the
 > Phase 4 chronicle, then `Docs/v1_Build_Spec_Self_Knowledge_2026-05-18.md`
 > for the spec, then `CLAUDE.md` for standing rules.
+>
+> **The remaining work has three shapes:** (1) ten bug fixes ranging
+> from small to medium, none architectural; (2) a full unscripted
+> stress test that gates ship; (3) App Store mechanical prep
+> (screenshots, ASC metadata, GitHub Pages, archive + upload + submit).
+> See NEXT.md for the full list with detail on each item.
 
 ---
 

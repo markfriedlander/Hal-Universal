@@ -1775,3 +1775,51 @@ during the stress test that follows Phase 4.
 - Next: docs catch-up commit, then Item 11 (Gemma jetsam
   investigation) and the stress test
 
+---
+
+## 2026-05-18 (evening — full remaining backlog captured before compaction)
+
+Mark surfaced the complete remaining work so it's in the docs
+before the next compaction window. NEXT.md rewritten with the full
+backlog organized into four sections:
+
+1. **Bugs to fix before ship** (10 items):
+   - Item 11 — Gemma jetsam crash investigation
+   - Memory Depth display mismatch
+   - Apple Intelligence appearing twice in Salon picker
+   - Salon toggle scroll/flash behavior
+   - Salon mode should show model names, not just "4 voices"
+   - Dolphin display name in pickers
+   - Prompt detail viewer segment labels (generic "Context" buckets)
+   - Settings audit after RAG and embedding changes
+   - selfKnowledge log labels — budget vs actual used
+   - Prompt detail viewer wiring — confirm done
+
+2. **Stress test** — full unscripted real-use walkthrough, gates ship.
+
+3. **App Store ship items** (5 mechanical):
+   - Screenshots × 6 iPhone
+   - ASC metadata
+   - README + privacy.html + support.html
+   - GitHub Pages verified
+   - Version bump + archive + upload + submit
+
+4. **Side work** (earlier-session items, not blocking):
+   - Item 6 (UI consistency sweep across the app)
+   - Item 9 (serial download queue indicator)
+   - Item 10 (self-knowledge corpus visibility) ✓ resolved via audit
+   - Re-enable EmbeddingGemma when MLX iOS fix ships
+   - Scroll behavior refinement (from Cluster C)
+   - Docs/ consolidation
+
+Most bugs are small-to-medium surgical work, not architectural.
+Item 11 is the only one with real diagnostic uncertainty. The
+stress test is the gating event between bug-fix work and ship.
+
+### State at end of entry
+
+- `main` (about to commit NEXT/HANDOFF/HISTORY rewrites)
+- Phases 1-4 all committed and verified
+- Comprehensive backlog captured in NEXT.md
+- CC at 80% context; compaction triggered after this commit lands
+
