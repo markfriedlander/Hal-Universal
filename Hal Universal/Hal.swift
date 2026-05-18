@@ -7363,7 +7363,15 @@ struct PowerUserView: View {
                 LabeledSliderControl(
                     label: "Memory Depth",
                     value: Binding(
-                        get: { Double(chatViewModel.memoryDepth) },
+                        // Display the runtime-effective depth (stored
+                        // memoryDepth clamped to the current model's max)
+                        // so the displayed number always agrees with the
+                        // slider thumb position. If stored exceeds max
+                        // (e.g. a switch path missed a clamp), the
+                        // .onAppear writeback below realigns storage to
+                        // the displayed value. Memory Depth display
+                        // mismatch fix, 2026-05-18.
+                        get: { Double(chatViewModel.effectiveMemoryDepth) },
                         set: { chatViewModel.memoryDepth = Int($0) }
                     ),
                     range: 1...Double(chatViewModel.maxMemoryDepth),
@@ -17547,7 +17555,12 @@ struct ModelConfiguration: Identifiable, Codable, Equatable, Hashable {
         // (AFM doesn't route through MLXWrapper.generateChatStream).
         defaultSettings: ModelSettings(
             temperature: 0.7,
-            effectiveMemoryDepth: 4,
+            // AFM's maxMemoryDepth is 3 turns (4096-token context × 12%
+            // shortTerm allocation = 491 tokens / 150 tokens-per-turn = 3).
+            // The default must not exceed the runtime max — otherwise the
+            // Settings slider shows a number that doesn't fit its own
+            // thumb (Memory Depth display mismatch, 2026-05-18).
+            effectiveMemoryDepth: 3,
             recencyWeight: 0.3,
             recencyHalfLifeDays: 90,
             maxRagSnippetsCharacters: 600,
@@ -19588,12 +19601,26 @@ class HalTestConsole: ObservableObject {
         let effective = ModelSettingsStore.shared.effectiveSettings(for: newModel)
         await MainActor.run {
             if let v = effective.temperature              { vm.temperature = v }
-            if let v = effective.effectiveMemoryDepth     { vm.memoryDepth = v }
+            // Clamp memoryDepth to the new model's max so the API path
+            // matches the UI switchToModel path. Without this, a per-
+            // model default that exceeds its own runtime limit (e.g. the
+            // pre-fix AFM default of 4 with max 3) would leave the
+            // Settings slider showing one value with the thumb at
+            // another. Memory Depth display mismatch, 2026-05-18.
+            if let v = effective.effectiveMemoryDepth     { vm.memoryDepth = min(v, vm.maxMemoryDepth) }
             if let v = effective.maxRagSnippetsCharacters { vm.maxRagSnippetsCharacters = Double(v) }
             if let v = effective.ragDedupThreshold        { vm.ragDedupSimilarityThreshold = v }
             if let v = effective.recencyWeight            { vm.memoryStore.recencyWeight = v }
             if let v = effective.recencyHalfLifeDays      { vm.memoryStore.recencyHalfLifeDays = v }
-            halLog("HALDEBUG-SETTINGS: Applied effective settings for \(newModel.displayName) via VM props: temp=\(effective.temperature.map { "\($0)" } ?? "—"), depth=\(effective.effectiveMemoryDepth.map { "\($0)" } ?? "—"), maxRag=\(effective.maxRagSnippetsCharacters.map { "\($0)" } ?? "—")")
+            // Defense in depth: even if effective.effectiveMemoryDepth
+            // was nil (leaving memoryDepth untouched from the previous
+            // model's value), the previous value may exceed the new
+            // model's max. Clamp unconditionally.
+            if vm.memoryDepth > vm.maxMemoryDepth {
+                halLog("HALDEBUG-SETTINGS: API path clamping memoryDepth \(vm.memoryDepth) → \(vm.maxMemoryDepth) (new model: \(newModel.displayName))")
+                vm.memoryDepth = vm.maxMemoryDepth
+            }
+            halLog("HALDEBUG-SETTINGS: Applied effective settings for \(newModel.displayName) via VM props: temp=\(effective.temperature.map { "\($0)" } ?? "—"), depth=\(vm.memoryDepth), maxRag=\(effective.maxRagSnippetsCharacters.map { "\($0)" } ?? "—")")
         }
     }
 
