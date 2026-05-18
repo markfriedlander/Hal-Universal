@@ -1734,14 +1734,39 @@ import SQLite3 // Direct C API; matches Hal.swift import for the same reason.
                 modelId: modelId,
                 llmService: llmService
             )
-            
-            // Step 5: Call C - Structured recording (private, stores to database)
-            await recordStructuredInsights(
-                reflection: verifiedReflection,
-                reflectionType: reflectionType,
-                llmService: llmService
-            )
-            
+
+            // Step 5: Structured-trait extraction (DISABLED 2026-05-18, pre-Phase-3).
+            //
+            // recordStructuredInsights used to fire here, extracting structured
+            // traits directly from a single reflection — bypassing the
+            // reinforcement gate. That competes with the TraitCrystallizer
+            // pipeline (Phase 2, 2026-05-18): the new design is reflections
+            // FIRST, then traits emerge through reinforcement and a
+            // category-aware threshold check via TraitCrystallizer.
+            //
+            // Two systems writing traits simultaneously would muddy lineage
+            // and confidence — and the live-test corpus confirmed it: the
+            // entries this path produced (effectiveness_pattern/
+            // ambiguity_as_input_buffer, learned_trait/static_self_
+            // congratulation) had no reinforcement_count > 1 and were
+            // noisier than what the crystallizer would have produced.
+            //
+            // The function itself stays defined below — useful as a
+            // reference for the Phase 3 trait-evolution LLM call (similar
+            // JSON-extraction shape) and recoverable if we decide to
+            // restore it as a separate concern. Just not wired into the
+            // chat path anymore.
+            //
+            // To restore: uncomment the call below. Note that doing so
+            // means accepting traits that didn't go through the
+            // reinforcement gate.
+            //
+            // await recordStructuredInsights(
+            //     reflection: verifiedReflection,
+            //     reflectionType: reflectionType,
+            //     llmService: llmService
+            // )
+
             let duration = Date().timeIntervalSince(startTime)
             print("HALDEBUG-REFLECTION: Type \(reflectionType) reflection complete in \(String(format: "%.1f", duration))s")
         }
