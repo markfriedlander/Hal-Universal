@@ -826,3 +826,126 @@ Nomic v1.5's design point.
 - Recall: 9/10 top-10 measured on device with Nomic
 - Subaru still misses top-10 — fixable via LLM-driven query expansion
   (queued, designed but not implemented)
+
+---
+
+## 2026-05-17 (evening, the long autonomous run)
+
+### Setting
+
+Mark queued a 5-item sequence and stepped away:
+
+  1. Salon cold-launch guard
+  2. Scroll behavior rewrite (web research first; firm requirement)
+  3. Visual verifications on device
+  4. Prompt export + detailed view color-coded segments + collapsible
+  5. Background download long-lock test (coordinate with Mark)
+
+Standing instruction reaffirmed: refactor-as-you-go.
+
+### Item 1 — Salon cold-launch guard (commit `4b531a5`)
+
+Cold-launch path in ChatViewModel.init now checks decodedSalon.seat1
+after decoding from UserDefaults. If empty, populates with the active
+model when downloaded, else Apple Foundation Models (always installed
+on any iOS-26-capable device — the only safe universal default).
+Verified live: cleared seat1 via SALON_SET_SEAT, terminated app,
+relaunched, log shows "Cold-launch guard tripped — seat1 was empty;
+populating with apple-foundation-models" and SALON_GET_STATE returns
+seat1=apple-foundation-models.
+
+### Item 2 — Scroll behavior rewrite (commit `4b531a5`)
+
+Web research before any code. Confirmed pattern: ScrollViewProxy.
+scrollTo(messageID, anchor: .top) on send-start, no further auto-scroll
+handlers. Matches claude.ai/ChatGPT web for sent messages.
+
+Stripped the May-16 scroll-anchor system entirely:
+  - userHasScrolled @State + its bottom-sentinel handlers — gone
+  - pinnedExchangeID @State — gone
+  - 400-char heuristic that picked between .top and .bottom — gone
+  - DragGesture's anchor-disengage onChanged — gone
+  - onChange(of: messages.count) auto-scroll-to-bottom — gone
+  - onChange(of: messages.last?.content) streaming auto-scroll — gone
+
+Kept:
+  - One scrollTo on send-start (anchor: .top)
+  - App-launch scrollTo("bottom") so the user lands on recent activity
+  - Downward DragGesture → dismiss keyboard
+
+Verified visually: sent "Hi Hal, what is 2 plus 2?", screenshot shows
+user message near top of visible area, Hal's response immediately
+below it, no further auto-scrolling. Per Mark's spec exactly.
+
+### Item 3 — Visual verifications (commit `a984b62`)
+
+Added SET_UI_STATE:<settings|threadPanel|none>:<true|false> API so
+sheet navigation could be driven from the test console — the iOS-26.5
+simulator's tap-into-toolbar path isn't reliable for our chat nav
+buttons on this SwiftUI hierarchy.
+
+All surfaces verified clean on iPhone 17 Pro sim:
+  - Chat home + new scroll behavior
+  - Settings sheet (Personality, Self-Knowledge toggle, Temp slider)
+  - System Prompt screen with token counter ("375 / 1000 tokens")
+  - Salon Mode pickers (4 seats; Seat 1 = Apple Intelligence per the
+    cold-launch guard)
+  - Model Library (Hal's Picks + new "Embedding (Memory)" section
+    showing all three backends: Apple NLContextual, EmbeddingGemma
+    300M, Nomic Embed Text v1.5)
+  - Hal app icon on springboard
+
+Screenshots saved at /tmp/visual_*.png during the run; not committed
+(disposable verification artifacts).
+
+### Item 4 — Prompt detail view (PARTIAL, commit `61f8240`)
+
+Extracted new view into Hal Universal/PromptDetailView.swift per the
+refactor-as-you-go rule. Components:
+
+  - PromptDetailSegmentKind enum with 10 cases. Each carries
+    displayName, SF Symbol icon, color (purple/orange/yellow/teal/
+    pink/green/brown/blue/gray/secondary), and exportTag (emoji +
+    uppercase label like 📜 SYSTEM PROMPT).
+  - parsePromptSegments(fullPrompt:): splits the assembled system
+    message on "\n\nCURRENT CONTEXT:\n" and classifies each "\n\n"-
+    separated context section by its opening text (e.g. "Summary of
+    earlier conversation:" → .summary). Anything unclassified falls
+    back to .other so the user still sees the content.
+  - PromptDetailView body: top legend banner + ForEach over segments
+    rendered as DisclosureGroups with colored tints and char counts.
+    A TokenBudgetSummary card at the bottom maps the segment colors
+    to actual token-count numbers.
+  - buildPromptDetailExportText: text-only variant with the same
+    structure. Emoji + label keep the export "color-coded" even when
+    pasted into plain text.
+
+Build clean.
+
+**NOT YET WIRED.** The new view is built but the chat bubble's
+contextMenu doesn't have a button to present it yet. Wiring plan in
+the commit message: add "View Prompt Details" entry next to the
+existing "View Details" toggle around Hal.swift:11742, with a
+.sheet(item:) presenter on the assistant-side bubble. The view
+expects (message, precedingUserContent, recentHistory) — the latter
+two come from walking chatViewModel.messages backwards from
+message.turnNumber.
+
+Stopped before wiring to update docs before the context window filled.
+
+### Item 5 — Background download long-lock test
+
+NOT STARTED. Requires coordination with Mark (he locks the phone
+face-down for 10 minutes while I monitor filesystem state). Queued for
+next session.
+
+### State at end of entry
+
+- `main` (about to commit docs)
+- Five commits this session: 4b531a5 (items 1+2), a984b62 (item 3 +
+  SET_UI_STATE), 61f8240 (item 4 partial)
+- Build clean, working tree had docs uncommitted at write time
+- Visual verifications confirmed all 4 named UI surfaces work
+- Refactor-as-you-go discipline maintained: one new file extracted
+  (PromptDetailView.swift), sync_hal_source.sh updated
+

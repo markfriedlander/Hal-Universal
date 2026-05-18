@@ -1,123 +1,86 @@
 # Hal Universal — Handoff Brief
-**Updated:** May 17, 2026 (afternoon, post-Nomic-shipped)
-**Branch:** `main` (about to commit Nomic backend work)
-**Working tree:** uncommitted Nomic implementation + refactor
+**Updated:** May 17, 2026 (evening, mid-Item-4)
+**Branch:** `main` @ `61f8240` (about to commit docs)
+**Working tree:** docs uncommitted at this write; will be committed before context ends
 
 > **For the next CC session:** read this brief, then `NEXT.md` for what to
-> do next, then the 2026-05-17 afternoon entry in `HISTORY.md` for the
-> Nomic story, then `CLAUDE.md` for standing rules.
+> do next, then the 2026-05-17 evening entry of `HISTORY.md` for how the
+> 5-item sequence unfolded, then `CLAUDE.md` for standing rules.
 
 ---
 
 ## TL;DR — where Hal is right now
 
-Three switchable embedding backends:
+Three big things landed this session:
 
-- **NLContextual** (default, built-in, 512-dim) — ships with iOS, no download.
-- **EmbeddingGemma 300M** (768-dim, ~210 MB) — compiled out for App Store
-  builds via `HAL_ENABLE_EMBEDDING_GEMMA` (Debug-only). Blocked by an
-  upstream `mlx-swift` Metal init crash on iOS 26.5; infrastructure stays
-  in place ready to flip on when Apple/the MLX team fixes
-  `mlx::core::metal::Device::Device()` at `device.cpp:328`.
-- **Nomic Embed Text v1.5** (768-dim, ~522 MB) — **available now**, opt-in
-  via Model Library. Uses Apple's MLTensor framework via
-  `jkrukowski/swift-embeddings` (MIT). No MLX dependency → no Metal
-  crash. Purpose-built for asymmetric retrieval (short queries against
-  short stored documents) with `search_query:` / `search_document:`
-  task instruction prefixes handled inside `EmbeddingProvider`.
+1. **Three-backend embedding system + dynamic BM25 quality gate.**
+   - NLContextual (default, built-in, 512-dim)
+   - EmbeddingGemma (compiled out via `HAL_ENABLE_EMBEDDING_GEMMA` —
+     blocked by upstream MLX iOS Metal crash)
+   - Nomic Embed Text v1.5 (opt-in via Model Library, 522 MB,
+     swift-embeddings on Apple's MLTensor)
+   - Dynamic BM25 quality gate: measures semantic relative spread
+     and BM25/semantic top-K median agreement per query, includes
+     or excludes BM25 from RRF accordingly. Self-correcting, no
+     hardcoded rules.
+   - **Recall on device (10 ground-truth queries, 70-row corpus):**
+     - NLContextual: 1/10 top-1, 4/10 top-5, 7/10 top-10
+     - Nomic + gate: **9/10 top-1, 10/10 top-5, 10/10 top-10**
 
-**Recall measured on device** with the 70-row eval corpus + 10 ground-truth
-queries:
+2. **LLM-driven query expansion (async).**
+   - `QueryExpansion.expand(query:memoryStore:llmService:)` is `async`,
+     no DispatchSemaphore (the prior version deadlocked under MainActor).
+   - Triggers when initial top-1 RRF < 0.020 AND !isEntityMatch.
+   - SQLite cache keyed by `(SHA-256 of normalized query, model_id)`.
+     Cleared on model switch.
+   - Doesn't move numbers on this corpus (the gate already maxes Nomic;
+     under NL the LLM produces conceptual synonyms that don't lexically
+     match plant text), but infrastructure is solid for richer corpora.
 
-| Metric | NLContextual | Nomic | Δ |
-|---|---|---|---|
-| Top-1 | 1/10 | **5/10** | +4 |
-| Top-5 | 4/10 | **8/10** | +4 |
-| Top-10 | 7/10 | **9/10** | +2 |
-
-The three previously-failing queries:
-- Berkeley: rank 18 → **5**
-- cello: rank 18 → **10**
-- Subaru: not in results → 17 (still misses top-10)
-
-Subaru is the only remaining miss. LLM-driven query expansion is queued
-as the next layer to address it.
+3. **5-item UX sequence (this evening): items 1–3 done, item 4 partial,
+   item 5 not started.**
+   - Item 1: Salon cold-launch guard ✓
+   - Item 2: Scroll behavior rewrite ✓ (user msg at top, no auto-scroll)
+   - Item 3: Visual verifications ✓ (all surfaces clean on sim)
+   - Item 4: PromptDetailView color-coded + collapsible — **built but
+     not wired into the UI yet**; the next session resumes here
+   - Item 5: BGDL long-lock test — not started; coordinate with Mark
 
 ---
 
-## What's in the code right now
-
-### Embedding system (extracted from Hal.swift on 2026-05-17)
+## File layout (extracted from Hal.swift this session series)
 
 ```
 Hal Universal/
-├── EmbeddingBackend.swift              — enum + UserDefaults + crash guard
-├── EmbeddingProvider.swift             — provider class + MemoryStore ext
-├── EmbedderMigrationCoordinator.swift  — @MainActor state machine + UI
-└── Hal.swift                           — everything else
+├── EmbeddingBackend.swift              — backend enum + crash guard + UI strings
+├── EmbeddingProvider.swift             — 3-backend dispatch + MemoryStore ext
+├── EmbedderMigrationCoordinator.swift  — @MainActor state machine + UI rows
+├── QueryExpansion.swift                — async expansion + SQLite cache
+├── PromptDetailView.swift              — NEW (2026-05-17 eve), color-coded segments
+└── Hal.swift                           — everything else (~22k lines, shrinking)
+
+scripts/
+└── sync_hal_source.sh                  — concatenates all .swift into Hal_Source.txt
+                                          for self-knowledge ingestion (per CLAUDE.md SOP)
 ```
 
-`EmbeddingPurpose` enum (`.document` | `.query`) threaded through
-`EmbeddingProvider.embed(_:as:)` and `MemoryStore.generateEmbedding(for:as:)`.
-Retrieval-asymmetric backends (Nomic) use it; NLContextual/Gemma ignore it.
-
-`EmbeddingBackend.isAvailableInThisBuild` gates the Gemma case on the
-`HAL_ENABLE_EMBEDDING_GEMMA` compile flag (Debug only). The UI iterates
-`allCases.filter { $0.isAvailableInThisBuild }` so store builds only show
-NLContextual + Nomic.
-
-### Nomic load + embed path (`EmbeddingProvider.embedNomicSwift`)
-
-1. Local-directory load via `NomicBert.loadModelBundle(from: URL)`
-   (the dedicated NomicBERT loader — Bert's loader chokes on Nomic's
-   weight key naming, learned the hard way today).
-2. `nomicPrefixed(text, purpose:)` prepends `"search_query: "` /
-   `"search_document: "` per Nomic's required task instruction format.
-3. `bundle.encode(prefixed, maxLength: 512)` → MLTensor [1, seqLen, hidden].
-4. Mean-pool over seqLen, L2-normalize, return `[Double]`.
-
-### Migration + download
-
-`MemoryStore.reEmbedAllNullRows()` re-embeds every NULL-embedding row
-using the active backend; passes `.document`. `EmbedderMigrationCoordinator`
-orchestrates wipe → warm-up wait → migration on a background task and
-publishes phase updates to the UI.
-
-Download flows through `MLXModelDownloader` / `BackgroundDownloadCoordinator`
-(same path the LLM models use).
-
----
-
-## Diagnostic APIs
-
-| Command | Purpose |
-|---|---|
-| `EMBEDDING_STATUS` | backend name, isLoaded, sample dim, expected dim |
-| `SET_EMBEDDING_BACKEND:<name>` | switch backend (nlcontextual / nomicswift / embeddinggemma) |
-| `MIGRATE_EMBEDDINGS_REEMBED` | run reEmbedAllNullRows synchronously |
-| `DOWNLOAD_EMBEDDING_MODEL[:<backend>]` | start download (defaults to nomicswift) |
-| `EMBEDDING_DOWNLOAD_STATUS[:<backend>]` | progress poll |
-| `FTS_DIAG` | FTS5 row counts + sample MATCH + schema (for the BM25-zero regression) |
-| `MEMORY_DUMP:<limit>` | row dump incl. entity_keywords + embedding dim |
-| `MEMORY_SEARCH_DEBUG:<q>` | full RRF pipeline trace |
-| `MEMORY_SIMILARITY_DEBUG:<q>` | raw cosine per row |
-| `INJECT_REALISTIC_TEST_CORPUS` | 70-row eval corpus, entity_keywords populated |
+When you extract a new file, add it to the `FILES` array in
+`sync_hal_source.sh` and re-run it.
 
 ---
 
 ## Build flags
 
 - `HAL_ENABLE_EMBEDDING_GEMMA` — Debug only. Gates the Gemma backend's
-  code path (load + embed). When unset, selecting Gemma falls back to
-  NLContextual at launch and the Model Library hides the Gemma row.
+  code path. Release builds compile it out; the UI hides the Gemma row.
 
 ## Dependencies
 
 ```
 mlx-swift 0.31.3
 mlx-swift-lm 3.31.3        (MLXLLM + MLXLMCommon + MLXHuggingFace + MLXEmbedders)
-swift-transformers 1.3.3   (exactVersion pin, bumped from 1.3.2 today)
-swift-embeddings 0.0.27    (exactVersion pin, new today — Nomic backend)
+swift-transformers 1.3.3   (exactVersion pin)
+swift-embeddings 0.0.27    (exactVersion pin) — Nomic backend
   → swift-safetensors 0.1.1
   → swift-sentencepiece 0.0.6
   → swift-numerics 1.1.1
@@ -139,7 +102,7 @@ xcrun devicectl device process launch --device D24FB384-9C55-5D33-9B0D-DAEBFA652
 ```
 
 - iPhone 16 Plus: `D24FB384-9C55-5D33-9B0D-DAEBFA6528D6`
-- API host: `marks-bigger-ass-fon-16.local` (mDNS — phone must be awake + on WiFi)
+- API host: `marks-bigger-ass-fon-16.local` (mDNS — phone awake + on WiFi)
 - API port: 8766
 - API token: `e9ee9ec5b315467fa655bd4296873f43` (in `tests/.hal_api_config.json`)
 - iPhone 17 Pro sim UDID: `10C6DB49-2723-4F95-8F81-AECB9CD72BD0`
@@ -149,53 +112,56 @@ For sim runs: `HAL_API_CONFIG=.hal_api_config_sim.json python3 tests/hal_test.py
 
 ---
 
-## SOP (refactor-as-you-go is now mandatory)
+## SOP (refactor-as-you-go is mandatory)
 
-1. **After any change to Hal's source files, sync `Hal_Source.txt`:**
+1. **After any change to Hal's source, sync `Hal_Source.txt`:**
    ```bash
    ./scripts/sync_hal_source.sh
    ```
-   The script concatenates all of `Hal Universal/*.swift` in a stable
-   order. When you extract a new file from Hal.swift, add it to the
-   `FILES` array inside `scripts/sync_hal_source.sh`.
-
 2. **Significant changes to a section of Hal.swift → extract into a
-   dedicated file** (per Mark's 2026-05-17 standing instruction).
-   Use the existing files (`EmbeddingBackend.swift`,
-   `EmbeddingProvider.swift`, `EmbedderMigrationCoordinator.swift`)
-   as the template.
-
+   dedicated file.** Use any of the existing extracted files as a
+   template (EmbeddingBackend.swift, EmbeddingProvider.swift,
+   EmbedderMigrationCoordinator.swift, QueryExpansion.swift,
+   PromptDetailView.swift).
 3. New enum case → sweep all switches.
-
 4. New AppStorage key → `defaults write com.MarkFriedlander.Hal10000 [key] "[value]"`.
-
-5. App build number bump happens at App Store submission (currently at 5).
-
+5. App build number bump happens at App Store submission (currently 5).
 6. Never `NUCLEAR_RESET` between plant and recall in a memory test.
-
 7. **Update HISTORY/HANDOFF/NEXT as work lands** (CLAUDE.md Golden Rule #8).
-
 8. **Warnings = errors** (CLAUDE.md Golden Rule #7).
-
 9. **API > asking the human** — expand the API if a question can't be
    answered through it.
 
 ---
 
+## New diagnostic / UI API commands this session
+
+| Command | Purpose |
+|---|---|
+| `SET_UI_STATE:<settings\|threadPanel\|none>:<true\|false>` | Programmatic sheet toggle for automation |
+| `SET_FORCE_EXPANSION:<true\|false>` | Force LLM expansion on every query (diagnostic) |
+| `MEMORY_SEARCH_EXPANDED:<query>` | Two-pass search-with-expansion diagnostic |
+| `CLEAR_QUERY_EXPANSION_CACHE` | Wipe cache |
+| `QUERY_EXPANSION_CACHE_STATUS` | Count cached entries |
+| `DOWNLOAD_EMBEDDING_MODEL[:<backend>]` | Catalog-driven download |
+| `EMBEDDING_DOWNLOAD_STATUS[:<backend>]` | Progress poll |
+| `SET_EMBEDDING_BACKEND:<name>` | Switch backend, wipe embeddings |
+| `MIGRATE_EMBEDDINGS_REEMBED` | Re-embed all NULL rows |
+| `FTS_DIAG` | FTS5 row counts + sample MATCH |
+
+---
+
 ## Known caveats
 
-- **EmbeddingGemma is unavailable in this build configuration** because
-  the underlying MLX-swift Metal init crashes on iOS 26.5
-  (`mlx::core::metal::Device::Device()` at `device.cpp:328` — libc++
-  `basic_string(const char*) detected nullptr` from a Metal architecture
-  name that returns nil on iOS 26+). Documented upstream issue. Code
-  stays in place behind `HAL_ENABLE_EMBEDDING_GEMMA` flag.
-- **Nomic adds ~522 MB on disk.** Same mental model as downloading a
-  local LLM — user opts in.
-- **Nomic load takes ~10–15 s on the iPhone 16 Plus** (MMAP-loading 546 MB
-  safetensors + tokenizer JSON parse). Subsequent embeds are fast (~80 ms
-  per text on this hardware, including the prefix prepend).
-- **FTS5 first-inject-after-install glitch** (documented 2026-05-17
-  morning): a fresh install with an immediate inject sees BM25 return 0
-  candidates until a NUCLEAR_RESET + re-inject. Minor; the test corpus
-  workflow already does the reset.
+- **EmbeddingGemma is compile-out in Release builds** — upstream MLX
+  Metal init crash on iOS 26.5. Code stays behind
+  `HAL_ENABLE_EMBEDDING_GEMMA` ready to re-enable.
+- **Nomic load takes ~10–15 s on iPhone 16+** (MMAP-loading 546 MB
+  safetensors + tokenizer JSON). Subsequent embeds are fast (~80 ms).
+- **FTS5 first-inject-after-install glitch** (documented earlier
+  today): a fresh install with an immediate inject sees BM25 return 0
+  candidates until a NUCLEAR_RESET + re-inject. The eval workflow does
+  the reset.
+- **Item 4 not wired** — `PromptDetailView` is built and clean but no
+  UI presents it yet. See NEXT.md "Item 4 (resume here)" for the exact
+  wiring steps.
