@@ -7539,6 +7539,115 @@ extension MemoryStore {
     /// `unified_content` as a JSON array. Each entry includes a content
     /// preview, the embedding length (0 if missing), and the key metadata
     /// fields. Used to verify write-side stored the planted turn with an
+    /// Read-only audit of the self_knowledge table for diagnostic /
+    /// pre-Phase-3 sanity checks. Returns row counts by format, by
+    /// category, by shareable status, and a distribution of
+    /// reinforcement_count buckets (so we can see at a glance whether
+    /// any reflections are eligible for the Phase 2 crystallizer).
+    /// Also returns the most recent N sample entries with the fields
+    /// most relevant for diagnosis. Added 2026-05-18 before Phase 3
+    /// to inspect what testing/development built up in the corpus.
+    func debugSelfKnowledgeAudit(sampleLimit: Int = 20) -> String {
+        guard ensureHealthyConnection() else {
+            return "{\"status\":\"error\",\"message\":\"no DB\"}"
+        }
+
+        // Total row count (including soft-deleted, so we know if anything's there at all).
+        func scalarInt(_ sql: String, bind: ((OpaquePointer?) -> Void)? = nil) -> Int {
+            var stmt: OpaquePointer?
+            defer { sqlite3_finalize(stmt) }
+            guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else { return -1 }
+            bind?(stmt)
+            return sqlite3_step(stmt) == SQLITE_ROW ? Int(sqlite3_column_int(stmt, 0)) : -1
+        }
+        let totalAll = scalarInt("SELECT count(*) FROM self_knowledge;")
+        let totalLive = scalarInt("SELECT count(*) FROM self_knowledge WHERE deleted_at IS NULL;")
+        let totalDeleted = scalarInt("SELECT count(*) FROM self_knowledge WHERE deleted_at IS NOT NULL;")
+
+        // By format.
+        var byFormat: [(String, Int)] = []
+        do {
+            var stmt: OpaquePointer?
+            defer { sqlite3_finalize(stmt) }
+            if sqlite3_prepare_v2(db, "SELECT format, count(*) FROM self_knowledge WHERE deleted_at IS NULL GROUP BY format ORDER BY count(*) DESC;", -1, &stmt, nil) == SQLITE_OK {
+                while sqlite3_step(stmt) == SQLITE_ROW {
+                    let fmt = sqlite3_column_text(stmt, 0).map { String(cString: $0) } ?? ""
+                    let n = Int(sqlite3_column_int(stmt, 1))
+                    byFormat.append((fmt, n))
+                }
+            }
+        }
+
+        // By category.
+        var byCategory: [(String, Int)] = []
+        do {
+            var stmt: OpaquePointer?
+            defer { sqlite3_finalize(stmt) }
+            if sqlite3_prepare_v2(db, "SELECT category, count(*) FROM self_knowledge WHERE deleted_at IS NULL GROUP BY category ORDER BY count(*) DESC;", -1, &stmt, nil) == SQLITE_OK {
+                while sqlite3_step(stmt) == SQLITE_ROW {
+                    let cat = sqlite3_column_text(stmt, 0).map { String(cString: $0) } ?? ""
+                    let n = Int(sqlite3_column_int(stmt, 1))
+                    byCategory.append((cat, n))
+                }
+            }
+        }
+
+        // Shareable distribution (0 / 1 / NULL).
+        let shareableNull = scalarInt("SELECT count(*) FROM self_knowledge WHERE deleted_at IS NULL AND shareable IS NULL;")
+        let shareableZero = scalarInt("SELECT count(*) FROM self_knowledge WHERE deleted_at IS NULL AND shareable = 0;")
+        let shareableOne = scalarInt("SELECT count(*) FROM self_knowledge WHERE deleted_at IS NULL AND shareable = 1;")
+
+        // Reinforcement-count buckets — critical for Phase 2 sanity.
+        let rc1 = scalarInt("SELECT count(*) FROM self_knowledge WHERE deleted_at IS NULL AND reinforcement_count = 1;")
+        let rc2 = scalarInt("SELECT count(*) FROM self_knowledge WHERE deleted_at IS NULL AND reinforcement_count = 2;")
+        let rc3 = scalarInt("SELECT count(*) FROM self_knowledge WHERE deleted_at IS NULL AND reinforcement_count = 3;")
+        let rc4plus = scalarInt("SELECT count(*) FROM self_knowledge WHERE deleted_at IS NULL AND reinforcement_count >= 4;")
+
+        // Promotion lineage stats: reflections that have been promoted vs not.
+        let reflectionsPromoted = scalarInt("SELECT count(*) FROM self_knowledge WHERE deleted_at IS NULL AND format = 'raw_reflection' AND promoted_to_trait_id IS NOT NULL;")
+        let reflectionsUnpromoted = scalarInt("SELECT count(*) FROM self_knowledge WHERE deleted_at IS NULL AND format = 'raw_reflection' AND promoted_to_trait_id IS NULL;")
+
+        // Sample entries — recent first, condensed.
+        var samples: [String] = []
+        do {
+            var stmt: OpaquePointer?
+            defer { sqlite3_finalize(stmt) }
+            let sql = "SELECT id, format, category, key, value, confidence, reinforcement_count, shareable, promoted_to_trait_id, created_at FROM self_knowledge WHERE deleted_at IS NULL ORDER BY created_at DESC LIMIT ?;"
+            if sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK {
+                sqlite3_bind_int(stmt, 1, Int32(sampleLimit))
+                while sqlite3_step(stmt) == SQLITE_ROW {
+                    let id = (sqlite3_column_text(stmt, 0).map { String(cString: $0) } ?? "").prefix(8)
+                    let fmt = sqlite3_column_text(stmt, 1).map { String(cString: $0) } ?? ""
+                    let cat = sqlite3_column_text(stmt, 2).map { String(cString: $0) } ?? ""
+                    let key = sqlite3_column_text(stmt, 3).map { String(cString: $0) } ?? ""
+                    let val = (sqlite3_column_text(stmt, 4).map { String(cString: $0) } ?? "").prefix(160)
+                    let conf = sqlite3_column_double(stmt, 5)
+                    let rc = Int(sqlite3_column_int(stmt, 6))
+                    // shareable column may be NULL; distinguish from 0.
+                    let shareable: String
+                    if sqlite3_column_type(stmt, 7) == SQLITE_NULL {
+                        shareable = "null"
+                    } else {
+                        shareable = "\(sqlite3_column_int(stmt, 7))"
+                    }
+                    let promotedTo = (sqlite3_column_text(stmt, 8).map { String(cString: $0) } ?? "").prefix(8)
+                    let created = Int(sqlite3_column_int64(stmt, 9))
+                    let escVal = String(val).replacingOccurrences(of: "\"", with: "\\\"").replacingOccurrences(of: "\n", with: " ")
+                    let escKey = key.replacingOccurrences(of: "\"", with: "\\\"")
+                    samples.append("{\"id\":\"\(id)\",\"format\":\"\(fmt)\",\"category\":\"\(cat)\",\"key\":\"\(escKey)\",\"value\":\"\(escVal)\",\"confidence\":\(conf),\"reinforcement_count\":\(rc),\"shareable\":\"\(shareable)\",\"promoted_to_trait_id\":\"\(promotedTo)\",\"created_at\":\(created)}")
+                }
+            }
+        }
+
+        // Serialize the breakdown arrays as JSON objects.
+        let byFormatJSON = byFormat.map { "\"\($0.0)\":\($0.1)" }.joined(separator: ",")
+        let byCategoryJSON = byCategory.map { "\"\($0.0)\":\($0.1)" }.joined(separator: ",")
+
+        return """
+        {"status":"ok","totalAll":\(totalAll),"totalLive":\(totalLive),"totalDeleted":\(totalDeleted),"byFormat":{\(byFormatJSON)},"byCategory":{\(byCategoryJSON)},"shareable":{"null":\(shareableNull),"zero":\(shareableZero),"one":\(shareableOne)},"reinforcementCount":{"1":\(rc1),"2":\(rc2),"3":\(rc3),"4+":\(rc4plus)},"reflections":{"promoted":\(reflectionsPromoted),"unpromoted":\(reflectionsUnpromoted)},"samples":[\(samples.joined(separator: ","))]}
+        """
+    }
+
     /// Read-only schema dump for any table via `PRAGMA table_info()`.
     /// Returns the column list as JSON so API callers can verify a schema
     /// migration landed (e.g. checking that `promoted_to_trait_id` exists
@@ -23176,6 +23285,23 @@ class HalTestConsole: ObservableObject {
             // regression.
             let counts = vm.memoryStore.debugFTSDiagnostic()
             return counts
+
+        } else if trimmed == "SELF_KNOWLEDGE_AUDIT" || trimmed.hasPrefix("SELF_KNOWLEDGE_AUDIT:") {
+            // Read-only audit of the self_knowledge corpus. Returns row
+            // counts by format / category / shareable, reinforcement-count
+            // distribution (for Phase 2 promotion-eligibility sanity), and
+            // a sample of recent entries with the lineage fields. Useful
+            // any time we need to understand what's actually in the
+            // self-knowledge layer, especially before changes that depend
+            // on it (Phase 3 trait-evolution work, the 2026-05-18 corpus
+            // audit before deciding whether to nuke and rebuild, etc).
+            //
+            // Example: SELF_KNOWLEDGE_AUDIT or SELF_KNOWLEDGE_AUDIT:50
+            let raw = trimmed.hasPrefix("SELF_KNOWLEDGE_AUDIT:")
+                ? String(trimmed.dropFirst("SELF_KNOWLEDGE_AUDIT:".count)).trimmingCharacters(in: .whitespaces)
+                : ""
+            let limit = max(0, min(200, Int(raw) ?? 20))
+            return vm.memoryStore.debugSelfKnowledgeAudit(sampleLimit: limit)
 
         } else if trimmed.hasPrefix("DB_SCHEMA:") {
             // Read-only schema-inspection diagnostic. Returns a JSON list of
