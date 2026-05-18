@@ -1,7 +1,7 @@
 # Hal Universal — Handoff Brief
-**Updated:** May 18, 2026 (late afternoon — Phase 4 complete; v1 self-knowledge crystallization functionally end-to-end)
-**Branch:** `main` @ `34c78ba` (Phase 4c, with 4a and 4b committed before it)
-**Working tree:** clean (only Xcode user state + untracked Docs/SC_Release_Materials/)
+**Updated:** May 18, 2026 (post-compaction — Item 11 Gemma jetsam crash fixed; bug-fix sprint in progress)
+**Branch:** `main` (Item 11 fix uncommitted at time of write; see git status)
+**Working tree:** Hal.swift + ProcessMemoryGuard.swift (new) + docs (commit pending)
 
 > **For the next CC session:** read this brief, then `NEXT.md` for the
 > full remaining backlog — bugs, stress test, App Store ship items —

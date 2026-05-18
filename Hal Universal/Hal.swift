@@ -4791,6 +4791,37 @@ class MLXWrapper: ObservableObject {
 
             halLog("HALDEBUG-MLX: Loading from local path: \(localPath.path)")
 
+            // Pre-flight memory check (Item 11 fix, 2026-05-18). Refuse the
+            // load if iOS-reported available memory is below the model's
+            // estimated requirement. Without this, a load attempt that
+            // exceeds the dirty-memory limit triggers jetsam and the
+            // process dies mid-load (Mark observed this during the
+            // 2026-05-18 Phase 2 live test switching Qwen → Gemma).
+            //
+            // Surfacing a user-visible error here is strictly better than
+            // a silent process kill — the chat thread survives, the user
+            // sees what happened, and they can try a smaller model or
+            // restart the conversation. See ProcessMemoryGuard.swift for
+            // the formula behind requiredMemoryMBForLoad.
+            let availableMBPreflight = processAvailableMemoryMB()
+            let requiredMBPreflight = requiredMemoryMBForLoad(modelConfig)
+            halLog("HALDEBUG-MEMORY: loadModel pre-flight model=\(modelConfig.id) availableMB=\(String(format: "%.0f", availableMBPreflight)) requiredMB=\(String(format: "%.0f", requiredMBPreflight))")
+            if availableMBPreflight < requiredMBPreflight {
+                let msg = memoryRefusalMessage(
+                    model: modelConfig,
+                    availableMB: availableMBPreflight,
+                    requiredMB: requiredMBPreflight
+                )
+                halLog("HALDEBUG-MEMORY: loadModel REFUSED — insufficient memory for \(modelConfig.displayName) (have \(String(format: "%.0f", availableMBPreflight))MB, need \(String(format: "%.0f", requiredMBPreflight))MB)")
+                await MainActor.run {
+                    self.isModelLoaded = false
+                    self.loadingProgress = 0.0
+                    self.mlxError = msg
+                    self.loadingMessage = "Memory pressure too high — load aborted."
+                }
+                return
+            }
+
             // Match LLMEval's cache config exactly. 20 MB is documented iOS example.
             Memory.cacheLimit = 20 * 1024 * 1024
 
@@ -4861,9 +4892,16 @@ class MLXWrapper: ObservableObject {
         // jetsam pressure is creeping up across salon swaps. Use
         // halLog (not print) so the lines surface in the API log
         // buffer for post-hoc inspection.
+        //
+        // We log both MLX's view (active/cache/peak inside the MLX
+        // allocator) and iOS's view (`os_proc_available_memory()` —
+        // how much process headroom remains before jetsam). MLX
+        // reports the bytes IT thinks it holds; iOS reports the
+        // pressure that actually decides whether we get killed.
         let memBefore = MLX.Memory.snapshot()
         let mb = { (b: Int) -> String in String(format: "%.1f MB", Double(b) / (1024.0 * 1024.0)) }
-        halLog("HALDEBUG-MEMORY: unloadModel ENTRY active=\(mb(memBefore.activeMemory)) cache=\(mb(memBefore.cacheMemory)) peak=\(mb(memBefore.peakMemory))")
+        let iosAvailBefore = processAvailableMemoryMB()
+        halLog("HALDEBUG-MEMORY: unloadModel ENTRY active=\(mb(memBefore.activeMemory)) cache=\(mb(memBefore.cacheMemory)) peak=\(mb(memBefore.peakMemory)) iosAvailMB=\(String(format: "%.0f", iosAvailBefore))")
 
         halLog("HALDEBUG-MLX: Unloading MLX model...")
 
@@ -4902,10 +4940,14 @@ class MLXWrapper: ObservableObject {
         halLog("HALDEBUG-MLX: MLX model unloaded successfully. Memory freed.")
 
         // Diagnostic memory snapshot — exit. Compare to entry to see
-        // how much memory the unload actually freed.
+        // how much memory the unload actually freed. iosAvailMB at
+        // exit is usually ≈ same as entry (Mach VM is lazy — pages
+        // don't drop instantly); the swap path then polls until the
+        // OS catches up before triggering the next load. See Item 11.
         let memAfter = MLX.Memory.snapshot()
         let delta = memBefore.delta(memAfter)
-        halLog("HALDEBUG-MEMORY: unloadModel EXIT  active=\(mb(memAfter.activeMemory)) cache=\(mb(memAfter.cacheMemory)) peak=\(mb(memAfter.peakMemory)) | Δactive=\(mb(delta.activeMemory)) Δcache=\(mb(delta.cacheMemory))")
+        let iosAvailAfter = processAvailableMemoryMB()
+        halLog("HALDEBUG-MEMORY: unloadModel EXIT  active=\(mb(memAfter.activeMemory)) cache=\(mb(memAfter.cacheMemory)) peak=\(mb(memAfter.peakMemory)) iosAvailMB=\(String(format: "%.0f", iosAvailAfter)) | Δactive=\(mb(delta.activeMemory)) Δcache=\(mb(delta.cacheMemory)) ΔiosAvailMB=\(String(format: "%.0f", iosAvailAfter - iosAvailBefore))")
     }
 
     // TEMPERATURE CHANGE 1/6: Add temperature parameter with default
@@ -5266,6 +5308,29 @@ class LLMService: ObservableObject {
     internal var mlxWrapper: MLXWrapper // Changed to internal for MLXModelDownloader access
     @Published var initializationError: String?
 
+    /// Handle to the in-flight MLX load Task spawned by `setupLLM`. Stored
+    /// so callers (notably `ChatViewModel.switchToModel`) can `await` the
+    /// load's completion before deciding whether the swap succeeded.
+    ///
+    /// The Task itself is detached and self-contained — it sets
+    /// `initializationError` on failure and updates the wrapper's
+    /// `isModelLoaded` / `mlxError` either way. Awaiting it simply
+    /// blocks until that work has finished, so subsequent code sees
+    /// a settled state.
+    ///
+    /// Added 2026-05-18 for Item 11 UX wiring — the memory pre-flight
+    /// refusal needs to revert the model selection and post a chat
+    /// message about the failure, neither of which is possible if
+    /// switchToModel proceeds before the load has actually been
+    /// attempted. See `awaitPendingMLXLoad()`.
+    private(set) var pendingMLXLoadTask: Task<Void, Never>?
+
+    /// Await whatever MLX load was last triggered by `setupLLM`, if any.
+    /// Safe to call when no load is pending (returns immediately).
+    func awaitPendingMLXLoad() async {
+        await pendingMLXLoadTask?.value
+    }
+
     private var currentModel: ModelConfiguration
     /// Exposes the model ID currently loaded in LLMService (for diagnostic use by HalTestConsole).
     var activeModelID: String { currentModel.id }
@@ -5343,6 +5408,13 @@ class LLMService: ObservableObject {
         halLog("HALDEBUG-LLM: currentModel updated to: \(self.currentModel.displayName) (source: \(self.currentModel.source))")
         self.initializationError = nil // Clear previous errors
 
+        // Clear any prior MLX load handle. Paths below that actually
+        // dispatch a new load will assign a fresh Task; paths that
+        // don't (already-loaded, AFM target, missing-files) leave it
+        // nil, which is exactly what `awaitPendingMLXLoad()` expects
+        // — it returns immediately when nothing is pending.
+        pendingMLXLoadTask = nil
+
         // Ensure this model is in the catalog. Otherwise vm.selectedModel /
         // chat-bubble footers / Hal's self-awareness all fall back to AFM
         // when looking up message.recordedByModel — visible as "Apple
@@ -5410,17 +5482,38 @@ class LLMService: ObservableObject {
                     // self-routes its @Published mutations to main via
                     // await MainActor.run, so the detach is safe.
                     // See Docs/UI_Thread_Diagnosis_2026-05-15.md.
-                    Task.detached { [weak self] in
+                    // Cancel any prior in-flight load Task so we don't
+                    // race two loads against each other if the user
+                    // double-taps a model. The new load supersedes.
+                    pendingMLXLoadTask?.cancel()
+                    pendingMLXLoadTask = Task.detached { [weak self] in
                         guard let self else { return }
-                        // For an MLX→MLX swap, give iOS a brief beat to
-                        // reclaim the just-freed memory before we trigger
-                        // the next load. 500ms is empirical — long enough
-                        // for the OS to actually drop the pages, short
-                        // enough that the user-perceived seat transition
-                        // stays sub-second on top of the load time.
+                        // For an MLX→MLX swap, wait for iOS to actually
+                        // reclaim the just-freed pages before starting
+                        // the next load. The previous behaviour was a
+                        // fixed 500 ms sleep; that's empirical and was
+                        // insufficient on the 2026-05-18 Phase 2 live
+                        // test, where Qwen → Gemma 4 E2B jetsam-killed
+                        // Hal mid-load. Now we poll
+                        // `os_proc_available_memory()` for up to 3
+                        // seconds, returning as soon as we have headroom
+                        // for the new model. If headroom never arrives,
+                        // the load is attempted anyway and loadModel's
+                        // own pre-flight check surfaces a clean error
+                        // rather than a process kill. See Item 11 in
+                        // HISTORY.md 2026-05-18 and
+                        // ProcessMemoryGuard.swift.
                         if isMLXToMLXSwap {
-                            try? await Task.sleep(nanoseconds: 500_000_000)
-                            halLog("HALDEBUG-MLX: 500ms memory-reclaim settle complete; starting load for \(model.displayName)")
+                            let requiredMB = requiredMemoryMBForLoad(resolvedModel)
+                            let result = await waitForMemoryHeadroom(
+                                requiredMB: requiredMB,
+                                timeoutSeconds: 3.0
+                            )
+                            if result.success {
+                                halLog("HALDEBUG-MLX: Memory headroom reached for \(model.displayName) after \(result.pollsTaken) polls / \(String(format: "%.2f", result.elapsedSeconds))s; availableMB=\(String(format: "%.0f", result.finalAvailableMB)) requiredMB=\(String(format: "%.0f", requiredMB)) — starting load")
+                            } else {
+                                halLog("HALDEBUG-MLX: Memory headroom NOT reached within 3s for \(model.displayName) (\(result.pollsTaken) polls, availableMB=\(String(format: "%.0f", result.finalAvailableMB)) requiredMB=\(String(format: "%.0f", requiredMB))) — proceeding to load; pre-flight check will refuse if still insufficient")
+                            }
                         }
                         await self.mlxWrapper.loadModel(modelConfig: resolvedModel)
                         if let mlxError = await self.mlxWrapper.mlxError {
@@ -10846,7 +10939,6 @@ class ChatViewModel: ObservableObject {
             return
         }
 
-        let oldModelName = selectedModel.displayName
         let oldModelID = selectedModelID
 
         print("HALDEBUG-SETTINGS: Switching model from \(selectedModelID) to \(newModel.id)")
@@ -10886,8 +10978,18 @@ class ChatViewModel: ObservableObject {
             halLog("HALDEBUG-SETTINGS: Applied effective settings for \(newModel.displayName) via VM props: temp=\(effective.temperature.map { "\($0)" } ?? "—"), depth=\(effective.effectiveMemoryDepth.map { "\($0)" } ?? "—"), maxRag=\(effective.maxRagSnippetsCharacters.map { "\($0)" } ?? "—")")
         }
 
-        // Setup LLM with new model
+        // Setup LLM with new model. For MLX this dispatches a detached
+        // load Task whose handle is captured in `pendingMLXLoadTask`;
+        // we await it below so post-load logic sees settled state.
         llmService.setupLLM(for: newModel)
+        await llmService.awaitPendingMLXLoad()
+
+        // Resolve the previous-model object once so we can revert to
+        // it cleanly on load failure. ModelCatalogService is the
+        // authoritative lookup; AFM is the safety floor if even that
+        // misses (it always exists).
+        let previousModel = ModelCatalogService.shared.getModel(byID: oldModelID)
+            ?? .appleFoundation
 
         // Clamp stored memoryDepth to new model's limit and write back so the slider,
         // the stored value, and runtime behavior all agree. Hal is built on transparency —
@@ -10899,12 +11001,51 @@ class ChatViewModel: ObservableObject {
                 memoryDepth = newMax
             }
         }
-        
-        // Add context window detection transparency message
+
+        // Check whether the load failed (missing files, memory refusal,
+        // MLX framework error). This branch supersedes the "switched
+        // to X" success message: we don't want to claim a swap that
+        // didn't happen.
+        if let initError = llmService.initializationError {
+            // Revert selection to the previous model — the safest outcome
+            // for a refused load is to leave the user where they were,
+            // not silently fall back to AFM (which would change Hal's
+            // behavior without their consent) and not leave them in a
+            // half-loaded state. Item 11 / 2026-05-18.
+            halLog("HALDEBUG-SETTINGS: Load of \(newModel.displayName) failed (\(initError.prefix(80))…); reverting to \(previousModel.displayName)")
+
+            await MainActor.run {
+                selectedModelID = oldModelID
+            }
+            llmService.setupLLM(for: previousModel)
+            await llmService.awaitPendingMLXLoad()
+
+            // Post bilateral chat messages explaining what happened.
+            // Phrase the synthetic user prompt as the action the user
+            // actually attempted ("can you switch to X?") so Hal's
+            // response (the error string) reads as a coherent reply
+            // rather than the previous oddly-shaped
+            // "are the [OLD] files missing?" prompt.
+            await MainActor.run {
+                let userMsg = "Hal, can you switch to \(newModel.displayName)?"
+                let halMsg = initError + "\n\nI've stayed on \(previousModel.displayName) for now."
+                let failureTurn = memoryStore.getCurrentTurnNumber(conversationId: conversationId) + 1
+                messages.append(ChatMessage(content: userMsg, isFromUser: true, recordedByModel: "user", turnNumber: failureTurn))
+                messages.append(ChatMessage(content: halMsg, isFromUser: false, recordedByModel: selectedModel.id, turnNumber: failureTurn))
+            }
+
+            await MainActor.run {
+                isModelSwitching = false
+            }
+            print("HALDEBUG-SETTINGS: Model switch ABORTED — \(newModel.displayName) failed to load; reverted to \(previousModel.displayName)")
+            return
+        }
+
+        // Add context window detection transparency message (success path only)
         await MainActor.run {
             let contextWindow = newModel.contextWindow
             let contextWindowFormatted = contextWindow >= 1000 ? "\(contextWindow / 1000)K" : "\(contextWindow)"
-            
+
             // Determine detection method from console logs pattern
             // (ModelCatalogService logs which method was used during catalog refresh)
             let detectionMethod: String
@@ -10918,10 +11059,10 @@ class ChatViewModel: ObservableObject {
                 // Context doesn't match name pattern - likely from config.json
                 detectionMethod = "config"
             }
-            
+
             let userMsg = "Hal, you're now using \(newModel.displayName)."
             let halMsg: String
-            
+
             switch detectionMethod {
             case "config":
                 halMsg = "Switched to \(newModel.displayName)! I fetched its official config.json and confirmed it has a \(contextWindowFormatted)-token context window. This is the accurate specification from the model's metadata."
@@ -10932,34 +11073,16 @@ class ChatViewModel: ObservableObject {
             default:
                 halMsg = "Switched to \(newModel.displayName) with a \(contextWindowFormatted)-token context window."
             }
-            
+
             let currentTurn = memoryStore.getCurrentTurnNumber(conversationId: conversationId) + 1
             messages.append(ChatMessage(content: userMsg, isFromUser: true, recordedByModel: "user", turnNumber: currentTurn))
             messages.append(ChatMessage(content: halMsg, isFromUser: false, recordedByModel: selectedModel.id, turnNumber: currentTurn))
         }
-        
-        // Check if model initialization failed due to missing files
-        if let initError = llmService.initializationError {
-            // Create bilateral messages about missing files
-            await MainActor.run {
-                let userMsg = "Hal, are the \(oldModelName) files missing?"
-                let halMsg = initError  // This is already the full message from Block 08
-                let failureTurn = memoryStore.getCurrentTurnNumber(conversationId: conversationId) + 1
-                messages.append(ChatMessage(content: userMsg, isFromUser: true, recordedByModel: "user", turnNumber: failureTurn))
-                messages.append(ChatMessage(content: halMsg, isFromUser: false, recordedByModel: selectedModel.id, turnNumber: failureTurn))
-            }
-            
-            // Switch to Apple Foundation as fallback
-            await MainActor.run {
-                selectedModelID = "apple-foundation-models"
-            }
-            llmService.setupLLM(for: .appleFoundation)
-        }
-        
+
         await MainActor.run {
             isModelSwitching = false
         }
-        
+
         print("HALDEBUG-SETTINGS: Model switch complete to \(newModel.displayName)")
     }
     

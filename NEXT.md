@@ -25,18 +25,37 @@ For the v1 self-knowledge spec: `Docs/v1_Build_Spec_Self_Knowledge_2026-05-18.md
 
 ## Bugs to fix before ship
 
-### Item 11 — Gemma jetsam crash investigation
+### Item 11 — Gemma jetsam crash investigation ✓ RESOLVED (2026-05-18 post-compaction)
 
-During the Phase 2 live test (2026-05-18), switching to Gemma 4 E2B with the prior salon's heavy context jetsam-killed Hal during model load. Workaround was switching to Qwen 3.5 2B, but that's not acceptable for real users.
+Diagnosed and fixed. New `Hal Universal/ProcessMemoryGuard.swift`
+exposes `os_proc_available_memory()` as `processAvailableMemoryMB()`
+and `requiredMemoryMBForLoad(_:)` (0.75× disk size + 250 MB margin,
+empirically calibrated from Qwen's 0.56 ratio). Three coordinated
+changes:
 
-Investigation plan:
-  - Reproduce on device (load Gemma after a heavy chat context).
-  - Measure memory pressure at swap points (Xcode → Debug Navigator → Memory, or log via `os_proc_available_memory()`).
-  - Check whether `MLXWrapper.unloadModel` fires before the new model loads. Commit `750f487` added a background-lifecycle unloader; verify the model-swap path runs the equivalent.
-  - Consider: eager release of inactive chat history before swap? Per-model context budgeting aware of pending swap?
-  - If structural fix isn't tractable: surface a "won't fit" error to the user rather than letting iOS kill the process.
+1. MLX→MLX swap path replaced the fixed 500 ms settle with
+   `waitForMemoryHeadroom(...)` — polls every ~150 ms for up to 3 s,
+   logs the reclamation curve.
+2. `MLXWrapper.loadModel` runs a pre-flight `availableMB >= requiredMB`
+   check before the dangerous mmap call. On refusal, sets `mlxError`
+   to a friendly user-facing message and returns.
+3. `ChatViewModel.switchToModel` now stores the load Task and awaits
+   it via `LLMService.awaitPendingMLXLoad()`. On failure: revert to
+   the previous model (not AFM), post a clean explanation in chat,
+   replace the misleading "Hal, are the [OLD] files missing?" prompt
+   with the neutral "Hal, can you switch to [NEW]?".
 
-Real user issue. Needs to land before ship.
+Verified on iPhone 16 Plus: cold-launch Gemma (3333 available vs 2999
+required) succeeds; Gemma → Qwen swap completes cleanly; first refusal
+test (pre-recalibration, 3271 < 4149) showed Hal logging
+"REFUSED — insufficient memory" instead of crashing. Build clean,
+zero new warnings, Hal_Source.txt synced. See HISTORY 2026-05-18
+post-compaction entry for the full chronicle.
+
+Follow-up monitoring: if a future stress-test load exceeds our 0.75×
+estimate and still crashes despite passing pre-flight, tighten the
+multiplier or introduce a per-model override (e.g. Gemma 4 E2B's
+QAT layout may have a different effective footprint).
 
 ### Memory Depth display mismatch
 

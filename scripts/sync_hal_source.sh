@@ -26,6 +26,7 @@ FILES=(
   "Hal Universal/PromptDetailView.swift"
   "Hal Universal/SelfKnowledgeEngine.swift"
   "Hal Universal/TraitCrystallizer.swift"
+  "Hal Universal/ProcessMemoryGuard.swift"
   "Hal Universal/Hal.swift"
 )
 
