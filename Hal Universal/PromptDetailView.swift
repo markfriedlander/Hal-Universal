@@ -95,6 +95,27 @@ enum PromptDetailSegmentKind: Sendable {
     /// emoji + label. Matches the SF Symbol's spirit without needing
     /// rendered SwiftUI.
     ///
+    /// Stable integer rank for each case, used by the nonisolated
+    /// `parsePromptSegments` to compare kinds without going through
+    /// the enum's synthesized Equatable (which the project-level
+    /// `SWIFT_DEFAULT_ACTOR_ISOLATION = MainActor` makes
+    /// @MainActor-isolated and therefore unusable from nonisolated
+    /// contexts). Pure value-type derivation, safe from any context.
+    nonisolated var kindRank: Int {
+        switch self {
+        case .systemPrompt:        return 0
+        case .temporal:            return 1
+        case .summary:             return 2
+        case .selfAwareness:       return 3
+        case .selfKnowledge:       return 4
+        case .ragRetrieval:        return 5
+        case .watchDelivery:       return 6
+        case .conversationHistory: return 7
+        case .userMessage:         return 8
+        case .other:               return 9
+        }
+    }
+
     /// Marked `nonisolated` so the nonisolated `buildPromptDetailExportText`
     /// can reference it without a @MainActor hop. The rest of the enum's
     /// view-side extension members (displayName/icon/color) are read
@@ -248,19 +269,85 @@ nonisolated func parsePromptSegments(fullPrompt: String) -> [PromptDetailSegment
         segments.append(PromptDetailSegment(kind: .systemPrompt, content: personaText))
     }
 
-    if parts.count > 1 {
-        let contextBody = parts.dropFirst().joined(separator: "\n\nCURRENT CONTEXT:\n")
-        let sections = contextBody.components(separatedBy: "\n\n")
-        // Use enumerated() so each segment gets a deterministic index;
-        // PromptDetailSegment combines (kind, index, content.hashValue)
-        // into a stable id that survives parent-body recomputes.
-        for (offset, section) in sections.enumerated() {
-            let body = section.trimmingCharacters(in: .whitespacesAndNewlines)
-            guard !body.isEmpty else { continue }
-            let kind = classifyPromptContextSection(body)
-            segments.append(PromptDetailSegment(kind: kind, content: body, index: offset))
+    guard parts.count > 1 else { return segments }
+
+    // The context body's sub-sections (Temporal, Summary, Self-Awareness,
+    // Self-Knowledge, RAG, Watch-Delivery) are joined with "\n\n" by
+    // buildChatMessages — BUT each sub-section internally also uses
+    // "\n\n" for paragraph breaks. A naive split on "\n\n" therefore
+    // shatters Self-Awareness into 4+ chunks and Self-Knowledge into
+    // 6-8 category chunks, each becoming its own viewer row. That's
+    // the "wall of Context rows" bug Mark called out 2026-05-18.
+    //
+    // Fix: walk paragraphs in order, classify each, and merge adjacent
+    // paragraphs that belong to the same logical section. A paragraph
+    // is treated as a continuation of the previous logical section when
+    // either (a) it classifies to the same kind as the previous
+    // classified paragraph, or (b) it classifies to .other and the
+    // previous classified paragraph had a known kind. The result is
+    // one viewer row per logical section, with all its paragraphs intact.
+    let contextBody = parts.dropFirst().joined(separator: "\n\nCURRENT CONTEXT:\n")
+    let paragraphs = contextBody.components(separatedBy: "\n\n")
+
+    // We avoid Optional<PromptDetailSegmentKind> for `currentKind` and
+    // direct `==` comparisons on the enum because the project-level
+    // `SWIFT_DEFAULT_ACTOR_ISOLATION = MainActor` makes the enum's
+    // synthesized Equatable conformance @MainActor-isolated, which
+    // can't be used from this nonisolated function. Instead we encode
+    // the kind via its `kindRank` Int (a pure-value comparison that
+    // doesn't go through Equatable), with -1 meaning "no current
+    // section yet". Same pattern as the existing nonisolated
+    // `PromptDetailSegment(kind:content:index:)` init which uses
+    // `\(kind)` printable form to derive the id.
+    var currentKindRank: Int = -1
+    var currentKind: PromptDetailSegmentKind = .other  // placeholder, ignored while rank == -1
+    var currentChunks: [String] = []
+    var segmentIndex = 0
+
+    func flush() {
+        guard currentKindRank >= 0, !currentChunks.isEmpty else { return }
+        let body = currentChunks.joined(separator: "\n\n")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        if !body.isEmpty {
+            segments.append(PromptDetailSegment(kind: currentKind, content: body, index: segmentIndex))
+            segmentIndex += 1
+        }
+        currentChunks = []
+    }
+
+    for paragraph in paragraphs {
+        let body = paragraph.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !body.isEmpty else { continue }
+        let kind = classifyPromptContextSection(body)
+        let rank = kind.kindRank
+
+        if currentKindRank < 0 {
+            // First paragraph: start a new section.
+            currentKind = kind
+            currentKindRank = rank
+            currentChunks = [body]
+            continue
+        }
+
+        if rank == currentKindRank {
+            // Same kind continuing — append to current section.
+            currentChunks.append(body)
+        } else if rank == PromptDetailSegmentKind.other.kindRank {
+            // Unclassified continuation paragraph (e.g. the trailing
+            // "You can reference this history naturally when relevant…"
+            // sentence in Self-Awareness). Attach to the running
+            // section rather than emitting a bare "Context" row.
+            currentChunks.append(body)
+        } else {
+            // New, distinguishable section begins. Flush the previous
+            // group and start fresh.
+            flush()
+            currentKind = kind
+            currentKindRank = rank
+            currentChunks = [body]
         }
     }
+    flush()
 
     return segments
 }
