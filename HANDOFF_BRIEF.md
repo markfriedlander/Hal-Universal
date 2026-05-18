@@ -1,14 +1,13 @@
 # Hal Universal — Handoff Brief
-**Updated:** May 18, 2026 (morning — Evolutionary Salon happened, v1 build spec written, Phase 1 of crystallization landed)
-**Branch:** `main` (about to commit combined Phase 1 + deferred extraction/AFM-audit/threshold work + salon archive + build spec)
-**Working tree:** SelfKnowledgeEngine.swift (new) + Hal.swift edits + EmbeddingBackend.swift + sync script + Hal_Source.txt resync + Docs/Evolutionary_Salon_2026-05-17/ (new) + Docs/v1_Build_Spec_Self_Knowledge_2026-05-18.md (new) + four doc updates, all committed together
+**Updated:** May 18, 2026 (afternoon — Phase 3 of v1 crystallization complete; pipeline structurally end-to-end)
+**Branch:** `main` @ `86ba310` (Phase 3d landed)
+**Working tree:** clean (only Xcode user state + untracked Docs/SC_Release_Materials/)
 
-> **For the next CC session:** read this brief, then `NEXT.md` for Phase 2
-> of the v1 crystallization build (TraitCrystallizer.swift + reinforcement-
-> based promotion), then the 2026-05-18 morning entry of `HISTORY.md` for
-> Phase 1 details and the Evolutionary Salon chronicle, then
-> `Docs/v1_Build_Spec_Self_Knowledge_2026-05-18.md` for the full spec,
-> then `CLAUDE.md` for standing rules.
+> **For the next CC session:** read this brief, then `NEXT.md` for Phase 4
+> of the v1 crystallization build (reflection privacy + viewer UI), then
+> the 2026-05-18 afternoon entry of `HISTORY.md` for the full Phase 3
+> chronicle, then `Docs/v1_Build_Spec_Self_Knowledge_2026-05-18.md` for
+> the spec, then `CLAUDE.md` for standing rules.
 
 ---
 
@@ -63,15 +62,36 @@ Three big things landed this session:
    (minus the meta-commentary forbidding), add Meta-Cognition as 7th
    category, no readiness mechanism.
 
-6. **v1 build spec written and Phase 1 landed.**
+6. **v1 build spec written; Phases 1, 2, 3 all landed.**
    `Docs/v1_Build_Spec_Self_Knowledge_2026-05-18.md` is the spec.
-   Phase 1 (today) added two nullable columns to `self_knowledge`
-   (`promoted_to_trait_id`, `shareability_decided_by_model`) with
-   ALTER migration, added Meta-Cognition handling to
-   `buildSelfKnowledgeContext`, and added a `DB_SCHEMA:<table>` API
-   diagnostic. Migration verified on real device (22 columns now,
-   the two new ones at positions 21 and 22). Phase 2 next:
-   TraitCrystallizer.swift + reinforcement-based promotion.
+
+   - **Phase 1** (commit `6eed526`): schema migration (two nullable
+     columns), Meta-Cognition category in injection builder,
+     `DB_SCHEMA:<table>` API diagnostic. Migration verified.
+   - **Phase 2** (commit `0a692cc`): `TraitCrystallizer.swift` +
+     reinforcement-based promotion. Live-tested on Qwen 3.5 2B —
+     end-to-end pipeline verified (synthesis-merge, candidate fetch,
+     LLM call, JSON parse, category validation, threshold deferral).
+   - **Pre-Phase-3**: `SELF_KNOWLEDGE_AUDIT` diagnostic (commit
+     `249540b`); `recordStructuredInsights` disabled from chat path
+     to remove competing trait-write system (commit `b292946`).
+   - **Phase 3** (commits `773636d`, `46da6a0`, `f6e230a`, `86ba310`):
+     foundation (`recommendedContradictionThreshold`, `MultiValuedTrait`,
+     `updateTraitValueInPlace`), collision detection (stub), real
+     evolution mechanism (deepen / absorb-tension / refuse with
+     deterministic weight rules), read-side update of
+     `buildSelfKnowledgeContext` to extract primary from multi-valued
+     JSON with `(±N tensions held)` annotation.
+
+   End-to-end pipeline now structurally complete:
+   `conversation → reflection (every 5 turns) → synthesis (cosine
+   merge bumps reinforcement_count) → crystallizer (when threshold
+   met) → if (category, key) collision: evolveExistingTrait
+   (cosine-fork: deepen / absorb-tension / refuse); else: INSERT
+   new trait → primary-only injection with tension-count annotation`.
+
+   Phase 4 next: reflection privacy (LLM-decided shareability,
+   stickiness, viewer "show private" toggle + one-time popup).
 
 ---
 

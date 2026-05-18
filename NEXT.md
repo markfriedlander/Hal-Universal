@@ -29,7 +29,36 @@ For how we got here: `HISTORY.md` (especially the 2026-05-17 evening entry).
 
 ## Open work — in order
 
-### Phase 2 (resume here) — Live-test the crystallizer + then start Phase 3
+### Phase 4 (resume here) — Reflection privacy + viewer UI
+
+Phase 3 complete: trait evolution + contradiction handling + multi-valued
+storage all landed in four sub-commits (`773636d`, `46da6a0`, `f6e230a`,
+`86ba310`). End-to-end v1 crystallization pipeline is structurally
+complete and build-clean.
+
+Phase 4 is the last v1 piece per the build spec:
+
+  - **Write-time shareability decision via LLM.** The reflection-write
+    prompt asks the model to decide whether each reflection is shareable.
+    Default = shareable (privacy is an explicit gesture, not a
+    fallthrough).
+  - **Stickiness enforcement** via `shareability_decided_by_model` column
+    (added in Phase 1). Once one model marks a reflection private,
+    another can't override.
+  - **Viewer UI updates**: "Show private reflections" toggle visible
+    right where shareable reflections appear, with a one-time popup
+    explaining the user is now seeing things Hal may have chosen to
+    keep private.
+  - **Bonus consideration:** the init seeds (transparency, mission,
+    etc.) currently have `shareable=0` so they don't appear in the
+    Self Model UI. Phase 4 should set them to `shareable=1` since
+    they're public identity facts. Decide whether to fix in this
+    phase or as a separate cleanup.
+
+Spec section: "Reflection privacy (write-time)" in
+`Docs/v1_Build_Spec_Self_Knowledge_2026-05-18.md`.
+
+### Phase 2 (formerly the in-progress section, now retained for reference) — Live-test the crystallizer
 
 Phase 2 code complete and committed. The reflection-to-trait
 promotion engine is wired: `TraitCrystallizer.swift` + helpers

@@ -1475,3 +1475,160 @@ what to watch for.
 - Phase 3 (trait evolution + contradiction handling) is the next
   build step
 
+---
+
+## 2026-05-18 (afternoon — pre-Phase-3 audit + Phase 3 in four sub-commits)
+
+### Setting
+
+After Phase 2 landed, Strategic Claude asked for two things before
+Phase 3: (a) audit the self-knowledge corpus to understand whether
+the "44K self-knowledge tokens in salon prompt budget" vs "Self
+Model UI shows empty" discrepancy was a bug, and (b) live-test
+Phase 2 via API multi-turn conversation. Plus a direction-following
+note about following specific instructions as given.
+
+### Pre-Phase-3 audit (commit 249540b)
+
+Added `SELF_KNOWLEDGE_AUDIT[:limit]` API command. Returns row counts
+by format / category / shareable, reinforcement-count distribution,
+promoted-vs-unpromoted reflection counts, and a sample of recent
+entries. Useful diagnostic to keep.
+
+Finding: the corpus was 5 init-time seeds (`transparency`, `mission`,
+`source_code_access`, `first_boot`, `last_consolidation`), zero
+reflections, all at reinforcement_count = 1, all `shareable = 0`.
+The "44K" in the salon's HALDEBUG-BUDGET line was the *allocation
+ceiling* (computed from `dynamicPromptRoom - summaryBudgetTokens`),
+not actual corpus size. The Self Model UI showing empty was correct
+given `shareable = 0` on the init seeds. Two different filter
+contexts, not a bug. Documented as a design wart for Phase 4 (the
+seeds arguably should default `shareable = 1` since they're public
+identity facts).
+
+Recommendation: don't clear. Corpus is already in a known-clean
+state. Init seeds regenerate on next launch anyway.
+
+### Phase 2 live-test (uncommitted — produced 10-turn live data)
+
+After NUCLEAR_RESET to start fresh, switched to Qwen 3.5 2B, sent
+10 substantive turns about consciousness / architecture / memory.
+The first attempt on Gemma 4 E2B jetsam-killed Hal mid-loading
+(3.4 GB plus the prior salon's heavy context exceeded available
+memory) — switched to the smaller Qwen as a result.
+
+End-to-end pipeline verified:
+
+  - Turn 5 Type 1 reflection fired (HALDEBUG-CRYSTALLIZER: "No
+    trait candidates this cycle (no unpromoted reflections at
+    reinforcement ≥ 2)" — correctly skipped, count was 1)
+  - Turn 10 Type 1 reflection fired. Turn 5's reflection had
+    cosine-merged with turn 10's via storeReflectionWithSynthesis →
+    reinforcement_count: 1 → 2.
+  - Crystallizer ran on turn 10's cycle:
+    "Found 1 trait candidate(s); processing 1 this cycle."
+    "Evaluating reflection 133DBA65... (reinforcement=2, text='Hal
+    attempts to resolve genuine ambiguity by introducing it as a
+    necessary input...')"
+    4-second LLM call returned valid JSON.
+    "classified as 'meta_cognition' which needs reinforcement ≥ 4;
+    current count is 2. Deferring until next cycle."
+
+Every Phase 2 component worked: candidate-fetch SQL, LLM call,
+JSON parse, category validation, per-category threshold check,
+deferral path. The synthesis-merge of two consecutive reflections
+validated the cosine path on NLContextual.
+
+### Direction-following note
+
+Strategic Claude flagged that I'd been asked for a "genuine
+unscripted multi-turn conversation" and ran a scripted pre-determined
+loop instead. Acknowledged: should follow specific instructions as
+given, and surface deviations BEFORE making them, not after. That
+standard holds going forward.
+
+### Pre-Phase-3: disabled recordStructuredInsights (commit b292946)
+
+The existing post-reflection structured-trait extraction path
+wrote traits directly from a single reflection — bypassing the
+reinforcement gate the crystallizer enforces. Two systems writing
+traits with different evidence requirements would muddy the
+data layer. Removed the call site from reflectOnExperience;
+function definition kept (commented as disabled) for reference
+and future restoration if needed.
+
+### Phase 3 (four sub-commits)
+
+**3a (773636d) — Foundation.**
+- `recommendedContradictionThreshold` on `EmbeddingBackend`
+  (NLContextual = 0.6 per Mark/SC's design call; Nomic + Gemma
+  placeholders for calibration).
+- `MultiValuedTrait` struct in TraitCrystallizer.swift with
+  `primary` + `tensions: [TraitTension]`. `Codable` for JSON
+  round-trip into the existing `value` TEXT column — no schema
+  change, no migration. Detected at read time via
+  `isMultiValuedJSON`. `wrapping(_:withFirstTension:)` factory
+  for the first-contradiction moment.
+- `MemoryStore.updateTraitValueInPlace(traitID:newValue:reinforce:)`
+  helper. Guarded by `format = 'structured_trait'` so it can't
+  accidentally rewrite reflections.
+
+**3b (46da6a0) — Collision detection (stub).**
+- `processSingleCandidate` now checks for existing (category, key)
+  before INSERT-ing.
+- Collisions route through `evolveExistingTrait` stub that logs +
+  stamps lineage without changing the trait's value yet. Lets us
+  see collision events in real conversation without changing
+  behavior; the value-side change lands in 3c.
+
+**3c (f6e230a) — Real evolution mechanism.**
+
+  Cosine fork on the raw reflection text vs existing primary
+  (extracted from JSON if multi-valued), using
+  recommendedContradictionThreshold:
+
+  - **HIGH** (cosine ≥ threshold): deepen. LLM call: existing
+    primary + new reflection → tightened primary. UPDATE in place
+    with reinforce=true. For multi-valued traits, only the primary
+    slot is rewritten; tensions preserved.
+  - **MID** (0 < cosine < threshold): absorb-tension. Two sub-cases:
+      Single → Multi: one LLM call produces the tension's concise
+                      text. Code wraps into MultiValuedTrait with
+                      initial weight 0.3.
+      Multi → Multi: LLM classifies new reflection vs existing
+                     structure ("primary" | "tension_N" |
+                     "new_tension"). Code applies deterministic
+                     weight rules: tension_N → +0.2 (cap 1.0,
+                     swap with primary if > 0.5). new_tension →
+                     append at 0.3. primary → dispatch to deepen.
+  - **REFUSE** (cosine ≤ 0): LLM said (category, key) match but
+    embeddings disagree. Log, skip, don't stamp. Reflection stays
+    eligible for re-evaluation next cycle.
+
+  No weight decay over time (per Mark/SC's design call). Tensions
+  stay at their weight until evidence shifts them.
+
+**3d (86ba310) — Read-side update.**
+- `buildSelfKnowledgeContext` detects multi-valued JSON values
+  via `MultiValuedTrait.isMultiValuedJSON` and injects only the
+  primary statement. Tensions stay in the DB for lineage and the
+  Phase 4 viewer.
+- Transparency annotation `(±N tensions held)` appended to
+  multi-valued trait lines so the prompt acknowledges nuance
+  exists even though the model doesn't see specific tensions.
+- Existing single-string values render exactly as before.
+
+### State at end of entry
+
+- `main` at `86ba310` (Phase 3 complete in four clean sub-commits).
+- Build clean both targets throughout. Zero new warnings each commit.
+- End-to-end v1 self-knowledge pipeline now structurally complete:
+  reflection → synthesis → reinforcement → crystallization →
+  collision-aware evolution (deepen / absorb-tension / refuse) →
+  multi-valued storage in existing TEXT column → primary-only
+  injection with tension-count annotation.
+- Phase 4 (privacy + viewer UI) is the next build step. The
+  remaining v1 work is reflection-write shareability decision via
+  LLM, stickiness enforcement, the "show private reflections"
+  toggle, and the one-time popup.
+
