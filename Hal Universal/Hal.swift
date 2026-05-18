@@ -17610,6 +17610,52 @@ class MLXModelDownloader: ObservableObject {
             let bgdlAlreadyActive = await BackgroundDownloadCoordinator.shared.hasActiveTasks(for: modelID)
             if bgdlAlreadyActive {
                 halLog("HALDEBUG-DOWNLOAD: \(modelID) — BGDL already has in-flight tasks (auto-reconnected); NOT re-triggering startDownload. Letting BGDL continue.")
+
+                // BUG FIX (2026-05-17, §7 retest aftermath): when iOS jetsam-
+                // kills Hal mid-download and the fresh process recovers via
+                // this branch, the @Published downloadStates dict starts
+                // empty. The Model Library UI binds to downloadStates[modelID]
+                // for the progress bar, so users saw no progress UI even
+                // though BGDL was actively downloading. Mark caught this
+                // during the §7 long-lock test (commit `97c8a7a`-adjacent).
+                //
+                // Fix: populate downloadStates with an `isDownloading: true`
+                // state seeded from BGDL's current byte counters, then spawn
+                // a polling task that mirrors BGDL progress into the
+                // @Published dict. The polling task self-terminates when
+                // markModelAsDownloadedFromBackground flips isDownloading
+                // to false on completion — the same lifecycle the normal
+                // startDownload path uses.
+                let initialFraction = BackgroundDownloadCoordinator.shared.progress(for: modelID)
+                let initialClamped = max(0.0, min(0.99, initialFraction))
+                await MainActor.run {
+                    let seedState = DownloadState(
+                        isDownloading: true,
+                        progress: initialClamped,
+                        message: "Downloading \(Int(initialClamped * 100))%...",
+                        error: nil,
+                        localPath: nil
+                    )
+                    self.downloadStates[modelID] = seedState
+                }
+                Task {
+                    while !Task.isCancelled {
+                        try? await Task.sleep(nanoseconds: 500_000_000)
+                        if Task.isCancelled { break }
+                        let shouldContinue = await MainActor.run { () -> Bool in
+                            guard var state = self.downloadStates[modelID], state.isDownloading else {
+                                return false
+                            }
+                            let bgdlFraction = BackgroundDownloadCoordinator.shared.progress(for: modelID)
+                            let fraction = max(0.0, min(0.99, bgdlFraction))
+                            state.progress = fraction
+                            state.message = "Downloading \(Int(fraction * 100))%..."
+                            self.downloadStates[modelID] = state
+                            return true
+                        }
+                        if !shouldContinue { break }
+                    }
+                }
                 continue
             }
 

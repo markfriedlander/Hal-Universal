@@ -1074,3 +1074,142 @@ verification surface is in place.
   lines from the legacy removal)
 - Items 1–4 complete; Item 5 queued for next exchange
 
+---
+
+## 2026-05-17 (later evening — Item 5 PASS + two follow-ups)
+
+### Setting
+
+After Item 4 committed (`97c8a7a`), Mark asked me to verify what I
+could actually reach from before compaction. He had a fuzzy memory
+of doing the BGDL long-lock test already. We searched the prior
+transcripts and the four-doc chronicle together — turned up the May
+15 PM handoff plus the May 15 evening session report. Verdict: the
+two-method hybrid (foreground for speed, background for resilience)
+was real and shipped (commit `eb133d6`), but the §7 long-lock test
+itself was prepped, set up, talked about, and never actually run to
+completion. NEXT.md was right to keep it open.
+
+So we ran it.
+
+### Item 5 — BGDL long-lock test, PASS (and a hard pass)
+
+Procedure: fresh `DOWNLOAD_MODEL:mlx-community/gemma-4-e2b-it-4bit`
+on the iPhone 16 Plus, Mark locked the phone face down, ten-minute
+timer, walked away. I went quiet (API would be unreachable during
+the lock anyway, and the test verifies bg URLSession behavior, not
+foreground polling).
+
+On unlock the timestamp story was clean — and tougher than the
+nominal §7 spec because iOS jetsam-killed Hal during the lock window
+(consistent with commit `750f487`'s lifecycle handler being there to
+mitigate jetsam pressure for MLX-warm processes on locked phones):
+
+  - `18:44:00.365` — fresh `BackgroundDownloadCoordinator init` (this
+    was a new process, not the one that initiated the download)
+  - `18:44:00.446` — `migrateBackgroundTasksToForeground: migrating
+    1 task(s)` — iOS resurrected Hal in the background to deliver
+    URLSession completion events, then willEnterForeground migration
+    fired
+  - `18:44:00.561` — `bg task 1 (model.safetensors) 1902.5/3415.2 MB
+    (55%)` — the bg URLSession had downloaded ~1.9 GB while Hal was
+    NOT running, just nsurlsessiond
+  - `18:44:00.567` — `migrate ✅ model.safetensors bg→fg with 14341
+    bytes of resume data; new fg task 1` — resumed from byte
+    1,902,500,000, not byte 0
+  - `18:44:02.070` — `resumeInFlightDownloadsIfAny: ... — BGDL
+    already has in-flight tasks (auto-reconnected); NOT re-triggering
+    startDownload` — the 1.5s settle delay from `f78de2c`
+    correctly suppressed the duplicate-enqueue race
+  - Foreground rolling at 3-5 MB/s from there; download completed in
+    the next ~5 minutes after unlock.
+
+All four §7 verification markers fired. The hybrid + race fix that
+landed on May 15 works as designed, even under the harder case
+(process termination mid-lock). Ship-blocker cleared.
+
+Math: ~1.9 GB transferred during a 10-min lock window where Hal's
+process wasn't even running = ~3.2 MB/s sustained inside
+nsurlsessiond. That's faster than the ~1.7 MB/s background-throttle
+estimate from the May 15 docs — either Mark's WiFi is fat enough
+that Apple's throttle is less aggressive than feared, or
+nsurlsessiond was opportunistic, or both.
+
+### Item 5 follow-up A — Progress-bar-on-recovery bug (real find)
+
+Mark noticed during the test that he could open the Model Library
+post-unlock and see no progress bar on Gemma, even though BGDL was
+clearly still downloading (logs were ticking, bytes were flowing).
+Real bug, not a test artifact.
+
+Root cause in `MLXModelDownloader.resumeInFlightDownloadsIfAny`
+(Hal.swift:17569): the recovery path correctly detects "BGDL has
+in-flight tasks for this model, don't re-trigger startDownload" —
+but it also never populates the `@Published downloadStates[modelID]`
+dict that the Model Library UI binds to. So the UI started fresh
+with no entry for the actively-downloading model and rendered
+nothing.
+
+Fix: in the `bgdlAlreadyActive` branch, seed `downloadStates[modelID]`
+with an `isDownloading: true` state initialized from BGDL's current
+byte counters, then spawn a polling task that mirrors BGDL progress
+into the @Published dict every 500ms (same cadence the normal
+`startDownload` path uses). The polling task self-terminates when
+`markModelAsDownloadedFromBackground` flips `isDownloading` to
+false on completion — same lifecycle pattern as the existing
+poller.
+
+Build clean, no new warnings (one transient `await on sync expression`
+warning got introduced by an initial sketch, immediately fixed by
+dropping the spurious await; `BackgroundDownloadCoordinator.progress(for:)`
+is sync, not async).
+
+### Item 5 follow-up B — Model card UI consistency (Option A: plain style)
+
+Mark also flagged that the LLM rows and the embedding rows in the
+Model Library used different action-row styles: LLM rows had small
+plain icon+text buttons (`.buttonStyle(.plain)`), embedding rows had
+big `.borderedProminent` pill buttons. Spacing read differently too,
+because the pills are taller.
+
+Diagnosis (sent to Mark): the LLM `ModelLibraryRow.actionRow` at
+Hal.swift:10177 uses plain icon+text in `.subheadline` /
+`.accentColor` for Download, Select/Active, Delete, Retry. The
+embedding `EmbedderBackendRow.actionRow` at EmbedderMigrationCoordinator.swift:230
+used `.borderedProminent` for Download + Switch, a non-button
+`Label` for Active, and just a trash icon (no "Delete" text) for
+delete.
+
+Mark picked Option A (make embedding match LLM). Implementation:
+rewrote `EmbedderBackendRow.actionRow` to mirror the LLM patterns
+verbatim — plain buttons, same icons (`arrow.down.circle.fill` for
+Download, `circle` for Select, `checkmark.circle.fill` for the
+disabled Active state, `trash` + "Delete" for delete), same colors,
+same spacing.
+
+Verified visually on the iPhone 17 Pro sim:
+  - Gemma 4 E2B (LLM, not downloaded) and EmbeddingGemma 300M
+    (embedding, not downloaded) now show identical "Download"
+    affordances — same icon, same text, same color, same height.
+  - The whole Model Library reads as one design language now.
+
+### Item 6 — UI consistency sweep (added to NEXT.md per Mark)
+
+The model-card mismatch was the visible one. Mark asked me to add a
+broader sweep as a queued item — surfaces likely to have similar
+drift include Settings sheet action buttons, Salon panel, system-
+prompt editor, compression popover, document import flow,
+NUCLEAR_RESET confirmation. Approach for that one is the same shape
+we used today: screenshot, diagnose, propose unified target per
+surface, get Mark's sign-off, implement surgically.
+
+### State at end of entry
+
+- `main` (about to commit Item 5 follow-ups + Item 6 doc)
+- Build clean for device + sim, no new warnings
+- Phone has the fixed build installed (Gemma fully downloaded;
+  Item 5 follow-up A protects the next jetsam-recover cycle)
+- Item 5 fully landed end-to-end including both follow-ups
+- Item 6 queued and described in NEXT.md
+- Items 1–5 + 5-A + 5-B complete; Item 6 next session
+

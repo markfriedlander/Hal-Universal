@@ -226,53 +226,97 @@ struct EmbedderBackendRow: View {
         }
     }
 
+    // Action row layout matches ModelLibraryRow (Hal.swift:10177) so the
+    // Model Library section reads as one unified design language:
+    //   - .buttonStyle(.plain) throughout (no .borderedProminent pills)
+    //   - SF-Symbol icon + short text label in .subheadline
+    //   - Active/Download/Select/Retry/Delete in the same visual weight
+    //   - Trash + "Delete" text in red (not just an icon)
+    //
+    // The embedding side adds one wrinkle the LLM side doesn't have: a
+    // "Switch" action that triggers a destructive re-embed migration.
+    // We surface that semantics through the existing confirmation dialog
+    // (set up on the parent VStack), so the button itself can stay quiet
+    // and just say "Select" like the LLM row.
     @ViewBuilder
     private var actionRow: some View {
         HStack(spacing: 12) {
             if isActive {
-                Label("Active", systemImage: "checkmark.circle.fill")
+                // "Active" reads as a disabled button (matches LLM row's
+                // Select/Active state). Same icon, same text style.
+                Button(action: {}) {
+                    HStack(spacing: 4) {
+                        Image(systemName: "checkmark.circle.fill")
+                        Text("Active")
+                    }
                     .font(.subheadline)
                     .foregroundColor(.secondary)
+                }
+                .buttonStyle(.plain)
+                .disabled(true)
                 Spacer()
             } else if !isDownloaded {
                 if isDownloading {
                     if let state = downloader.downloadStates[backend.modelID ?? ""] {
-                        VStack(alignment: .leading, spacing: 4) {
-                            ProgressView(value: state.progress).progressViewStyle(.linear)
-                            Text(state.message).font(.caption2).foregroundColor(.secondary)
+                        VStack(alignment: .leading, spacing: 6) {
+                            ProgressView(value: state.progress)
+                            Text(state.message)
+                                .font(.caption)
+                                .foregroundColor(.secondary)
                         }
                         .frame(maxWidth: .infinity, alignment: .leading)
                     }
                     Spacer()
-                    Button("Cancel", role: .destructive) {
+                    Button(action: {
                         if let id = backend.modelID {
                             downloader.cancelDownload(modelID: id)
                         }
+                    }) {
+                        Text("Cancel")
+                            .font(.caption)
+                            .foregroundColor(.red)
                     }
-                    .font(.subheadline)
+                    .buttonStyle(.plain)
                 } else {
                     Button(action: { coordinator.startDownload() }) {
-                        Label("Download \(backend.displayName)", systemImage: "arrow.down.circle")
-                            .font(.subheadline)
+                        HStack(spacing: 4) {
+                            Image(systemName: "arrow.down.circle.fill")
+                            Text("Download")
+                        }
+                        .font(.subheadline)
+                        .foregroundColor(.accentColor)
                     }
-                    .buttonStyle(.borderedProminent)
+                    .buttonStyle(.plain)
                     Spacer()
                 }
             } else {
+                // Downloaded but not active — "Select" triggers the
+                // destructive confirmation dialog (parent VStack handles
+                // it). Same affordance as ModelLibraryRow's Select state.
                 Button(action: { showingConfirm = true }) {
-                    Label("Switch to \(backend.displayName)", systemImage: "arrow.triangle.2.circlepath")
-                        .font(.subheadline)
+                    HStack(spacing: 4) {
+                        Image(systemName: "circle")
+                        Text("Select")
+                    }
+                    .font(.subheadline)
+                    .foregroundColor(.accentColor)
                 }
-                .buttonStyle(.borderedProminent)
+                .buttonStyle(.plain)
+
                 Spacer()
+
                 if backend.modelID != nil {
-                    Button(role: .destructive, action: {
+                    Button(action: {
                         if let id = backend.modelID {
                             Task { await downloader.deleteModel(modelID: id) }
                         }
                     }) {
-                        Image(systemName: "trash")
-                            .foregroundColor(.red)
+                        HStack(spacing: 4) {
+                            Image(systemName: "trash")
+                            Text("Delete")
+                        }
+                        .font(.subheadline)
+                        .foregroundColor(.red)
                     }
                     .buttonStyle(.plain)
                     .disabled(isActive)

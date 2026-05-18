@@ -10,31 +10,55 @@ For how we got here: `HISTORY.md` (especially the 2026-05-17 evening entry).
 ## What the next session should do first
 
 1. **Read this file, then `HANDOFF_BRIEF.md`, then the 2026-05-17
-   post-compaction entry of `HISTORY.md`.** That's the chronicle of
-   how Item 4 wiring landed (including the collapse-bug fix) and
-   what's queued.
+   post-compaction entry of `HISTORY.md`.** Item 4 (PromptDetailView),
+   Item 5 (BGDL long-lock test — passed §7), and two Item-5 follow-ups
+   (progress-bar-on-recovery bug + model card UI consistency) all
+   landed this session.
 2. **Verify the live state:**
    ```bash
    python3 tests/hal_test.py state                       # responds
    python3 tests/hal_test.py cmd "SALON_GET_STATE"       # seat1 filled
    python3 tests/hal_test.py cmd "EMBEDDING_STATUS"      # backend loaded
    ```
-3. **Pick up where this session paused: Item 5 (below).**
+3. **Pick up where this session paused: Item 6 (below).**
 
 ---
 
 ## Open work — in order
 
-### Item 5 (resume here) — Background download long-lock test (coordinate with Mark)
+### Item 6 (resume here) — UI consistency sweep
 
-Delete a model, trigger a fresh download, then Mark locks the phone
-face down for 10 minutes. Verify the filesystem state before and
-after. The new commands available for this:
-  - `DOWNLOAD_EMBEDDING_MODEL:nomicswift` is a clean 522 MB candidate
-  - `EMBEDDING_DOWNLOAD_STATUS:nomicswift` polls progress
-  - `MLXModelDownloader.shared.startDownload(...)` for any LLM via API
+Mark caught a real one in the Model Library: LLM rows and embedding
+rows had different action-row styles (plain icon+text vs bordered-
+prominent pills) and different spacing. The Model Library was fixed
+this session by making the embedding side match the LLM plain style
+— see `EmbedderBackendRow.actionRow` in
+`Hal Universal/EmbedderMigrationCoordinator.swift`.
 
-Mark coordinates the lock-and-wait; CC monitors filesystem and logs.
+The broader work is a sweep of the rest of the app for similar
+mismatches. Concrete places to check:
+
+  - **Settings sheet**: action buttons (Export Thread, Upload
+    Document, etc.) vs. inline toggles vs. nav links — are they
+    visually consistent?
+  - **Salon panel**: seat picker buttons, model selection chrome.
+    Different style from Model Library?
+  - **Reflections viewer** (if one exists in Settings → Power User):
+    list row treatment.
+  - **System prompt editor** sheet: button placement, save/cancel
+    affordance.
+  - **Document import flow**: progress indicators, success/error
+    states.
+  - **Compression-explanation popover** (the badge in the chat
+    bubble footer): visual weight relative to other in-chat
+    affordances.
+  - **NUCLEAR_RESET confirmation**: matches other destructive
+    confirmations?
+
+Approach: take screenshots of each surface, list mismatches, propose
+unified targets (probably matching the plain-icon-+-text-+-color
+style the Model Library now uses), get Mark's sign-off per surface,
+implement surgically.
 
 ---
 

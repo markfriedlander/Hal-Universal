@@ -911,53 +911,97 @@ struct EmbedderBackendRow: View {
         }
     }
 
+    // Action row layout matches ModelLibraryRow (Hal.swift:10177) so the
+    // Model Library section reads as one unified design language:
+    //   - .buttonStyle(.plain) throughout (no .borderedProminent pills)
+    //   - SF-Symbol icon + short text label in .subheadline
+    //   - Active/Download/Select/Retry/Delete in the same visual weight
+    //   - Trash + "Delete" text in red (not just an icon)
+    //
+    // The embedding side adds one wrinkle the LLM side doesn't have: a
+    // "Switch" action that triggers a destructive re-embed migration.
+    // We surface that semantics through the existing confirmation dialog
+    // (set up on the parent VStack), so the button itself can stay quiet
+    // and just say "Select" like the LLM row.
     @ViewBuilder
     private var actionRow: some View {
         HStack(spacing: 12) {
             if isActive {
-                Label("Active", systemImage: "checkmark.circle.fill")
+                // "Active" reads as a disabled button (matches LLM row's
+                // Select/Active state). Same icon, same text style.
+                Button(action: {}) {
+                    HStack(spacing: 4) {
+                        Image(systemName: "checkmark.circle.fill")
+                        Text("Active")
+                    }
                     .font(.subheadline)
                     .foregroundColor(.secondary)
+                }
+                .buttonStyle(.plain)
+                .disabled(true)
                 Spacer()
             } else if !isDownloaded {
                 if isDownloading {
                     if let state = downloader.downloadStates[backend.modelID ?? ""] {
-                        VStack(alignment: .leading, spacing: 4) {
-                            ProgressView(value: state.progress).progressViewStyle(.linear)
-                            Text(state.message).font(.caption2).foregroundColor(.secondary)
+                        VStack(alignment: .leading, spacing: 6) {
+                            ProgressView(value: state.progress)
+                            Text(state.message)
+                                .font(.caption)
+                                .foregroundColor(.secondary)
                         }
                         .frame(maxWidth: .infinity, alignment: .leading)
                     }
                     Spacer()
-                    Button("Cancel", role: .destructive) {
+                    Button(action: {
                         if let id = backend.modelID {
                             downloader.cancelDownload(modelID: id)
                         }
+                    }) {
+                        Text("Cancel")
+                            .font(.caption)
+                            .foregroundColor(.red)
                     }
-                    .font(.subheadline)
+                    .buttonStyle(.plain)
                 } else {
                     Button(action: { coordinator.startDownload() }) {
-                        Label("Download \(backend.displayName)", systemImage: "arrow.down.circle")
-                            .font(.subheadline)
+                        HStack(spacing: 4) {
+                            Image(systemName: "arrow.down.circle.fill")
+                            Text("Download")
+                        }
+                        .font(.subheadline)
+                        .foregroundColor(.accentColor)
                     }
-                    .buttonStyle(.borderedProminent)
+                    .buttonStyle(.plain)
                     Spacer()
                 }
             } else {
+                // Downloaded but not active — "Select" triggers the
+                // destructive confirmation dialog (parent VStack handles
+                // it). Same affordance as ModelLibraryRow's Select state.
                 Button(action: { showingConfirm = true }) {
-                    Label("Switch to \(backend.displayName)", systemImage: "arrow.triangle.2.circlepath")
-                        .font(.subheadline)
+                    HStack(spacing: 4) {
+                        Image(systemName: "circle")
+                        Text("Select")
+                    }
+                    .font(.subheadline)
+                    .foregroundColor(.accentColor)
                 }
-                .buttonStyle(.borderedProminent)
+                .buttonStyle(.plain)
+
                 Spacer()
+
                 if backend.modelID != nil {
-                    Button(role: .destructive, action: {
+                    Button(action: {
                         if let id = backend.modelID {
                             Task { await downloader.deleteModel(modelID: id) }
                         }
                     }) {
-                        Image(systemName: "trash")
-                            .foregroundColor(.red)
+                        HStack(spacing: 4) {
+                            Image(systemName: "trash")
+                            Text("Delete")
+                        }
+                        .font(.subheadline)
+                        .foregroundColor(.red)
                     }
                     .buttonStyle(.plain)
                     .disabled(isActive)
@@ -19403,6 +19447,52 @@ class MLXModelDownloader: ObservableObject {
             let bgdlAlreadyActive = await BackgroundDownloadCoordinator.shared.hasActiveTasks(for: modelID)
             if bgdlAlreadyActive {
                 halLog("HALDEBUG-DOWNLOAD: \(modelID) — BGDL already has in-flight tasks (auto-reconnected); NOT re-triggering startDownload. Letting BGDL continue.")
+
+                // BUG FIX (2026-05-17, §7 retest aftermath): when iOS jetsam-
+                // kills Hal mid-download and the fresh process recovers via
+                // this branch, the @Published downloadStates dict starts
+                // empty. The Model Library UI binds to downloadStates[modelID]
+                // for the progress bar, so users saw no progress UI even
+                // though BGDL was actively downloading. Mark caught this
+                // during the §7 long-lock test (commit `97c8a7a`-adjacent).
+                //
+                // Fix: populate downloadStates with an `isDownloading: true`
+                // state seeded from BGDL's current byte counters, then spawn
+                // a polling task that mirrors BGDL progress into the
+                // @Published dict. The polling task self-terminates when
+                // markModelAsDownloadedFromBackground flips isDownloading
+                // to false on completion — the same lifecycle the normal
+                // startDownload path uses.
+                let initialFraction = BackgroundDownloadCoordinator.shared.progress(for: modelID)
+                let initialClamped = max(0.0, min(0.99, initialFraction))
+                await MainActor.run {
+                    let seedState = DownloadState(
+                        isDownloading: true,
+                        progress: initialClamped,
+                        message: "Downloading \(Int(initialClamped * 100))%...",
+                        error: nil,
+                        localPath: nil
+                    )
+                    self.downloadStates[modelID] = seedState
+                }
+                Task {
+                    while !Task.isCancelled {
+                        try? await Task.sleep(nanoseconds: 500_000_000)
+                        if Task.isCancelled { break }
+                        let shouldContinue = await MainActor.run { () -> Bool in
+                            guard var state = self.downloadStates[modelID], state.isDownloading else {
+                                return false
+                            }
+                            let bgdlFraction = BackgroundDownloadCoordinator.shared.progress(for: modelID)
+                            let fraction = max(0.0, min(0.99, bgdlFraction))
+                            state.progress = fraction
+                            state.message = "Downloading \(Int(fraction * 100))%..."
+                            self.downloadStates[modelID] = state
+                            return true
+                        }
+                        if !shouldContinue { break }
+                    }
+                }
                 continue
             }
 

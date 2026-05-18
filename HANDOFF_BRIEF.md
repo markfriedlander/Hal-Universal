@@ -1,12 +1,14 @@
 # Hal Universal — Handoff Brief
-**Updated:** May 17, 2026 (post-compaction continuation, Item 4 done)
-**Branch:** `main` (about to commit Item 4 final + docs)
-**Working tree:** Item 4 wiring + collapse-bug fix + legacy cleanup, plus doc updates, will be committed together
+**Updated:** May 17, 2026 (later evening — Items 1–5 done, two Item-5 follow-ups landed, Item 6 queued)
+**Branch:** `main` (about to commit Item 5 follow-ups + Item 6 doc)
+**Working tree:** progress-bar-on-recovery bug fix in Hal.swift + Model Library plain-style consistency in EmbedderMigrationCoordinator.swift + four doc updates, will be committed together
 
 > **For the next CC session:** read this brief, then `NEXT.md` for what to
-> do next (Item 5 — BGDL long-lock test — is the next concrete step), then
-> the 2026-05-17 post-compaction entry of `HISTORY.md` for how Item 4
-> landed, then `CLAUDE.md` for standing rules.
+> do next (Item 6 — UI consistency sweep — is the next concrete step), then
+> the 2026-05-17 later-evening entry of `HISTORY.md` for how the §7 BGDL
+> long-lock test passed (including the harder jetsam-kill-mid-lock case)
+> and the two follow-ups that came out of it, then `CLAUDE.md` for
+> standing rules.
 
 ---
 
@@ -38,14 +40,36 @@ Three big things landed this session:
      under NL the LLM produces conceptual synonyms that don't lexically
      match plant text), but infrastructure is solid for richer corpora.
 
-3. **5-item UX sequence: items 1–4 done, item 5 queued.**
+3. **5-item UX sequence + two Item-5 follow-ups: all done. Item 6 queued.**
    - Item 1: Salon cold-launch guard ✓
    - Item 2: Scroll behavior rewrite ✓ (user msg at top, no auto-scroll)
    - Item 3: Visual verifications ✓ (all surfaces clean on sim)
    - Item 4: PromptDetailView color-coded + collapsible ✓
      (wired into ChatBubbleView's assistant-side contextMenu, collapse
      bug fixed via stable segment IDs, legacy unused view removed)
-   - Item 5: BGDL long-lock test — queued; coordinate with Mark
+   - Item 5: BGDL long-lock test ✓ PASSED — and passed the harder
+     case where iOS jetsam-killed Hal during the lock window. All four
+     §7 verification markers fired: bg URLSession kept running in
+     nsurlsessiond while Hal's process was dead, downloaded ~1.9 GB
+     autonomously, then `migrate ✅ model.safetensors bg→fg with 14341
+     bytes of resume data` on unlock. The 1.5s settle delay from
+     commit `f78de2c` correctly suppressed the duplicate-enqueue race.
+   - Item 5 follow-up A: Progress-bar-on-recovery bug ✓ — Mark caught
+     that the Model Library UI showed no progress bar after a jetsam-
+     and-resume, even though BGDL was actively downloading. Root cause:
+     `resumeInFlightDownloadsIfAny` correctly says "don't re-trigger
+     startDownload" when BGDL has in-flight tasks, but it never seeded
+     `MLXModelDownloader.downloadStates[modelID]` either. Fixed by
+     seeding the @Published dict + spawning a polling task that
+     mirrors BGDL byte progress into it.
+   - Item 5 follow-up B: Model card UI consistency ✓ — Mark flagged
+     that LLM rows and embedding rows had different action-row styles
+     (plain icon+text vs .borderedProminent pills). Made embedding
+     match LLM (Option A). All Model Library rows now use the same
+     plain icon+text style with consistent spacing.
+   - Item 6: UI consistency sweep (queued, see NEXT.md) — broader
+     pass across Settings, Salon panel, system-prompt editor,
+     compression popover, document import, NUCLEAR_RESET dialog, etc.
 
 ---
 
