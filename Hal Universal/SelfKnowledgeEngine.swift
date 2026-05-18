@@ -465,6 +465,94 @@ import SQLite3 // Direct C API; matches Hal.swift import for the same reason.
             return results
         }
 
+        /// Phase 2 (v1 crystallization, 2026-05-18): return reflections that
+        /// are eligible for promotion to a trait. A reflection is eligible
+        /// when:
+        ///   - format = 'raw_reflection'
+        ///   - reinforcement_count ≥ `minReinforcement` (caller-supplied
+        ///     floor; typically the MIN of all per-category trait thresholds
+        ///     so we don't miss anything; the TraitCrystallizer then
+        ///     re-checks the category-specific threshold after the LLM
+        ///     classifies)
+        ///   - promoted_to_trait_id IS NULL (not already promoted)
+        ///   - deleted_at IS NULL (not soft-deleted)
+        ///
+        /// Returns tuples carrying everything the crystallizer needs to
+        /// fire its LLM call and store the resulting trait. Sorted by
+        /// reinforcement_count DESC so the strongest-reinforced candidates
+        /// are processed first (if we're batch-bounded, we still get the
+        /// most stable ones).
+        func getTraitCandidates(minReinforcement: Int) -> [(id: String, text: String, reinforcementCount: Int, modelId: String?)] {
+            guard ensureHealthyConnection() else { return [] }
+
+            let sql = """
+            SELECT id, value, reinforcement_count, model_id
+            FROM self_knowledge
+            WHERE format = 'raw_reflection'
+              AND reinforcement_count >= ?
+              AND promoted_to_trait_id IS NULL
+              AND deleted_at IS NULL
+            ORDER BY reinforcement_count DESC, last_reinforced DESC
+            """
+
+            var stmt: OpaquePointer?
+            var results: [(String, String, Int, String?)] = []
+            if sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK {
+                sqlite3_bind_int(stmt, 1, Int32(minReinforcement))
+                while sqlite3_step(stmt) == SQLITE_ROW {
+                    if let idPtr = sqlite3_column_text(stmt, 0),
+                       let valPtr = sqlite3_column_text(stmt, 1) {
+                        let id = String(cString: idPtr)
+                        let text = String(cString: valPtr)
+                        let count = Int(sqlite3_column_int(stmt, 2))
+                        let modelId: String? = if let p = sqlite3_column_text(stmt, 3) {
+                            String(cString: p)
+                        } else {
+                            nil
+                        }
+                        results.append((id, text, count, modelId))
+                    }
+                }
+            }
+            sqlite3_finalize(stmt)
+            return results
+        }
+
+        /// Phase 2 (v1 crystallization): record the trait that a reflection
+        /// crystallized into. After a successful trait INSERT, the caller
+        /// invokes this to set the source reflection's `promoted_to_trait_id`
+        /// column so future scans skip it (and reverse-lineage queries can
+        /// find all reflections that fed any given trait via
+        /// `WHERE promoted_to_trait_id = ?`).
+        ///
+        /// Idempotent — re-running with the same (reflectionID, traitID)
+        /// pair is a harmless no-op since UPDATE writes the same value.
+        /// Returns true on successful update (1 row affected); false on
+        /// missing reflection or DB error.
+        @discardableResult
+        func markReflectionPromoted(reflectionID: String, traitID: String) -> Bool {
+            guard ensureHealthyConnection() else { return false }
+
+            let sql = """
+            UPDATE self_knowledge
+            SET promoted_to_trait_id = ?, updated_at = ?
+            WHERE id = ? AND format = 'raw_reflection' AND deleted_at IS NULL
+            """
+
+            var stmt: OpaquePointer?
+            var success = false
+            if sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK {
+                sqlite3_bind_text(stmt, 1, (traitID as NSString).utf8String, -1, nil)
+                sqlite3_bind_int64(stmt, 2, Int64(Date().timeIntervalSince1970))
+                sqlite3_bind_text(stmt, 3, (reflectionID as NSString).utf8String, -1, nil)
+                if sqlite3_step(stmt) == SQLITE_DONE {
+                    success = sqlite3_changes(db) > 0
+                }
+            }
+            sqlite3_finalize(stmt)
+            return success
+        }
+
         /// Replace an existing reflection's text in place. Used after
         /// synthesis — the new "deeper" reflection takes over the old
         /// entry's row (id stays stable so any references survive),

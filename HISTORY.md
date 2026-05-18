@@ -1380,3 +1380,98 @@ Build clean for both phone and sim destinations. No new warnings.
 - Phase 1 done; Phase 2 (TraitCrystallizer.swift + reinforcement
   promotion) next
 
+---
+
+## 2026-05-18 (late morning — Phase 2 of v1 crystallization)
+
+### What landed
+
+Phase 2: the reflection-to-trait promotion engine.
+
+**New file: `Hal Universal/TraitCrystallizer.swift`** (~300 lines).
+Scope: per-category reinforcement thresholds, the candidate scanner,
+the trait-generator LLM call orchestration, JSON parsing of the LLM's
+output, the post-classification category-threshold check, and the
+INSERT-trait + stamp-reflection-with-lineage flow. `@MainActor`-isolated
+because it calls MemoryStore methods and LLMService directly; the
+underlying LLM work happens off the main thread inside
+`llmService.generateChatResponse`. Marked `nonisolated` on the
+threshold enum so SQL-side code can read it without an actor hop.
+
+**Two new helpers on MemoryStore** (in SelfKnowledgeEngine.swift):
+  - `getTraitCandidates(minReinforcement:)` — returns reflections
+    eligible for promotion: `format='raw_reflection'`,
+    `reinforcement_count ≥ minReinforcement`, `promoted_to_trait_id
+    IS NULL`, `deleted_at IS NULL`. Sorted by reinforcement count DESC
+    so the strongest-reinforced candidates process first within the
+    batch limit.
+  - `markReflectionPromoted(reflectionID:traitID:)` — stamps the
+    reflection's `promoted_to_trait_id` column with the new trait's
+    UUID. Idempotent.
+
+**Per-category thresholds (starting values, AppStorage-tunable later):**
+  - value=2, capability=2, evolution=2 (discrete/factual, solidify
+    quickly)
+  - preference=3, behavior_pattern=3, learned_trait=3 (behavioral,
+    need a confirmation window)
+  - meta_cognition=4, existential_observation=4 (most reflective,
+    most prone to one-off noise — longest window)
+
+**Trait-generator prompt:** lifted from Qwen's salon-3 template
+almost verbatim, with one deliberate reversal — Qwen forbade meta-
+commentary about Hal's architecture; we explicitly invite it. Traits
+about how Hal works on himself are exactly the kind of self-knowledge
+the system is built to surface.
+
+**Cadence + AFM gate.** The crystallizer is chained into the Type 1
+reflection Task (every 5 turns) — same Task so the freshly-bumped
+`reinforcement_count` is visible to the candidate query before it
+runs. Parallel Tasks would have raced. Lives inside the existing
+`isActiveAFMForSelfKnowledge` gate from yesterday's audit, so AFM
+sessions never trigger crystallization.
+
+**JSON parsing defenses:** strips markdown code fences, finds first-`{`
+through last-`}` substring to skip preamble, validates all three
+required fields are present + non-empty, normalizes category to
+lowercase and key to lowercase-with-underscores. Unknown categories
+(LLM invented something) are refused with a log line — the candidate
+gets re-evaluated on a future cycle.
+
+**Batch bound:** processSingleCandidate is called serially in a loop
+up to `batchLimit=5` per invocation. The next turn picks up
+remaining candidates. Bounds the worst-case impact of a backlog
+without losing any candidates.
+
+### Verification
+
+Build clean for both sim and phone destinations. Zero new warnings.
+The wiring matches the proven reflection-task pattern (same indented
+location in the chat path, same AFM gate, same Task spawning).
+Schema migration from Phase 1 verified earlier today via
+`DB_SCHEMA:self_knowledge` — both new columns present at positions
+21 and 22.
+
+**What's NOT yet verified** (deferred to organic use):
+  - End-to-end live test of the promotion path requires (a) Hal on
+    MLX, (b) sustained conversation generating real reflections,
+    (c) sufficient cosine-similarity merges to push a reflection's
+    reinforcement_count to threshold. That happens during normal
+    use, not synthetically.
+  - The Qwen template's behavior on Hal's actual MLX models (Gemma,
+    Llama, Qwen, Dolphin) for JSON adherence. We know Qwen wrote it,
+    and Gemma's salon answer used clean JSON-friendly output. Llama
+    was more conversational. We'll learn the real failure modes when
+    candidates start firing.
+
+Documented the live-test path in NEXT.md so the next session knows
+what to watch for.
+
+### State at end of entry
+
+- `main` about to commit Phase 2 as a single coherent unit
+- TraitCrystallizer.swift in place; sync_hal_source.sh updated
+- Hal.swift has the wiring; AFM gate preserved
+- Build clean both targets, no new warnings
+- Phase 3 (trait evolution + contradiction handling) is the next
+  build step
+

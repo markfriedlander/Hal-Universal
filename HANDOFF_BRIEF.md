@@ -88,7 +88,16 @@ Hal Universal/
 ├── SelfKnowledgeEngine.swift           — NEW (2026-05-17 late eve): MemoryStore
 │                                          self-knowledge CRUD, maintenance, reflection
 │                                          orchestration. Extracted from Hal.swift LEGO
-│                                          blocks 4.1/4.2/4.3 (~1,900 lines).
+│                                          blocks 4.1/4.2/4.3 (~1,900 lines). +
+│                                          Phase 2 helpers: getTraitCandidates,
+│                                          markReflectionPromoted.
+├── TraitCrystallizer.swift             — NEW (2026-05-18, Phase 2): reflection-to-trait
+│                                          promotion engine. Per-category reinforcement
+│                                          thresholds, candidate scanner, Qwen-derived
+│                                          trait-generator LLM prompt, JSON parse +
+│                                          INSERT-trait + stamp-lineage. Chained into
+│                                          Type 1 reflection Task in chat path under
+│                                          AFM gate.
 └── Hal.swift                           — everything else (~19.7k lines, shrinking)
 
 scripts/

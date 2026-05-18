@@ -13358,6 +13358,25 @@ class ChatViewModel: ObservableObject {
                                                                                             currentTurn: turn,
                                                                                             modelId: self.selectedModel.id
                                                                                         )
+
+                                                                                        // Phase 2 (v1 crystallization, 2026-05-18):
+                                                                                        // After the reflection write settles,
+                                                                                        // sweep for trait candidates. Chained in
+                                                                                        // the same Task so the freshly-bumped
+                                                                                        // reinforcement_count is visible to the
+                                                                                        // crystallizer's SQL query (parallel
+                                                                                        // Tasks would race against the reflection
+                                                                                        // write and miss it). AFM gate is at the
+                                                                                        // outer `if isActiveAFMForSelfKnowledge`,
+                                                                                        // so this only fires for MLX sessions —
+                                                                                        // consistent with the 2026-05-16
+                                                                                        // directive that AFM does not participate
+                                                                                        // in the self-knowledge write path.
+                                                                                        await TraitCrystallizer.processTraitCandidates(
+                                                                                            memoryStore: self.memoryStore,
+                                                                                            llmService: self.llmService,
+                                                                                            activeModelID: self.selectedModel.id
+                                                                                        )
                                                                                     }
                                                                                 }
                                                                             }

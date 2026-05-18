@@ -29,42 +29,44 @@ For how we got here: `HISTORY.md` (especially the 2026-05-17 evening entry).
 
 ## Open work — in order
 
-### Phase 2 (resume here) — TraitCrystallizer.swift + reinforcement-based promotion
+### Phase 2 (resume here) — Live-test the crystallizer + then start Phase 3
 
-Spec: `Docs/v1_Build_Spec_Self_Knowledge_2026-05-18.md`. Pre-decided:
+Phase 2 code complete and committed. The reflection-to-trait
+promotion engine is wired: `TraitCrystallizer.swift` + helpers
+in `SelfKnowledgeEngine.swift` + chat-path wiring under the AFM
+gate. Build clean, schema verified.
 
-  - Background task deferred via `Task { ... }` after render
-  - Trait-generator uses active model (AFM gate enforces MLX-only)
-  - Per-category reinforcement threshold (AppStorage-tunable)
-  - Reinforcement-only mechanism for v1 (no pattern clustering, no
-    periodic LLM mining)
+What's NOT yet verified end-to-end (deferred to organic use):
 
-Concrete work for Phase 2:
+  - The full promotion path requires Hal on MLX with sustained
+    conversation generating real reflections that accumulate to
+    reinforcement_count >= 2. That happens during normal use, not
+    synthetically.
+  - JSON adherence from each of the four MLX models when prompted
+    with the Qwen-derived template. We know Qwen wrote clean JSON.
+    Gemma's salon answer used JSON-friendly output. Llama was more
+    conversational — may need a follow-up prompt nudge.
 
-  1. Create `Hal Universal/TraitCrystallizer.swift`. Add to
-     `sync_hal_source.sh` FILES array.
-  2. Define per-category reinforcement thresholds (struct or
-     constants). Starting values per spec: value=2, preference=3,
-     behavior_pattern=3, capability=2, learned_trait=3, evolution=2,
-     meta_cognition=4, existential_observation=4.
-  3. Implement `processTraitCandidates(llmService:)` — the background
-     task that runs after a turn renders. Scans reflections where
-     `reinforcement_count >= category_threshold` AND
-     `promoted_to_trait_id IS NULL` (not yet promoted).
-  4. For each candidate: run the trait-generator LLM prompt (Qwen
-     template, see spec section "The trait-generator prompt (v1)"
-     — including the **reversal** of Qwen's "forbid meta-commentary"
-     constraint).
-  5. INSERT new trait. SET `promoted_to_trait_id` on source
-     reflection(s).
-  6. AFM gate at the call site in the chat path. Same pattern as
-     yesterday's audit: `if selectedModel.source == .appleFoundation
-     { halLog skip } else { Task { await ... } }`.
-  7. Test path: write enough similar reflections to trip the
-     threshold; verify trait gets created with correct lineage.
+**Live-test path:**
+  1. Switch Hal to an MLX model (Gemma is the workhorse).
+  2. Send conversation that produces 5+ user/assistant exchanges
+     about a recurring topic (so reflection synthesis trips and
+     reinforcement_count climbs).
+  3. Watch logs for `HALDEBUG-CRYSTALLIZER` lines:
+     - "No trait candidates this cycle" → nothing eligible yet
+     - "Evaluating reflection X..." → candidate found
+     - "Crystallized reflection X... → trait 'category/key'" →
+       success path
+     - "LLM proposed unknown category 'X'" → prompt may need nudge
+     - "Could not parse trait-generator response" → JSON format
+       failure (model-specific issue)
+  4. After a successful crystallization, query the trait via
+     `DB_SCHEMA:self_knowledge` + a SELECT for traits with
+     promoted_to_trait_id NOT NULL (reverse lineage).
 
-Should land as a single commit titled "Phase 2: TraitCrystallizer
-+ reinforcement-based promotion". Build clean, verified on device.
+Once live-tested at least once, move on to Phase 3.
+
+### Phase 3 — Trait evolution + contradiction handling
 
 ### Phase 3 — Trait evolution + contradiction handling
 
