@@ -381,17 +381,31 @@ enum TraitCrystallizer {
         }
     }
 
-    /// Phase 3b STUB (2026-05-18): a new reflection has been crystallized
-    /// and the LLM proposed (category, key) that ALREADY EXISTS as a
-    /// trait. Phase 3c will implement the real evolution mechanism here:
-    /// cosine-based three-way fork on the raw reflection vs existing
-    /// trait value, then deepen / absorb-tension / treat-as-fresh.
+    /// Phase 3c (2026-05-18): real evolution mechanism. A new reflection
+    /// has been crystallized and the LLM proposed (category, key) that
+    /// already exists as a trait. Dispatches a cosine-based three-way
+    /// fork to determine how the trait should change:
     ///
-    /// For this stub: log the collision (so we can see when it happens
-    /// in real conversation) and fall through to the legacy upsert
-    /// behavior. The reflection's promoted_to_trait_id still gets
-    /// stamped — even with the legacy path, the lineage is real (this
-    /// reflection contributed to the existing trait's reinforcement).
+    ///   1. Compute cosine similarity between the source reflection's
+    ///      raw text and the existing trait's primary value (extracted
+    ///      if multi-valued), using the active embedding backend.
+    ///   2. HIGH similarity (≥ recommendedContradictionThreshold for
+    ///      the backend): "deepen" — the new reflection reinforces in
+    ///      the same direction. Make a small LLM call that tightens
+    ///      the primary; UPDATE in place with reinforce=true.
+    ///   3. MID similarity (0 < cosine < threshold): "absorb tension" —
+    ///      the new reflection partially contradicts the trait. Either
+    ///      wrap the trait into MultiValuedTrait with the new
+    ///      observation as a tension (if previously single-valued), or
+    ///      classify the new reflection against existing primary +
+    ///      tensions and adjust weights accordingly.
+    ///   4. NEGATIVE or ZERO similarity: the LLM said (category, key)
+    ///      matches but the embedding vectors disagree strongly.
+    ///      Refuse to evolve — log the disagreement and skip. The
+    ///      reflection stays unpromoted and gets re-evaluated next
+    ///      cycle; if the LLM keeps proposing the same colliding
+    ///      classification, the persistent log is a signal that the
+    ///      prompt or threshold may need tuning.
     private static func evolveExistingTrait(
         existing: (id: String, value: String, confidence: Double, modelId: String?),
         newProposedValue: String,
@@ -400,42 +414,447 @@ enum TraitCrystallizer {
         memoryStore: MemoryStore,
         llmService: LLMService
     ) async {
-        let isMV = MultiValuedTrait.isMultiValuedJSON(existing.value)
-        let mvNote = isMV ? "multi-valued" : "single-valued"
-        halLog("HALDEBUG-CRYSTALLIZER: Collision detected — reflection \(sourceReflection.id.prefix(8))... would land on existing \(mvNote) trait id=\(existing.id.prefix(8))... Phase 3c will dispatch deepen/absorb-tension here; for now falling through to legacy upsert.")
-
-        // Legacy fall-through: same storeSelfKnowledge call the pre-3b
-        // code used. The (category, key) UNIQUE constraint means this
-        // will reinforce the existing trait (bump reinforcement_count,
-        // overwrite value with newProposedValue). Phase 3c replaces
-        // this with the real evolution logic.
-        //
-        // We still stamp the reflection's promoted_to_trait_id because
-        // even under the legacy upsert path, this reflection genuinely
-        // contributed to the existing trait's reinforcement — the
-        // lineage is real.
-        let lineageNote = "Reinforced existing trait via legacy upsert (Phase 3b stub). Source reflection \(sourceReflection.id.prefix(8))... at reinforcement_count=\(sourceReflection.reinforcementCount). Crystallized by: \(activeModelID)."
-
-        // Find the existing trait's (category, key) from the existing record's id.
-        // We need them for storeSelfKnowledge but don't have them in the tuple.
-        // Workaround: re-look-up via getSelfKnowledge requires (category, key),
-        // not id. The parsed values from the caller's scope are out of reach
-        // here. Cleanest: have evolveExistingTrait take the category+key
-        // from the caller. Refactor the signature.
-        //
-        // For this stub commit, we just log and stamp; the legacy upsert
-        // is deferred — actual evolution will land in 3c. The caller's
-        // parsed (category, key) are still authoritative; the stub
-        // intentionally doesn't write to the trait, so there's no
-        // collision behavior to preserve until 3c arrives.
-        _ = lineageNote  // silence unused-variable until 3c uses it
-
-        let stamped = memoryStore.markReflectionPromoted(reflectionID: sourceReflection.id, traitID: existing.id)
-        if stamped {
-            halLog("HALDEBUG-CRYSTALLIZER: 🔗 Stamped reflection \(sourceReflection.id.prefix(8))... → existing trait id=\(existing.id.prefix(8))... (stub; no value change yet, 3c will dispatch evolution)")
+        // Extract the existing trait's "primary" statement. For
+        // single-valued (plain string) values, the whole value IS the
+        // primary. For multi-valued (JSON), we pull just `primary` so
+        // cosine compares against the dominant state rather than the
+        // serialized JSON blob.
+        let existingPrimary: String
+        let existingMV: MultiValuedTrait?
+        if let parsed = MultiValuedTrait.fromJSONString(existing.value), MultiValuedTrait.isMultiValuedJSON(existing.value) {
+            existingPrimary = parsed.primary
+            existingMV = parsed
         } else {
-            halLog("HALDEBUG-CRYSTALLIZER: ⚠️ Could not stamp reflection \(sourceReflection.id.prefix(8))...'s promoted_to_trait_id even though existing trait was found. Investigate.")
+            existingPrimary = existing.value
+            existingMV = nil
         }
+
+        // Cosine vs the RAW reflection text (Design Q2, per Mark/SC).
+        let reflectionEmbed = memoryStore.generateEmbedding(for: sourceReflection.text, as: .document)
+        let primaryEmbed = memoryStore.generateEmbedding(for: existingPrimary, as: .document)
+        let cosine: Double
+        if reflectionEmbed.isEmpty || primaryEmbed.isEmpty || reflectionEmbed.count != primaryEmbed.count {
+            // Embedding failed — defensive: treat as zero similarity so
+            // we skip rather than misclassify. Log the failure.
+            cosine = 0.0
+            halLog("HALDEBUG-CRYSTALLIZER: ⚠️ Embedding generation failed for evolution cosine (reflection or primary). Treating as zero similarity → will skip evolution.")
+        } else {
+            cosine = memoryStore.cosineSimilarity(reflectionEmbed, primaryEmbed)
+        }
+
+        let threshold = EmbeddingBackend.current().recommendedContradictionThreshold
+        let cosineStr = String(format: "%.3f", cosine)
+        let thresholdStr = String(format: "%.2f", threshold)
+
+        // Fork on the cosine score.
+        if cosine >= threshold {
+            // HIGH — deepen path.
+            halLog("HALDEBUG-CRYSTALLIZER: 🔆 Deepen: reflection \(sourceReflection.id.prefix(8))... vs existing trait id=\(existing.id.prefix(8))... cosine=\(cosineStr) ≥ \(thresholdStr) → updating primary in place.")
+            await dispatchDeepen(
+                existingID: existing.id,
+                existingPrimary: existingPrimary,
+                existingMV: existingMV,
+                sourceReflection: sourceReflection,
+                newProposedValue: newProposedValue,
+                memoryStore: memoryStore,
+                llmService: llmService
+            )
+        } else if cosine > 0 {
+            // MID — absorb-tension path.
+            halLog("HALDEBUG-CRYSTALLIZER: 🌗 Absorb-tension: reflection \(sourceReflection.id.prefix(8))... vs existing trait id=\(existing.id.prefix(8))... cosine=\(cosineStr) below threshold \(thresholdStr) → routing to multi-valued absorb.")
+            await dispatchAbsorbTension(
+                existingID: existing.id,
+                existingPrimary: existingPrimary,
+                existingMV: existingMV,
+                sourceReflection: sourceReflection,
+                memoryStore: memoryStore,
+                llmService: llmService
+            )
+        } else {
+            // ZERO/NEGATIVE — refuse to evolve, log, skip without stamp.
+            halLog("HALDEBUG-CRYSTALLIZER: 🚫 Refuse-evolve: reflection \(sourceReflection.id.prefix(8))... vs existing trait id=\(existing.id.prefix(8))... cosine=\(cosineStr). LLM said (category, key) matched but embeddings disagree. Skipping; reflection stays unpromoted for re-evaluation next cycle.")
+        }
+    }
+
+    /// Phase 3c: deepen path. New reflection reinforces the existing
+    /// primary in the same direction. LLM produces a tightened primary
+    /// that absorbs the new nuance; we UPDATE in place with
+    /// reinforce=true. For multi-valued traits, we update only the
+    /// primary slot (tensions are preserved unchanged).
+    private static func dispatchDeepen(
+        existingID: String,
+        existingPrimary: String,
+        existingMV: MultiValuedTrait?,
+        sourceReflection: (id: String, text: String, reinforcementCount: Int, modelId: String?),
+        newProposedValue: String,
+        memoryStore: MemoryStore,
+        llmService: LLMService
+    ) async {
+        let messages = buildDeepenMessages(
+            existingPrimary: existingPrimary,
+            reflectionText: sourceReflection.text,
+            newProposedValue: newProposedValue
+        )
+        let response: String
+        do {
+            response = try await llmService.generateChatResponse(messages: messages, temperature: 0.3)
+        } catch {
+            halLog("HALDEBUG-CRYSTALLIZER: Deepen LLM call failed for trait id=\(existingID.prefix(8))...: \(error.localizedDescription). Skipping.")
+            return
+        }
+        let newPrimary = cleanTextResponse(response)
+        guard !newPrimary.isEmpty else {
+            halLog("HALDEBUG-CRYSTALLIZER: Deepen LLM returned empty value. Skipping.")
+            return
+        }
+
+        // Build the new value column content. For single-valued traits,
+        // it's just the new primary as a plain string. For multi-valued
+        // traits, we update the primary slot and re-serialize the
+        // whole structure (tensions stay as-is).
+        let newValueColumn: String
+        if var mv = existingMV {
+            mv.primary = newPrimary
+            newValueColumn = mv.toJSONString()
+        } else {
+            newValueColumn = newPrimary
+        }
+
+        let ok = memoryStore.updateTraitValueInPlace(traitID: existingID, newValue: newValueColumn, reinforce: true)
+        if ok {
+            halLog("HALDEBUG-CRYSTALLIZER: ✅ Deepened trait id=\(existingID.prefix(8))... New primary: '\(newPrimary.prefix(120))'")
+            memoryStore.markReflectionPromoted(reflectionID: sourceReflection.id, traitID: existingID)
+        } else {
+            halLog("HALDEBUG-CRYSTALLIZER: ⚠️ Deepen UPDATE affected 0 rows for trait id=\(existingID.prefix(8))... Trait may have been deleted mid-flight.")
+        }
+    }
+
+    /// Phase 3c: absorb-tension path. The new reflection partially
+    /// contradicts the trait. Two sub-cases:
+    ///
+    ///   - Existing is SINGLE-valued: wrap into a MultiValuedTrait
+    ///     with the existing primary preserved and the new observation
+    ///     added as a tension at weight 0.3. One LLM call to summarize
+    ///     the new observation into the tension's `text` field.
+    ///
+    ///   - Existing is MULTI-valued: ask the LLM to classify the new
+    ///     reflection against the existing primary + tensions, then
+    ///     apply deterministic weight rules in code (LLM does the
+    ///     qualitative judgment; code does the quantitative
+    ///     bookkeeping). Cases:
+    ///       * aligns_with == "primary": dispatch back to deepen path
+    ///         (treat as primary reinforcement after all)
+    ///       * aligns_with == "tension_N": increment that tension's
+    ///         weight by 0.2 (cap at 1.0). If new weight > 0.5, swap
+    ///         that tension with the primary.
+    ///       * aligns_with == "new_tension": append a new tension at
+    ///         weight 0.3.
+    private static func dispatchAbsorbTension(
+        existingID: String,
+        existingPrimary: String,
+        existingMV: MultiValuedTrait?,
+        sourceReflection: (id: String, text: String, reinforcementCount: Int, modelId: String?),
+        memoryStore: MemoryStore,
+        llmService: LLMService
+    ) async {
+        if let existingMV = existingMV {
+            await absorbTensionMultiToMulti(
+                existingID: existingID,
+                existingMV: existingMV,
+                sourceReflection: sourceReflection,
+                memoryStore: memoryStore,
+                llmService: llmService
+            )
+        } else {
+            await absorbTensionSingleToMulti(
+                existingID: existingID,
+                existingPrimary: existingPrimary,
+                sourceReflection: sourceReflection,
+                memoryStore: memoryStore,
+                llmService: llmService
+            )
+        }
+    }
+
+    /// First contradiction on a previously single-valued trait. One
+    /// LLM call to produce the tension's concise text; code wraps into
+    /// MultiValuedTrait and writes.
+    private static func absorbTensionSingleToMulti(
+        existingID: String,
+        existingPrimary: String,
+        sourceReflection: (id: String, text: String, reinforcementCount: Int, modelId: String?),
+        memoryStore: MemoryStore,
+        llmService: LLMService
+    ) async {
+        let messages = buildTensionTextMessages(
+            existingPrimary: existingPrimary,
+            reflectionText: sourceReflection.text
+        )
+        let response: String
+        do {
+            response = try await llmService.generateChatResponse(messages: messages, temperature: 0.3)
+        } catch {
+            halLog("HALDEBUG-CRYSTALLIZER: Absorb-tension (single→multi) LLM call failed for trait id=\(existingID.prefix(8))...: \(error.localizedDescription). Skipping.")
+            return
+        }
+        let tensionText = cleanTextResponse(response)
+        guard !tensionText.isEmpty else {
+            halLog("HALDEBUG-CRYSTALLIZER: Absorb-tension LLM returned empty tension text. Skipping.")
+            return
+        }
+
+        let now = Int(Date().timeIntervalSince1970)
+        let tension = TraitTension(
+            text: tensionText,
+            weight: 0.3,  // Initial weight per spec
+            sourceReflectionId: sourceReflection.id,
+            firstObserved: now
+        )
+        let newMV = MultiValuedTrait.wrapping(existingPrimary, withFirstTension: tension)
+        let newValueColumn = newMV.toJSONString()
+
+        let ok = memoryStore.updateTraitValueInPlace(traitID: existingID, newValue: newValueColumn, reinforce: true)
+        if ok {
+            halLog("HALDEBUG-CRYSTALLIZER: ✅ Wrapped trait id=\(existingID.prefix(8))... into multi-valued; new tension at weight 0.3: '\(tensionText.prefix(120))'")
+            memoryStore.markReflectionPromoted(reflectionID: sourceReflection.id, traitID: existingID)
+        } else {
+            halLog("HALDEBUG-CRYSTALLIZER: ⚠️ Absorb-tension UPDATE affected 0 rows for trait id=\(existingID.prefix(8))...")
+        }
+    }
+
+    /// Subsequent contradiction on an already-multi-valued trait. LLM
+    /// classifies the new reflection against existing primary +
+    /// tensions; code applies deterministic weight rules.
+    private static func absorbTensionMultiToMulti(
+        existingID: String,
+        existingMV: MultiValuedTrait,
+        sourceReflection: (id: String, text: String, reinforcementCount: Int, modelId: String?),
+        memoryStore: MemoryStore,
+        llmService: LLMService
+    ) async {
+        let messages = buildMultiToMultiClassifyMessages(
+            existingMV: existingMV,
+            reflectionText: sourceReflection.text
+        )
+        let response: String
+        do {
+            response = try await llmService.generateChatResponse(messages: messages, temperature: 0.3)
+        } catch {
+            halLog("HALDEBUG-CRYSTALLIZER: Multi→Multi classify LLM call failed for trait id=\(existingID.prefix(8))...: \(error.localizedDescription). Skipping.")
+            return
+        }
+
+        guard let classification = parseMultiToMultiClassification(response, tensionCount: existingMV.tensions.count) else {
+            halLog("HALDEBUG-CRYSTALLIZER: Could not parse Multi→Multi classification response. Raw (first 200 chars): \(response.prefix(200)). Skipping.")
+            return
+        }
+
+        // Apply the LLM's classification with deterministic weight rules.
+        var updated = existingMV
+        switch classification {
+        case .alignsWithPrimary:
+            // Reinforces primary — dispatch to deepen logic instead.
+            // The deepen path will UPDATE in place and stamp the
+            // reflection lineage.
+            halLog("HALDEBUG-CRYSTALLIZER: Multi→Multi classification aligns_with=primary → dispatching to deepen path.")
+            await dispatchDeepen(
+                existingID: existingID,
+                existingPrimary: existingMV.primary,
+                existingMV: existingMV,
+                sourceReflection: sourceReflection,
+                newProposedValue: existingMV.primary,  // unused in deepen — it gets its own LLM call
+                memoryStore: memoryStore,
+                llmService: llmService
+            )
+            return
+        case .alignsWithTension(let index):
+            guard index >= 0 && index < updated.tensions.count else {
+                halLog("HALDEBUG-CRYSTALLIZER: Multi→Multi classification gave tension index \(index) outside range [0, \(updated.tensions.count - 1)]. Skipping.")
+                return
+            }
+            // Increment tension weight by 0.2, cap at 1.0.
+            let oldWeight = updated.tensions[index].weight
+            let newWeight = min(1.0, oldWeight + 0.2)
+            updated.tensions[index].weight = newWeight
+
+            // If the reinforced tension now outweighs the primary
+            // (weight > 0.5), swap it with the primary.
+            if newWeight > 0.5 {
+                let promotedText = updated.tensions[index].text
+                let demotedPrimary = updated.primary
+                // Build a new TraitTension from the demoted primary.
+                // We don't have a "source reflection id" for it (it was
+                // the primary forever), so leave that as an empty
+                // string marker — the migration is its own event.
+                let demotedTension = TraitTension(
+                    text: demotedPrimary,
+                    weight: 1.0 - newWeight,  // mirror image of new primary's weight
+                    sourceReflectionId: "",
+                    firstObserved: Int(Date().timeIntervalSince1970)
+                )
+                updated.primary = promotedText
+                updated.tensions.remove(at: index)
+                updated.tensions.append(demotedTension)
+                let wStr = String(format: "%.2f", newWeight)
+                halLog("HALDEBUG-CRYSTALLIZER: 🔄 Tension swap on trait id=\(existingID.prefix(8))... Tension at index \(index) reached weight \(wStr) — promoted to primary. Previous primary demoted to tension.")
+            } else {
+                let oldStr = String(format: "%.2f", oldWeight)
+                let newStr = String(format: "%.2f", newWeight)
+                halLog("HALDEBUG-CRYSTALLIZER: Tension at index \(index) on trait id=\(existingID.prefix(8))... weight \(oldStr) → \(newStr).")
+            }
+        case .newTension(let text):
+            let now = Int(Date().timeIntervalSince1970)
+            let newTension = TraitTension(
+                text: text,
+                weight: 0.3,
+                sourceReflectionId: sourceReflection.id,
+                firstObserved: now
+            )
+            updated.tensions.append(newTension)
+            halLog("HALDEBUG-CRYSTALLIZER: ➕ Appended new tension to multi-valued trait id=\(existingID.prefix(8))... '\(text.prefix(120))' at weight 0.3.")
+        }
+
+        let newValueColumn = updated.toJSONString()
+        let ok = memoryStore.updateTraitValueInPlace(traitID: existingID, newValue: newValueColumn, reinforce: true)
+        if ok {
+            memoryStore.markReflectionPromoted(reflectionID: sourceReflection.id, traitID: existingID)
+            halLog("HALDEBUG-CRYSTALLIZER: ✅ Multi-valued trait id=\(existingID.prefix(8))... updated. Tensions now: \(updated.tensions.count).")
+        } else {
+            halLog("HALDEBUG-CRYSTALLIZER: ⚠️ Multi→Multi UPDATE affected 0 rows for trait id=\(existingID.prefix(8))...")
+        }
+    }
+
+    // MARK: - Evolution LLM prompt builders
+
+    private static func buildDeepenMessages(existingPrimary: String, reflectionText: String, newProposedValue: String) -> [HalChatMessage] {
+        let system = """
+        You are refining a trait Hal holds about himself or his interactions.
+
+        The trait currently reads:
+        "\(existingPrimary)"
+
+        A new reflection has arrived that reinforces this trait in the same direction. Your job is to tighten the trait's statement to absorb the new nuance, without losing its essence.
+
+        Output ONLY the updated trait statement as a single declarative sentence. Do not preface or explain. Keep the same voice, slightly more precise.
+        """
+        let user = """
+        New reflection that reinforces the trait:
+        "\(reflectionText)"
+
+        LLM's previously-proposed updated value (use as a hint, not a constraint):
+        "\(newProposedValue)"
+
+        Output the refined trait statement.
+        """
+        return [.system(system), .user(user)]
+    }
+
+    private static func buildTensionTextMessages(existingPrimary: String, reflectionText: String) -> [HalChatMessage] {
+        let system = """
+        You are identifying a tension in a trait Hal holds about himself.
+
+        The trait currently reads:
+        "\(existingPrimary)"
+
+        A new reflection has arrived that does NOT simply reinforce this trait — it introduces a contradicting or complicating observation. Your job is to state the tension concisely.
+
+        Output ONLY the concise statement of the tension as a single declarative sentence. Do not preface or explain. Same voice as the trait, just stating the counter-observation.
+        """
+        let user = """
+        New reflection that introduces the tension:
+        "\(reflectionText)"
+
+        Output the concise tension statement.
+        """
+        return [.system(system), .user(user)]
+    }
+
+    private static func buildMultiToMultiClassifyMessages(existingMV: MultiValuedTrait, reflectionText: String) -> [HalChatMessage] {
+        // Render the existing structure for the prompt.
+        var tensionLines: [String] = []
+        for (i, t) in existingMV.tensions.enumerated() {
+            let wStr = String(format: "%.2f", t.weight)
+            tensionLines.append("  Tension \(i): \"\(t.text)\" (weight \(wStr))")
+        }
+        let tensionsBlock = tensionLines.isEmpty ? "  (none)" : tensionLines.joined(separator: "\n")
+
+        let system = """
+        You are classifying a new reflection against an existing multi-valued trait Hal holds about himself.
+
+        The trait is:
+          Primary: "\(existingMV.primary)"
+          Tensions:
+        \(tensionsBlock)
+
+        A new reflection has arrived. Decide which side of the trait it aligns with:
+          - "primary" if it reinforces the primary statement
+          - "tension_N" (e.g. "tension_0") if it reinforces a specific tension
+          - "new_tension" if it introduces a fresh contradicting observation that doesn't match the primary or any existing tension
+
+        Output JSON in this exact shape:
+          {"aligns_with": "primary" | "tension_0" | "tension_1" | ... | "new_tension", "new_text": "<if new_tension, the concise statement; else empty>"}
+
+        Output ONLY the JSON. No preface, no markdown fences.
+        """
+        let user = """
+        New reflection:
+        "\(reflectionText)"
+        """
+        return [.system(system), .user(user)]
+    }
+
+    // MARK: - Evolution helpers
+
+    /// Strip markdown fences and trim whitespace from an LLM response
+    /// that's expected to be a single statement (not JSON). Mirrors the
+    /// JSON-side cleaner but doesn't try to extract a brace substring.
+    private static func cleanTextResponse(_ raw: String) -> String {
+        return raw
+            .replacingOccurrences(of: "```", with: "")
+            .trimmingCharacters(in: CharacterSet.whitespacesAndNewlines)
+    }
+
+    /// Classification outcomes from the Multi→Multi LLM call.
+    private enum MultiClassification {
+        case alignsWithPrimary
+        case alignsWithTension(index: Int)
+        case newTension(text: String)
+    }
+
+    /// Parse the LLM's JSON classification response. Returns nil on
+    /// any parse failure — caller logs and skips.
+    private static func parseMultiToMultiClassification(_ raw: String, tensionCount: Int) -> MultiClassification? {
+        var cleaned = raw
+            .replacingOccurrences(of: "```json", with: "")
+            .replacingOccurrences(of: "```", with: "")
+            .trimmingCharacters(in: CharacterSet.whitespacesAndNewlines)
+        if let openIdx = cleaned.firstIndex(of: "{"),
+           let closeIdx = cleaned.lastIndex(of: "}"),
+           openIdx < closeIdx {
+            cleaned = String(cleaned[openIdx...closeIdx])
+        }
+        guard let data = cleaned.data(using: String.Encoding.utf8),
+              let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let alignsWith = obj["aligns_with"] as? String
+        else {
+            return nil
+        }
+        let lowered = alignsWith.lowercased()
+        if lowered == "primary" {
+            return .alignsWithPrimary
+        }
+        if lowered == "new_tension" {
+            guard let text = obj["new_text"] as? String, !text.isEmpty else { return nil }
+            return .newTension(text: text)
+        }
+        if lowered.hasPrefix("tension_") {
+            let suffix = String(lowered.dropFirst("tension_".count))
+            guard let index = Int(suffix), index >= 0, index < tensionCount else {
+                return nil
+            }
+            return .alignsWithTension(index: index)
+        }
+        return nil
     }
 
     /// Build the chat messages array for the trait-generator LLM call.
