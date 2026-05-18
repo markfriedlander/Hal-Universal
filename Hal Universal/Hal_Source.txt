@@ -21711,6 +21711,36 @@ class HalTestConsole: ObservableObject {
         } else if trimmed == "GET_UI_STATE" {
             return buildUIStateJSON(vm: vm)
 
+        } else if trimmed.hasPrefix("SET_UI_STATE:") {
+            // SET_UI_STATE:<settings|threadPanel|none>:<true|false>
+            //
+            // Programmatic toggle of the chat-view sheet state so test
+            // and screenshot automation can navigate without relying on
+            // the iOS simulator's tap-into-toolbar path (which has been
+            // flaky on iOS 26.5 sim for our app). Production users
+            // continue to drive these via the toolbar buttons.
+            let body = String(trimmed.dropFirst("SET_UI_STATE:".count))
+            let parts = body.split(separator: ":", maxSplits: 1, omittingEmptySubsequences: false).map(String.init)
+            guard parts.count == 2 else {
+                return "{\"status\":\"error\",\"message\":\"Expected SET_UI_STATE:<settings|threadPanel|none>:<true|false>\"}"
+            }
+            let target = parts[0].lowercased()
+            let value = (parts[1].lowercased() == "true" || parts[1] == "1")
+            switch target {
+            case "settings":
+                vm.showingSettings = value
+                if value { vm.showingThreadPanel = false }
+            case "threadpanel":
+                vm.showingThreadPanel = value
+                if value { vm.showingSettings = false }
+            case "none":
+                vm.showingSettings = false
+                vm.showingThreadPanel = false
+            default:
+                return "{\"status\":\"error\",\"message\":\"Unknown target '\(target)' (use settings|threadPanel|none)\"}"
+            }
+            return "{\"status\":\"ok\",\"command\":\"SET_UI_STATE\",\"target\":\"\(target)\",\"value\":\(value)}"
+
         } else if trimmed == "GET_RENDERED_MESSAGES" {
             return buildRenderedMessagesJSON(vm: vm)
 
