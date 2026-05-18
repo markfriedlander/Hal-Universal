@@ -9,56 +9,132 @@ For how we got here: `HISTORY.md` (especially the 2026-05-17 evening entry).
 
 ## What the next session should do first
 
-1. **Read this file, then `HANDOFF_BRIEF.md`, then the 2026-05-17
-   post-compaction entry of `HISTORY.md`.** Item 4 (PromptDetailView),
-   Item 5 (BGDL long-lock test — passed §7), and two Item-5 follow-ups
-   (progress-bar-on-recovery bug + model card UI consistency) all
-   landed this session.
+1. **Read this file, then `HANDOFF_BRIEF.md`, then the 2026-05-18
+   morning entry of `HISTORY.md`** (covers Phase 1 of v1 crystallization,
+   the salon chronicle, and yesterday's late-evening deferred work),
+   then `Docs/v1_Build_Spec_Self_Knowledge_2026-05-18.md` for the
+   full spec.
 2. **Verify the live state:**
    ```bash
    python3 tests/hal_test.py state                       # responds
    python3 tests/hal_test.py cmd "SALON_GET_STATE"       # seat1 filled
    python3 tests/hal_test.py cmd "EMBEDDING_STATUS"      # backend loaded
+   curl ... DB_SCHEMA:self_knowledge                     # 22 columns including
+                                                         # promoted_to_trait_id +
+                                                         # shareability_decided_by_model
    ```
-3. **Pick up where this session paused: Item 6 (below).**
+3. **Pick up Phase 2 of the v1 crystallization build (below).**
 
 ---
 
 ## Open work — in order
 
-### Item 6 (resume here) — UI consistency sweep
+### Phase 2 (resume here) — TraitCrystallizer.swift + reinforcement-based promotion
 
-Mark caught a real one in the Model Library: LLM rows and embedding
-rows had different action-row styles (plain icon+text vs bordered-
-prominent pills) and different spacing. The Model Library was fixed
-this session by making the embedding side match the LLM plain style
-— see `EmbedderBackendRow.actionRow` in
-`Hal Universal/EmbedderMigrationCoordinator.swift`.
+Spec: `Docs/v1_Build_Spec_Self_Knowledge_2026-05-18.md`. Pre-decided:
 
-The broader work is a sweep of the rest of the app for similar
-mismatches. Concrete places to check:
+  - Background task deferred via `Task { ... }` after render
+  - Trait-generator uses active model (AFM gate enforces MLX-only)
+  - Per-category reinforcement threshold (AppStorage-tunable)
+  - Reinforcement-only mechanism for v1 (no pattern clustering, no
+    periodic LLM mining)
+
+Concrete work for Phase 2:
+
+  1. Create `Hal Universal/TraitCrystallizer.swift`. Add to
+     `sync_hal_source.sh` FILES array.
+  2. Define per-category reinforcement thresholds (struct or
+     constants). Starting values per spec: value=2, preference=3,
+     behavior_pattern=3, capability=2, learned_trait=3, evolution=2,
+     meta_cognition=4, existential_observation=4.
+  3. Implement `processTraitCandidates(llmService:)` — the background
+     task that runs after a turn renders. Scans reflections where
+     `reinforcement_count >= category_threshold` AND
+     `promoted_to_trait_id IS NULL` (not yet promoted).
+  4. For each candidate: run the trait-generator LLM prompt (Qwen
+     template, see spec section "The trait-generator prompt (v1)"
+     — including the **reversal** of Qwen's "forbid meta-commentary"
+     constraint).
+  5. INSERT new trait. SET `promoted_to_trait_id` on source
+     reflection(s).
+  6. AFM gate at the call site in the chat path. Same pattern as
+     yesterday's audit: `if selectedModel.source == .appleFoundation
+     { halLog skip } else { Task { await ... } }`.
+  7. Test path: write enough similar reflections to trip the
+     threshold; verify trait gets created with correct lineage.
+
+Should land as a single commit titled "Phase 2: TraitCrystallizer
++ reinforcement-based promotion". Build clean, verified on device.
+
+### Phase 3 — Trait evolution + contradiction handling
+
+Spec: same doc, section "Trait evolution mechanism". The
+mid-similarity / contradiction path is the architectural novelty.
+Multi-valued JSON storage in the existing `value` TEXT column with
+`primary` + `tensions[]`. `recommendedContradictionThreshold` on
+`EmbeddingBackend` (NLContextual start 0.6, Nomic needs-calibration).
+
+### Phase 4 — Reflection privacy + viewer UI
+
+Spec: same doc. Write-time shareability decision via LLM, stickiness
+enforcement via `shareability_decided_by_model`, "show private
+reflections" toggle in viewer, one-time popup with the explanatory
+copy from the spec.
+
+---
+
+## Other open items
+
+### Item 6 — UI consistency sweep (deferred from yesterday)
+
+Mark caught the Model Library mismatch (LLM rows vs embedding rows
+— now fixed). The broader work is a sweep of the rest of the app
+for similar mismatches. Concrete places to check:
 
   - **Settings sheet**: action buttons (Export Thread, Upload
     Document, etc.) vs. inline toggles vs. nav links — are they
     visually consistent?
   - **Salon panel**: seat picker buttons, model selection chrome.
     Different style from Model Library?
-  - **Reflections viewer** (if one exists in Settings → Power User):
-    list row treatment.
+  - **Reflections viewer** (Power User): list row treatment.
   - **System prompt editor** sheet: button placement, save/cancel
     affordance.
   - **Document import flow**: progress indicators, success/error
     states.
-  - **Compression-explanation popover** (the badge in the chat
-    bubble footer): visual weight relative to other in-chat
-    affordances.
+  - **Compression-explanation popover**: visual weight relative to
+    other in-chat affordances.
   - **NUCLEAR_RESET confirmation**: matches other destructive
     confirmations?
 
-Approach: take screenshots of each surface, list mismatches, propose
-unified targets (probably matching the plain-icon-+-text-+-color
-style the Model Library now uses), get Mark's sign-off per surface,
-implement surgically.
+Approach: screenshot each surface, list mismatches, propose unified
+targets (probably matching the plain-icon-+-text-+-color style the
+Model Library now uses), get Mark's sign-off per surface, implement
+surgically.
+
+### Item 9 — Serial download queue indicator (flagged 2026-05-17 night)
+
+When multiple downloads are tapped in succession, no UI indicator
+that the additional taps registered. Looks broken. Adjacent to but
+distinct from the Item-5-followup-a fix (single-download state
+recovery after jetsam). Approach: investigate how `MLXModelDownloader`
+queue is exposed to the UI; add a queue-position indicator or
+"queued" pill on rows where `isDownloading` is false but the model
+is awaiting its turn.
+
+### Item 10 — Self-knowledge corpus visibility discrepancy (flagged 2026-05-17 night)
+
+During the salon, the prompt budget log showed `selfKnowledge=44493`
+tokens of corpus injected, but Mark reports Hal's UI shows no
+self-knowledge entries. We've been nuking the DB during testing,
+which makes this curious. Possible causes:
+  (a) UI filter is `shareable=1` and the corpus is mostly non-shareable
+  (b) The corpus includes ingested `Hal_Source.txt` self-knowledge that
+      isn't surfaced in the user-facing viewer
+  (c) Two different categories are getting injected vs. viewed
+  (d) Something else
+
+Approach: query `DB_SCHEMA:self_knowledge` + a SELECT-with-counts
+query to see what's actually in the table by category and format.
 
 ---
 

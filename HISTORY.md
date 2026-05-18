@@ -1213,3 +1213,170 @@ surface, get Mark's sign-off, implement surgically.
 - Item 6 queued and described in NEXT.md
 - Items 1–5 + 5-A + 5-B complete; Item 6 next session
 
+---
+
+## 2026-05-17 (late evening — extraction + AFM gate + per-backend threshold, all deferred)
+
+Three big pieces of work landed on disk last night between commit
+`1849f72` (Item 5 follow-ups + Model Library consistency) and the
+morning's Phase 1. They were never committed independently because
+they were intermediate steps in a single longer line of work, and
+the natural commit point came after Phase 1. All three are recorded
+together in the next entry's commit.
+
+### Per-backend reflection-synthesis threshold
+
+`storeReflectionWithSynthesis` previously hardcoded 0.85, calibrated
+against NLContextual. Switched callers to Nomic would have used a
+miscalibrated threshold (Nomic's "related" band is ~0.7-0.9, not
+0.85-0.99). Added `recommendedSynthesisThreshold` to the
+`EmbeddingBackend` enum with NLContextual=0.85 (existing) and Nomic
++ EmbeddingGemma marked as needs-calibration-from-real-corpus.
+Plumbed through `storeReflectionWithSynthesis`'s default parameter
+so the value is looked up per-active-backend at call time, with
+explicit override available for calibration runs.
+
+### SelfKnowledgeEngine.swift — full extraction
+
+Pulled three LEGO blocks (4.1 Self-Knowledge CRUD, 4.2 Maintenance,
+4.3 Reflection Orchestration — ~1,844 lines total) out of Hal.swift
+and into a new dedicated file `Hal Universal/SelfKnowledgeEngine.swift`.
+All three blocks were already independent `extension MemoryStore`
+declarations, so the extraction was mechanical: cut + paste + header
+comment explaining scope. Two privacy widenings needed:
+`MemoryStore.ensureHealthyConnection` from `private` → internal, and
+`mlxInsightStructuringAugmentation` from `fileprivate` → internal.
+Both documented at the new declaration sites. Hal.swift dropped from
+21,572 → 19,728 lines.
+
+### AFM gate audit (Mark's directive)
+
+Audit found two real gaps. The previously-built gate at
+`buildSelfKnowledgeContext` correctly prevents self-knowledge
+injection into AFM prompts, but the **write side** had no equivalent
+gate. Specifically:
+
+  - `reflectOnExperience` (called every 5 turns for Type 1, every
+    15 for Type 2) fired on ANY active model. When AFM was active,
+    it generated reflections via AFM and wrote them to the database
+    — meaning Hal's persistent self-knowledge was being shaped by a
+    model that doesn't see self-knowledge in its prompt. Asymmetric
+    in a bad way.
+  - `consolidateAndDecay` (called every 100 turns / 24 hours) calls
+    `reviewShareability` which uses the LLM. Same problem.
+
+Fix: wrapped all three call sites in the chat path with the same
+`isActiveAFMForSelfKnowledge` check. Skips with a halLog line
+explaining; preserves all data accumulated by prior MLX sessions
+untouched; resumes operations when the user switches back to MLX.
+The `lastReflectionTurn` tracker only advances when a reflection
+actually fires (not when gated), so the next MLX session doesn't
+falsely think reflections already ran.
+
+### Evolutionary Salon (2026-05-17 evening)
+
+Ran the 4-seat Evolutionary Salon end-to-end. Raw output archived
+under `Docs/Evolutionary_Salon_2026-05-17/`. 5.5 minutes wall clock
+for all four seats sequentially (Gemma, Llama, Qwen, Dolphin) in
+independent mode, no host summarizer. Full chronicle and
+post-salon discussion happened in chat between Mark, Strategic
+Claude, and CC; the resulting v1 spec is at
+`Docs/v1_Build_Spec_Self_Knowledge_2026-05-18.md` (written next
+morning).
+
+Key salon decisions that influenced the spec:
+- Per-category reinforcement threshold (variable, not global)
+- Multi-valued / weighted-blend contradiction handling (no replacement, no branching)
+- Trait-generator extracts "internal shift" not summary (Qwen template)
+- Add Meta-Cognition as 7th category (Gemma proposal)
+- No readiness signaling mechanism in v1
+
+### State at end of entry
+
+- Working tree had ~2000 lines of uncommitted Hal.swift changes,
+  plus new SelfKnowledgeEngine.swift, plus per-backend threshold
+  on EmbeddingBackend, plus salon archive directory
+- Build clean throughout
+- Phone running latest build (deployed mid-session)
+- All work committed the next morning together with Phase 1
+
+---
+
+## 2026-05-18 (morning — Phase 1 of v1 crystallization)
+
+### Setting
+
+Mark and Strategic Claude had a long discussion overnight about
+whether to ship the automated salon trigger + button + report
+pipeline. Decision: NO — that part is App-Store-out-of-scope. The
+salon mechanism stays in code, runnable manually via API, and gets
+documented in the README. Building an automated trigger that
+produces a report of proposed code changes creates a promise we
+can't keep for users who can't implement the proposals.
+
+What stays in v1: reflection-to-trait crystallization (the part
+where Hal becomes more himself over time through reinforcement).
+The salon-as-introspection is a separate developer-only layer.
+
+### Build spec written
+
+`Docs/v1_Build_Spec_Self_Knowledge_2026-05-18.md`. Four phases laid
+out:
+  1. Schema + Meta-Cognition (small)
+  2. TraitCrystallizer.swift + reinforcement-based promotion (medium)
+  3. Trait evolution + contradiction handling (medium)
+  4. Privacy + viewer UI (small-medium)
+
+Four open architectural questions surfaced and resolved by Mark + SC:
+  1. Background promotion task → deferred via Task after render
+  2. Trait-generator model → active model (AFM gate already enforces MLX-only)
+  3. Contradiction-detection threshold → per-backend (NLContextual start 0.6)
+  4. Power-user exposure → reinforcement thresholds yes, cosine thresholds no
+
+### Phase 1 implementation
+
+Three small changes:
+
+1. **Schema migration.** Added two nullable columns to the
+   `self_knowledge` CREATE TABLE: `promoted_to_trait_id TEXT` and
+   `shareability_decided_by_model TEXT`. Both NULL on legacy rows.
+   Added matching `ALTER TABLE ADD COLUMN` statements in the existing
+   migration block at MemoryStore init — the duplicate-column-name
+   error code 1 is silently swallowed for re-runs.
+
+2. **Meta-Cognition handling.** Added a 7th case to the `category`
+   switch in `buildSelfKnowledgeContext` (Hal.swift) — "Ways of
+   Thinking" header, placed after Identity Milestones. Without this
+   case, traits written under `meta_cognition` would have fallen
+   through to default and never reached the prompt — silently inert
+   self-knowledge, which is the worst kind.
+
+3. **DB_SCHEMA API command (bonus).** While verifying the migration,
+   noticed the existing DB-init log messages use `print()` not
+   `halLog()`, so they're invisible to the API. Added a small
+   `DB_SCHEMA:<table>` diagnostic that returns the column list via
+   `PRAGMA table_info()` as JSON. Useful for verifying any future
+   schema migration; verified Phase 1's migration on the real device
+   immediately.
+
+### Verification
+
+`curl DB_SCHEMA:self_knowledge` on the phone returned 22 columns
+including the two new ones at positions 21 and 22. The migration
+ran successfully on the existing DB with no data loss (legacy rows
+have NULL for both new columns, which is the intended behavior).
+
+Build clean for both phone and sim destinations. No new warnings.
+
+### State at end of entry
+
+- `main` about to commit a single bundle covering yesterday's
+  deferred extraction + AFM gate audit + per-backend threshold
+  PLUS today's Phase 1 (schema migration + Meta-Cognition + DB_SCHEMA
+  diagnostic) PLUS the salon archive PLUS the v1 build spec
+- Splitting into two commits would have required surgical
+  separation of commingled Hal.swift edits across the two days;
+  cost vs. benefit didn't justify it
+- Phase 1 done; Phase 2 (TraitCrystallizer.swift + reinforcement
+  promotion) next
+

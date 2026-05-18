@@ -24,6 +24,7 @@ FILES=(
   "Hal Universal/EmbedderMigrationCoordinator.swift"
   "Hal Universal/QueryExpansion.swift"
   "Hal Universal/PromptDetailView.swift"
+  "Hal Universal/SelfKnowledgeEngine.swift"
   "Hal Universal/Hal.swift"
 )
 

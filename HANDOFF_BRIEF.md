@@ -1,14 +1,14 @@
 # Hal Universal — Handoff Brief
-**Updated:** May 17, 2026 (later evening — Items 1–5 done, two Item-5 follow-ups landed, Item 6 queued)
-**Branch:** `main` (about to commit Item 5 follow-ups + Item 6 doc)
-**Working tree:** progress-bar-on-recovery bug fix in Hal.swift + Model Library plain-style consistency in EmbedderMigrationCoordinator.swift + four doc updates, will be committed together
+**Updated:** May 18, 2026 (morning — Evolutionary Salon happened, v1 build spec written, Phase 1 of crystallization landed)
+**Branch:** `main` (about to commit combined Phase 1 + deferred extraction/AFM-audit/threshold work + salon archive + build spec)
+**Working tree:** SelfKnowledgeEngine.swift (new) + Hal.swift edits + EmbeddingBackend.swift + sync script + Hal_Source.txt resync + Docs/Evolutionary_Salon_2026-05-17/ (new) + Docs/v1_Build_Spec_Self_Knowledge_2026-05-18.md (new) + four doc updates, all committed together
 
-> **For the next CC session:** read this brief, then `NEXT.md` for what to
-> do next (Item 6 — UI consistency sweep — is the next concrete step), then
-> the 2026-05-17 later-evening entry of `HISTORY.md` for how the §7 BGDL
-> long-lock test passed (including the harder jetsam-kill-mid-lock case)
-> and the two follow-ups that came out of it, then `CLAUDE.md` for
-> standing rules.
+> **For the next CC session:** read this brief, then `NEXT.md` for Phase 2
+> of the v1 crystallization build (TraitCrystallizer.swift + reinforcement-
+> based promotion), then the 2026-05-18 morning entry of `HISTORY.md` for
+> Phase 1 details and the Evolutionary Salon chronicle, then
+> `Docs/v1_Build_Spec_Self_Knowledge_2026-05-18.md` for the full spec,
+> then `CLAUDE.md` for standing rules.
 
 ---
 
@@ -40,36 +40,38 @@ Three big things landed this session:
      under NL the LLM produces conceptual synonyms that don't lexically
      match plant text), but infrastructure is solid for richer corpora.
 
-3. **5-item UX sequence + two Item-5 follow-ups: all done. Item 6 queued.**
-   - Item 1: Salon cold-launch guard ✓
-   - Item 2: Scroll behavior rewrite ✓ (user msg at top, no auto-scroll)
-   - Item 3: Visual verifications ✓ (all surfaces clean on sim)
-   - Item 4: PromptDetailView color-coded + collapsible ✓
-     (wired into ChatBubbleView's assistant-side contextMenu, collapse
-     bug fixed via stable segment IDs, legacy unused view removed)
-   - Item 5: BGDL long-lock test ✓ PASSED — and passed the harder
-     case where iOS jetsam-killed Hal during the lock window. All four
-     §7 verification markers fired: bg URLSession kept running in
-     nsurlsessiond while Hal's process was dead, downloaded ~1.9 GB
-     autonomously, then `migrate ✅ model.safetensors bg→fg with 14341
-     bytes of resume data` on unlock. The 1.5s settle delay from
-     commit `f78de2c` correctly suppressed the duplicate-enqueue race.
-   - Item 5 follow-up A: Progress-bar-on-recovery bug ✓ — Mark caught
-     that the Model Library UI showed no progress bar after a jetsam-
-     and-resume, even though BGDL was actively downloading. Root cause:
-     `resumeInFlightDownloadsIfAny` correctly says "don't re-trigger
-     startDownload" when BGDL has in-flight tasks, but it never seeded
-     `MLXModelDownloader.downloadStates[modelID]` either. Fixed by
-     seeding the @Published dict + spawning a polling task that
-     mirrors BGDL byte progress into it.
-   - Item 5 follow-up B: Model card UI consistency ✓ — Mark flagged
-     that LLM rows and embedding rows had different action-row styles
-     (plain icon+text vs .borderedProminent pills). Made embedding
-     match LLM (Option A). All Model Library rows now use the same
-     plain icon+text style with consistent spacing.
-   - Item 6: UI consistency sweep (queued, see NEXT.md) — broader
-     pass across Settings, Salon panel, system-prompt editor,
-     compression popover, document import, NUCLEAR_RESET dialog, etc.
+3. **5-item UX sequence + two Item-5 follow-ups: all done.** History.
+   (Salon cold-launch guard, scroll rewrite, visual verifications,
+   PromptDetailView wired with collapse-bug fix, §7 BGDL long-lock
+   passed including jetsam-kill recovery, progress-bar-on-recovery
+   fix, Model Library plain-style consistency.) See HISTORY for
+   2026-05-17 entries.
+
+4. **Yesterday's late-evening deferred work:** SelfKnowledgeEngine.swift
+   extraction from Hal.swift (~1,844 lines, three LEGO blocks pulled
+   into one new file), per-backend `recommendedSynthesisThreshold` on
+   EmbeddingBackend, and AFM gate audit that found two real gaps
+   (reflectOnExperience and consolidateAndDecay both fired regardless
+   of active model — fixed). All committed today with Phase 1.
+
+5. **The Evolutionary Salon ran (2026-05-17 evening).** 4 seats
+   (Gemma, Llama, Qwen, Dolphin), independent mode, no host. 5.5 min
+   wall clock for all four. Raw output archived at
+   `Docs/Evolutionary_Salon_2026-05-17/`. Decisions carried into v1
+   spec: per-category threshold (no global N), multi-valued
+   contradiction handling, Qwen's trait-generator template
+   (minus the meta-commentary forbidding), add Meta-Cognition as 7th
+   category, no readiness mechanism.
+
+6. **v1 build spec written and Phase 1 landed.**
+   `Docs/v1_Build_Spec_Self_Knowledge_2026-05-18.md` is the spec.
+   Phase 1 (today) added two nullable columns to `self_knowledge`
+   (`promoted_to_trait_id`, `shareability_decided_by_model`) with
+   ALTER migration, added Meta-Cognition handling to
+   `buildSelfKnowledgeContext`, and added a `DB_SCHEMA:<table>` API
+   diagnostic. Migration verified on real device (22 columns now,
+   the two new ones at positions 21 and 22). Phase 2 next:
+   TraitCrystallizer.swift + reinforcement-based promotion.
 
 ---
 
@@ -78,11 +80,16 @@ Three big things landed this session:
 ```
 Hal Universal/
 ├── EmbeddingBackend.swift              — backend enum + crash guard + UI strings
+│                                          (+ recommendedSynthesisThreshold per-backend)
 ├── EmbeddingProvider.swift             — 3-backend dispatch + MemoryStore ext
 ├── EmbedderMigrationCoordinator.swift  — @MainActor state machine + UI rows
 ├── QueryExpansion.swift                — async expansion + SQLite cache
-├── PromptDetailView.swift              — NEW (2026-05-17 eve), color-coded segments
-└── Hal.swift                           — everything else (~22k lines, shrinking)
+├── PromptDetailView.swift              — color-coded segments, collapsible sections
+├── SelfKnowledgeEngine.swift           — NEW (2026-05-17 late eve): MemoryStore
+│                                          self-knowledge CRUD, maintenance, reflection
+│                                          orchestration. Extracted from Hal.swift LEGO
+│                                          blocks 4.1/4.2/4.3 (~1,900 lines).
+└── Hal.swift                           — everything else (~19.7k lines, shrinking)
 
 scripts/
 └── sync_hal_source.sh                  — concatenates all .swift into Hal_Source.txt
@@ -173,6 +180,7 @@ For sim runs: `HAL_API_CONFIG=.hal_api_config_sim.json python3 tests/hal_test.py
 | `SET_EMBEDDING_BACKEND:<name>` | Switch backend, wipe embeddings |
 | `MIGRATE_EMBEDDINGS_REEMBED` | Re-embed all NULL rows |
 | `FTS_DIAG` | FTS5 row counts + sample MATCH |
+| `DB_SCHEMA:<table>` | NEW (2026-05-18) PRAGMA-based schema inspection for any table |
 
 ---
 

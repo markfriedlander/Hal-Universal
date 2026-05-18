@@ -176,4 +176,48 @@ nonisolated enum EmbeddingBackend: String, Sendable, CaseIterable {
         case .nomicSwift: return "~522 MB"
         }
     }
+
+    // MARK: - Reflection synthesis threshold (per backend)
+    //
+    // The cosine-similarity threshold above which two reflections are
+    // considered "the same thought said differently" and synthesized into
+    // a single entry rather than stored separately. See
+    // `MemoryStore.storeReflectionWithSynthesis` for how this is consumed.
+    //
+    // CRITICAL: thresholds are NOT transferable between backends. Each
+    // embedding model has its own score distribution — NLContextual's
+    // unrelated text scores 0.05-0.10, Nomic's scores 0.3-0.5. A threshold
+    // calibrated for one will misbehave for another. Calibrate empirically
+    // for each backend by running known-related and known-unrelated text
+    // pairs and finding the gap.
+    //
+    // Marked nonisolated so the synthesis path (which is nonisolated) can
+    // read it without an actor hop.
+    nonisolated var recommendedSynthesisThreshold: Double {
+        switch self {
+        case .nlContextual:
+            // Calibrated empirically against Apple's NLContextual sentence
+            // vectors. Unrelated English text scores >0.6 from shared
+            // language structure alone, so 0.85 requires real conceptual
+            // overlap. Conservative bias toward false negatives (stores
+            // near-duplicates as separate entries rather than merging
+            // unrelated thoughts).
+            return 0.85
+        case .nomicSwift:
+            // PLACEHOLDER — needs calibration from real corpus data on
+            // Nomic. The 0.85 number is NOT calibrated for Nomic; it's a
+            // safe starting value that will likely produce too many false
+            // negatives (Nomic's "clearly related" band is typically
+            // 0.7-0.9, not 0.85-0.99). CC should calibrate from the
+            // first sustained Nomic corpus we get and update this number.
+            // Leaving the same as NLContextual until then to avoid
+            // accidental over-merging.
+            return 0.85
+        case .embeddingGemma:
+            // PLACEHOLDER — same situation as Nomic. EmbeddingGemma is
+            // currently compile-out behind HAL_ENABLE_EMBEDDING_GEMMA;
+            // when re-enabled, calibrate from real corpus data.
+            return 0.85
+        }
+    }
 }
