@@ -94,7 +94,12 @@ enum PromptDetailSegmentKind: Sendable {
     /// copy-and-paste transcript still color-codes via prefixed
     /// emoji + label. Matches the SF Symbol's spirit without needing
     /// rendered SwiftUI.
-    var exportTag: String {
+    ///
+    /// Marked `nonisolated` so the nonisolated `buildPromptDetailExportText`
+    /// can reference it without a @MainActor hop. The rest of the enum's
+    /// view-side extension members (displayName/icon/color) are read
+    /// only from SwiftUI bodies which are already main-actor-isolated.
+    nonisolated var exportTag: String {
         switch self {
         case .systemPrompt:        return "📜 SYSTEM PROMPT"
         case .temporal:            return "🕒 TEMPORAL CONTEXT"
@@ -150,23 +155,64 @@ struct PromptDetailSegment: Identifiable, Sendable {
 nonisolated func classifyPromptContextSection(_ section: String) -> PromptDetailSegmentKind {
     let trimmed = section.trimmingCharacters(in: .whitespacesAndNewlines)
     let lower = trimmed.lowercased()
+
+    // Explicit prefix markers (set deterministically by buildChatMessages
+    // — these are unambiguous matches).
     if lower.hasPrefix("summary of earlier conversation:") { return .summary }
     if lower.hasPrefix("relevant past context:") { return .ragRetrieval }
     if lower.hasPrefix("delivery context:") { return .watchDelivery }
-    // Self-awareness usually contains conversational stats — turn
-    // count, uptime, recency. Detect a few of those keywords.
-    if lower.contains("turn count") || lower.contains("conversation uptime") || lower.contains("messages so far") {
+
+    // Self-Awareness body is produced by buildSelfAwarenessContext and
+    // opens with the "You are Hal" framing followed by a structured
+    // "Your history and capabilities:" block. Match any of the
+    // distinctive markers we actually emit. Phase 4-era bodies include
+    // "Conversation threads:", "Current session duration:", "App uptime:"
+    // and (when reflection is due) "It has been N turns since your last
+    // self-reflection." Audit pass 2026-05-18.
+    if lower.hasPrefix("you are hal") ||
+       lower.contains("your history and capabilities:") ||
+       lower.contains("conversation threads:") ||
+       lower.contains("current session duration:") ||
+       lower.contains("app uptime:") ||
+       lower.contains("since your last self-reflection") ||
+       lower.contains("turn count") ||
+       lower.contains("conversation uptime") ||
+       lower.contains("messages so far") {
         return .selfAwareness
     }
-    // Self-knowledge usually carries structured-trait or reflection
-    // text. Use a couple of distinctive content markers.
-    if lower.contains("persistent trait") || lower.contains("reflection") || lower.contains("self-knowledge:") {
+
+    // Self-Knowledge body is produced by buildSelfKnowledgeContext and
+    // opens with "Persistent knowledge (survives conversation deletion):"
+    // followed by category headers like "Core Values:", "Proven
+    // Capabilities:", "User Preferences:", "Learned User Traits:",
+    // "Interaction Patterns:", "Identity Milestones:", "Ways of Thinking:".
+    // Match the opener and a sampling of the category headers so the
+    // segment classifies whether or not all categories are populated.
+    if lower.hasPrefix("persistent knowledge") ||
+       lower.contains("core values:") ||
+       lower.contains("proven capabilities:") ||
+       lower.contains("user preferences:") ||
+       lower.contains("learned user traits:") ||
+       lower.contains("interaction patterns:") ||
+       lower.contains("identity milestones:") ||
+       lower.contains("ways of thinking:") ||
+       lower.contains("persistent trait") ||
+       lower.contains("self-knowledge:") {
         return .selfKnowledge
     }
-    // Temporal context typically opens with a date statement.
-    if lower.hasPrefix("today is") || lower.contains("it is now") || lower.contains("current date") {
+
+    // Temporal context body opens with "Current date and time:" /
+    // "Day of week:" / "Time of day:" (buildTemporalContext) plus the
+    // optional timing signals ("Device:", "This thread:", "Resuming
+    // after Xh gap", etc.). Match the deterministic openers.
+    if lower.hasPrefix("today is") ||
+       lower.contains("it is now") ||
+       lower.contains("current date and time:") ||
+       lower.contains("day of week:") ||
+       lower.contains("time of day:") {
         return .temporal
     }
+
     return .other
 }
 

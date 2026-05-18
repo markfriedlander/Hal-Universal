@@ -245,19 +245,25 @@ struct TokenBreakdown: Equatable {
     let completionTokens: Int
     let contextWindow: Int  // Store actual context window size from model
     
-    var totalPromptTokens: Int {
+    // All four derived properties are marked `nonisolated` so the
+    // nonisolated `buildPromptDetailExportText` (PromptDetailView.swift)
+    // can compute the budget summary without a @MainActor hop. Each
+    // returns a value derived from `let` stored properties; thread-
+    // safety follows from the struct being a pure value type. Same
+    // pattern as `exportTag` on PromptDetailSegmentKind.
+    nonisolated var totalPromptTokens: Int {
         return systemTokens + summaryTokens + ragTokens + shortTermTokens + userInputTokens
     }
-    
-    var totalTokens: Int {
+
+    nonisolated var totalTokens: Int {
         return totalPromptTokens + completionTokens
     }
-    
-    var contextWindowSize: Int {
+
+    nonisolated var contextWindowSize: Int {
         return contextWindow
     }
-    
-    var percentageUsed: Double {
+
+    nonisolated var percentageUsed: Double {
         return (Double(totalTokens) / Double(contextWindowSize)) * 100.0
     }
 }
