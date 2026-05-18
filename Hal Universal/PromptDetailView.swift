@@ -1,0 +1,473 @@
+// PromptDetailView.swift
+// Hal Universal
+//
+// Created 2026-05-17 (per Mark's directive: "color-coded segments so
+// users can visually distinguish system prompt, self-knowledge, RAG
+// snippets, conversation history, and user message. Collapsible
+// sections for dense content. This is an educational surface and it
+// should feel like one.").
+//
+// The PromptDetailView shows the full prompt that produced a given
+// assistant turn, broken into structurally-meaningful, color-coded
+// sections that the user can expand and collapse independently.
+// Sections map to how Hal actually assembles his prompts in
+// buildChatMessages (system persona → temporal context → conversation
+// summary → self-awareness → self-knowledge → RAG snippets → watch
+// delivery → conversation history → current user input).
+//
+// Refactor-as-you-go: lives in its own file rather than nested inside
+// the iOSChatView struct (which is where the previous unused
+// PromptDetailView was defined).
+
+import SwiftUI
+
+// MARK: - Segment classification
+
+/// Logical sections of an assembled prompt. Each one gets its own
+/// color, icon, and short header label so the user can see at a
+/// glance what's in the prompt and how it's organized.
+enum PromptDetailSegmentKind: Sendable {
+    case systemPrompt          // Layer 1 + Layer 2 (persona/framing)
+    case temporal              // Date/time/device/uptime
+    case summary               // Compressed conversation summary
+    case selfAwareness         // Runtime stats (turn count, etc.)
+    case selfKnowledge         // Persistent traits / reflections
+    case ragRetrieval          // Long-term memory snippets
+    case watchDelivery         // Watch-specific brevity instruction
+    case conversationHistory   // Recent turn pairs
+    case userMessage           // The user input that triggered this turn
+    case other                 // Unclassified context
+
+    /// Display label for the section header.
+    var displayName: String {
+        switch self {
+        case .systemPrompt:        return "System Prompt"
+        case .temporal:            return "Temporal Context"
+        case .summary:             return "Conversation Summary"
+        case .selfAwareness:       return "Self-Awareness"
+        case .selfKnowledge:       return "Self-Knowledge"
+        case .ragRetrieval:        return "Memory Snippets (RAG)"
+        case .watchDelivery:       return "Watch Delivery Note"
+        case .conversationHistory: return "Conversation History"
+        case .userMessage:         return "User Message"
+        case .other:               return "Context"
+        }
+    }
+
+    /// SF Symbol icon for the row.
+    var icon: String {
+        switch self {
+        case .systemPrompt:        return "scroll"
+        case .temporal:            return "clock"
+        case .summary:             return "doc.append"
+        case .selfAwareness:       return "gauge"
+        case .selfKnowledge:       return "brain"
+        case .ragRetrieval:        return "magnifyingglass"
+        case .watchDelivery:       return "applewatch"
+        case .conversationHistory: return "bubble.left.and.bubble.right"
+        case .userMessage:         return "person.circle"
+        case .other:               return "ellipsis.circle"
+        }
+    }
+
+    /// Section color. Picked for distinguishability on both light and
+    /// dark mode; the rendered tint sits at moderate saturation so
+    /// section headers read clearly without overpowering the body
+    /// text. Order matches the assembly order in buildChatMessages
+    /// so the palette tells a story when scanned top-to-bottom.
+    var color: Color {
+        switch self {
+        case .systemPrompt:        return .purple
+        case .temporal:            return .orange
+        case .summary:             return .yellow
+        case .selfAwareness:       return .teal
+        case .selfKnowledge:       return .pink
+        case .ragRetrieval:        return .green
+        case .watchDelivery:       return .brown
+        case .conversationHistory: return .blue
+        case .userMessage:         return .gray
+        case .other:               return .secondary
+        }
+    }
+
+    /// Short text label used by the export (text-only) variant so a
+    /// copy-and-paste transcript still color-codes via prefixed
+    /// emoji + label. Matches the SF Symbol's spirit without needing
+    /// rendered SwiftUI.
+    var exportTag: String {
+        switch self {
+        case .systemPrompt:        return "📜 SYSTEM PROMPT"
+        case .temporal:            return "🕒 TEMPORAL CONTEXT"
+        case .summary:             return "📄 CONVERSATION SUMMARY"
+        case .selfAwareness:       return "📊 SELF-AWARENESS"
+        case .selfKnowledge:       return "🧠 SELF-KNOWLEDGE"
+        case .ragRetrieval:        return "🔍 MEMORY SNIPPETS (RAG)"
+        case .watchDelivery:       return "⌚ WATCH DELIVERY NOTE"
+        case .conversationHistory: return "💬 CONVERSATION HISTORY"
+        case .userMessage:         return "👤 USER MESSAGE"
+        case .other:               return "• CONTEXT"
+        }
+    }
+}
+
+/// One parsed segment of a prompt — its classification plus the
+/// verbatim body text. Conformance to Identifiable so SwiftUI can
+/// render a stable ForEach.
+struct PromptDetailSegment: Identifiable, Sendable {
+    let id = UUID()
+    let kind: PromptDetailSegmentKind
+    let content: String
+}
+
+// MARK: - Parser
+
+/// Classify a context-block section by its opening line. The
+/// patterns mirror the literal section starters used in
+/// buildChatMessages (e.g. "Summary of earlier conversation:",
+/// "Relevant past context:", "DELIVERY CONTEXT:"). Anything that
+/// doesn't match a known marker falls back to .other so the user
+/// still sees the content — better to display unclassified than to
+/// drop it.
+nonisolated func classifyPromptContextSection(_ section: String) -> PromptDetailSegmentKind {
+    let trimmed = section.trimmingCharacters(in: .whitespacesAndNewlines)
+    let lower = trimmed.lowercased()
+    if lower.hasPrefix("summary of earlier conversation:") { return .summary }
+    if lower.hasPrefix("relevant past context:") { return .ragRetrieval }
+    if lower.hasPrefix("delivery context:") { return .watchDelivery }
+    // Self-awareness usually contains conversational stats — turn
+    // count, uptime, recency. Detect a few of those keywords.
+    if lower.contains("turn count") || lower.contains("conversation uptime") || lower.contains("messages so far") {
+        return .selfAwareness
+    }
+    // Self-knowledge usually carries structured-trait or reflection
+    // text. Use a couple of distinctive content markers.
+    if lower.contains("persistent trait") || lower.contains("reflection") || lower.contains("self-knowledge:") {
+        return .selfKnowledge
+    }
+    // Temporal context typically opens with a date statement.
+    if lower.hasPrefix("today is") || lower.contains("it is now") || lower.contains("current date") {
+        return .temporal
+    }
+    return .other
+}
+
+/// Parse a `fullPromptUsed` string into a list of segments.
+///
+/// The system message that Hal sends to the LLM has the shape:
+///
+///     <persona>
+///
+///     CURRENT CONTEXT:
+///     <section1>
+///
+///     <section2>
+///     ...
+///
+/// We split on the literal "\n\nCURRENT CONTEXT:\n" boundary; the
+/// first half becomes the .systemPrompt segment. The remainder is
+/// split into context sections on "\n\n" and each section is
+/// classified by `classifyPromptContextSection`.
+///
+/// The caller can optionally append .conversationHistory and
+/// .userMessage segments before/after by inspecting the chat
+/// message context — those don't live inside `fullPromptUsed` (the
+/// LLM receives them as separate chat-message turns) but the user
+/// reads the prompt as a unified whole, so we render them as
+/// adjacent segments.
+nonisolated func parsePromptSegments(fullPrompt: String) -> [PromptDetailSegment] {
+    var segments: [PromptDetailSegment] = []
+
+    let parts = fullPrompt.components(separatedBy: "\n\nCURRENT CONTEXT:\n")
+    let personaText = parts.first?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+    if !personaText.isEmpty {
+        segments.append(PromptDetailSegment(kind: .systemPrompt, content: personaText))
+    }
+
+    if parts.count > 1 {
+        let contextBody = parts.dropFirst().joined(separator: "\n\nCURRENT CONTEXT:\n")
+        let sections = contextBody.components(separatedBy: "\n\n")
+        for section in sections {
+            let body = section.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !body.isEmpty else { continue }
+            let kind = classifyPromptContextSection(body)
+            segments.append(PromptDetailSegment(kind: kind, content: body))
+        }
+    }
+
+    return segments
+}
+
+// MARK: - View
+
+/// Color-coded, collapsible prompt detail view. Replaces the
+/// previous flat text-blob PromptDetailView (which was defined but
+/// never wired into the UI). Wired in by the chat bubble's "View
+/// Prompt Details" context menu entry.
+struct PromptDetailView: View {
+    let message: ChatMessage
+    let precedingUserContent: String?  // The user input that triggered this assistant turn
+    let recentHistory: [ChatMessage]   // A few prior turns for context, optional
+
+    @Environment(\.dismiss) var dismiss
+    @State private var expandedSegments: Set<UUID> = []
+
+    private var segments: [PromptDetailSegment] {
+        var result: [PromptDetailSegment] = []
+        if let prompt = message.fullPromptUsed, !prompt.isEmpty {
+            result.append(contentsOf: parsePromptSegments(fullPrompt: prompt))
+        }
+        // Append conversation-history and user-message segments so the
+        // viewer presents the WHOLE input to the LLM as one ordered
+        // narrative, even though the chat layer split it across
+        // multiple .system / .user / .assistant messages.
+        if !recentHistory.isEmpty {
+            let body = recentHistory.map { m in
+                let speaker = m.isFromUser ? "User" : "Hal"
+                return "[\(speaker)] \(m.content)"
+            }.joined(separator: "\n\n")
+            result.append(PromptDetailSegment(kind: .conversationHistory, content: body))
+        }
+        if let userMsg = precedingUserContent, !userMsg.isEmpty {
+            result.append(PromptDetailSegment(kind: .userMessage, content: userMsg))
+        }
+        return result
+    }
+
+    var body: some View {
+        NavigationView {
+            ScrollView {
+                VStack(alignment: .leading, spacing: 14) {
+                    // Top legend so the color language is self-explanatory.
+                    PromptDetailLegend()
+                        .padding(.horizontal, 16)
+                        .padding(.top, 8)
+
+                    ForEach(segments) { segment in
+                        PromptDetailSegmentCard(
+                            segment: segment,
+                            isExpanded: Binding(
+                                get: { expandedSegments.contains(segment.id) },
+                                set: { newValue in
+                                    if newValue {
+                                        expandedSegments.insert(segment.id)
+                                    } else {
+                                        expandedSegments.remove(segment.id)
+                                    }
+                                }
+                            )
+                        )
+                        .padding(.horizontal, 16)
+                    }
+
+                    // Token breakdown summary — shows actual numbers
+                    // tagged to the colors above so users can read
+                    // the budget in the same visual language as the
+                    // segments.
+                    if let breakdown = message.tokenBreakdown {
+                        TokenBudgetSummary(breakdown: breakdown)
+                            .padding(.horizontal, 16)
+                            .padding(.top, 6)
+                    }
+                }
+                .padding(.bottom, 24)
+            }
+            .navigationTitle("Prompt Details")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .navigationBarLeading) {
+                    Button("Copy as Text") {
+                        UIPasteboard.general.string = buildPromptDetailExportText(
+                            message: message,
+                            precedingUserContent: precedingUserContent,
+                            recentHistory: recentHistory
+                        )
+                    }
+                }
+                ToolbarItem(placement: .navigationBarTrailing) {
+                    Button("Done") { dismiss() }
+                }
+            }
+        }
+    }
+}
+
+// MARK: - Sub-views
+
+private struct PromptDetailLegend: View {
+    var body: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            Text("How this prompt is built")
+                .font(.caption)
+                .fontWeight(.semibold)
+                .foregroundColor(.secondary)
+            Text("Each colored section below is one piece of the prompt Hal sent to the model. Tap a section to expand it. The colors match the legend below the breakdown.")
+                .font(.caption2)
+                .foregroundColor(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+        }
+        .padding(10)
+        .background(Color.gray.opacity(0.08))
+        .cornerRadius(8)
+    }
+}
+
+private struct PromptDetailSegmentCard: View {
+    let segment: PromptDetailSegment
+    @Binding var isExpanded: Bool
+
+    var body: some View {
+        DisclosureGroup(isExpanded: $isExpanded) {
+            Text(segment.content)
+                .font(.system(.footnote, design: .monospaced))
+                .textSelection(.enabled)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .padding(10)
+                .background(segment.kind.color.opacity(0.08))
+                .cornerRadius(6)
+                .padding(.top, 6)
+        } label: {
+            HStack(spacing: 8) {
+                Image(systemName: segment.kind.icon)
+                    .foregroundColor(segment.kind.color)
+                    .imageScale(.medium)
+                Text(segment.kind.displayName)
+                    .font(.subheadline)
+                    .fontWeight(.semibold)
+                    .foregroundColor(segment.kind.color)
+                Spacer()
+                Text("\(segment.content.count) chars")
+                    .font(.caption2)
+                    .foregroundColor(.secondary)
+                    .monospacedDigit()
+            }
+        }
+        .padding(.vertical, 10)
+        .padding(.horizontal, 12)
+        .background(
+            RoundedRectangle(cornerRadius: 8)
+                .fill(segment.kind.color.opacity(0.06))
+        )
+        .overlay(
+            RoundedRectangle(cornerRadius: 8)
+                .stroke(segment.kind.color.opacity(0.3), lineWidth: 1)
+        )
+    }
+}
+
+private struct TokenBudgetSummary: View {
+    let breakdown: TokenBreakdown
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            HStack(spacing: 6) {
+                Image(systemName: "chart.bar.fill")
+                    .foregroundColor(.indigo)
+                Text("Token Budget")
+                    .font(.subheadline)
+                    .fontWeight(.semibold)
+            }
+            VStack(alignment: .leading, spacing: 4) {
+                tokenRow(label: "System Prompt", value: breakdown.systemTokens, color: .purple)
+                tokenRow(label: "Conversation Summary", value: breakdown.summaryTokens, color: .yellow)
+                tokenRow(label: "Memory Snippets (RAG)", value: breakdown.ragTokens, color: .green)
+                tokenRow(label: "Short-Term History", value: breakdown.shortTermTokens, color: .blue)
+                tokenRow(label: "User Input", value: breakdown.userInputTokens, color: .gray)
+            }
+            Divider().padding(.vertical, 2)
+            HStack {
+                Text("Prompt (in)").font(.footnote).fontWeight(.semibold)
+                Spacer()
+                Text(formatTokens(breakdown.totalPromptTokens)).font(.footnote).fontWeight(.semibold).monospacedDigit()
+            }
+            HStack {
+                Text("Completion (out)").font(.footnote).fontWeight(.semibold)
+                Spacer()
+                Text(formatTokens(breakdown.completionTokens)).font(.footnote).fontWeight(.semibold).monospacedDigit()
+            }
+            Divider().padding(.vertical, 2)
+            HStack {
+                Text("Total").font(.footnote).fontWeight(.bold)
+                Spacer()
+                Text("\(formatTokens(breakdown.totalTokens)) / \(formatTokens(breakdown.contextWindowSize))")
+                    .font(.footnote).fontWeight(.bold).monospacedDigit()
+            }
+            HStack {
+                Text("Window Usage").font(.footnote).foregroundColor(.secondary)
+                Spacer()
+                Text(String(format: "%.1f%%", breakdown.percentageUsed))
+                    .font(.footnote).foregroundColor(.secondary).monospacedDigit()
+            }
+        }
+        .padding(12)
+        .background(Color.indigo.opacity(0.05))
+        .cornerRadius(8)
+    }
+
+    private func tokenRow(label: String, value: Int, color: Color) -> some View {
+        HStack(spacing: 8) {
+            Circle().fill(color).frame(width: 8, height: 8)
+            Text(label).font(.caption)
+            Spacer()
+            Text(formatTokens(value)).font(.caption).monospacedDigit().foregroundColor(.secondary)
+        }
+    }
+
+    private func formatTokens(_ count: Int) -> String {
+        let f = NumberFormatter()
+        f.numberStyle = .decimal
+        f.groupingSeparator = " "
+        return f.string(from: NSNumber(value: count)) ?? "\(count)"
+    }
+}
+
+// MARK: - Text export
+
+/// Text-only export of a prompt, structured the same way as the
+/// in-app view — each segment gets a tagged header (📜 SYSTEM PROMPT,
+/// 🧠 SELF-KNOWLEDGE, etc.) followed by the verbatim body. The
+/// emoji + label combination color-codes the export visually even
+/// when pasted into plain-text destinations like email or notes.
+nonisolated func buildPromptDetailExportText(
+    message: ChatMessage,
+    precedingUserContent: String?,
+    recentHistory: [ChatMessage]
+) -> String {
+    var lines: [String] = []
+    lines.append("# Hal — Prompt Details")
+    lines.append("Turn \(message.turnNumber) — \(message.recordedByModel)")
+    lines.append("")
+
+    if let prompt = message.fullPromptUsed, !prompt.isEmpty {
+        for segment in parsePromptSegments(fullPrompt: prompt) {
+            lines.append("━━ \(segment.kind.exportTag) ━━")
+            lines.append(segment.content)
+            lines.append("")
+        }
+    }
+    if !recentHistory.isEmpty {
+        lines.append("━━ \(PromptDetailSegmentKind.conversationHistory.exportTag) ━━")
+        for m in recentHistory {
+            let speaker = m.isFromUser ? "User" : "Hal"
+            lines.append("[\(speaker)] \(m.content)")
+            lines.append("")
+        }
+    }
+    if let userMsg = precedingUserContent, !userMsg.isEmpty {
+        lines.append("━━ \(PromptDetailSegmentKind.userMessage.exportTag) ━━")
+        lines.append(userMsg)
+        lines.append("")
+    }
+    if let breakdown = message.tokenBreakdown {
+        lines.append("━━ 📊 TOKEN BUDGET ━━")
+        lines.append("System Prompt:      \(breakdown.systemTokens)")
+        lines.append("Conv. Summary:      \(breakdown.summaryTokens)")
+        lines.append("Memory (RAG):       \(breakdown.ragTokens)")
+        lines.append("Short-Term History: \(breakdown.shortTermTokens)")
+        lines.append("User Input:         \(breakdown.userInputTokens)")
+        lines.append("Prompt (in):        \(breakdown.totalPromptTokens)")
+        lines.append("Completion (out):   \(breakdown.completionTokens)")
+        lines.append("Total:              \(breakdown.totalTokens) / \(breakdown.contextWindowSize)")
+        lines.append(String(format: "Window Usage:       %.1f%%", breakdown.percentageUsed))
+    }
+    return lines.joined(separator: "\n")
+}

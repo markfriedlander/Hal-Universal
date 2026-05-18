@@ -12077,11 +12077,16 @@ struct MarkdownView: View {
     
     
 // ==== LEGO START: 14 PromptDetailView (Full Prompt & Context Viewer) ====
-    // MARK: - PromptDetailView (NEW: Displays full prompt and context)
-    struct PromptDetailView: View {
+    // PromptDetailView was extracted to Hal Universal/PromptDetailView.swift
+    // on 2026-05-17 as part of the color-coded-segments + collapsible-
+    // sections rebuild (Mark's directive). The old single-blob view that
+    // lived here is preserved temporarily below in case something
+    // references it during the transition — TODO remove once we've
+    // confirmed no internal callers depend on it.
+    private struct _LegacyPromptDetailView_Unused: View {
         let message: ChatMessage // The Hal message for which we want to see details
         @Environment(\.dismiss) var dismiss
-        
+
         var body: some View {
             NavigationView {
                 ScrollView {

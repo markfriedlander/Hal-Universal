@@ -23,6 +23,7 @@ FILES=(
   "Hal Universal/EmbeddingProvider.swift"
   "Hal Universal/EmbedderMigrationCoordinator.swift"
   "Hal Universal/QueryExpansion.swift"
+  "Hal Universal/PromptDetailView.swift"
   "Hal Universal/Hal.swift"
 )
 
