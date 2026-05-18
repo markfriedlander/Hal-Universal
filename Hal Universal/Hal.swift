@@ -12896,7 +12896,29 @@ class ChatViewModel: ObservableObject {
 
                                             for entry in allKnowledge {
                                                 let confidenceStr = String(format: "%.0f%%", entry.confidence * 100)
-                                                let entryText = "  - \(entry.key): \(entry.value) (confidence: \(confidenceStr))"
+
+                                                // Phase 3d (2026-05-18): a trait's value column may now
+                                                // hold either a plain string (single-valued, the
+                                                // original format) OR a serialized MultiValuedTrait
+                                                // JSON object (with primary + tensions[]). Detect at
+                                                // read time and inject only the primary statement —
+                                                // tensions live in the DB for lineage and viewer
+                                                // transparency, not in the system prompt. A
+                                                // transparency annotation `(±N tensions held)` after
+                                                // the primary lets the prompt acknowledge nuance
+                                                // exists even though the model doesn't see the
+                                                // individual tensions.
+                                                let displayValue: String
+                                                let tensionAnnotation: String
+                                                if MultiValuedTrait.isMultiValuedJSON(entry.value),
+                                                   let mv = MultiValuedTrait.fromJSONString(entry.value) {
+                                                    displayValue = mv.primary
+                                                    tensionAnnotation = mv.tensions.isEmpty ? "" : " (±\(mv.tensions.count) tensions held)"
+                                                } else {
+                                                    displayValue = entry.value
+                                                    tensionAnnotation = ""
+                                                }
+                                                let entryText = "  - \(entry.key): \(displayValue) (confidence: \(confidenceStr))\(tensionAnnotation)"
 
                                                 switch entry.category {
                                                 case "value":
