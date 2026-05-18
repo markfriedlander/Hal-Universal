@@ -1,11 +1,12 @@
 # Hal Universal — Handoff Brief
-**Updated:** May 17, 2026 (evening, mid-Item-4)
-**Branch:** `main` @ `61f8240` (about to commit docs)
-**Working tree:** docs uncommitted at this write; will be committed before context ends
+**Updated:** May 17, 2026 (post-compaction continuation, Item 4 done)
+**Branch:** `main` (about to commit Item 4 final + docs)
+**Working tree:** Item 4 wiring + collapse-bug fix + legacy cleanup, plus doc updates, will be committed together
 
 > **For the next CC session:** read this brief, then `NEXT.md` for what to
-> do next, then the 2026-05-17 evening entry of `HISTORY.md` for how the
-> 5-item sequence unfolded, then `CLAUDE.md` for standing rules.
+> do next (Item 5 — BGDL long-lock test — is the next concrete step), then
+> the 2026-05-17 post-compaction entry of `HISTORY.md` for how Item 4
+> landed, then `CLAUDE.md` for standing rules.
 
 ---
 
@@ -37,14 +38,14 @@ Three big things landed this session:
      under NL the LLM produces conceptual synonyms that don't lexically
      match plant text), but infrastructure is solid for richer corpora.
 
-3. **5-item UX sequence (this evening): items 1–3 done, item 4 partial,
-   item 5 not started.**
+3. **5-item UX sequence: items 1–4 done, item 5 queued.**
    - Item 1: Salon cold-launch guard ✓
    - Item 2: Scroll behavior rewrite ✓ (user msg at top, no auto-scroll)
    - Item 3: Visual verifications ✓ (all surfaces clean on sim)
-   - Item 4: PromptDetailView color-coded + collapsible — **built but
-     not wired into the UI yet**; the next session resumes here
-   - Item 5: BGDL long-lock test — not started; coordinate with Mark
+   - Item 4: PromptDetailView color-coded + collapsible ✓
+     (wired into ChatBubbleView's assistant-side contextMenu, collapse
+     bug fixed via stable segment IDs, legacy unused view removed)
+   - Item 5: BGDL long-lock test — queued; coordinate with Mark
 
 ---
 
@@ -162,6 +163,8 @@ For sim runs: `HAL_API_CONFIG=.hal_api_config_sim.json python3 tests/hal_test.py
   today): a fresh install with an immediate inject sees BM25 return 0
   candidates until a NUCLEAR_RESET + re-inject. The eval workflow does
   the reset.
-- **Item 4 not wired** — `PromptDetailView` is built and clean but no
-  UI presents it yet. See NEXT.md "Item 4 (resume here)" for the exact
-  wiring steps.
+- **Pre-existing nonisolated/MainActor warnings in PromptDetailView.swift**
+  (export-tag + token-budget helpers, ~7 warnings). They've been there
+  since commit `61f8240` and are unrelated to this session's changes.
+  Worth a follow-up commit to clean up per Golden Rule #7, but not a
+  blocker.

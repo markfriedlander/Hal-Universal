@@ -114,9 +114,28 @@ enum PromptDetailSegmentKind: Sendable {
 /// verbatim body text. Conformance to Identifiable so SwiftUI can
 /// render a stable ForEach.
 struct PromptDetailSegment: Identifiable, Sendable {
-    let id = UUID()
+    // Stable, deterministic ID derived from position + content so
+    // ForEach identity survives `body` recomputes. The previous
+    // `let id = UUID()` minted a fresh UUID each time the parent's
+    // computed `segments` ran, which made ForEach re-create every
+    // card and reset their local @State (e.g. DisclosureGroup
+    // expansion). Including content in the hash means the rare case
+    // where two segments of the same kind have the same body still
+    // collide gracefully; we tack on the index to disambiguate.
+    let id: String
     let kind: PromptDetailSegmentKind
     let content: String
+
+    // Marked nonisolated so parsePromptSegments (also nonisolated)
+    // can call this without a @MainActor hop. The interpolation
+    // `\(kind)` would otherwise pull in PromptDetailSegmentKind's
+    // @MainActor-isolated extension surface (displayName/icon/etc.);
+    // using kind.rawHashValue keeps the id derivation pure.
+    nonisolated init(kind: PromptDetailSegmentKind, content: String, index: Int = 0) {
+        self.kind = kind
+        self.content = content
+        self.id = "seg-\(index)-\(content.hashValue)"
+    }
 }
 
 // MARK: - Parser
@@ -186,11 +205,14 @@ nonisolated func parsePromptSegments(fullPrompt: String) -> [PromptDetailSegment
     if parts.count > 1 {
         let contextBody = parts.dropFirst().joined(separator: "\n\nCURRENT CONTEXT:\n")
         let sections = contextBody.components(separatedBy: "\n\n")
-        for section in sections {
+        // Use enumerated() so each segment gets a deterministic index;
+        // PromptDetailSegment combines (kind, index, content.hashValue)
+        // into a stable id that survives parent-body recomputes.
+        for (offset, section) in sections.enumerated() {
             let body = section.trimmingCharacters(in: .whitespacesAndNewlines)
             guard !body.isEmpty else { continue }
             let kind = classifyPromptContextSection(body)
-            segments.append(PromptDetailSegment(kind: kind, content: body))
+            segments.append(PromptDetailSegment(kind: kind, content: body, index: offset))
         }
     }
 
@@ -209,7 +231,12 @@ struct PromptDetailView: View {
     let recentHistory: [ChatMessage]   // A few prior turns for context, optional
 
     @Environment(\.dismiss) var dismiss
-    @State private var expandedSegments: Set<UUID> = []
+    // NOTE (2026-05-17, post-Item-4-wire): previously kept a Set<UUID>
+    // of expanded segment IDs here, but `segments` below is computed
+    // and PromptDetailSegment.id = UUID() regenerates on every body
+    // pass. The Set stored stale IDs, so cards collapsed on the next
+    // redraw. Now each card owns its own @State; this view doesn't
+    // need to track expansion at all.
 
     private var segments: [PromptDetailSegment] {
         var result: [PromptDetailSegment] = []
@@ -243,20 +270,8 @@ struct PromptDetailView: View {
                         .padding(.top, 8)
 
                     ForEach(segments) { segment in
-                        PromptDetailSegmentCard(
-                            segment: segment,
-                            isExpanded: Binding(
-                                get: { expandedSegments.contains(segment.id) },
-                                set: { newValue in
-                                    if newValue {
-                                        expandedSegments.insert(segment.id)
-                                    } else {
-                                        expandedSegments.remove(segment.id)
-                                    }
-                                }
-                            )
-                        )
-                        .padding(.horizontal, 16)
+                        PromptDetailSegmentCard(segment: segment)
+                            .padding(.horizontal, 16)
                     }
 
                     // Token breakdown summary — shows actual numbers
@@ -313,7 +328,14 @@ private struct PromptDetailLegend: View {
 
 private struct PromptDetailSegmentCard: View {
     let segment: PromptDetailSegment
-    @Binding var isExpanded: Bool
+    // Each card owns its own expansion state. We can't use a parent-
+    // tracked Set<UUID> because PromptDetailSegment IDs are freshly
+    // minted UUIDs on each body recompute (the parent's `segments`
+    // is a computed property). Local @State survives card-level
+    // redraws as long as the card's identity in the ForEach is stable
+    // — which it is, because the ForEach keys by segment.id and the
+    // segment list order/contents don't change for a given message.
+    @State private var isExpanded: Bool = false
 
     var body: some View {
         DisclosureGroup(isExpanded: $isExpanded) {

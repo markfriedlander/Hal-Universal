@@ -11410,6 +11410,40 @@ struct WidgetTestView: View {
         @EnvironmentObject var chatViewModel: ChatViewModel
         @State private var showingDetails: Bool = false
         @State private var showingCompressionExplanation: Bool = false
+        // Item 4 (2026-05-17): "View Prompt Details" sheet state. Presents
+        // the color-coded, collapsible PromptDetailView (lives in its own
+        // file as of 2026-05-17). Only ever set true on the assistant-side
+        // branch of the bubble's contextMenu — user bubbles don't surface it.
+        @State private var showingPromptDetail: Bool = false
+
+        // MARK: - Prompt-detail context resolution
+        //
+        // These two properties give the new PromptDetailView the surrounding
+        // chat context it needs without coupling the view to ChatViewModel.
+        //
+        // `precedingUserContent`: the user message that paired with this
+        // assistant message (same turn number, immediately prior in the
+        // messages array). Walking backwards is robust to interleaved status
+        // messages or salon participants that don't share the turn.
+        //
+        // `recentHistory`: up to ~4 turn pairs before this message, so the
+        // detail view can show "what the model saw as conversation history."
+        // Capped to keep the sheet's history section scrollable rather than
+        // unboundedly long for deep conversations.
+        private var precedingUserContent: String? {
+            guard let idx = chatViewModel.messages.firstIndex(where: { $0.id == message.id }) else { return nil }
+            for i in stride(from: idx - 1, through: 0, by: -1) {
+                let m = chatViewModel.messages[i]
+                if m.isFromUser && m.turnNumber == message.turnNumber { return m.content }
+            }
+            return nil
+        }
+
+        private var recentHistory: [ChatMessage] {
+            guard let idx = chatViewModel.messages.firstIndex(where: { $0.id == message.id }) else { return [] }
+            let start = max(0, idx - 8)  // ~4 turn pairs (user + assistant each)
+            return Array(chatViewModel.messages[start..<idx])
+        }
 
         // Provide screen width directly.
         //
@@ -11745,6 +11779,23 @@ struct WidgetTestView: View {
                             } label: {
                                 Label("View Details", systemImage: "info.circle")
                             }
+                            // Item 4 (2026-05-17): the new color-coded,
+                            // collapsible prompt detail view. Lives in its
+                            // own Swift file (PromptDetailView.swift). The
+                            // legacy single-blob viewer that used to live in
+                            // LEGO 14 of Hal.swift has been removed.
+                            Button {
+                                showingPromptDetail = true
+                            } label: {
+                                Label("View Prompt Details", systemImage: "doc.text.magnifyingglass")
+                            }
+                        }
+                        .sheet(isPresented: $showingPromptDetail) {
+                            PromptDetailView(
+                                message: message,
+                                precedingUserContent: precedingUserContent,
+                                recentHistory: recentHistory
+                            )
                         }
                         footerView
                     }
@@ -12076,202 +12127,14 @@ struct MarkdownView: View {
     
     
     
-// ==== LEGO START: 14 PromptDetailView (Full Prompt & Context Viewer) ====
+// ==== LEGO START: 14 PromptDetailView (extracted file) ====
     // PromptDetailView was extracted to Hal Universal/PromptDetailView.swift
     // on 2026-05-17 as part of the color-coded-segments + collapsible-
-    // sections rebuild (Mark's directive). The old single-blob view that
-    // lived here is preserved temporarily below in case something
-    // references it during the transition — TODO remove once we've
-    // confirmed no internal callers depend on it.
-    private struct _LegacyPromptDetailView_Unused: View {
-        let message: ChatMessage // The Hal message for which we want to see details
-        @Environment(\.dismiss) var dismiss
-
-        var body: some View {
-            NavigationView {
-                ScrollView {
-                    VStack(alignment: .leading, spacing: 20) {
-                        if let prompt = message.fullPromptUsed {
-                            Text("Full Prompt Used:")
-                                .font(.headline)
-                            Text(prompt)
-                                .font(.footnote)
-                                .textSelection(.enabled)
-                                .padding()
-                                .background(Color.gray.opacity(0.1))
-                                .cornerRadius(8)
-                        } else {
-                            Text("No full prompt available for this response.")
-                                .font(.subheadline)
-                                .foregroundColor(.secondary)
-                        }
-                        
-                        if let snippets = message.usedContextSnippets, !snippets.isEmpty {
-                            Text("Context Snippets Used:")
-                                .font(.headline)
-                            
-                            ForEach(snippets) { snippet in
-                                VStack(alignment: .leading, spacing: 5) {
-                                    Text("Source: \(snippet.source.capitalized)")
-                                        .font(.caption)
-                                        .foregroundColor(.blue)
-                                    Text(snippet.content)
-                                        .font(.footnote)
-                                        .textSelection(.enabled)
-                                        .padding(8)
-                                        .background(Color.green.opacity(0.1))
-                                        .cornerRadius(6)
-                                    if let urlString = snippet.filePath {
-                                        let url = URL(fileURLWithPath: urlString)
-                                        Button("Open Source Document") {
-                                            UIApplication.shared.open(url) { success in
-                                                if !success {
-                                                    print("HALDEBUG-DEEPLINK: Failed to open document at path: \(urlString)")
-                                                }
-                                            }
-                                        }
-                                        .font(.caption)
-                                        .padding(.horizontal, 8)
-                                        .padding(.vertical, 4)
-                                        .background(Capsule().fill(Color.blue.opacity(0.2)))
-                                        .foregroundColor(.blue)
-                                    }
-                                }
-                                .padding(.bottom, 5)
-                            }
-                        } else {
-                            Text("No specific context snippets were used for this response.")
-                                .font(.subheadline)
-                                .foregroundColor(.secondary)
-                        }
-                        
-                        // Token Usage Breakdown
-                        if let breakdown = message.tokenBreakdown {
-                            Divider()
-                                .padding(.vertical, 10)
-                            
-                            Text("Token Usage")
-                                .font(.headline)
-                            
-                            VStack(alignment: .leading, spacing: 8) {
-                                HStack {
-                                    Text("System:")
-                                        .font(.system(.footnote, design: .monospaced))
-                                        .foregroundColor(.secondary)
-                                    Spacer()
-                                    Text("â‰ˆ \(formatTokenCount(breakdown.systemTokens))")
-                                        .font(.system(.footnote, design: .monospaced))
-                                }
-                                
-                                HStack {
-                                    Text("Summary:")
-                                        .font(.system(.footnote, design: .monospaced))
-                                        .foregroundColor(.secondary)
-                                    Spacer()
-                                    Text("â‰ˆ \(formatTokenCount(breakdown.summaryTokens))")
-                                        .font(.system(.footnote, design: .monospaced))
-                                }
-                                
-                                HStack {
-                                    Text("RAG Context:")
-                                        .font(.system(.footnote, design: .monospaced))
-                                        .foregroundColor(.secondary)
-                                    Spacer()
-                                    Text("â‰ˆ \(formatTokenCount(breakdown.ragTokens))")
-                                        .font(.system(.footnote, design: .monospaced))
-                                }
-                                
-                                HStack {
-                                    Text("Short-Term:")
-                                        .font(.system(.footnote, design: .monospaced))
-                                        .foregroundColor(.secondary)
-                                    Spacer()
-                                    Text("â‰ˆ \(formatTokenCount(breakdown.shortTermTokens))")
-                                        .font(.system(.footnote, design: .monospaced))
-                                }
-                                
-                                HStack {
-                                    Text("User Input:")
-                                        .font(.system(.footnote, design: .monospaced))
-                                        .foregroundColor(.secondary)
-                                    Spacer()
-                                    Text("â‰ˆ \(formatTokenCount(breakdown.userInputTokens))")
-                                        .font(.system(.footnote, design: .monospaced))
-                                }
-                                
-                                Divider()
-                                    .padding(.vertical, 4)
-                                
-                                HStack {
-                                    Text("Prompt (in):")
-                                        .font(.system(.footnote, design: .monospaced))
-                                        .fontWeight(.semibold)
-                                    Spacer()
-                                    Text("â‰ˆ \(formatTokenCount(breakdown.totalPromptTokens))")
-                                        .font(.system(.footnote, design: .monospaced))
-                                        .fontWeight(.semibold)
-                                }
-                                
-                                HStack {
-                                    Text("Completion (out):")
-                                        .font(.system(.footnote, design: .monospaced))
-                                        .fontWeight(.semibold)
-                                    Spacer()
-                                    Text("â‰ˆ \(formatTokenCount(breakdown.completionTokens))")
-                                        .font(.system(.footnote, design: .monospaced))
-                                        .fontWeight(.semibold)
-                                }
-                                
-                                Divider()
-                                    .padding(.vertical, 4)
-                                
-                                HStack {
-                                    Text("Total:")
-                                        .font(.system(.footnote, design: .monospaced))
-                                        .fontWeight(.bold)
-                                    Spacer()
-                                    Text("â‰ˆ \(formatTokenCount(breakdown.totalTokens)) / \(formatTokenCount(breakdown.contextWindowSize))")
-                                        .font(.system(.footnote, design: .monospaced))
-                                        .fontWeight(.bold)
-                                }
-                                
-                                HStack {
-                                    Text("Window Usage:")
-                                        .font(.system(.footnote, design: .monospaced))
-                                        .foregroundColor(.secondary)
-                                    Spacer()
-                                    Text(String(format: "%.1f%%", breakdown.percentageUsed))
-                                        .font(.system(.footnote, design: .monospaced))
-                                }
-                            }
-                            .padding()
-                            .background(Color.gray.opacity(0.08))
-                            .cornerRadius(8)
-                        }
-                    }
-                    .padding()
-                }
-                .navigationTitle("Prompt Details")
-                .navigationBarTitleDisplayMode(.inline)
-                .toolbar {
-                    ToolbarItem(placement: .navigationBarTrailing) {
-                        Button("Done") {
-                            dismiss()
-                        }
-                    }
-                }
-            }
-        }
-        
-        // Helper to format token counts with thousand separators
-        private func formatTokenCount(_ count: Int) -> String {
-            let formatter = NumberFormatter()
-            formatter.numberStyle = .decimal
-            formatter.groupingSeparator = " "
-            return formatter.string(from: NSNumber(value: count)) ?? "\(count)"
-        }
-    }
-// ==== LEGO END: 14 PromptDetailView (Full Prompt & Context Viewer) ====
+    // sections rebuild. The legacy single-blob viewer that lived here is
+    // gone — see PromptDetailView.swift for the current implementation.
+    // The contextMenu entry that surfaces it lives on ChatBubbleView's
+    // assistant-side branch (LEGO 13).
+// ==== LEGO END: 14 PromptDetailView (extracted file) ====
     
     
     

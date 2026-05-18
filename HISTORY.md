@@ -949,3 +949,128 @@ next session.
 - Refactor-as-you-go discipline maintained: one new file extracted
   (PromptDetailView.swift), sync_hal_source.sh updated
 
+---
+
+## 2026-05-17 (post-compaction continuation)
+
+### Setting
+
+Resuming the morning after compaction. Mark asked me to verify the
+live state first, then pick up Item 4 wiring per NEXT.md, then move
+on to Item 5 (BGDL long-lock test) before a chat. The handoff brief
+and NEXT.md had the wiring checklist spelled out exactly, so this
+was a continuation rather than rediscovery.
+
+### Live-state verification
+
+Three documented checks all green:
+  - `state` → AFM active, 70 turns of history intact, conversation
+    `96C3FA13…`.
+  - `SALON_GET_STATE` → isEnabled=false, seat1=apple-foundation-models.
+    The Item 1 cold-launch guard is still holding (seat1 didn't
+    revert to empty across the overnight).
+  - `EMBEDDING_STATUS` → nlcontextual loaded, 512-dim. Default
+    embedder, as expected for a fresh install.
+
+Git clean at `c350559` with only Xcode user state + an untracked
+release-materials folder in the working tree. Matched HANDOFF_BRIEF
+exactly — no drift overnight.
+
+### Item 4 wiring — what landed
+
+Wiring as documented in NEXT.md:
+
+  1. Added `@State private var showingPromptDetail` to ChatBubbleView
+     alongside the existing showingDetails / showingCompressionExplanation
+     state.
+  2. Added two computed properties on the struct:
+       - `precedingUserContent`: walks `chatViewModel.messages`
+         backwards from the assistant message and returns the user
+         content whose `turnNumber` matches. Robust to interleaved
+         status messages or salon participants who don't share the turn.
+       - `recentHistory`: returns up to ~4 turn pairs (8 messages)
+         immediately preceding this message. Capped so the detail
+         sheet stays scrollable.
+  3. Added a "View Prompt Details" Button to the assistant-side
+     contextMenu (Hal.swift around line 11748), placed right after
+     the existing "View Details" toggle. Uses the
+     doc.text.magnifyingglass SF Symbol.
+  4. Added `.sheet(isPresented: $showingPromptDetail)` on the
+     bubble's outer VStack so the new PromptDetailView presents
+     full-screen with NavigationView chrome (Done + Copy as Text).
+
+Build clean (CLAUDE.md Golden Rule #7 — no new warnings). The pre-
+existing nonisolated-vs-MainActor warnings on the export and token-
+budget helpers were already in the file at commit 61f8240 and are
+left for a follow-up.
+
+### The collapse bug — a real find, fixed
+
+After wiring, visual verification on the iPhone 17 Pro simulator:
+the contextMenu appeared correctly with the new entry, the sheet
+opened, segments rendered with their colors. Tapping a DisclosureGroup
+toggled the chevron rotation but the body never appeared — and on
+the next layout pass even the chevron snapped back.
+
+Root cause: `PromptDetailSegment.id = UUID()` regenerates on every
+parent body recompute (the parent's `segments` is a computed
+property, so each pass mints fresh PromptDetailSegment instances).
+Two consequences:
+
+  1. The original Set<UUID>-based expansion state in the parent
+     would have stored stale IDs that no longer matched after the
+     next re-render.
+  2. The fallback I tried — moving expansion state into the card
+     itself as @State — also fails, because ForEach keys on
+     segment.id, and a new UUID per pass means the card is treated
+     as identity-replaced (fresh @State, instantly collapsed).
+
+Fix: stabilize the ID. Replaced `let id = UUID()` with a
+deterministic `let id: String` derived from `seg-\(index)-\(content.hashValue)`.
+The parser now uses `enumerated()` to pass an index per context
+section. Same kind + same content in different positions still get
+distinct IDs because index participates. The init is marked
+`nonisolated` so the parser (also nonisolated) can call it without
+crossing actor boundaries.
+
+With stable IDs, card-local @State for expansion is the cleanest
+pattern — the parent doesn't need to coordinate, and each card
+toggles independently. Removed the parent's `expandedSegments` and
+the custom Binding plumbing entirely.
+
+Verified end-to-end on the sim: long-press a Hal bubble → "View
+Prompt Details" → System Prompt expanded showing the persona text
+with purple tinting → collapsed cleanly → Temporal Context expanded
+showing date + time + day + device with orange tinting.
+
+### Cleanup — `_LegacyPromptDetailView_Unused` removed
+
+With the new view wired and verified, the legacy single-blob
+PromptDetailView (renamed `_LegacyPromptDetailView_Unused` in commit
+61f8240 as a transitional safety net) is gone from Hal.swift LEGO 14.
+That LEGO block is now a redirector comment pointing at
+PromptDetailView.swift. Saves ~200 lines of dead code from the
+ingested self-knowledge corpus.
+
+### Item 5 — Background download long-lock test
+
+To be coordinated with Mark next. The plan from NEXT.md:
+DOWNLOAD_EMBEDDING_MODEL:nomicswift is the 522 MB candidate; he
+locks the phone face-down for 10 minutes while I monitor filesystem
+state and download progress logs. The new
+EMBEDDING_DOWNLOAD_STATUS:nomicswift command polls progress, so the
+verification surface is in place.
+
+### State at end of entry
+
+- `main` (about to commit Item 4 final + docs)
+- Item 4 fully landed end-to-end: wiring + collapse bug fix + legacy
+  cleanup, all in one followup commit
+- Build clean, no new warnings
+- PromptDetailView.swift now has stable IDs + card-local @State
+- Hal.swift LEGO 14 is a redirector comment instead of a 200-line
+  legacy view
+- Hal_Source.txt synced (23,312 lines, was 23,497 — dropped ~185
+  lines from the legacy removal)
+- Items 1–4 complete; Item 5 queued for next exchange
+
