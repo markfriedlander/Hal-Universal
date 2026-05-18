@@ -580,6 +580,115 @@ import SQLite3 // Direct C API; matches Hal.swift import for the same reason.
             return results
         }
 
+        /// Phase 4c (v1 reflection privacy viewer, 2026-05-18): return
+        /// ALL reflections — both shareable and private — with a flag
+        /// indicating which is which. Powers the "show private" toggle
+        /// in the Self Model viewer: the viewer fetches everything once
+        /// and filters in Swift based on the toggle state. Single round-
+        /// trip to the DB rather than two queries (one shareable-only,
+        /// one all-inclusive).
+        ///
+        /// Returns the same shape as getShareableReflections plus a
+        /// shareable Bool. The caller can also display the
+        /// shareability_decided_by_model audit value to surface who made
+        /// the call — useful in transparency-mode UI.
+        func getAllReflectionsForViewer() -> [(id: String, conversationId: String, timestamp: Int, reflectionType: Int, freeFormText: String, turnNumber: Int, modelId: String, shareable: Bool, shareabilityDecidedByModel: String?)] {
+            guard ensureHealthyConnection() else { return [] }
+
+            let sql = """
+            SELECT id, key, value, notes, model_id, created_at, shareable, shareability_decided_by_model
+            FROM self_knowledge
+            WHERE format = 'raw_reflection' AND deleted_at IS NULL
+            ORDER BY created_at DESC
+            """
+
+            var stmt: OpaquePointer?
+            var results: [(String, String, Int, Int, String, Int, String, Bool, String?)] = []
+
+            if sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK {
+                while sqlite3_step(stmt) == SQLITE_ROW {
+                    if let idPtr = sqlite3_column_text(stmt, 0),
+                       sqlite3_column_text(stmt, 1) != nil, // key fetched for column alignment
+                       let valuePtr = sqlite3_column_text(stmt, 2),
+                       let notesPtr = sqlite3_column_text(stmt, 3),
+                       let modelIdPtr = sqlite3_column_text(stmt, 4) {
+
+                        let id = String(cString: idPtr)
+                        let freeFormText = String(cString: valuePtr)
+                        let notes = String(cString: notesPtr)
+                        let modelId = String(cString: modelIdPtr)
+                        let timestamp = Int(sqlite3_column_int64(stmt, 5))
+                        let shareable = sqlite3_column_int(stmt, 6) != 0
+                        let decider: String? = sqlite3_column_type(stmt, 7) == SQLITE_NULL
+                            ? nil
+                            : sqlite3_column_text(stmt, 7).map { String(cString: $0) }
+
+                        // Mirror getShareableReflections's notes parsing for
+                        // conversationId, reflectionType, turnNumber.
+                        var conversationId = ""
+                        var reflectionType = 0
+                        var turnNumber = 0
+                        let notesParts = notes.components(separatedBy: ", ")
+                        for part in notesParts {
+                            if part.hasPrefix("Type: ") {
+                                let type = part.replacingOccurrences(of: "Type: ", with: "")
+                                reflectionType = type == "practical" ? 1 : 2
+                            } else if part.hasPrefix("Turn: ") {
+                                turnNumber = Int(part.replacingOccurrences(of: "Turn: ", with: "")) ?? 0
+                            } else if part.hasPrefix("ConversationID: ") {
+                                conversationId = part.replacingOccurrences(of: "ConversationID: ", with: "")
+                            }
+                        }
+
+                        results.append((id, conversationId, timestamp, reflectionType, freeFormText, turnNumber, modelId, shareable, decider))
+                    }
+                }
+            }
+            sqlite3_finalize(stmt)
+            return results
+        }
+
+        /// Phase 4c counterpart for structured traits. Returns every
+        /// structured_trait entry — shareable and private — with the
+        /// flag. The viewer filters in Swift based on the "show private"
+        /// toggle state.
+        func getAllStructuredTraitsForViewer() -> [(category: String, key: String, value: String, confidence: Double, reinforcementCount: Int, lastReinforced: Int, shareable: Bool, shareabilityDecidedByModel: String?)] {
+            guard ensureHealthyConnection() else { return [] }
+
+            let sql = """
+            SELECT category, key, value, confidence, reinforcement_count, last_reinforced, shareable, shareability_decided_by_model
+            FROM self_knowledge
+            WHERE format = 'structured_trait' AND deleted_at IS NULL
+            ORDER BY category, last_reinforced DESC
+            """
+
+            var stmt: OpaquePointer?
+            var results: [(String, String, String, Double, Int, Int, Bool, String?)] = []
+
+            if sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK {
+                while sqlite3_step(stmt) == SQLITE_ROW {
+                    if let categoryPtr = sqlite3_column_text(stmt, 0),
+                       let keyPtr = sqlite3_column_text(stmt, 1),
+                       let valuePtr = sqlite3_column_text(stmt, 2) {
+                        let category = String(cString: categoryPtr)
+                        let key = String(cString: keyPtr)
+                        let value = String(cString: valuePtr)
+                        let confidence = sqlite3_column_double(stmt, 3)
+                        let reinforcementCount = Int(sqlite3_column_int(stmt, 4))
+                        let lastReinforced = Int(sqlite3_column_int64(stmt, 5))
+                        let shareable = sqlite3_column_int(stmt, 6) != 0
+                        let decider: String? = sqlite3_column_type(stmt, 7) == SQLITE_NULL
+                            ? nil
+                            : sqlite3_column_text(stmt, 7).map { String(cString: $0) }
+
+                        results.append((category, key, value, confidence, reinforcementCount, lastReinforced, shareable, decider))
+                    }
+                }
+            }
+            sqlite3_finalize(stmt)
+            return results
+        }
+
         /// Phase 3 (v1 trait evolution, 2026-05-18): replace an existing
         /// trait's `value` column in place. Used by the crystallizer's
         /// evolution path when a new reflection arrives that collides

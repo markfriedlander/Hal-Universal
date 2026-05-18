@@ -9539,25 +9539,79 @@ struct WidgetTestView: View {
 
     struct SelfReflectionView: View {
         @Environment(\.dismiss) var dismiss
-        @State private var reflections: [(id: String, conversationId: String, timestamp: Int, reflectionType: Int, freeFormText: String, turnNumber: Int, modelId: String)] = []
-        @State private var selfKnowledge: [(category: String, key: String, value: String, confidence: Double, reinforcementCount: Int, lastReinforced: Int)] = []
-        
+        // Phase 4c (2026-05-18): full corpus loaded once with shareability
+        // flags. The view filters by the showPrivate toggle in Swift —
+        // showing only shareable when off, and everything (with a clear
+        // visual marker on private rows) when on.
+        @State private var allReflections: [(id: String, conversationId: String, timestamp: Int, reflectionType: Int, freeFormText: String, turnNumber: Int, modelId: String, shareable: Bool, shareabilityDecidedByModel: String?)] = []
+        @State private var allTraits: [(category: String, key: String, value: String, confidence: Double, reinforcementCount: Int, lastReinforced: Int, shareable: Bool, shareabilityDecidedByModel: String?)] = []
+        @State private var showPrivate: Bool = false
+        @State private var showingPrivacyPopup: Bool = false
+        // Persisted once-per-install: the first time the user toggles
+        // "show private" on, we surface a short explanatory popup.
+        // Once acknowledged, the popup stays quiet on subsequent toggles.
+        @AppStorage("hasSeenShowPrivatePopup") private var hasSeenShowPrivatePopup: Bool = false
+
+        // Filtered slices used by the view body. When showPrivate is
+        // false (default), only shareable rows render. When true,
+        // everything renders; private rows get a 🔒 visual marker.
+        private var visibleReflections: [(id: String, conversationId: String, timestamp: Int, reflectionType: Int, freeFormText: String, turnNumber: Int, modelId: String, shareable: Bool, shareabilityDecidedByModel: String?)] {
+            showPrivate ? allReflections : allReflections.filter { $0.shareable }
+        }
+
+        private var visibleTraits: [(category: String, key: String, value: String, confidence: Double, reinforcementCount: Int, lastReinforced: Int, shareable: Bool, shareabilityDecidedByModel: String?)] {
+            showPrivate ? allTraits : allTraits.filter { $0.shareable }
+        }
+
         var body: some View {
             NavigationView {
                 ScrollView {
                     VStack(alignment: .leading, spacing: 20) {
+                        // Phase 4c: "Show private" toggle at the top of the
+                        // viewer. Visible (not buried in settings) so the
+                        // architectural-transparency principle is honored —
+                        // Hal has agency over presentation but the human is
+                        // never actually locked out. The toggle triggers a
+                        // one-time popup explaining what they're about to
+                        // see; afterwards it operates silently.
+                        HStack(spacing: 8) {
+                            Image(systemName: showPrivate ? "eye.fill" : "eye.slash.fill")
+                                .foregroundColor(showPrivate ? .accentColor : .secondary)
+                            Toggle(isOn: Binding(
+                                get: { showPrivate },
+                                set: { newValue in
+                                    if newValue && !hasSeenShowPrivatePopup {
+                                        // Defer the actual toggle until the user
+                                        // acknowledges the popup. The popup's OK
+                                        // button flips both showPrivate and the
+                                        // AppStorage flag in one move.
+                                        showingPrivacyPopup = true
+                                    } else {
+                                        showPrivate = newValue
+                                    }
+                                }
+                            )) {
+                                Text("Show private reflections")
+                                    .font(.subheadline)
+                            }
+                        }
+                        .padding(.horizontal, 12)
+                        .padding(.vertical, 10)
+                        .background(Color.gray.opacity(0.08))
+                        .cornerRadius(8)
+
                         // SECTION 1: Reflections (format='raw_reflection')
                         Text("Reflections")
                             .font(.headline)
                         
-                        if reflections.isEmpty {
-                            Text("No shareable reflections yet.")
+                        if visibleReflections.isEmpty {
+                            Text(showPrivate ? "No reflections yet." : "No shareable reflections yet.")
                                 .font(.subheadline)
                                 .foregroundColor(.secondary)
                                 .padding()
                                 .frame(maxWidth: .infinity, alignment: .center)
                         } else {
-                            ForEach(reflections, id: \.id) { reflection in
+                            ForEach(visibleReflections, id: \.id) { reflection in
                                 VStack(alignment: .leading, spacing: 8) {
                                     // Type badge and metadata
                                     HStack {
@@ -9570,9 +9624,26 @@ struct WidgetTestView: View {
                                                 Capsule().fill(reflection.reflectionType == 1 ? Color.blue.opacity(0.2) : Color.purple.opacity(0.2))
                                             )
                                             .foregroundColor(reflection.reflectionType == 1 ? .blue : .purple)
-                                        
+
+                                        // Phase 4c: lock marker for private entries
+                                        // when the toggle is on. Hal marked these
+                                        // private; we're showing them by user request.
+                                        if !reflection.shareable {
+                                            HStack(spacing: 4) {
+                                                Image(systemName: "lock.fill")
+                                                    .font(.caption2)
+                                                Text("Private")
+                                                    .font(.caption2)
+                                                    .fontWeight(.semibold)
+                                            }
+                                            .foregroundColor(.orange)
+                                            .padding(.horizontal, 6)
+                                            .padding(.vertical, 2)
+                                            .background(Capsule().fill(Color.orange.opacity(0.12)))
+                                        }
+
                                         Spacer()
-                                        
+
                                         Text(formatDate(timestamp: reflection.timestamp))
                                             .font(.caption2)
                                             .foregroundColor(.secondary)
@@ -9612,15 +9683,15 @@ struct WidgetTestView: View {
                         Text("Traits")
                             .font(.headline)
                         
-                        if selfKnowledge.isEmpty {
-                            Text("No shareable self-knowledge yet.")
+                        if visibleTraits.isEmpty {
+                            Text(showPrivate ? "No traits yet." : "No shareable self-knowledge yet.")
                                 .font(.subheadline)
                                 .foregroundColor(.secondary)
                                 .padding()
                                 .frame(maxWidth: .infinity, alignment: .center)
                         } else {
                             // Group by category
-                            ForEach(Array(Dictionary(grouping: selfKnowledge, by: \.category).sorted(by: { $0.key < $1.key })), id: \.key) { category, entries in
+                            ForEach(Array(Dictionary(grouping: visibleTraits, by: \.category).sorted(by: { $0.key < $1.key })), id: \.key) { category, entries in
                                 VStack(alignment: .leading, spacing: 8) {
                                     // Category header
                                     Text(formatCategory(category))
@@ -9628,16 +9699,32 @@ struct WidgetTestView: View {
                                         .fontWeight(.semibold)
                                         .foregroundColor(.blue)
                                         .padding(.top, 8)
-                                    
+
                                     // Entries in this category
                                     ForEach(entries, id: \.key) { entry in
                                         VStack(alignment: .leading, spacing: 4) {
-                                            // Key
-                                            Text(entry.key)
-                                                .font(.caption)
-                                                .fontWeight(.medium)
-                                                .foregroundColor(.primary)
-                                            
+                                            // Key + private marker
+                                            HStack(spacing: 6) {
+                                                Text(entry.key)
+                                                    .font(.caption)
+                                                    .fontWeight(.medium)
+                                                    .foregroundColor(.primary)
+
+                                                if !entry.shareable {
+                                                    HStack(spacing: 3) {
+                                                        Image(systemName: "lock.fill")
+                                                            .font(.caption2)
+                                                        Text("Private")
+                                                            .font(.caption2)
+                                                            .fontWeight(.semibold)
+                                                    }
+                                                    .foregroundColor(.orange)
+                                                    .padding(.horizontal, 5)
+                                                    .padding(.vertical, 1)
+                                                    .background(Capsule().fill(Color.orange.opacity(0.12)))
+                                                }
+                                            }
+
                                             // Value
                                             Text(entry.value)
                                                 .font(.footnote)
@@ -9646,25 +9733,25 @@ struct WidgetTestView: View {
                                                 .frame(maxWidth: .infinity, alignment: .leading)
                                                 .background(Color.green.opacity(0.08))
                                                 .cornerRadius(6)
-                                            
+
                                             // Metadata
                                             HStack {
                                                 Text("Confidence: \(String(format: "%.0f%%", entry.confidence * 100))")
                                                     .font(.caption2)
                                                     .foregroundColor(.secondary)
-                                                
+
                                                 Text("•")
                                                     .font(.caption2)
                                                     .foregroundColor(.secondary)
-                                                
+
                                                 Text("Reinforced \(entry.reinforcementCount)x")
                                                     .font(.caption2)
                                                     .foregroundColor(.secondary)
-                                                
+
                                                 Text("•")
                                                     .font(.caption2)
                                                     .foregroundColor(.secondary)
-                                                
+
                                                 Text(formatDate(timestamp: entry.lastReinforced))
                                                     .font(.caption2)
                                                     .foregroundColor(.secondary)
@@ -9690,14 +9777,35 @@ struct WidgetTestView: View {
                 .onAppear {
                     loadData()
                 }
+                // Phase 4c: one-time explanatory popup on the first
+                // "show private" toggle. After the user acknowledges,
+                // hasSeenShowPrivatePopup stays true forever and the
+                // toggle operates silently thereafter.
+                .alert("Showing Hal's private reflections", isPresented: $showingPrivacyPopup) {
+                    Button("OK") {
+                        hasSeenShowPrivatePopup = true
+                        showPrivate = true
+                    }
+                    Button("Cancel", role: .cancel) {
+                        // Toggle stays off, popup won't fire again until
+                        // the user toggles it on (since we don't flip
+                        // hasSeenShowPrivatePopup until they confirm).
+                    }
+                } message: {
+                    Text("These are reflections Hal chose to keep private. He marked them this way because they touch on his own uncertainty or internal experience. You're welcome to read them. Hal will continue marking new reflections private as he sees fit.")
+                }
             }
         }
-        
-        // Load data from MemoryStore
+
+        // Load data from MemoryStore. Phase 4c: pull the full corpus
+        // (shareable + private) so the toggle can switch between views
+        // without re-querying. The DB cost is roughly the same — most
+        // installations have far fewer reflections than the toggle
+        // would benefit from caching.
         private func loadData() {
             let memoryStore = MemoryStore.shared
-            reflections = memoryStore.getShareableReflections()
-            selfKnowledge = memoryStore.getShareableSelfKnowledge()
+            allReflections = memoryStore.getAllReflectionsForViewer()
+            allTraits = memoryStore.getAllStructuredTraitsForViewer()
         }
         
         // Helper: Format timestamp as relative date
