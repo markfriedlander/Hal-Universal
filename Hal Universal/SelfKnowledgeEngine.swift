@@ -518,6 +518,66 @@ import SQLite3 // Direct C API; matches Hal.swift import for the same reason.
             return results
         }
 
+        /// Phase 3 (v1 trait evolution, 2026-05-18): replace an existing
+        /// trait's `value` column in place. Used by the crystallizer's
+        /// evolution path when a new reflection arrives that collides
+        /// with an existing trait's (category, key) — either deepening
+        /// the primary statement (single-string write) or wrapping it
+        /// into the multi-valued JSON structure (tension write).
+        ///
+        /// `reinforce` controls whether reinforcement_count and
+        /// last_reinforced advance with this write. Typical evolution
+        /// events DO reinforce (it's a "new observation of the same
+        /// trait"); a pure rewrite that's just consolidating prior
+        /// state does not. The crystallizer uses reinforce=true.
+        ///
+        /// Idempotent in the sense that writing the same value with
+        /// reinforce=false twice produces no change beyond an
+        /// updated_at bump. Returns true on successful UPDATE (1 row
+        /// affected); false on missing trait or DB error.
+        @discardableResult
+        func updateTraitValueInPlace(traitID: String, newValue: String, reinforce: Bool) -> Bool {
+            guard ensureHealthyConnection() else { return false }
+
+            // Two SQL flavors depending on whether we're advancing the
+            // reinforcement counter — separated rather than building
+            // dynamically to keep parameter binding simple.
+            let sql: String
+            if reinforce {
+                sql = """
+                UPDATE self_knowledge
+                SET value = ?, reinforcement_count = reinforcement_count + 1, last_reinforced = ?, updated_at = ?
+                WHERE id = ? AND format = 'structured_trait' AND deleted_at IS NULL
+                """
+            } else {
+                sql = """
+                UPDATE self_knowledge
+                SET value = ?, updated_at = ?
+                WHERE id = ? AND format = 'structured_trait' AND deleted_at IS NULL
+                """
+            }
+
+            var stmt: OpaquePointer?
+            var success = false
+            if sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK {
+                let now = Int64(Date().timeIntervalSince1970)
+                sqlite3_bind_text(stmt, 1, (newValue as NSString).utf8String, -1, nil)
+                if reinforce {
+                    sqlite3_bind_int64(stmt, 2, now)
+                    sqlite3_bind_int64(stmt, 3, now)
+                    sqlite3_bind_text(stmt, 4, (traitID as NSString).utf8String, -1, nil)
+                } else {
+                    sqlite3_bind_int64(stmt, 2, now)
+                    sqlite3_bind_text(stmt, 3, (traitID as NSString).utf8String, -1, nil)
+                }
+                if sqlite3_step(stmt) == SQLITE_DONE {
+                    success = sqlite3_changes(db) > 0
+                }
+            }
+            sqlite3_finalize(stmt)
+            return success
+        }
+
         /// Phase 2 (v1 crystallization): record the trait that a reflection
         /// crystallized into. After a successful trait INSERT, the caller
         /// invokes this to set the source reflection's `promoted_to_trait_id`

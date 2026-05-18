@@ -126,6 +126,97 @@ nonisolated enum TraitPromotionThreshold {
     ]
 }
 
+// MARK: - Multi-valued trait storage (Phase 3, 2026-05-18)
+//
+// Once a trait starts collecting contradictory reflections — say,
+// "Hal prefers naming uncertainty plainly" gets a counter-example
+// reflection like "Hal sometimes hides uncertainty to seem more useful"
+// — we don't replace the primary and we don't branch into two traits.
+// We keep the tension as a feature of the trait, with a weighted
+// secondary state that records the contradiction and can swap with
+// the primary if it gathers enough evidence over time.
+//
+// Storage: the trait row's `value` column holds either:
+//   - A plain string (single-valued; original format, still the
+//     default for newly-crystallized traits)
+//   - A JSON object with `primary` + `tensions[]` (multi-valued;
+//     created on first contradiction-driven evolution)
+//
+// Format is detected at read time (no schema migration, no backfill
+// of existing plain-string entries — per Mark/SC's Phase 3 call).
+// The `isMultiValuedJSON` helper does the detection; encode/decode
+// handle the round-trip.
+
+/// A single counter-state on a trait. Records the contradicting
+/// observation, when it was first seen, where it came from, and its
+/// current weight (influence relative to the primary state).
+nonisolated struct TraitTension: Codable, Sendable {
+    let text: String
+    var weight: Double
+    let sourceReflectionId: String
+    let firstObserved: Int
+
+    enum CodingKeys: String, CodingKey {
+        case text
+        case weight
+        case sourceReflectionId = "source_reflection_id"
+        case firstObserved = "first_observed"
+    }
+}
+
+/// The multi-valued trait structure. A trait that has only ever been
+/// reinforced in the same direction stays a plain string in the DB;
+/// once evolution introduces tension, the column gets serialized into
+/// this shape and stays multi-valued thereafter (even if tensions
+/// later decay back to inactive weights — they stay in the record).
+nonisolated struct MultiValuedTrait: Codable, Sendable {
+    var primary: String
+    var tensions: [TraitTension]
+
+    /// Serialize to the JSON string that goes into the `value` column.
+    func toJSONString() -> String {
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = []  // compact, single-line
+        guard let data = try? encoder.encode(self),
+              let str = String(data: data, encoding: .utf8) else {
+            // Defensive: if encoding fails for any reason, fall back to
+            // just the primary so we don't lose the durable shift.
+            return primary
+        }
+        return str
+    }
+
+    /// Parse from the `value` column. Returns nil if the string isn't
+    /// a valid MultiValuedTrait JSON object — caller treats nil as
+    /// "this is a plain string value, not multi-valued."
+    static func fromJSONString(_ s: String) -> MultiValuedTrait? {
+        guard let data = s.data(using: .utf8) else { return nil }
+        let decoder = JSONDecoder()
+        return try? decoder.decode(MultiValuedTrait.self, from: data)
+    }
+
+    /// Wrap a plain-string trait value into the multi-valued structure.
+    /// Used at the moment of first contradiction-driven evolution, when
+    /// a previously single-valued trait acquires its first tension.
+    static func wrapping(_ existingPrimary: String, withFirstTension tension: TraitTension) -> MultiValuedTrait {
+        return MultiValuedTrait(primary: existingPrimary, tensions: [tension])
+    }
+
+    /// Cheap detector — does this string look like a serialized
+    /// MultiValuedTrait? Inspects the first non-whitespace character
+    /// and looks for a JSON object opening; full validity is verified
+    /// by `fromJSONString` returning non-nil. We don't try to detect
+    /// arbitrary JSON — only our specific shape, so single-string
+    /// values that happen to start with `{` (rare in practice — trait
+    /// values are declarative sentences) will fail the parse and be
+    /// treated as plain strings.
+    static func isMultiValuedJSON(_ s: String) -> Bool {
+        let trimmed = s.trimmingCharacters(in: CharacterSet.whitespacesAndNewlines)
+        guard trimmed.hasPrefix("{") else { return false }
+        return fromJSONString(trimmed) != nil
+    }
+}
+
 /// TraitCrystallizer — the reflection-to-trait promotion engine.
 ///
 /// Marked @MainActor so it can call MemoryStore methods and the LLM

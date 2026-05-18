@@ -220,4 +220,41 @@ nonisolated enum EmbeddingBackend: String, Sendable, CaseIterable {
             return 0.85
         }
     }
+
+    // MARK: - Trait-evolution contradiction threshold (per backend, Phase 3)
+    //
+    // The cosine-similarity threshold above which a new reflection is
+    // considered to be reinforcing an existing trait in the SAME direction
+    // (the "deepen" path — the LLM just refines the trait's value in
+    // place). Below this threshold, the reflection is treated as a
+    // contradiction or tension (the "absorb-tension" path — multi-valued
+    // JSON storage with a weighted secondary state).
+    //
+    // Same per-backend story as the synthesis threshold: each embedding
+    // model has its own score distribution. NLContextual's "clearly
+    // aligned" band is much narrower than Nomic's. A single number won't
+    // work across all three; calibrate per backend.
+    //
+    // Important: this threshold is LOWER than recommendedSynthesisThreshold
+    // because synthesis asks "are these effectively the same thought?"
+    // (very high bar, conservative against merging unrelated content),
+    // while contradiction detection asks "is this reinforcing or
+    // contradicting?" (lower bar, only needs to distinguish broad
+    // agreement from broad disagreement).
+    nonisolated var recommendedContradictionThreshold: Double {
+        switch self {
+        case .nlContextual:
+            // Per Mark/SC's Phase 3 design call (2026-05-18): start at 0.6.
+            // Calibrate from real evolution events once they accumulate.
+            return 0.6
+        case .nomicSwift:
+            // PLACEHOLDER — needs calibration. Nomic's wider score
+            // distribution likely wants a lower threshold here (maybe
+            // 0.4-0.5), but we'll know after observing real evolutions.
+            return 0.6
+        case .embeddingGemma:
+            // PLACEHOLDER — same situation as Nomic. Compile-out today.
+            return 0.6
+        }
+    }
 }
