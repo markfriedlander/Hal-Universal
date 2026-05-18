@@ -1632,3 +1632,146 @@ and future restoration if needed.
   LLM, stickiness enforcement, the "show private reflections"
   toggle, and the one-time popup.
 
+---
+
+## 2026-05-18 (late afternoon — Phase 4 privacy + viewer UI, all four sub-commits)
+
+### Setting
+
+Strategic Claude greenlit Phase 4 after Phase 3 landed clean. Three
+items besides the Phase 4 build itself:
+  - The Gemma jetsam crash from the live test goes on the bug list
+    as Item 11 — needs proper diagnosis before ship, but doesn't
+    block Phase 4.
+  - After Phase 4 ships, run a full unscripted stress test — real
+    use, not scripted API batches.
+  - Reaffirmation on direction-following from the earlier note.
+
+### Phase 4a (cc6b229) — Write-time shareability decision + stickiness
+
+The reflection-write prompt now ends with a `[SHAREABLE: yes|no]`
+marker request. The model decides inline; no extra LLM call needed.
+Default-to-yes when missing or unparseable (privacy is an explicit
+gesture).
+
+Pipeline:
+  - `parseShareabilityMarker` strips marker via NSRegularExpression
+    (case-insensitive, accepts yes/no/public/private/true/false).
+    Uses the LAST match to avoid LLM hallucinations inside the prose.
+  - `generateFreeFormReflection` returns `(text, shareable)` tuple
+    instead of just text.
+  - `reflectOnExperience` plumbs the bool through to
+    `storeReflectionWithSynthesis`.
+  - `storeReflectionWithSynthesis` accepts `shareable: Bool = true`
+    and threads it through all 8 fall-through `storeReflection`
+    call sites (no-prior-reflections, embed-failed, no-match,
+    short-synthesis, synthesis-error, update-failed).
+  - `storeReflection` passes `modelId` to `storeSelfKnowledge` as
+    `shareabilityDecidedByModel` — first-writer is the decider.
+
+Stickiness in `storeSelfKnowledge`:
+  - SELECT now fetches existing `shareable` + `shareability_decided_by_model`.
+  - On UPDATE/reinforce: if existing `shareability_decided_by_model`
+    is non-NULL, BOTH columns preserve. First decision wins. New
+    caller's preference is silently dropped.
+  - On legacy rows (audit NULL): new caller's values apply,
+    establishing the decision for the first time.
+  - INSERT path writes both columns from caller params.
+
+The synthesis-merge path (`updateReflectionText`) was already not
+touching shareable or audit — correct stickiness behavior, no
+change needed.
+
+### Phase 4b (b090fb3) — Init seeds promoted to shareable=1
+
+The four init-time identity seeds (transparency, mission,
+source_code_access, first_boot) plus the periodic last_consolidation
+event now write with `shareable: true` and
+`shareabilityDecidedByModel: "initialization"` (or `"system"` for
+consolidation). They're public identity facts — should appear in
+the Self Model viewer by default.
+
+Existing installs that already have these entries continue to show
+them with pre-Phase-4 `shareable=0` until next reinforcement (which
+will set the audit field and stickiness then preserves the
+existing value). Fresh installs after Phase 4b get the right values
+day zero. Verified via `RESET_SELF_KNOWLEDGE` + relaunch on the sim
+— 4 seeds, all `shareable=1`.
+
+### Phase 4c (34c78ba) — Self Model viewer toggle + one-time popup
+
+Two new MemoryStore helpers:
+  - `getAllReflectionsForViewer()` — returns full reflection corpus
+    with shareable Bool + shareabilityDecidedByModel audit.
+  - `getAllStructuredTraitsForViewer()` — same shape for traits.
+
+`SelfReflectionView` refactored:
+  - State: `allReflections` + `allTraits` hold full corpus;
+    `visibleReflections` + `visibleTraits` filter by `showPrivate`.
+  - Toggle row at viewer top: eye/eye.slash.fill icon, "Show private
+    reflections" label, bound through a Binding that intercepts the
+    first toggle-on to fire the popup.
+  - `@AppStorage("hasSeenShowPrivatePopup")` flag persists the
+    popup-seen state per install.
+  - Popup uses the exact spec copy: "These are reflections Hal chose
+    to keep private. He marked them this way because they touch on
+    his own uncertainty or internal experience. You're welcome to
+    read them. Hal will continue marking new reflections private as
+    he sees fit." OK + Cancel buttons. OK flips both
+    hasSeenShowPrivatePopup and showPrivate; Cancel leaves both
+    alone so the popup fires next attempt.
+  - Private rows render with 🔒 + "Private" capsule next to type
+    badge (reflections) or key (traits). Orange tint.
+
+### Phase 4d — End-to-end verification on iPhone 17 Pro sim
+
+Build clean both targets, zero new warnings throughout Phase 4.
+Visual verification on sim with fresh-init DB:
+
+  - `SELF_KNOWLEDGE_AUDIT:20` shows 4 init seeds all `shareable=1`
+    after `RESET_SELF_KNOWLEDGE` + relaunch (first-time init wrote
+    the new values).
+  - Self Model viewer opens with toggle visible (eye.slash icon,
+    OFF), "No shareable reflections yet" message, 4 traits rendered
+    in the Traits section.
+  - Tapping toggle ON: popup appears with the exact spec copy.
+  - Tapping OK: toggle flips ON, eye.fill green, "No reflections
+    yet" copy (no private content to show, but the path renders).
+  - Tapping toggle OFF then ON again: NO popup. AppStorage gate
+    holds. Stickiness verified.
+
+The [SHAREABLE: yes|no] marker round-trip with a real LLM is the
+one piece NOT directly visually verified in Phase 4d — that requires
+sustained MLX conversation generating reflections. Will be exercised
+during the stress test that follows Phase 4.
+
+### Items added to the queue
+
+  - **Item 11: Gemma jetsam crash investigation.** During the Phase 2
+    live test, switching to Gemma 4 E2B with the prior salon's heavy
+    context jetsam-killed Hal during model load. Switching to the
+    smaller Qwen 3.5 2B was an expedient workaround for the test,
+    not an acceptable resolution — a real user doesn't get that
+    option. Needs proper diagnosis of the memory pressure: better
+    unload of prior MLX model before swap? Eager release of inactive
+    chat history? Per-model context budgeting? Not blocking Phase 4
+    but needed before ship.
+  - **Stress test.** After Phase 4: full unscripted real-use
+    walkthrough — long conversations across models, salon mode,
+    settings changes, document import, export, general feature
+    tour. NOT scripted API batches. End-to-end signal on how
+    everything holds together with all the recent changes in place.
+
+### State at end of entry
+
+- `main` at `34c78ba` (Phase 4c, with 4a and 4b committed before it)
+- Phase 4 code-complete and verified on sim
+- v1 self-knowledge crystallization is now functionally complete:
+  reflection generation with shareability decision → synthesis with
+  stickiness preservation → reinforcement-based crystallization →
+  collision-aware evolution (deepen / absorb-tension / refuse) →
+  multi-valued storage → primary-only injection → user-facing
+  viewer with privacy toggle
+- Next: docs catch-up commit, then Item 11 (Gemma jetsam
+  investigation) and the stress test
+

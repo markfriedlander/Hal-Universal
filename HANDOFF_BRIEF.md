@@ -1,13 +1,13 @@
 # Hal Universal — Handoff Brief
-**Updated:** May 18, 2026 (afternoon — Phase 3 of v1 crystallization complete; pipeline structurally end-to-end)
-**Branch:** `main` @ `86ba310` (Phase 3d landed)
+**Updated:** May 18, 2026 (late afternoon — Phase 4 complete; v1 self-knowledge crystallization functionally end-to-end)
+**Branch:** `main` @ `34c78ba` (Phase 4c, with 4a and 4b committed before it)
 **Working tree:** clean (only Xcode user state + untracked Docs/SC_Release_Materials/)
 
-> **For the next CC session:** read this brief, then `NEXT.md` for Phase 4
-> of the v1 crystallization build (reflection privacy + viewer UI), then
-> the 2026-05-18 afternoon entry of `HISTORY.md` for the full Phase 3
-> chronicle, then `Docs/v1_Build_Spec_Self_Knowledge_2026-05-18.md` for
-> the spec, then `CLAUDE.md` for standing rules.
+> **For the next CC session:** read this brief, then `NEXT.md` for next
+> steps (Item 11 Gemma jetsam investigation + the full unscripted stress
+> test), then the 2026-05-18 late-afternoon entry of `HISTORY.md` for the
+> Phase 4 chronicle, then `Docs/v1_Build_Spec_Self_Knowledge_2026-05-18.md`
+> for the spec, then `CLAUDE.md` for standing rules.
 
 ---
 
@@ -83,15 +83,33 @@ Three big things landed this session:
      `buildSelfKnowledgeContext` to extract primary from multi-valued
      JSON with `(±N tensions held)` annotation.
 
-   End-to-end pipeline now structurally complete:
-   `conversation → reflection (every 5 turns) → synthesis (cosine
-   merge bumps reinforcement_count) → crystallizer (when threshold
-   met) → if (category, key) collision: evolveExistingTrait
+   End-to-end pipeline now functionally complete:
+   `conversation → reflection (every 5 turns, with LLM-decided
+   shareability via [SHAREABLE: yes|no] marker) → synthesis
+   (cosine merge bumps reinforcement_count, preserves existing
+   shareability decision per stickiness) → crystallizer (when
+   threshold met) → if (category, key) collision: evolveExistingTrait
    (cosine-fork: deepen / absorb-tension / refuse); else: INSERT
-   new trait → primary-only injection with tension-count annotation`.
+   new trait → primary-only injection with tension-count annotation
+   → user-facing Self Model viewer with privacy toggle + one-time
+   popup`.
 
-   Phase 4 next: reflection privacy (LLM-decided shareability,
-   stickiness, viewer "show private" toggle + one-time popup).
+   - **Phase 4** (commits `cc6b229`, `b090fb3`, `34c78ba`):
+     write-time shareability decision parsed inline from prompt;
+     stickiness on UPDATE in storeSelfKnowledge (first decision
+     wins); init seeds promoted to shareable=1 with audit stamp;
+     Self Model viewer toggle + popup. All verified on sim:
+     fresh-init shows all 4 seeds at shareable=1; toggle/popup
+     work as designed; popup fires once.
+
+   Two items added to the queue:
+   - **Item 11: Gemma jetsam crash** during Phase 2 live test
+     (memory pressure swapping to a 3.4 GB MLX model on top of
+     prior heavy context). Needs proper diagnosis before ship.
+   - **Stress test**: full unscripted real-use walkthrough —
+     conversations across models, salon mode, settings, document
+     import/export, feature tour. End-to-end signal with all
+     recent changes in place.
 
 ---
 

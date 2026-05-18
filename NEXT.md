@@ -29,34 +29,54 @@ For how we got here: `HISTORY.md` (especially the 2026-05-17 evening entry).
 
 ## Open work — in order
 
-### Phase 4 (resume here) — Reflection privacy + viewer UI
+### Item 11 (resume here) — Gemma jetsam crash investigation
 
-Phase 3 complete: trait evolution + contradiction handling + multi-valued
-storage all landed in four sub-commits (`773636d`, `46da6a0`, `f6e230a`,
-`86ba310`). End-to-end v1 crystallization pipeline is structurally
-complete and build-clean.
+During the Phase 2 live test, switching to Gemma 4 E2B with the
+prior salon's heavy context jetsam-killed Hal during model load.
+The test continued with Qwen 3.5 2B instead, but that's not an
+acceptable resolution for a real user.
 
-Phase 4 is the last v1 piece per the build spec:
+Investigation plan:
+  - Reproduce the failure mode on device (load Gemma after a heavy
+    chat context).
+  - Measure memory pressure at swap points (Xcode → Debug Navigator
+    → Memory, or log via `os_proc_available_memory()`).
+  - Check whether `MLXWrapper.unloadModel` is firing before the new
+    model loads. Commit `750f487` added a lifecycle handler that
+    unloads on background; verify the equivalent runs on model
+    swap.
+  - Consider: eager release of inactive chat history before swap?
+    Per-model context budgeting that's aware of pending swap?
+  - If structural fix isn't tractable: surface a "won't fit" error
+    to the user with guidance, rather than letting iOS kill the
+    process.
 
-  - **Write-time shareability decision via LLM.** The reflection-write
-    prompt asks the model to decide whether each reflection is shareable.
-    Default = shareable (privacy is an explicit gesture, not a
-    fallthrough).
-  - **Stickiness enforcement** via `shareability_decided_by_model` column
-    (added in Phase 1). Once one model marks a reflection private,
-    another can't override.
-  - **Viewer UI updates**: "Show private reflections" toggle visible
-    right where shareable reflections appear, with a one-time popup
-    explaining the user is now seeing things Hal may have chosen to
-    keep private.
-  - **Bonus consideration:** the init seeds (transparency, mission,
-    etc.) currently have `shareable=0` so they don't appear in the
-    Self Model UI. Phase 4 should set them to `shareable=1` since
-    they're public identity facts. Decide whether to fix in this
-    phase or as a separate cleanup.
+Not blocking other work but needs to be resolved before App Store
+ship — a memory crash from a normal model switch is a real user
+issue.
 
-Spec section: "Reflection privacy (write-time)" in
-`Docs/v1_Build_Spec_Self_Knowledge_2026-05-18.md`.
+### Stress test — full unscripted walkthrough
+
+After Item 11 (or in parallel if it gets complicated): real-use
+end-to-end test, not scripted API batches. Coverage:
+
+  - Long conversations across multiple models (AFM ↔ MLX switches,
+    multiple MLX-to-MLX swaps)
+  - Salon mode with the four-seat setup
+  - Settings changes (temperature, memory depth, RAG threshold,
+    etc.) during conversation
+  - Document import + a follow-up conversation that uses it via RAG
+  - Export thread (verify the format reads cleanly)
+  - Self Model viewer (especially the new privacy toggle once
+    there's organic content to gate)
+  - General feature tour — see if anything obvious is broken
+
+Goal: signal on how everything holds together with all the recent
+changes in place (per-backend thresholds, SelfKnowledgeEngine
+extraction, AFM gate audit, four-phase crystallization, viewer
+privacy). The stress test will also exercise the [SHAREABLE: yes|no]
+marker round-trip that Phase 4d couldn't directly verify (requires
+sustained MLX conversation generating reflections).
 
 ### Phase 2 (formerly the in-progress section, now retained for reference) — Live-test the crystallizer
 
