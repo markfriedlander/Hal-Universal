@@ -116,21 +116,38 @@ to single line with tail-elision if names get long.
 parenthetical base model. Shortened to "Dolphin 3.0"; the full
 lineage stays visible in the Model Library card description.
 
-### Prompt detail viewer segment labels ✓ RESOLVED (2026-05-18, commit 100168a)
+### Prompt detail viewer segment labels ✓ RESOLVED (2026-05-18, commits 100168a + e8ce4f4)
 
-`classifyPromptContextSection` keyword set didn't match what
-`buildSelfAwarenessContext` / `buildSelfKnowledgeContext` /
+First cut (100168a) fixed the classifier — the keyword set hadn't
+matched what `buildSelfAwarenessContext` / `buildSelfKnowledgeContext` /
 `buildTemporalContext` actually emit after wrapper-marker stripping
 ("You are Hal", "Persistent knowledge", "Current date and time:",
-"Conversation threads:", etc.). Updated classifier to recognize the
-actual openers plus a sampling of category headers. Anything still
-unmatched falls through to `.other` → "Context" label, preserving
-prior fallback behavior.
+etc.). Updated classifier to recognize the real openers plus a
+sampling of category headers.
 
-Also cleaned up the seven pre-existing MainActor-isolation warnings
-that HANDOFF_BRIEF noted as a follow-up — `exportTag` and the four
-`TokenBreakdown` derived properties are now `nonisolated`. Golden
-Rule #7 back in green.
+But Mark's screenshot still showed ~13 generic "Context" rows. Root
+cause was deeper: the parser was splitting the context body on
+"\n\n" and classifying each fragment independently. The bodies
+themselves contain "\n\n" between their internal paragraphs
+(Self-Awareness has 4 paragraphs, Self-Knowledge has 6-8 category
+sections). Even with correct classification, each fragment became
+its own viewer row.
+
+Second cut (`e8ce4f4`) rewrote `parsePromptSegments` to walk
+paragraphs in order and merge adjacent paragraphs of the same kind
+plus unclassified continuations into one logical section. Result:
+~6 sections instead of ~13 (System Prompt, Temporal, Summary,
+Self-Awareness, Self-Knowledge, RAG, ± Watch Delivery / User
+Message).
+
+Verified locally with a representative prompt structure: 11
+paragraphs collapse to 6 logical sections, each preserving its
+internal "\n\n" paragraph breaks inside the collapsible card.
+
+Also (in 100168a) cleaned up the seven pre-existing MainActor
+warnings that HANDOFF_BRIEF noted as a follow-up — `exportTag` and
+the four `TokenBreakdown` derived properties are now `nonisolated`.
+Golden Rule #7 back in green.
 
 ### Settings audit after RAG and embedding changes ✓ RESOLVED (2026-05-18 — verified via API, no commit needed)
 
