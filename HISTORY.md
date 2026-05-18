@@ -1974,3 +1974,115 @@ footprint exceeds our 0.75× estimate. The formula is empirical;
 if a future test crashes despite passing pre-flight, we tighten
 the multiplier or add a second margin tier for known-tight models.
 
+### Bug sprint continuation — eight items in three commits
+
+After Item 11 landed, worked through the bug list in NEXT.md.
+
+**Memory Depth display mismatch** (commit `7f274a4`).
+Reproduced by setting memoryDepth=100 on Qwen (max 209) then
+switching to AFM (max 3): state reported memoryDepth=100,
+maxMemoryDepth=3, so the slider thumb pinned at 3 while the
+"100 turns" label stayed put. Two root causes:
+
+  1. AFM's `defaultSettings.effectiveMemoryDepth` was 4 while AFM's
+     actual runtime max is 3 (4096 × 12% / 150 = 3.27 → 3). Even a
+     clean state produced a mismatched display the moment you
+     switched to AFM. Now 3.
+  2. The API-side `switchToModel` (lives in HalTestConsole, line
+     ~19589) applied per-model `effective.effectiveMemoryDepth`
+     without clamping — the UI path at ~10999 clamps but the API
+     path was missing it. Added inline clamp plus an unconditional
+     defense-in-depth clamp so any value that exceeds the new
+     model's max gets pulled down.
+
+Also changed the Settings sheet's Memory Depth slider binding to
+display `effectiveMemoryDepth` (clamped) instead of raw
+`memoryDepth`. The displayed number and slider thumb now always
+agree; storage gets corrected to the displayed value on the user's
+first slider interaction.
+
+**Four bundled bugs around the salon picker** (commit `ab1df36`).
+Working in roughly the same area of code:
+
+  - *AFM duplicate in Salon picker.* The catalog seed marks AFM as
+    `isDownloaded == true`, and `ChatViewModel.downloadedModels`
+    filtered on that, then `usableModels` prepended AFM explicitly
+    — two entries. Fixed by restricting downloadedModels to
+    MLX-source.
+
+  - *"Salon Mode: 4 voices" → model names.* Added
+    `ChatViewModel.salonSeatSummary` (joins active seat displayNames
+    with " · "). Settings sheet's Salon row now shows
+    "Qwen 3.5 2B · Gemma 4 E2B" with single-line truncation.
+
+  - *Dolphin display name.* Was "Dolphin 3.0 (Llama 3.2 3B)" — the
+    only catalog entry with a parenthetical base model. Shortened
+    to "Dolphin 3.0".
+
+  - *selfKnowledge log labels.* HALDEBUG-BUDGET's `selfKnowledge=`
+    was the allocation ceiling, not actual usage; confusing during
+    the Phase 2 live test (read as "44K being injected"). Relabeled
+    to `selfKnowledgeBudget=`, added a new HALDEBUG-SELF-KNOWLEDGE
+    line after `resolveSegment` with
+    `selfKnowledgeUsed=N tokens (M chars) of selfKnowledgeBudget=K`.
+    Verified on Qwen turn: budget=91392 used=277 — corpus is lean.
+    Also relabeled summary/RAG budget fields for consistency.
+
+**PromptDetailView segment classification + warning cleanup** (commit
+`100168a`).
+The "multiple Context entries in Phase 4 screenshots" bug:
+`classifyPromptContextSection` was looking for keywords like
+"turn count" / "persistent trait" / "today is" — none of which
+appear in the bodies that `buildSelfAwarenessContext` /
+`buildSelfKnowledgeContext` / `buildTemporalContext` actually emit
+after the wrapper markers are stripped. The real openers are
+"You are Hal" + "Your history and capabilities:" /
+"Persistent knowledge" + category headers / "Current date and
+time:". Updated the classifier to match those plus a sampling of
+the category headers as fallbacks.
+
+While in the file, cleaned up the seven pre-existing
+MainActor-isolation warnings that HANDOFF_BRIEF had flagged as
+follow-up work — `PromptDetailSegmentKind.exportTag` and the four
+`TokenBreakdown` derived properties (`totalPromptTokens`,
+`totalTokens`, `contextWindowSize`, `percentageUsed`) marked
+`nonisolated`. Golden Rule #7 (warnings = errors) is back in
+green.
+
+**Settings audit** (verified, no commit). Walked through every
+Settings control via API and confirmed each one round-trips:
+SET_TEMPERATURE, SET_MEMORY_DEPTH, SET_RAG_DEDUP, SET_MAX_RAG_CHARS,
+SET_RECENCY_WEIGHT, SET_RECENCY_HALFLIFE, SET_SELF_KNOWLEDGE,
+EMBEDDING_STATUS. All controls reflect actual state on read and
+persist correctly on write — no regressions from the RAG/embedding
+architectural changes.
+
+### Two items deferred
+
+**Salon toggle scroll/flash.** Reviewed the code paths:
+`setSalonEnabled` mutates `@Published var salonConfig`, which
+triggers `ChatViewModel.objectWillChange` and re-renders any
+observer (including all the ChatBubbleViews because they read
+`salonConfig.activeSeats.count` for the footer seat text). Nothing
+in the code obviously shifts layout — but Mark observed a visible
+scroll/flash that's hard to identify without a video. Left a
+detailed note in NEXT.md asking Mark to capture the exact visual
+artifact next sighting so we can target precisely. Defensive
+option flagged for if it recurs: cache the seat-count value at the
+chat-view body level and pass it into ChatBubbleView as a value
+parameter to break the @Published chain.
+
+**PromptDetailView wiring confirmation.** Code-side is healthy:
+the contextMenu hook (97c8a7a) and the new classifier (100168a)
+should be sufficient. Mark to visually verify on phone with real
+conversation content that the segment colors classify correctly.
+
+### State at end of entry
+
+- `main` @ `100168a` (4 commits ahead since last summary)
+- Working tree: clean apart from this docs commit
+- All builds clean, zero new warnings (pre-existing 7 warnings
+  in PromptDetailView also cleared)
+- 8 of 10 NEXT.md bug items resolved; 2 deferred for Mark
+- Next phase: stress test (gates ship), then App Store mechanics
+

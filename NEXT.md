@@ -57,50 +57,117 @@ estimate and still crashes despite passing pre-flight, tighten the
 multiplier or introduce a per-model override (e.g. Gemma 4 E2B's
 QAT layout may have a different effective footprint).
 
-### Memory Depth display mismatch
+### Memory Depth display mismatch ✓ RESOLVED (2026-05-18, commit 7f274a4)
 
-The Memory Depth setting display doesn't match the actual stored value (observed by Mark). Reproduce, identify whether it's a read-side (display) or write-side (storage) discrepancy, fix.
+Reproduced via:
+  `SET_MEMORY_DEPTH:100` on Qwen (max 209)
+  `SWITCH_MODEL:apple-foundation-models` (max 3)
+  → state: memoryDepth=100, maxMemoryDepth=3 — slider shows "100 turns"
+    with thumb pinned at 3.
 
-### Apple Intelligence appearing twice in Salon picker
+Three coordinated fixes:
+1. AFM's `defaultSettings.effectiveMemoryDepth` was off-by-one: set to 4
+   while AFM's runtime max is 3 (4096 × 12% / 150 = 3.27 → 3). Now 3.
+2. The API-side `switchToModel` was missing the clamping that the UI
+   path already has. Added an unconditional defense-in-depth clamp at
+   the apply site.
+3. The Settings sheet's Memory Depth slider binding now displays
+   `effectiveMemoryDepth` (clamped) so the number and thumb always
+   agree; storage gets corrected to the displayed value on first
+   user slider interaction.
 
-In the Salon seat-assignment picker, "Apple Intelligence" shows up as two separate options. Probably a duplicate-source bug in the picker's data assembly — `[ModelConfiguration.appleFoundation] + downloadedModels` accidentally including AFM in `downloadedModels` too. Audit the salon picker construction.
+### Apple Intelligence appearing twice in Salon picker ✓ RESOLVED (2026-05-18, commit ab1df36)
 
-### Salon toggle scroll/flash behavior
+`ChatViewModel.downloadedModels` filtered `isDownloaded == true`, which
+included AFM (the catalog seed marks AFM as downloaded). Then
+`usableModels` prepended AFM, producing two entries. Fixed by
+restricting `downloadedModels` to `$0.source == .mlx && $0.isDownloaded`.
 
-When toggling Salon mode on/off, the chat surface scrolls or flashes in a distracting way. Trace whether `ChatViewModel.salonConfig.isEnabled` change triggers an unintended layout pass or scroll event.
+### Salon toggle scroll/flash behavior — needs visual repro
 
-### Salon mode should show model names not just "4 voices"
+Investigated. The salon picker uses `setSalonEnabled` which mutates
+`@Published var salonConfig`, triggering ChatViewModel.objectWillChange
+and re-rendering all observers. ChatBubbleView reads
+`salonConfig.activeSeats.count` for the per-message footer seat text
+(line ~10152), so every bubble re-evaluates body on salon toggle.
+Whether that explains the "scroll/flash" depends on what Mark sees —
+in code review nothing obviously shifts layout. Recommend Mark
+captures a video or describes the exact visual artifact (sliding
+animation? text reflow? scroll position change? brief opacity
+flicker?) on next try, then we can target precisely.
 
-Current display: "Salon Mode: 4 voices". Should show the actual model names (Gemma, Llama, Qwen, Dolphin) so the user knows which models are in the active configuration without opening Settings.
+Defensive option if it recurs: cache the salon seat-count value at
+the chat-view body level and pass into ChatBubbleView as a value
+parameter instead of having each bubble observe the VM directly —
+breaks the @Published chain for non-salon changes, but doesn't help
+the case where salon itself toggles.
 
-### Dolphin display name in pickers
+### Salon mode should show model names not just "4 voices" ✓ RESOLVED (2026-05-18, commit ab1df36)
 
-The Dolphin display name in model pickers is awkward (likely too long, or shows the underlying llama base in a confusing way). Cleanup pass on `ModelConfiguration.displayName` for `mlx-community/dolphin3.0-llama3.2-3B-4Bit`.
+New `ChatViewModel.salonSeatSummary` computed property joins active
+seat displayNames with " · ". Settings sheet's Salon Mode row now
+shows "Qwen 3.5 2B · Gemma 4 E2B" instead of "2 voices". Truncates
+to single line with tail-elision if names get long.
 
-### Prompt detail viewer segment labels
+### Dolphin display name in pickers ✓ RESOLVED (2026-05-18, commit ab1df36)
 
-In `PromptDetailView`, several segments render with the generic "Context" label (seen in Phase 4 screenshots — multiple "Context" entries). Should be more descriptive (e.g. "Self-Knowledge", "Memory Snippets", "Summary"). Audit the segment-kind classification in `PromptDetailView.swift`'s parser and add explicit cases where they currently fall to the generic bucket.
+`ModelConfiguration.dolphin3Llama32_3B4bit.displayName` was
+"Dolphin 3.0 (Llama 3.2 3B)" — the only catalog entry with a
+parenthetical base model. Shortened to "Dolphin 3.0"; the full
+lineage stays visible in the Model Library card description.
 
-### Settings audit after RAG and embedding changes
+### Prompt detail viewer segment labels ✓ RESOLVED (2026-05-18, commit 100168a)
 
-Walk through every Settings panel control and verify it still works correctly given the RAG/embedding architectural changes since v1.6:
-  - Temperature
-  - Memory depth
-  - RAG dedup threshold
-  - RAG snippet character budget
-  - Recency weight / half-life
-  - Self-knowledge toggle
-  - Embedding backend selection
-  - System prompt editor
-Each should reflect actual current state on read and persist correctly on write.
+`classifyPromptContextSection` keyword set didn't match what
+`buildSelfAwarenessContext` / `buildSelfKnowledgeContext` /
+`buildTemporalContext` actually emit after wrapper-marker stripping
+("You are Hal", "Persistent knowledge", "Current date and time:",
+"Conversation threads:", etc.). Updated classifier to recognize the
+actual openers plus a sampling of category headers. Anything still
+unmatched falls through to `.other` → "Context" label, preserving
+prior fallback behavior.
 
-### selfKnowledge log labels — budget vs actual used
+Also cleaned up the seven pre-existing MainActor-isolation warnings
+that HANDOFF_BRIEF noted as a follow-up — `exportTag` and the four
+`TokenBreakdown` derived properties are now `nonisolated`. Golden
+Rule #7 back in green.
 
-The `HALDEBUG-BUDGET` log line includes `selfKnowledge=44493` which is the *allocation ceiling*, not actual usage. This caused confusion during the salon (interpreted as "44K of self-knowledge being injected"). Fix: clarify the log labels — `selfKnowledgeBudget=X` for the ceiling, plus an `selfKnowledgeUsed=Y` line after `resolveSegment` for what actually got injected. Lives in `buildChatMessages` around the HALDEBUG-BUDGET log.
+### Settings audit after RAG and embedding changes ✓ RESOLVED (2026-05-18 — verified via API, no commit needed)
 
-### Prompt detail viewer wiring — confirm whether done or not
+Walked through every Settings control via API:
+  - `SET_TEMPERATURE:0.9` → state shows temperature=0.9 ✓
+  - `SET_MEMORY_DEPTH:6` → state shows memoryDepth=6 ✓
+  - `SET_RAG_DEDUP:0.92` → state shows ragDedupThreshold=0.92 ✓
+  - `SET_MAX_RAG_CHARS:1800` → state shows maxRagSnippetsCharacters=1800 ✓
+  - `SET_RECENCY_WEIGHT:0.45` → state shows recencyWeight=0.45 ✓
+  - `SET_RECENCY_HALFLIFE:120` → state shows recencyHalfLifeDays=120 ✓
+  - `SET_SELF_KNOWLEDGE:false` then `:true` → state toggles cleanly ✓
+  - `EMBEDDING_STATUS` returns active backend ✓
+  - System prompt set/get works via `SET_SYSTEM_PROMPT` ✓
 
-Item 4 from 2026-05-17 was the PromptDetailView wiring. Committed at `97c8a7a` with `View Prompt Details` added to ChatBubbleView's assistant-side contextMenu. Visual verification on sim confirmed it opens, the legend renders, segments expand. Confirm one more time on phone with real conversation content that everything works end-to-end and the segments classify correctly.
+All controls reflect actual state on read and persist correctly on
+write. No regressions from the RAG/embedding architectural changes.
+
+### selfKnowledge log labels — budget vs actual used ✓ RESOLVED (2026-05-18, commit ab1df36)
+
+`HALDEBUG-BUDGET` line now uses `selfKnowledgeBudget=` (the
+allocation ceiling) instead of the ambiguous `selfKnowledge=`, and
+a new `HALDEBUG-SELF-KNOWLEDGE` line fires immediately after
+`resolveSegment` reporting `selfKnowledgeUsed=N tokens (M chars) of
+selfKnowledgeBudget=K`. Verified on Qwen turn: budget=91392,
+used=277 (1109 chars) — confirms the corpus is lean. Also relabeled
+`summary=`/`RAG=` → `summaryBudget=`/`RAGBudget=` in the same line
+for consistency.
+
+### Prompt detail viewer wiring — Mark to confirm on phone
+
+Code-side is healthy: contextMenu hook in ChatBubbleView calls
+PromptDetailView with the fixed-id segments + collapsible cards
+(commit `97c8a7a`), and segment classification now covers
+Self-Awareness / Self-Knowledge / Temporal correctly (commit
+`100168a`). Awaiting Mark's visual confirmation on real-device
+conversation content that the segments classify and color-code as
+expected.
 
 ---
 

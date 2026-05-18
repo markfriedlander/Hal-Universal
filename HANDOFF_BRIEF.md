@@ -1,7 +1,52 @@
 # Hal Universal — Handoff Brief
-**Updated:** May 18, 2026 (post-compaction — Item 11 Gemma jetsam crash fixed; bug-fix sprint in progress)
-**Branch:** `main` (Item 11 fix uncommitted at time of write; see git status)
-**Working tree:** Hal.swift + ProcessMemoryGuard.swift (new) + docs (commit pending)
+**Updated:** May 18, 2026 (post-compaction — Item 11 + 8 bug-list items resolved; stress test gates ship)
+**Branch:** `main` @ `100168a` (4 commits ahead of pre-sprint)
+**Working tree:** clean (docs commit pending)
+
+## Sprint summary (2026-05-18 post-compaction)
+
+Mark's directive: start with Item 11, work through the bug list, then
+stress test, then ship mechanics. Work autonomously.
+
+Eight items resolved in four commits + docs:
+
+- **30b651b** — Item 11 (Gemma jetsam crash): ProcessMemoryGuard.swift
+  with `os_proc_available_memory()`, headroom poll replaces fixed 500
+  ms settle, pre-flight refusal in `loadModel`, `switchToModel` awaits
+  the load via new `LLMService.awaitPendingMLXLoad()` and reverts to
+  the previous model on failure with a clean chat message.
+- **7f274a4** — Memory Depth display mismatch: AFM default was 4 vs
+  runtime max 3 (now 3), API switchToModel was missing the clamp the
+  UI path already has (added + defense-in-depth unconditional clamp),
+  Settings slider binding now displays `effectiveMemoryDepth` so the
+  number and thumb always agree.
+- **ab1df36** — Four bundled fixes: AFM duplicate in Salon picker
+  (downloadedModels now MLX-only), salon "N voices" → model-name
+  summary, "Dolphin 3.0 (Llama 3.2 3B)" → "Dolphin 3.0",
+  `HALDEBUG-BUDGET` log relabeled (`selfKnowledgeBudget=`) plus new
+  `selfKnowledgeUsed=` log after `resolveSegment`.
+- **100168a** — PromptDetailView segment-label audit (catches all the
+  actual content openers from buildChatMessages instead of the stale
+  keyword set) plus cleanup of seven pre-existing MainActor warnings
+  via `nonisolated` annotations on `exportTag` and four TokenBreakdown
+  derived properties. Golden Rule #7 (warnings = errors) back in green.
+
+Also verified during the sprint:
+- Settings audit: every control (temperature, memory depth, RAG dedup,
+  max RAG chars, recency weight/half-life, self-knowledge toggle,
+  embedding backend, system prompt) round-trips correctly via API.
+- Cold-launch Gemma loads with new pre-flight (3333 available vs 2999
+  required); Gemma → Qwen swap completes with headroom poll succeeding
+  on the first poll.
+
+Two items in the bug list deferred:
+- **Salon toggle scroll/flash**: needs visual repro. Code review
+  didn't surface anything that obviously shifts layout. Mark to
+  capture a video on next sighting so we can target precisely.
+- **PromptDetailView wiring confirmation**: Mark to visually verify
+  on phone that the segment colors classify correctly with real
+  conversation content (especially after the 100168a classifier
+  update).
 
 > **For the next CC session:** read this brief, then `NEXT.md` for the
 > full remaining backlog — bugs, stress test, App Store ship items —
