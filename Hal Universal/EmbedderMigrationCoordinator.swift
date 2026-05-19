@@ -172,13 +172,23 @@ struct EmbedderBackendRow: View {
                         .font(.subheadline)
                         .fontWeight(.medium)
                         .foregroundColor(.primary)
-                        .lineLimit(1)
+                        // Was .lineLimit(1) — on the 6.7" iPhone in dark
+                        // mode the embedding display names (EmbeddingGemma
+                        // 300M, Nomic Embed Text v1.5) got cut off with
+                        // "…" because the trailing size column claimed
+                        // too much room. Now allowed to wrap to up to two
+                        // lines so the full name is always visible.
+                        // Matches how iOS Settings displays multi-word
+                        // row labels.
+                        .lineLimit(2)
+                        .fixedSize(horizontal: false, vertical: true)
                     Spacer(minLength: 8)
                     if let size = backend.sizeBlurb {
                         Text(size)
                             .font(.caption)
                             .foregroundColor(.secondary)
                             .monospacedDigit()
+                            .lineLimit(1)
                     }
                     // Status dot: green = active, grey = downloaded, none = not downloaded
                     if isActive {

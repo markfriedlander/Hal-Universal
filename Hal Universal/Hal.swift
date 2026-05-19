@@ -15199,30 +15199,21 @@ class DocumentImportManager: ObservableObject {
         "json": "JSON Data",
         "xml": "XML Document",
         "html": "HTML Document",
-        "htm": "HTML Document"
+        "htm": "HTML Document",
+        "docx": "Microsoft Word"
     ]
-    
-    // UPDATED: Mac Catalyst adds DOCX/DOC support (NSAttributedString.DocumentType works on macOS)
-    #if targetEnvironment(macCatalyst)
-    private let macOnlySupportedFormats: [String: String] = [
-        "docx": "Microsoft Word",
-        "doc": "Microsoft Word (Legacy)"
-    ]
-    #endif
+
+    // .doc (legacy Word binary format pre-2007) is intentionally not in
+    // supportedFormats — there is no reliable iOS-native parser for it.
+    // The case in processDocumentImmediatelyWithEntities() catches it
+    // separately and emits a clear "save as .docx" error rather than
+    // a generic unsupported-format message.
 
     private init() {} // Private initializer for singleton
-    
-    // UPDATED: Helper to check if format is supported on current platform
+
+    // Helper to check if format is supported.
     private func isFormatSupported(_ fileExtension: String) -> Bool {
-        if supportedFormats.keys.contains(fileExtension) {
-            return true
-        }
-        #if targetEnvironment(macCatalyst)
-        if macOnlySupportedFormats.keys.contains(fileExtension) {
-            return true
-        }
-        #endif
-        return false
+        supportedFormats.keys.contains(fileExtension)
     }
 
     // ENHANCED: Main Import Function with Entity Extraction (from Hal10000App.swift)
@@ -15421,6 +15412,7 @@ class DocumentImportManager: ObservableObject {
         case rtfExtractionFailed(String)
         case unsupportedFileFormat(String)
         case fileTooLarge(String, Double) // filename, size in MB
+        case legacyDocFormat(String)      // .doc binary format
 
         // Added nonisolated to errorDescription to satisfy LocalizedError protocol
         nonisolated var errorDescription: String? {
@@ -15433,6 +15425,8 @@ class DocumentImportManager: ObservableObject {
                 return "Unsupported file format: \(filename)"
             case .fileTooLarge(let filename, let sizeMB):
                 return "File too large: \(filename) (\(String(format: "%.1f", sizeMB)) MB). Maximum size is 25 MB."
+            case .legacyDocFormat(let filename):
+                return "Legacy .doc format not supported on iOS: \(filename). Please open the file in Word, Pages, or any modern editor and save as .docx, then re-import."
             }
         }
     }
@@ -15465,17 +15459,32 @@ class DocumentImportManager: ObservableObject {
                 throw DocumentProcessingError.rtfExtractionFailed(url.lastPathComponent)
             }
             
-        #if targetEnvironment(macCatalyst)
-        case "docx", "doc":
-            // DOCX/DOC extraction via NSAttributedString (Mac Catalyst only)
-            if let content = extractDOCXContent(from: url) {
-                print("HALDEBUG-IMPORT: Extracted \(content.count) chars from Word document")
+        case "docx":
+            // Office Open XML format. A .docx file is a zip archive with
+            // word/document.xml inside containing the run-text. iOS has no
+            // built-in NSAttributedString reader for it (Mac AppKit can read
+            // .docFormat / .officeOpenXML but iOS UIKit can't), so we do
+            // the extraction ourselves with a minimal PKZIP reader (see
+            // MiniZip below) + XMLParser walking <w:t> elements.
+            do {
+                let content = try DocxTextExtractor.extractText(from: url)
+                print("HALDEBUG-IMPORT: Extracted \(content.count) chars from DOCX")
+                if content.isEmpty {
+                    throw DocumentProcessingError.unsupportedFileFormat(url.lastPathComponent)
+                }
                 return content
-            } else {
+            } catch {
+                print("HALDEBUG-IMPORT: DOCX extraction failed: \(error.localizedDescription)")
                 throw DocumentProcessingError.unsupportedFileFormat(url.lastPathComponent)
             }
-        #endif
-            
+
+        case "doc":
+            // Legacy binary Word format (pre-2007). No reliable iOS-native
+            // parser exists and the format is essentially obsolete — Word
+            // 2007+ defaults to .docx. Tell the user how to convert.
+            print("HALDEBUG-IMPORT: .doc legacy binary format rejected: \(url.lastPathComponent)")
+            throw DocumentProcessingError.legacyDocFormat(url.lastPathComponent)
+
         default:
             throw DocumentProcessingError.unsupportedFileFormat(url.lastPathComponent)
         }
@@ -15516,25 +15525,10 @@ class DocumentImportManager: ObservableObject {
         }
     }
     
-    #if targetEnvironment(macCatalyst)
-    // NEW: DOCX/DOC content extraction using NSAttributedString (Mac Catalyst only)
-    private func extractDOCXContent(from url: URL) -> String? {
-        do {
-            // On macOS, NSAttributedString can read .docx and .doc files
-            let attributedString = try NSAttributedString(
-                url: url,
-                options: [.documentType: NSAttributedString.DocumentType.docFormat],
-                documentAttributes: nil
-            )
-            let text = attributedString.string.trimmingCharacters(in: .whitespacesAndNewlines)
-            print("HALDEBUG-IMPORT: DOCX: Extracted \(text.count) characters")
-            return text.isEmpty ? nil : text
-        } catch {
-            print("HALDEBUG-IMPORT: DOCX extraction failed: \(error.localizedDescription)")
-            return nil
-        }
-    }
-    #endif
+    // docx extraction lives in DocxTextExtractor (defined below). The macOS
+    // NSAttributedString path that used to live here only worked under
+    // Mac Catalyst, which we don't ship; the iOS-native zip + XML parse
+    // works on iPhone, iPad, and "Designed for iPad" on Mac.
 
     // MENTAT'S PROVEN CHUNKING STRATEGY: 400 chars target, 50 chars overlap, sentence-aware (from Hal10000App.swift)
     private func createMentatChunks(from content: String, targetSize: Int = 400, overlap: Int = 50) -> [String] {
@@ -15771,6 +15765,279 @@ class DocumentImportManager: ObservableObject {
     }
 }
 // ==== LEGO END: 27 DocumentImportManager (Ingest & Entities) ====
+
+
+// ==== LEGO START: 27.1 DOCX Parser (MiniZip + XML text extraction) ====
+//
+// iOS-native .docx text extractor. A .docx file is an OPC zip archive
+// containing word/document.xml; that XML's <w:t> elements hold the
+// run-text. iOS UIKit has no NSAttributedString reader for .docx (only
+// macOS AppKit does), so we ship our own minimal zip reader + XMLParser.
+// Zero third-party dependencies — just Foundation + Compression.
+
+import Compression
+
+private enum MiniZipError: Error, CustomStringConvertible {
+    case notAZip
+    case unsupportedCompression(UInt16)
+    case decompressFailed
+    case zip64Unsupported
+    case truncated
+
+    var description: String {
+        switch self {
+        case .notAZip: return "Not a valid zip archive (no End-of-Central-Directory record)"
+        case .unsupportedCompression(let m): return "Unsupported zip compression method \(m) (only Store=0 and Deflate=8 are handled)"
+        case .decompressFailed: return "Deflate decompression failed"
+        case .zip64Unsupported: return "ZIP64 archives not supported by MiniZip"
+        case .truncated: return "Zip data truncated or central-directory entry malformed"
+        }
+    }
+}
+
+private struct MiniZipEntry {
+    let name: String
+    let compressedSize: Int
+    let uncompressedSize: Int
+    let method: UInt16       // 0=stored, 8=deflate
+    let localHeaderOffset: Int
+}
+
+private enum MiniZip {
+    // PKZIP magic numbers.
+    static let eocdSignature: UInt32 = 0x06054b50
+    static let centralFileHeader: UInt32 = 0x02014b50
+    static let localFileHeader: UInt32 = 0x04034b50
+
+    // Use loadUnaligned: zip multi-byte fields are NOT 4/2-byte-aligned
+    // (e.g. compressedSize is at offset cdOffset+20, name lengths are
+    // single bytes that shift everything). The regular `load(fromByteOffset:as:)`
+    // crashes with an alignment assertion in debug builds; loadUnaligned
+    // does the byte-wise read safely. Added 2026-05-19.
+    static func u32(_ d: Data, _ off: Int) -> UInt32 {
+        return d.withUnsafeBytes { raw in
+            UInt32(littleEndian: raw.loadUnaligned(fromByteOffset: off, as: UInt32.self))
+        }
+    }
+    static func u16(_ d: Data, _ off: Int) -> UInt16 {
+        return d.withUnsafeBytes { raw in
+            UInt16(littleEndian: raw.loadUnaligned(fromByteOffset: off, as: UInt16.self))
+        }
+    }
+
+    /// Parse the End-of-Central-Directory record and walk the central
+    /// directory entries. Returns a list of all entries with their offsets
+    /// and sizes so the caller can decide which ones to actually decompress.
+    static func entries(in data: Data) throws -> [MiniZipEntry] {
+        guard data.count >= 22 else { throw MiniZipError.notAZip }
+        // Scan the last (22 + 65535) bytes for the EOCD signature. The zip
+        // comment, if any, lives between EOCD and EOF; max comment length
+        // is 65535 per the spec.
+        let scanStart = max(0, data.count - (22 + 65535))
+        var eocdOffset: Int? = nil
+        var i = data.count - 22
+        while i >= scanStart {
+            if u32(data, i) == eocdSignature {
+                eocdOffset = i
+                break
+            }
+            i -= 1
+        }
+        guard let eocd = eocdOffset else { throw MiniZipError.notAZip }
+
+        let totalEntries = Int(u16(data, eocd + 10))
+        let centralDirOffset = Int(u32(data, eocd + 16))
+
+        // ZIP64 sentinel — central directory offset 0xFFFFFFFF means we'd
+        // need to parse the ZIP64 locator/EOCD records. Not implemented;
+        // docx files never use ZIP64 (they're tens to hundreds of KB).
+        if centralDirOffset == 0xFFFFFFFF { throw MiniZipError.zip64Unsupported }
+
+        var entries: [MiniZipEntry] = []
+        var cursor = centralDirOffset
+        for _ in 0..<totalEntries {
+            guard cursor + 46 <= data.count,
+                  u32(data, cursor) == centralFileHeader else {
+                throw MiniZipError.truncated
+            }
+            let method = u16(data, cursor + 10)
+            let compressedSize = Int(u32(data, cursor + 20))
+            let uncompressedSize = Int(u32(data, cursor + 24))
+            let nameLen = Int(u16(data, cursor + 28))
+            let extraLen = Int(u16(data, cursor + 30))
+            let commentLen = Int(u16(data, cursor + 32))
+            let localOffset = Int(u32(data, cursor + 42))
+
+            // ZIP64 size sentinel — again, not implemented.
+            if compressedSize == 0xFFFFFFFF || uncompressedSize == 0xFFFFFFFF || localOffset == 0xFFFFFFFF {
+                throw MiniZipError.zip64Unsupported
+            }
+
+            let nameStart = cursor + 46
+            guard nameStart + nameLen <= data.count else { throw MiniZipError.truncated }
+            let name = String(data: data.subdata(in: nameStart..<nameStart + nameLen), encoding: .utf8) ?? ""
+            entries.append(MiniZipEntry(
+                name: name,
+                compressedSize: compressedSize,
+                uncompressedSize: uncompressedSize,
+                method: method,
+                localHeaderOffset: localOffset
+            ))
+            cursor += 46 + nameLen + extraLen + commentLen
+        }
+        return entries
+    }
+
+    /// Extract one entry's decompressed bytes from the source data.
+    /// Supports stored (method 0) and deflated (method 8) entries — the
+    /// only two methods Office Open XML packages use in practice.
+    static func extract(_ entry: MiniZipEntry, from data: Data) throws -> Data {
+        let lh = entry.localHeaderOffset
+        guard lh + 30 <= data.count,
+              u32(data, lh) == localFileHeader else {
+            throw MiniZipError.truncated
+        }
+        // Local file header repeats name & extra; lengths can differ from
+        // the central directory entry, so re-read here rather than reusing.
+        let nameLen = Int(u16(data, lh + 26))
+        let extraLen = Int(u16(data, lh + 28))
+        let dataStart = lh + 30 + nameLen + extraLen
+        let dataEnd = dataStart + entry.compressedSize
+        guard dataEnd <= data.count else { throw MiniZipError.truncated }
+        let payload = data.subdata(in: dataStart..<dataEnd)
+
+        switch entry.method {
+        case 0:
+            return payload
+        case 8:
+            // Apple's Compression framework's COMPRESSION_ZLIB is "raw
+            // deflate" (no zlib RFC 1950 header) — exactly what zip
+            // stores. Output buffer sized to uncompressedSize + 1KB pad.
+            let outSize = max(entry.uncompressedSize + 1024, 64 * 1024)
+            var out = Data(count: outSize)
+            let written: Int = payload.withUnsafeBytes { srcRaw in
+                let src = srcRaw.bindMemory(to: UInt8.self).baseAddress!
+                return out.withUnsafeMutableBytes { dstRaw in
+                    let dst = dstRaw.bindMemory(to: UInt8.self).baseAddress!
+                    return compression_decode_buffer(dst, outSize, src, payload.count, nil, COMPRESSION_ZLIB)
+                }
+            }
+            guard written > 0 else { throw MiniZipError.decompressFailed }
+            return out.prefix(written)
+        default:
+            throw MiniZipError.unsupportedCompression(entry.method)
+        }
+    }
+}
+
+enum DocxParseError: Error, LocalizedError {
+    case notADocx
+    case documentXmlMissing
+    case xmlParseFailed(String?)
+    case readFailed(String)
+
+    var errorDescription: String? {
+        switch self {
+        case .notADocx: return "Not a valid .docx archive."
+        case .documentXmlMissing: return ".docx is missing word/document.xml."
+        case .xmlParseFailed(let msg): return "Failed to parse word/document.xml: \(msg ?? "unknown error")."
+        case .readFailed(let msg): return "Failed to read .docx file: \(msg)."
+        }
+    }
+}
+
+/// Extracts the run-text from a .docx file's word/document.xml. Whitespace
+/// is preserved approximately: each `<w:p>` paragraph becomes a `\n`,
+/// each `<w:br/>` becomes a `\n`, each `<w:tab/>` becomes a `\t`, and
+/// adjacent `<w:t>` runs concatenate without space. Tables, headers,
+/// footers, comments, and tracked-changes content are intentionally not
+/// included — the chat-import use case wants the body text. If the use
+/// case expands later, parse word/header*.xml / word/footer*.xml /
+/// word/tables/* the same way.
+final class DocxTextExtractor: NSObject, XMLParserDelegate {
+    static func extractText(from url: URL) throws -> String {
+        let data: Data
+        do { data = try Data(contentsOf: url) } catch {
+            throw DocxParseError.readFailed(error.localizedDescription)
+        }
+        let entries: [MiniZipEntry]
+        do { entries = try MiniZip.entries(in: data) } catch {
+            throw DocxParseError.notADocx
+        }
+        guard let docEntry = entries.first(where: { $0.name == "word/document.xml" }) else {
+            throw DocxParseError.documentXmlMissing
+        }
+        let xmlData: Data
+        do { xmlData = try MiniZip.extract(docEntry, from: data) } catch {
+            throw DocxParseError.xmlParseFailed("\(error)")
+        }
+        let extractor = DocxTextExtractor()
+        let parser = XMLParser(data: xmlData)
+        parser.delegate = extractor
+        guard parser.parse() else {
+            throw DocxParseError.xmlParseFailed(parser.parserError?.localizedDescription)
+        }
+        // Collapse runs of 3+ newlines (from nested paragraph wrappers)
+        // down to a paragraph break. Trim outer whitespace.
+        let collapsed = extractor.buffer
+            .replacingOccurrences(of: "\n\n\n", with: "\n\n", options: .literal)
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        return collapsed
+    }
+
+    private var buffer = ""
+    private var insideRunText = false
+
+    /// Local element name regardless of namespace prefix. XMLParser
+    /// without `.shouldProcessNamespaces` reports qualified names like
+    /// "w:t"; this strips the prefix.
+    private func localName(_ elementName: String) -> String {
+        if let colon = elementName.lastIndex(of: ":") {
+            return String(elementName[elementName.index(after: colon)...])
+        }
+        return elementName
+    }
+
+    func parser(_ parser: XMLParser,
+                didStartElement elementName: String,
+                namespaceURI: String?,
+                qualifiedName qName: String?,
+                attributes attributeDict: [String: String] = [:]) {
+        switch localName(elementName) {
+        case "t":
+            insideRunText = true
+        case "tab":
+            buffer += "\t"
+        case "br":
+            buffer += "\n"
+        default:
+            break
+        }
+    }
+
+    func parser(_ parser: XMLParser, foundCharacters string: String) {
+        if insideRunText {
+            buffer += string
+        }
+    }
+
+    func parser(_ parser: XMLParser,
+                didEndElement elementName: String,
+                namespaceURI: String?,
+                qualifiedName qName: String?) {
+        switch localName(elementName) {
+        case "t":
+            insideRunText = false
+        case "p":
+            // Paragraph end: newline separator.
+            buffer += "\n"
+        default:
+            break
+        }
+    }
+}
+
+// ==== LEGO END: 27.1 DOCX Parser ====
 
 
 
@@ -19071,6 +19338,17 @@ extension DocumentImportManager {
         let url = URL(fileURLWithPath: path)
         guard FileManager.default.fileExists(atPath: path) else {
             return (false, "File not found: \(path)")
+        }
+        // Special-case .doc (legacy binary Word format pre-2007). There is
+        // no reliable iOS-native parser; rather than swallow it as a
+        // generic "Could not process" we surface the actionable hint:
+        // open in any modern editor and save as .docx. Done here (not in
+        // processDocumentImmediatelyWithEntities) so the friendly message
+        // round-trips back via the API return tuple instead of getting
+        // collapsed into a skipped-files list.
+        if url.pathExtension.lowercased() == "doc" {
+            print("HALDEBUG-IMPORT: .doc legacy binary format rejected: \(url.lastPathComponent)")
+            return (false, DocumentImportManager.DocumentProcessingError.legacyDocFormat(url.lastPathComponent).errorDescription ?? "Legacy .doc format not supported on iOS")
         }
         // On macOS startAccessingSecurityScopedResource always returns true for plain paths.
         // On iOS the file must be in an accessible location (e.g. the app's Documents dir).
