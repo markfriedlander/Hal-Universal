@@ -771,6 +771,10 @@ def main():
         target = args[1]
         value = args[2] if len(args) > 2 else "true"
         result = send_command(f"SET_UI_STATE:{target}:{value}", config)
+        # SwiftUI sheet transitions take a moment to animate in. A short
+        # sleep here lets a follow-up screenshot capture the presented
+        # sheet rather than the previous frame.
+        time.sleep(0.7)
         print(json.dumps(result, indent=2))
 
     elif subcommand == "logs":
