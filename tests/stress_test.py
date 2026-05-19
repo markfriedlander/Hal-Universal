@@ -127,7 +127,13 @@ MLX_MODELS = [
     "mlx-community/gemma-4-e2b-it-4bit",
     "mlx-community/Llama-3.2-3B-Instruct-4bit",
     "mlx-community/Qwen3.5-2B-Instruct-4bit",
-    "mlx-community/Dolphin3.0-Llama3.2-3B-4bit",
+    # Note: Hal's catalog stores Dolphin with this exact case
+    # (lowercase d/l, capital B in "4Bit"). HuggingFace URLs are
+    # case-insensitive but Hal's catalog lookup is case-sensitive,
+    # so passing "Dolphin3.0-Llama3.2-3B-4bit" (the prettier-looking
+    # form) silently falls through to the community-model code path
+    # and fails with "size couldn't be determined." Use canonical case.
+    "mlx-community/dolphin3.0-llama3.2-3B-4Bit",
 ]
 AFM = "apple-foundation-models"
 

@@ -173,6 +173,30 @@ Still useful for Mark to do a real-device verification with a
 richer conversation (the sim test had ~4 messages), but the
 wiring is confirmed working on the structural level.
 
+### Bug 7 — Case-sensitive catalog lookup is a footgun
+
+Hal's `ModelCatalogService.getModel(byID:)` is case-sensitive,
+but HuggingFace URLs aren't. The catalog stores Dolphin as
+`mlx-community/dolphin3.0-llama3.2-3B-4Bit` (lowercase d/l,
+capital B — this IS HF's canonical form, but unusual relative
+to other catalog entries). Any tooling that uses HF's friendlier
+casing (`Dolphin3.0-Llama3.2-3B-4bit`) silently misses the
+catalog and falls into the community-model code path, which
+then fails with a confusing "size couldn't be determined from
+its repository" error even when the model is downloaded.
+
+Found 2026-05-19 while investigating why the overnight stress
+test reported Dolphin failing — turned out my probe was using
+the wrong case and Hal was correctly refusing.
+
+Small fix: make `getModel(byID:)` do a case-insensitive
+comparison when the exact lookup misses. (Should never affect
+correctness — IDs are unique across cases on HF.) Defense in
+depth: also normalize the catalog's Dolphin entry to match the
+naming convention of the other four MLX models
+(`Dolphin3.0-Llama3.2-3B-4bit`) so direct lookups don't need
+the special-case understanding.
+
 ### Bug 6 — Stress test probe assertion fixes
 
 The stress test driver has three false-positive failure assertions

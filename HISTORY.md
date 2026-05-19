@@ -2659,3 +2659,47 @@ Plus Bug 6 (stress test probe-assertion cleanups, low-impact).
 - Sim screenshots saved at `Docs/sim_screenshots_2026-05-19/`
 - All test infrastructure committed
 - HANDOFF_BRIEF, NEXT, HISTORY all reflect current reality
+
+### 2026-05-19 (very late — Dolphin case-mismatch finding)
+
+Mark asked why Dolphin couldn't be downloaded. Investigated and
+found it was a case-sensitivity gotcha in MY test scripts, not
+a Hal bug or HF outage:
+
+- Hal's catalog at Hal.swift:18115 stores Dolphin as
+  `mlx-community/dolphin3.0-llama3.2-3B-4Bit` (lowercase d/l,
+  capital B in "4Bit"). This IS the canonical HuggingFace repo
+  name (HF normalizes URLs to this form via 307 redirect, even
+  from the prettier-looking `Dolphin3.0-Llama3.2-3B-4bit`).
+- My stress_test.py used the prettier form `Dolphin3.0-Llama3.2-3B-4bit`
+  (capital D/L, lowercase b).
+- Hal's catalog lookup is case-sensitive. When my probe passed
+  the prettier form, the catalog lookup missed → Hal fell into
+  the community-model code path → that path tried to fetch size
+  from HF for the prettier-cased ID → got back the canonical-
+  cased model metadata → Hal's size-determination heuristic
+  didn't recognize the path mismatch → returned nil sizeGB →
+  refused with "size couldn't be determined from its repository."
+
+Dolphin was already downloaded on the device the whole time.
+
+Fix:
+- tests/stress_test.py: corrected the Dolphin ID to the
+  canonical case the catalog expects.
+
+Verified Bug 3 fix with the correct ID:
+- SWITCH_MODEL AFM → Dolphin (correct case) took 2.0s
+  (awaitPendingMLXLoad doing its job)
+- Immediate /chat returned a real Dolphin response ("Done.")
+- Both Gemma AND Dolphin first-turn-after-swap now work.
+
+**Real bug noted but NOT patched tonight:** Hal's catalog
+lookup is case-sensitive but HuggingFace URLs aren't. Calling
+SWITCH_MODEL or DOWNLOAD_MODEL with a different-cased ID for a
+known model silently falls through to the community path
+instead of normalizing. This is a footgun for any tooling that
+uses HF's user-friendly casing rather than Hal's canonical
+casing. Worth a small fix in `getModel(byID:)` (case-
+insensitive comparison) but adding to NEXT.md as Bug 7 rather
+than patching now without further design review.
+
