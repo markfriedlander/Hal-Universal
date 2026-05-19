@@ -7629,9 +7629,19 @@ extension MemoryStore {
     /// characters from each token, drop short/empty tokens, lowercase the
     /// rest, and join with OR so any-word match returns a hit.
     func sanitizeFTSQuery(_ query: String) -> String {
+        // 2026-05-19 fix: REPLACE non-alphanumerics with spaces (don't
+        // just strip them). The FTS5 unicode61 tokenizer treats _ - .
+        // and similar as word boundaries, so an indexed token
+        // "alpha_brennach" lives as ["alpha", "brennach"]. Stripping
+        // the underscore in the query collapses it to "alphabrennach"
+        // — a single token that matches NEITHER index token. Replace
+        // with a space and tokenization aligns. Without this, any
+        // distinctive marker containing _ - . (which is most code-
+        // identifier-shaped tokens and many doc-unique words) returns
+        // zero BM25 hits.
         let raw = query.lowercased()
         let allowed = CharacterSet.alphanumerics.union(.whitespaces)
-        let cleaned = String(raw.unicodeScalars.filter { allowed.contains($0) })
+        let cleaned = String(raw.unicodeScalars.map { allowed.contains($0) ? Character($0) : Character(" ") })
         let tokens = cleaned
             .components(separatedBy: .whitespaces)
             .map { $0.trimmingCharacters(in: .whitespaces) }
