@@ -1,220 +1,119 @@
 # Hal Universal — Handoff Brief
-**Updated:** May 18, 2026 (post-compaction — Item 11 + 8 bug-list items resolved; stress test gates ship)
-**Branch:** `main` @ `100168a` (4 commits ahead of pre-sprint)
-**Working tree:** clean (docs commit pending)
+**Updated:** May 19, 2026 (overnight autonomous session)
+**Branch:** `main` (4 commits ahead of pre-session `b33d2de`)
+**Working tree:** clean
 
-## Sprint summary (2026-05-18 post-compaction)
+## Where Hal is right now
 
-Mark's directive: start with Item 11, work through the bug list, then
-stress test, then ship mechanics. Work autonomously.
+The overnight session landed three things that move ship readiness
+forward and produced two deferred-work items that need decisions
+before the next push.
 
-Eight items resolved in four commits + docs:
+### Landed
 
-- **30b651b** — Item 11 (Gemma jetsam crash): ProcessMemoryGuard.swift
-  with `os_proc_available_memory()`, headroom poll replaces fixed 500
-  ms settle, pre-flight refusal in `loadModel`, `switchToModel` awaits
-  the load via new `LLMService.awaitPendingMLXLoad()` and reverts to
-  the previous model on failure with a clean chat message.
-- **7f274a4** — Memory Depth display mismatch: AFM default was 4 vs
-  runtime max 3 (now 3), API switchToModel was missing the clamp the
-  UI path already has (added + defense-in-depth unconditional clamp),
-  Settings slider binding now displays `effectiveMemoryDepth` so the
-  number and thumb always agree.
-- **ab1df36** — Four bundled fixes: AFM duplicate in Salon picker
-  (downloadedModels now MLX-only), salon "N voices" → model-name
-  summary, "Dolphin 3.0 (Llama 3.2 3B)" → "Dolphin 3.0",
-  `HALDEBUG-BUDGET` log relabeled (`selfKnowledgeBudget=`) plus new
-  `selfKnowledgeUsed=` log after `resolveSegment`.
-- **100168a** — PromptDetailView segment-label audit (catches all the
-  actual content openers from buildChatMessages instead of the stale
-  keyword set) plus cleanup of seven pre-existing MainActor warnings
-  via `nonisolated` annotations on `exportTag` and four TokenBreakdown
-  derived properties. Golden Rule #7 (warnings = errors) back in green.
+1. **Memory entitlements — Gemma 4 E2B is now actually usable.**
+   Commit `b286429`. Added
+   `Hal Universal/Hal Universal.entitlements` with Increased Memory
+   Limit + Extended Virtual Addressing, registered the capabilities
+   via Xcode UI, wired into both Debug and Release configs of the
+   Hal Universal target. Pre-entitlements: Gemma had ~100-200 MB
+   headroom and the per-turn pre-flight refused almost every chat.
+   Post-entitlements: ~6100 MB headroom, Gemma sustains ~30-turn
+   conversations before the pre-flight kicks in. This is the real
+   fix that unblocks Gemma as a viable MLX model.
 
-Also verified during the sprint:
-- Settings audit: every control (temperature, memory depth, RAG dedup,
-  max RAG chars, recency weight/half-life, self-knowledge toggle,
-  embedding backend, system prompt) round-trips correctly via API.
-- Cold-launch Gemma loads with new pre-flight (3333 available vs 2999
-  required); Gemma → Qwen swap completes with headroom poll succeeding
-  on the first poll.
+2. **Item 2 — Nomic synthesis threshold calibrated.** Commit
+   `7439d4a`. Added `EMBED_SIM` / `EMBED_SIM_BATCH` API + the
+   `tests/nomic_calibration_probe.py` driver. Measured on device
+   (NLContextual SAME 0.73-0.93, RELATED 0.71-0.83 — bands overlap)
+   and set `recommendedSynthesisThreshold` for Nomic to **0.85**.
+   Code comment in `EmbeddingBackend.swift:206-232` documents the
+   measured distribution and the reasoning.
 
-Two items in the bug list deferred:
-- **Salon toggle scroll/flash**: needs visual repro. Code review
-  didn't surface anything that obviously shifts layout. Mark to
-  capture a video on next sighting so we can target precisely.
-- **PromptDetailView wiring confirmation**: Mark to visually verify
-  on phone that the segment colors classify correctly with real
-  conversation content (especially after the 100168a classifier
-  update).
+3. **Item 1 — Gemma memory-depth tuning done.** 8 runs total
+   (4 depths × 2 replicates). Methodology rebuilt twice after
+   two false starts (see HISTORY for the chronicle). All 8 runs
+   hit the same 30-turn ceiling. Memory recall doesn't track
+   depth meaningfully: depth 2 = 3/16, depth 3 = 2/16, depth 4 =
+   2/16, depth 5 = 4/16. **Recommendation: keep current default
+   of 5.** Full results table:
+   `tests/gemma_depth_results_2026-05-19.md`.
 
-> **For the next CC session:** read this brief, then `NEXT.md` for the
-> full remaining backlog — bugs, stress test, App Store ship items —
-> then the 2026-05-18 late-afternoon entry of `HISTORY.md` for the
-> Phase 4 chronicle, then `Docs/v1_Build_Spec_Self_Knowledge_2026-05-18.md`
-> for the spec, then `CLAUDE.md` for standing rules.
->
-> **The remaining work has three shapes:** (1) ten bug fixes ranging
-> from small to medium, none architectural; (2) a full unscripted
-> stress test that gates ship; (3) App Store mechanical prep
-> (screenshots, ASC metadata, GitHub Pages, archive + upload + submit).
-> See NEXT.md for the full list with detail on each item.
+4. **ASC v2.0 metadata + README rewrite.** Commit `157196b`.
+   `Docs/ASC_v2.0_REVISED.md` is side-by-side with the existing
+   paste-ready — Mark picks which ships. Demotes the over-promised
+   "memory compression" framing, adds Self Model + per-turn
+   pre-flight + Nomic retrieval as real v2.0 features.
 
----
+5. **Stress test ran (20 / 25 PASS).** Real ship-relevant fails:
+   first-turn-after-switch fails for Gemma + Dolphin (3 GB MLX
+   models — race between MLX load and chat send). Smaller MLX
+   models (Llama, Qwen) and AFM are fine. See Deferred below.
 
-## TL;DR — where Hal is right now
+### Deferred — needs decisions or hands
 
-Three big things landed this session:
+- **`SET_MEMORY_DEPTH` persistence bug.** Reproduced isolated:
+  SET to 2, terminate + launch, next chat runs at depth=5 because
+  `ChatViewModel` init calls `ModelSettingsStore.shared.applyEffectiveSettings(for: initialModel)`
+  (Hal.swift:11402) which silently overwrites the user override.
+  Smoking gun: `HALDEBUG-SETTINGS: Applied effective settings for
+  Gemma 4 E2B: ... depth=5` log line during init. Two reasonable
+  fixes; both are product calls. See HISTORY 2026-05-19 entry.
 
-1. **Three-backend embedding system + dynamic BM25 quality gate.**
-   - NLContextual (default, built-in, 512-dim)
-   - EmbeddingGemma (compiled out via `HAL_ENABLE_EMBEDDING_GEMMA` —
-     blocked by upstream MLX iOS Metal crash)
-   - Nomic Embed Text v1.5 (opt-in via Model Library, 522 MB,
-     swift-embeddings on Apple's MLTensor)
-   - Dynamic BM25 quality gate: measures semantic relative spread
-     and BM25/semantic top-K median agreement per query, includes
-     or excludes BM25 from RRF accordingly. Self-correcting, no
-     hardcoded rules.
-   - **Recall on device (10 ground-truth queries, 70-row corpus):**
-     - NLContextual: 1/10 top-1, 4/10 top-5, 7/10 top-10
-     - Nomic + gate: **9/10 top-1, 10/10 top-5, 10/10 top-10**
+- **First-turn-after-swap race for 3 GB MLX models.** Gemma +
+  Dolphin reliably fail the first chat after a SWITCH_MODEL.
+  Hypothesis: `SWITCH_MODEL` returns before MLX has finished
+  loading, and the immediate chat hits the not-loaded gate.
+  Proposed fix: have SWITCH_MODEL block on model-ready before
+  returning, or have `/chat` queue behind in-flight loads.
 
-2. **LLM-driven query expansion (async).**
-   - `QueryExpansion.expand(query:memoryStore:llmService:)` is `async`,
-     no DispatchSemaphore (the prior version deadlocked under MainActor).
-   - Triggers when initial top-1 RRF < 0.020 AND !isEntityMatch.
-   - SQLite cache keyed by `(SHA-256 of normalized query, model_id)`.
-     Cleared on model switch.
-   - Doesn't move numbers on this corpus (the gate already maxes Nomic;
-     under NL the LLM produces conceptual synonyms that don't lexically
-     match plant text), but infrastructure is solid for richer corpora.
+- **Unscripted-reactive Item 1 follow-up.** SC asked for
+  "improvised reactively" prompts on Item 1; I went scripted-
+  for-comparability. Mark agreed scripted-first for settings
+  derivation, then unscripted as the realism check. The
+  unscripted pass did not happen tonight.
 
-3. **5-item UX sequence + two Item-5 follow-ups: all done.** History.
-   (Salon cold-launch guard, scroll rewrite, visual verifications,
-   PromptDetailView wired with collapse-bug fix, §7 BGDL long-lock
-   passed including jetsam-kill recovery, progress-bar-on-recovery
-   fix, Model Library plain-style consistency.) See HISTORY for
-   2026-05-17 entries.
-
-4. **Yesterday's late-evening deferred work:** SelfKnowledgeEngine.swift
-   extraction from Hal.swift (~1,844 lines, three LEGO blocks pulled
-   into one new file), per-backend `recommendedSynthesisThreshold` on
-   EmbeddingBackend, and AFM gate audit that found two real gaps
-   (reflectOnExperience and consolidateAndDecay both fired regardless
-   of active model — fixed). All committed today with Phase 1.
-
-5. **The Evolutionary Salon ran (2026-05-17 evening).** 4 seats
-   (Gemma, Llama, Qwen, Dolphin), independent mode, no host. 5.5 min
-   wall clock for all four. Raw output archived at
-   `Docs/Evolutionary_Salon_2026-05-17/`. Decisions carried into v1
-   spec: per-category threshold (no global N), multi-valued
-   contradiction handling, Qwen's trait-generator template
-   (minus the meta-commentary forbidding), add Meta-Cognition as 7th
-   category, no readiness mechanism.
-
-6. **v1 build spec written; Phases 1, 2, 3 all landed.**
-   `Docs/v1_Build_Spec_Self_Knowledge_2026-05-18.md` is the spec.
-
-   - **Phase 1** (commit `6eed526`): schema migration (two nullable
-     columns), Meta-Cognition category in injection builder,
-     `DB_SCHEMA:<table>` API diagnostic. Migration verified.
-   - **Phase 2** (commit `0a692cc`): `TraitCrystallizer.swift` +
-     reinforcement-based promotion. Live-tested on Qwen 3.5 2B —
-     end-to-end pipeline verified (synthesis-merge, candidate fetch,
-     LLM call, JSON parse, category validation, threshold deferral).
-   - **Pre-Phase-3**: `SELF_KNOWLEDGE_AUDIT` diagnostic (commit
-     `249540b`); `recordStructuredInsights` disabled from chat path
-     to remove competing trait-write system (commit `b292946`).
-   - **Phase 3** (commits `773636d`, `46da6a0`, `f6e230a`, `86ba310`):
-     foundation (`recommendedContradictionThreshold`, `MultiValuedTrait`,
-     `updateTraitValueInPlace`), collision detection (stub), real
-     evolution mechanism (deepen / absorb-tension / refuse with
-     deterministic weight rules), read-side update of
-     `buildSelfKnowledgeContext` to extract primary from multi-valued
-     JSON with `(±N tensions held)` annotation.
-
-   End-to-end pipeline now functionally complete:
-   `conversation → reflection (every 5 turns, with LLM-decided
-   shareability via [SHAREABLE: yes|no] marker) → synthesis
-   (cosine merge bumps reinforcement_count, preserves existing
-   shareability decision per stickiness) → crystallizer (when
-   threshold met) → if (category, key) collision: evolveExistingTrait
-   (cosine-fork: deepen / absorb-tension / refuse); else: INSERT
-   new trait → primary-only injection with tension-count annotation
-   → user-facing Self Model viewer with privacy toggle + one-time
-   popup`.
-
-   - **Phase 4** (commits `cc6b229`, `b090fb3`, `34c78ba`):
-     write-time shareability decision parsed inline from prompt;
-     stickiness on UPDATE in storeSelfKnowledge (first decision
-     wins); init seeds promoted to shareable=1 with audit stamp;
-     Self Model viewer toggle + popup. All verified on sim:
-     fresh-init shows all 4 seeds at shareable=1; toggle/popup
-     work as designed; popup fires once.
-
-   Two items added to the queue:
-   - **Item 11: Gemma jetsam crash** during Phase 2 live test
-     (memory pressure swapping to a 3.4 GB MLX model on top of
-     prior heavy context). Needs proper diagnosis before ship.
-   - **Stress test**: full unscripted real-use walkthrough —
-     conversations across models, salon mode, settings, document
-     import/export, feature tour. End-to-end signal with all
-     recent changes in place.
+- **Screenshots, version bump, archive, ASC submit.** Mechanical,
+  gated on Mark + Xcode UI. See NEXT.md.
 
 ---
 
-## File layout (extracted from Hal.swift this session series)
+## File layout
 
 ```
 Hal Universal/
-├── EmbeddingBackend.swift              — backend enum + crash guard + UI strings
-│                                          (+ recommendedSynthesisThreshold per-backend)
-├── EmbeddingProvider.swift             — 3-backend dispatch + MemoryStore ext
-├── EmbedderMigrationCoordinator.swift  — @MainActor state machine + UI rows
-├── QueryExpansion.swift                — async expansion + SQLite cache
-├── PromptDetailView.swift              — color-coded segments, collapsible sections
-├── SelfKnowledgeEngine.swift           — NEW (2026-05-17 late eve): MemoryStore
-│                                          self-knowledge CRUD, maintenance, reflection
-│                                          orchestration. Extracted from Hal.swift LEGO
-│                                          blocks 4.1/4.2/4.3 (~1,900 lines). +
-│                                          Phase 2 helpers: getTraitCandidates,
-│                                          markReflectionPromoted.
-├── TraitCrystallizer.swift             — NEW (2026-05-18, Phase 2): reflection-to-trait
-│                                          promotion engine. Per-category reinforcement
-│                                          thresholds, candidate scanner, Qwen-derived
-│                                          trait-generator LLM prompt, JSON parse +
-│                                          INSERT-trait + stamp-lineage. Chained into
-│                                          Type 1 reflection Task in chat path under
-│                                          AFM gate.
-└── Hal.swift                           — everything else (~19.7k lines, shrinking)
+├── Hal Universal.entitlements         — NEW (b286429): memory caps
+├── EmbeddingBackend.swift             — backend enum + thresholds
+│                                          (Nomic synthesis threshold
+│                                          calibrated tonight)
+├── EmbeddingProvider.swift            — 3-backend dispatch
+├── EmbedderMigrationCoordinator.swift — migration state machine
+├── QueryExpansion.swift               — async query expansion
+├── PromptDetailView.swift             — color-coded segments viewer
+├── SelfKnowledgeEngine.swift          — self-knowledge CRUD + reflection
+├── TraitCrystallizer.swift            — Phase 2 reinforcement-promotion
+├── ProcessMemoryGuard.swift           — Item 11: os_proc_available_memory
+└── Hal.swift                          — everything else (~19.7k lines)
+
+tests/
+├── hal_test.py                        — HTTP+file API test runner
+├── nomic_calibration_probe.py         — NEW: SAME/RELATED/UNREL probe
+├── gemma_depth_probe.py               — NEW: per-depth conversation driver
+│                                          with ground-truth verification
+├── gemma_depth_all.sh                 — NEW: 8-replicate orchestrator
+├── gemma_depth_summary.py             — NEW: per-run results parser
+├── gemma_depth_results_2026-05-19.md  — NEW: Item 1 final results table
+└── stress_test.py                     — NEW: multi-model + settings + RAG +
+                                          salon probe (5 real findings, see
+                                          HISTORY for breakdown)
 
 scripts/
-└── sync_hal_source.sh                  — concatenates all .swift into Hal_Source.txt
-                                          for self-knowledge ingestion (per CLAUDE.md SOP)
+└── sync_hal_source.sh                 — concatenates all .swift into
+                                          Hal_Source.txt (run after any
+                                          source change)
 ```
-
-When you extract a new file, add it to the `FILES` array in
-`sync_hal_source.sh` and re-run it.
 
 ---
-
-## Build flags
-
-- `HAL_ENABLE_EMBEDDING_GEMMA` — Debug only. Gates the Gemma backend's
-  code path. Release builds compile it out; the UI hides the Gemma row.
-
-## Dependencies
-
-```
-mlx-swift 0.31.3
-mlx-swift-lm 3.31.3        (MLXLLM + MLXLMCommon + MLXHuggingFace + MLXEmbedders)
-swift-transformers 1.3.3   (exactVersion pin)
-swift-embeddings 0.0.27    (exactVersion pin) — Nomic backend
-  → swift-safetensors 0.1.1
-  → swift-sentencepiece 0.0.6
-  → swift-numerics 1.1.1
-```
 
 ## Build + Deploy (iPhone 16 Plus)
 
@@ -242,7 +141,7 @@ For sim runs: `HAL_API_CONFIG=.hal_api_config_sim.json python3 tests/hal_test.py
 
 ---
 
-## SOP (refactor-as-you-go is mandatory)
+## SOP (unchanged — refactor-as-you-go is mandatory)
 
 1. **After any change to Hal's source, sync `Hal_Source.txt`:**
    ```bash
@@ -250,9 +149,7 @@ For sim runs: `HAL_API_CONFIG=.hal_api_config_sim.json python3 tests/hal_test.py
    ```
 2. **Significant changes to a section of Hal.swift → extract into a
    dedicated file.** Use any of the existing extracted files as a
-   template (EmbeddingBackend.swift, EmbeddingProvider.swift,
-   EmbedderMigrationCoordinator.swift, QueryExpansion.swift,
-   PromptDetailView.swift).
+   template.
 3. New enum case → sweep all switches.
 4. New AppStorage key → `defaults write com.MarkFriedlander.Hal10000 [key] "[value]"`.
 5. App build number bump happens at App Store submission (currently 5).
@@ -261,24 +158,24 @@ For sim runs: `HAL_API_CONFIG=.hal_api_config_sim.json python3 tests/hal_test.py
 8. **Warnings = errors** (CLAUDE.md Golden Rule #7).
 9. **API > asking the human** — expand the API if a question can't be
    answered through it.
+10. **Don't bail on a probe based on ambiguous telemetry.** Add
+    instrumentation, not exit doors. (Lesson from tonight.)
+11. **Confirm any deviation from a stated directive before executing
+    it.** (Lesson from tonight — scripted-vs-improvised.)
 
 ---
 
-## New diagnostic / UI API commands this session
+## New diagnostic / API commands this session
 
 | Command | Purpose |
 |---|---|
-| `SET_UI_STATE:<settings\|threadPanel\|none>:<true\|false>` | Programmatic sheet toggle for automation |
-| `SET_FORCE_EXPANSION:<true\|false>` | Force LLM expansion on every query (diagnostic) |
-| `MEMORY_SEARCH_EXPANDED:<query>` | Two-pass search-with-expansion diagnostic |
-| `CLEAR_QUERY_EXPANSION_CACHE` | Wipe cache |
-| `QUERY_EXPANSION_CACHE_STATUS` | Count cached entries |
-| `DOWNLOAD_EMBEDDING_MODEL[:<backend>]` | Catalog-driven download |
-| `EMBEDDING_DOWNLOAD_STATUS[:<backend>]` | Progress poll |
-| `SET_EMBEDDING_BACKEND:<name>` | Switch backend, wipe embeddings |
-| `MIGRATE_EMBEDDINGS_REEMBED` | Re-embed all NULL rows |
-| `FTS_DIAG` | FTS5 row counts + sample MATCH |
-| `DB_SCHEMA:<table>` | NEW (2026-05-18) PRAGMA-based schema inspection for any table |
+| `EMBED_SIM:<t1>\|\|\|<t2>` | Cosine sim between two texts under active backend |
+| `EMBED_SIM_BATCH:<t1a>\|\|\|<t2a>~~~<t1b>\|\|\|<t2b>~~~…` | Batched form |
+| `GET_LOGS:<N>` | Pull the last N HALDEBUG-* lines from the in-process buffer |
+
+(Tonight's probes also lean heavily on the already-existing
+`HALDEBUG-CHAT … depth=N` log line at Hal.swift:12910 as ground
+truth for what depth a chat actually ran at.)
 
 ---
 
@@ -289,12 +186,13 @@ For sim runs: `HAL_API_CONFIG=.hal_api_config_sim.json python3 tests/hal_test.py
   `HAL_ENABLE_EMBEDDING_GEMMA` ready to re-enable.
 - **Nomic load takes ~10–15 s on iPhone 16+** (MMAP-loading 546 MB
   safetensors + tokenizer JSON). Subsequent embeds are fast (~80 ms).
-- **FTS5 first-inject-after-install glitch** (documented earlier
-  today): a fresh install with an immediate inject sees BM25 return 0
-  candidates until a NUCLEAR_RESET + re-inject. The eval workflow does
-  the reset.
-- **Pre-existing nonisolated/MainActor warnings in PromptDetailView.swift**
-  (export-tag + token-budget helpers, ~7 warnings). They've been there
-  since commit `61f8240` and are unrelated to this session's changes.
-  Worth a follow-up commit to clean up per Golden Rule #7, but not a
-  blocker.
+- **`SET_MEMORY_DEPTH` doesn't survive app re-init** — see
+  Deferred above. Workaround: re-SET after every relaunch (the
+  probe drivers do this).
+- **First chat after SWITCH_MODEL to Gemma/Dolphin fails reliably** —
+  see Deferred above. Workaround: wait 10-15 s before sending,
+  or send a chat that's OK to throw away.
+- **`xcrun devicectl device process launch` does NOT unload MLX
+  weights** — iOS keeps the prior process state warm. To actually
+  free memory, hard `terminate --pid <pid>` first, then launch.
+  (The probe drivers do this.)
