@@ -23352,17 +23352,19 @@ struct ModelConfiguration: Identifiable, Codable, Equatable, Hashable {
         // 128K context comfortably absorb richer retrieved context, which
         // supports stronger Maxim #2 / #3 behavior.
         //
-        // Memory-depth note (Item 11 follow-up, 2026-05-18 evening): the
-        // earlier hedge to 4 turns has been reverted to 8 now that we
-        // enable mlx-swift-lm's built-in 4-bit KV cache quantization
-        // (kvCacheQuantizationBits: 4 below). That cuts per-token KV
-        // memory by ~4×, making longer conversations feasible without
-        // pre-flight refusals. The pre-flight check still lives as a
-        // safety net for the edge case where even the quantized
-        // footprint would exceed the dirty-memory cliff.
+        // Memory-depth note (Item 11 follow-up, 2026-05-18): the
+        // previous default of 8 turns of history was lowered to 4
+        // because stress testing showed Gemma jetsam-killing the app
+        // after ~5 substantive turns. The KV quantization attempt
+        // (kvCacheQuantizationBits=4) would have allowed restoring to
+        // 8, but Gemma4Text in mlx-swift-lm doesn't support the
+        // quantized cache path — see the explanatory comment near
+        // kvCacheBytesPerPromptToken below. Until that's patched
+        // upstream, the depth hedge + per-turn pre-flight refusal is
+        // our only protection against long-conversation jetsam.
         defaultSettings: ModelSettings(
             temperature: 0.7,
-            effectiveMemoryDepth: 8,
+            effectiveMemoryDepth: 4,
             recencyWeight: 0.3,
             recencyHalfLifeDays: 90,
             maxRagSnippetsCharacters: 1400,
@@ -23386,21 +23388,37 @@ struct ModelConfiguration: Identifiable, Codable, Equatable, Hashable {
             m4Refusal:     .mixed,
             m5Evolution:   .standout
         ),
-        // Item 11 follow-up (2026-05-18 evening): Gemma 4 E2B's
-        // unquantized KV cache is ~120 KB/token — the heaviest in the
-        // catalog. With mlx-swift-lm's 4-bit KV quantization enabled
-        // below, that drops to ~30 KB/token, putting Gemma in the same
-        // memory class as Qwen for KV growth purposes. The per-turn
-        // pre-flight uses this post-quantization value; if the
-        // quantization is ever disabled, restore to 120 * 1024.
-        kvCacheBytesPerPromptToken: 30 * 1024,
-        // Enable mlx-swift-lm's QuantizedKVCache mode at 4 bits. This
-        // is the actual fix for the stress-test failure mode: it cuts
-        // KV memory growth by ~4× without requiring conversation-depth
-        // hedges or per-turn refusals. Group size defaults to 64 in
-        // GenerateParameters. Quality impact for chat is empirically
-        // minimal — MLX 4-bit KV is a standard production technique.
-        kvCacheQuantizationBits: 4
+        // Item 11 follow-up (2026-05-18): Gemma 4 E2B's architecture has
+        // the largest per-token KV-cache footprint of the catalog —
+        // empirically observed jetsam-killing after ~5 substantive turns
+        // on iPhone 16 Plus during stress testing. 120 KB/token is a
+        // conservative estimate; the per-turn pre-flight will refuse a
+        // turn cleanly rather than letting the process crash.
+        //
+        // KV quantization attempt + revert (2026-05-18 evening):
+        // mlx-swift-lm exposes a 4-bit KV cache mode via
+        // GenerateParameters.kvBits — but it requires the model's
+        // attention layer to route through `attentionWithCacheUpdate`
+        // (which dispatches to quantizedScaledDotProductAttention when
+        // the cache is a QuantizedKVCache). Gemma4Text.swift in
+        // mlx-swift-lm calls `MLXFast.scaledDotProductAttention`
+        // directly with raw key/value tensors — it doesn't support the
+        // quantized cache path. Setting kvBits=4 hands the attention a
+        // cache type it can't consume and the process crashes on the
+        // first generation. Confirmed empirically.
+        //
+        // Other catalog models (Llama, Qwen 3.5, Dolphin via Llama base)
+        // DO use attentionWithCacheUpdate and would work — but they're
+        // already light enough not to need it.
+        //
+        // Path forward (logged in NEXT.md): either (a) patch
+        // Gemma4Text upstream / vendor a fix to use
+        // attentionWithCacheUpdate, or (b) accept that Gemma 4 E2B
+        // long conversations get refused by the per-turn pre-flight
+        // rather than running with quantized KV.
+        kvCacheBytesPerPromptToken: 120 * 1024
+        // kvCacheQuantizationBits intentionally left unset (= nil =
+        // no quantization) until Gemma4Text supports the path.
     )
 
     /// Phi-4 Mini Instruct 4-bit — the reasoner voice. Microsoft's late-2025
