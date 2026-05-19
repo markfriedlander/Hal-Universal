@@ -113,20 +113,65 @@ Fix options:
 - Have `/chat` queue behind any in-flight load with a small timeout.
   Preserves the convention but adds queue logic.
 
-### Bug 4 — Salon toggle scroll/flash (carried over)
+### Bug 4 — Salon toggle scroll/flash ✓ REPRODUCED + diagnosed
 
-Still needs visual repro. Code review (2026-05-18) didn't surface
-anything that obviously shifts layout. Mark to capture a video on
-the next sighting so we can target precisely. Defensive option if
-it recurs: cache the salon seat-count value at the chat-view body
-level and pass it into ChatBubbleView as a value parameter to
-break the @Published chain for non-salon changes.
+Reproduced 2026-05-19 on iPhone 17 Pro simulator via the UI
+picker tap (NOT via the API `SALON_SET_ENABLED:` command — that
+path doesn't trigger it). Visual evidence:
+`Docs/sim_screenshots_2026-05-19/repro_salon_before_toggle.png`
+vs `repro_salon_after_single.png`. Scroll position shifts up by
+~one row-height when toggling Multi LLM → Single LLM.
 
-### Bug 5 — PromptDetailView wiring confirmation (carried over)
+**Root cause** (Hal.swift:7127-7170 + 7272-7276): the AI Model
+section row content changes shape between Salon Mode and Active
+Model variants:
+- Salon Mode row: Text + Spacer + HStack(person.2.fill icon +
+  seat-summary text)
+- Active Model row: Text + Spacer + HStack(status-dot Circle +
+  model-name text)
 
-Code-side is healthy: contextMenu hook (97c8a7a) + classifier
-update (100168a). Mark to visually verify on phone with real
-conversation content.
+The two variants have slightly different intrinsic heights. Plus
+the explanatory caption text below the picker changes ("Advanced
+settings for single model operation" vs "Configure multiple
+models for collaborative conversations") — same .font, but
+different content length can force a different wrap. When
+salonConfig.isEnabled toggles, List/Form re-layouts and the
+scroll position adjusts.
+
+**Fix vector:** stabilize the row content height. Options:
+- Wrap both row variants' trailing HStack in a fixed `.frame(height: ...)`
+  so the intrinsic height doesn't differ.
+- Use a stable `.frame(minHeight: ...)` on the row's HStack.
+- Move the conditional caption to a position that doesn't
+  trigger List re-layout.
+
+Code change is small but needs visual diff verification — run the
+same before/after toggle sequence after the fix and confirm scroll
+position stays stable.
+
+### Bug 5 — PromptDetailView wiring confirmation ✓ VERIFIED on sim
+
+Verified on iPhone 17 Pro simulator 2026-05-19. Long-press on a
+Hal response bubble opens the context menu including "Prompt
+Details Viewer." Tapping it opens the sheet which renders 5
+color-coded segment cards correctly:
+- System Prompt (purple) — 1,894 chars
+- Temporal Context (orange) — 196 chars
+- Self-Awareness (cyan) — 1,660 chars
+- Conversation History (blue) — 838 chars
+- User Message (gray) — 33 chars
+
+Plus the Token Budget breakdown at the bottom (System Prompt
+375, Conversation Summary 0, Memory Snippets (RAG) 0, Short-Term
+History 0, User Input 8, Prompt-in 383, Completion-out 252, Total
+635 / 4096, Window Usage 15.5%).
+
+Visual evidence:
+`Docs/sim_screenshots_2026-05-19/05_prompt_details_viewer.png`.
+
+Still useful for Mark to do a real-device verification with a
+richer conversation (the sim test had ~4 messages), but the
+wiring is confirmed working on the structural level.
 
 ### Bug 6 — Stress test probe assertion fixes
 

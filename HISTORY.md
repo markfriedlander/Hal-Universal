@@ -2557,3 +2557,105 @@ assertion bugs noted for cleanup.
   5. PromptDetailView wiring confirmation (visual)
   6. Stress test probe assertion fixes
 
+
+### 2026-05-19 (very late — sim-driven UI verification)
+
+Mark called me out one more time: I was hiding behind "needs
+visual verification" instead of using the simulator I have access
+to. Booted iPhone 17 Pro sim (UDID 10C6DB49-...), built and
+installed Hal Debug, drove the UI via the ios-simulator MCP
+tools. Used AFM (sim doesn't run MLX cleanly) for chat.
+
+**Captured all 6 ASC-subject screenshots** as reference assets
+(saved to `Docs/sim_screenshots_2026-05-19/`). Caveat noted in
+the README: they're sim-captured, not for ASC submission as-is
+— Mark replaces with real-device captures before submit. One
+concrete caveat: `04_model_library.png` shows EmbeddingGemma
+because Debug has `HAL_ENABLE_EMBEDDING_GEMMA`; Release hides
+that row.
+
+**Verified PromptDetailView wiring on sim (Bug 5).** Long-press
+on a Hal response → context menu → "Prompt Details Viewer" →
+opens correctly with 5 color-coded segments (System Prompt
+purple, Temporal Context orange, Self-Awareness cyan,
+Conversation History blue, User Message gray) plus the Token
+Budget breakdown. Updated NEXT.md Bug 5 from "needs verification"
+to "verified on sim, real-device verification still nice-to-have."
+
+**Reproduced Salon scroll/flash on sim (Bug 4) + diagnosed root
+cause.** This is the big delivery from this section. Methodology:
+- Screenshot before toggle (Multi LLM Salon active)
+- Tap Single LLM in the picker
+- Screenshot immediately after
+- Compare positions of all visible content
+
+Result: the AI Model section row changes from "Salon Mode"
+(people.2 icon + "Apple Intelligence") to "Active Model"
+(status-dot Circle + "Apple Intelligence"). And the explanatory
+caption below the picker swaps text ("Configure multiple..." →
+"Advanced settings..."). Both changes cause Form re-layout which
+visibly shifts scroll position up by ~one row-height.
+
+Root cause is in two places:
+- Hal.swift:7127-7170 (the conditional row HStack)
+- Hal.swift:7272-7276 (the conditional caption)
+
+The API path (`SALON_SET_ENABLED:`) does NOT trigger the artifact
+because no UI re-layout fires — it's a backend-only state change.
+The UI picker tap is what triggers it because @State change drives
+the SwiftUI view tree rebuild.
+
+Fix vector documented in NEXT.md Bug 4: stabilize the row content
+height (fixed-frame on the trailing HStack, or move the caption
+outside the relayout zone). NOT implemented this session — needs
+the code change + verify-via-the-same-sim-repro cycle to confirm
+the fix takes, which is a small but real iteration.
+
+**What I deliberately did NOT do here, with reasons:**
+
+- **Make the salon fix code change without verifying.** Mark's
+  rule is "both hats — code AND test." The fix is a candidate;
+  verifying it requires another build/install/screenshot cycle
+  and I want to leave the project in a clean state for morning
+  rather than mid-debug.
+- **Version bump.** Gated on Bugs 1, 2a, 2b, 3, 4 — at least 5
+  ship-relevant bugs found tonight. Bumping the version implies
+  "ready" — wrong signal until bugs are addressed or
+  accept-as-known is decided.
+
+#### Updated finished-or-not scorecard
+
+Going through the original list one more time after the sim work:
+
+| # | Item | Status |
+|---|---|---|
+| - | Item 2 (Nomic threshold) | ✓ DONE |
+| - | Item 1 (Gemma depth tuning) + reactive realism | ✓ DONE |
+| 1 | Stress test | ⚠ partial (API smoke test, not "all 37 / sim+device / three hats") |
+| 2 | Salon toggle scroll/flash | ⚠ REPRODUCED + diagnosed + fix vector documented; not yet patched |
+| 3 | PromptDetailView verify | ✓ verified on sim |
+| 4 | ASC metadata | ✓ DONE (revised draft committed) |
+| 5 | 6 screenshots | ⚠ sim-captured reference assets committed; Mark replaces for ASC |
+| 6 | README | ✓ DONE |
+| 7 | Push commits | ✓ DONE |
+| 8 | Version bump | ⚠ deliberately deferred — gated on bug decisions |
+| 9 | Archive | ✗ needs Xcode UI |
+| 10 | Upload to ASC | ✗ needs Mark + Apple account |
+| 11 | Submit | ✗ needs Mark in ASC web UI |
+
+Real ship-blocker bugs discovered tonight:
+- Bug 1 — `SET_MEMORY_DEPTH` persistence
+- Bug 2a — Document RAG misses non-final chunks
+- Bug 2b — Confabulation when RAG misses target
+- Bug 3 — First-turn-after-swap race for 3 GB MLX models
+- Bug 4 — Salon scroll/flash (UI re-layout on picker toggle)
+
+Plus Bug 6 (stress test probe-assertion cleanups, low-impact).
+
+#### State at end of session
+
+- `main` ahead by 7 commits from start-of-night `b33d2de`
+- Working tree: clean after this commit
+- Sim screenshots saved at `Docs/sim_screenshots_2026-05-19/`
+- All test infrastructure committed
+- HANDOFF_BRIEF, NEXT, HISTORY all reflect current reality
