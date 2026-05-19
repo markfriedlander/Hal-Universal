@@ -39,7 +39,15 @@ Hal Universal does not collect, store, or share any personal data. All memory an
 
 Hal maintains a persistent semantic memory across conversations. It weighs recency and relevance, applies decay over time, and retrieves what's useful when it's useful. You can see exactly what Hal remembers and why — transparency is built into the architecture.
 
-When a model's context window is smaller than Hal's full memory, Hal asks the active model to *compress* its own self-knowledge for that turn — never silently trim. The footer of each response shows when compression happened.
+When self-knowledge sections exceed the current model's per-turn budget, Hal asks the active model to compress them in place rather than silently trim — a small "condensed" badge in the message footer marks when that happened. When a whole turn would exceed the model's working memory, Hal posts a brief explanation in chat and skips that turn rather than crashing.
+
+**Optional upgraded retrieval:** Nomic Embed Text v1.5 is available as an opt-in download in Settings → Browse Model Library (522 MB). It significantly improves recall on specific facts compared to the default on-device embedder.
+
+---
+
+## Self Model
+
+Hal builds a structured self-model of you over time from patterns it notices in your conversations — values, preferences, recurring themes. Browse it in Settings → Self Model. Each entry is private by default; you can toggle entries to "shareable" if you want them included in exports. Every entry is editable. Nothing leaves your device without your action.
 
 ---
 
