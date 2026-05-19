@@ -5173,8 +5173,22 @@ class MLXWrapper: ObservableObject {
                     //     on the normal-response distribution rather than a
                     //     true runaway cap.
                     let maxOutputTokens = 4096
+                    // Per-model KV cache quantization (Item 11 follow-up,
+                    // 2026-05-18 evening). When the model config sets
+                    // `kvCacheQuantizationBits` (e.g. 4 for Gemma 4 E2B),
+                    // pass it through to GenerateParameters so mlx-swift-lm
+                    // uses its built-in QuantizedKVCache. Cuts per-token KV
+                    // memory by ~4× and is the real fix for the long-
+                    // conversation jetsam failure mode. nil keeps the prior
+                    // unquantized behavior (used by Qwen / Llama / Dolphin
+                    // — they're already light enough to not need it).
+                    let kvBits = self.currentModelConfig?.kvCacheQuantizationBits
+                    if let bits = kvBits {
+                        halLog("HALDEBUG-MLX-CHAT: KV cache quantization ENABLED — \(bits) bits (groupSize=64)")
+                    }
                     let parameters = GenerateParameters(
                         maxTokens: maxOutputTokens,
+                        kvBits: kvBits,
                         temperature: Float(temperature),
                         repetitionPenalty: modelPenalty,
                         repetitionContextSize: modelPenaltyCtx
@@ -17629,6 +17643,25 @@ struct ModelConfiguration: Identifiable, Codable, Equatable, Hashable {
     var prefillTokensPerSec: Double?
     var maximCompliance: MaximScorecard?
 
+    // MARK: - KV cache quantization (Item 11 follow-up, 2026-05-18 evening)
+    //
+    // Per Mark's directive: mlx-swift-lm ships a built-in 4-bit KV-cache
+    // quantization mode via `GenerateParameters.kvBits`. Setting kvBits=4
+    // shrinks per-token KV memory by ~4× (FP16 → 4-bit) with minimal
+    // generation-quality impact for chat workloads. Models that need
+    // this most are the ones with the heaviest per-token footprint
+    // (Gemma 4 E2B); lighter models (Qwen 3.5 2B) don't need it and
+    // can skip the small dequantization overhead during inference.
+    //
+    // `nil` = no quantization (default, identical to prior behavior).
+    // `4` or `8` = quantize KV to that bit width.
+    // Group size defaults to 64 (MLX's recommended value).
+    //
+    // When set, `kvCacheBytesPerPromptToken` below should also be set to
+    // the *post-quantization* value so the per-turn pre-flight reflects
+    // actual runtime memory, not pre-quantization.
+    var kvCacheQuantizationBits: Int?
+
     // MARK: - KV-cache footprint per prompt token (Item 11 follow-up, 2026-05-18)
     //
     // Conservative estimate of how many bytes of process working memory
@@ -17680,7 +17713,8 @@ struct ModelConfiguration: Identifiable, Codable, Equatable, Hashable {
         generationTokensPerSec: Double? = nil,
         prefillTokensPerSec: Double? = nil,
         maximCompliance: MaximScorecard? = nil,
-        kvCacheBytesPerPromptToken: Int? = nil
+        kvCacheBytesPerPromptToken: Int? = nil,
+        kvCacheQuantizationBits: Int? = nil
     ) {
         self.id = id
         self.displayName = displayName
@@ -17698,6 +17732,7 @@ struct ModelConfiguration: Identifiable, Codable, Equatable, Hashable {
         self.prefillTokensPerSec = prefillTokensPerSec
         self.maximCompliance = maximCompliance
         self.kvCacheBytesPerPromptToken = kvCacheBytesPerPromptToken
+        self.kvCacheQuantizationBits = kvCacheQuantizationBits
     }
     
     func hash(into hasher: inout Hasher) {
@@ -17795,17 +17830,17 @@ struct ModelConfiguration: Identifiable, Codable, Equatable, Hashable {
         // 128K context comfortably absorb richer retrieved context, which
         // supports stronger Maxim #2 / #3 behavior.
         //
-        // Memory-depth note (Item 11 follow-up, 2026-05-18): the previous
-        // default was 8 turns of history, but stress testing on iPhone 16
-        // Plus showed Gemma jetsam-killing the app after ~5 substantive
-        // turns. By turn 5, the prompt was ~8000 tokens; Gemma's
-        // 120 KB/token KV cost put working memory over the dirty-memory
-        // cliff. Lowered to 4 turns to bound worst-case KV footprint;
-        // the per-turn pre-flight in MLXWrapper.generateChatStream is
-        // the safety net for whatever still sneaks past.
+        // Memory-depth note (Item 11 follow-up, 2026-05-18 evening): the
+        // earlier hedge to 4 turns has been reverted to 8 now that we
+        // enable mlx-swift-lm's built-in 4-bit KV cache quantization
+        // (kvCacheQuantizationBits: 4 below). That cuts per-token KV
+        // memory by ~4×, making longer conversations feasible without
+        // pre-flight refusals. The pre-flight check still lives as a
+        // safety net for the edge case where even the quantized
+        // footprint would exceed the dirty-memory cliff.
         defaultSettings: ModelSettings(
             temperature: 0.7,
-            effectiveMemoryDepth: 4,
+            effectiveMemoryDepth: 8,
             recencyWeight: 0.3,
             recencyHalfLifeDays: 90,
             maxRagSnippetsCharacters: 1400,
@@ -17829,13 +17864,21 @@ struct ModelConfiguration: Identifiable, Codable, Equatable, Hashable {
             m4Refusal:     .mixed,
             m5Evolution:   .standout
         ),
-        // Item 11 follow-up (2026-05-18): Gemma 4 E2B's architecture has
-        // the largest per-token KV-cache footprint of the catalog —
-        // empirically observed jetsam-killing after ~5 substantive turns
-        // on iPhone 16 Plus during stress testing. 120 KB/token is a
-        // conservative estimate; the per-turn pre-flight will refuse a
-        // turn cleanly rather than letting the process crash.
-        kvCacheBytesPerPromptToken: 120 * 1024
+        // Item 11 follow-up (2026-05-18 evening): Gemma 4 E2B's
+        // unquantized KV cache is ~120 KB/token — the heaviest in the
+        // catalog. With mlx-swift-lm's 4-bit KV quantization enabled
+        // below, that drops to ~30 KB/token, putting Gemma in the same
+        // memory class as Qwen for KV growth purposes. The per-turn
+        // pre-flight uses this post-quantization value; if the
+        // quantization is ever disabled, restore to 120 * 1024.
+        kvCacheBytesPerPromptToken: 30 * 1024,
+        // Enable mlx-swift-lm's QuantizedKVCache mode at 4 bits. This
+        // is the actual fix for the stress-test failure mode: it cuts
+        // KV memory growth by ~4× without requiring conversation-depth
+        // hedges or per-turn refusals. Group size defaults to 64 in
+        // GenerateParameters. Quality impact for chat is empirically
+        // minimal — MLX 4-bit KV is a standard production technique.
+        kvCacheQuantizationBits: 4
     )
 
     /// Phi-4 Mini Instruct 4-bit — the reasoner voice. Microsoft's late-2025
