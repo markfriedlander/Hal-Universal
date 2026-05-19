@@ -2466,9 +2466,18 @@ extension MemoryStore {
         }
 
         let queryEmbedding = generateEmbedding(for: query, as: .query)
-        guard !queryEmbedding.isEmpty else {
-            print("HALDEBUG-SEARCH: Query embedding is empty, cannot perform semantic search.")
-            return UnifiedSearchContext(snippets: [], totalTokens: 0)
+        let semanticAvailable = !queryEmbedding.isEmpty
+        if !semanticAvailable {
+            // BUG 2a fix (2026-05-19): an empty query embedding (embedding
+            // backend not yet loaded, or NLContextual model compilation
+            // failure on sim) used to early-return zero results — which
+            // also killed BM25, even though BM25 doesn't need embeddings.
+            // Imported documents became unfindable by lexical query in
+            // that state. Now we skip the semantic pass and let BM25 carry
+            // retrieval. Quality may degrade vs. the hybrid path, but
+            // lexically distinctive terms (doc-unique words, names) still
+            // surface their source chunks.
+            print("HALDEBUG-SEARCH: Query embedding unavailable — skipping semantic pass, BM25 will carry retrieval.")
         }
 
         // Hybrid retrieval with Reciprocal Rank Fusion (Commit C, 2026-05-17).
@@ -2511,7 +2520,7 @@ extension MemoryStore {
 
         var semanticScored: [(id: String, score: Double)] = []
         var stmt: OpaquePointer?
-        if sqlite3_prepare_v2(db, semanticSQL, -1, &stmt, nil) == SQLITE_OK {
+        if semanticAvailable, sqlite3_prepare_v2(db, semanticSQL, -1, &stmt, nil) == SQLITE_OK {
             while sqlite3_step(stmt) == SQLITE_ROW {
                 guard let idCString = sqlite3_column_text(stmt, 0),
                       let contentCString = sqlite3_column_text(stmt, 1),
@@ -2592,10 +2601,21 @@ extension MemoryStore {
 
         // --- 2. BM25 retrieval via FTS5 ---
         halLog("HALDEBUG-SEARCH: Performing FTS5 BM25 retrieval (RRF-style)...")
+        // BM25 SQL JOINs unified_content_fts with unified_content. Both
+        // tables expose source_type / source_id / position via the FTS5
+        // contentless-table mirror columns, so unqualified column names
+        // in the exclusion clause are ambiguous. The naive whitespace-
+        // anchored replace below missed the `AND NOT (source_type=...`
+        // pattern produced by buildExclusionClause, leaving an unqualified
+        // `source_type` in the SQL — every chat turn with excludeTurns
+        // populated hit a `prepare failed: ambiguous column name` and
+        // silently returned zero BM25 candidates. Fixed by qualifying
+        // ALL three column references inside the parenthesized NOT-clause
+        // regardless of leading whitespace. Bug 2a follow-up (2026-05-19).
         let bm25ExclusionClause = exclusionClause
-            .replacingOccurrences(of: " AND source_type", with: " AND u.source_type")
-            .replacingOccurrences(of: " AND source_id", with: " AND u.source_id")
-            .replacingOccurrences(of: " AND turn_number", with: " AND u.turn_number")
+            .replacingOccurrences(of: "(source_type=", with: "(u.source_type=")
+            .replacingOccurrences(of: " source_id=", with: " u.source_id=")
+            .replacingOccurrences(of: " turn_number ", with: " u.turn_number ")
         let bm25SQL = """
         SELECT u.id, u.content, u.source_type, u.source_id, u.position, u.metadata_json, u.timestamp, u.recorded_by_model,
                -bm25(unified_content_fts) AS bm25_score
@@ -2608,6 +2628,12 @@ extension MemoryStore {
         """
         var bm25Stmt: OpaquePointer?
         var bm25Ordered: [String] = []  // ids in rank order
+        // Set to true when BM25's top-1 is a distinctive lexical match
+        // (rare/unique token like an imported document's unique vocabulary).
+        // RRF gives BM25 a smaller `k` in that regime so distinctive lexical
+        // hits dominate semantic-only matches that happen to share generic
+        // tokens. See Bug 2a fix (2026-05-19).
+        var bm25Distinctive: Bool = false
         if sqlite3_prepare_v2(db, bm25SQL, -1, &bm25Stmt, nil) == SQLITE_OK {
             let originalSanitized = sanitizeFTSQuery(query)
             // Merge LLM-supplied expansion terms (if any) with the
@@ -2750,6 +2776,9 @@ extension MemoryStore {
             let bm25DistinctiveThreshold: Double = 1.5
             let bm25Top1 = bm25Scores.first ?? 0
             let bm25HasStrongMatch = bm25Top1 >= bm25DistinctiveThreshold
+            // Hoist out for RRF weighting (Bug 2a follow-up): when BM25 is
+            // matching distinctive tokens, its rank-1 should dominate RRF.
+            bm25Distinctive = bm25HasStrongMatch
             let applyGate = semanticRelativeSpread >= semanticConfidenceThreshold && !bm25HasStrongMatch
             if !applyGate {
                 if bm25HasStrongMatch {
@@ -2797,20 +2826,27 @@ extension MemoryStore {
         }
 
         // --- 3. RRF fusion ---
-        // rrf(d) = sum over retrievers L of 1 / (k + rank_L(d)), k=60
-        let rrfK: Double = 60.0
+        // rrf(d) = sum over retrievers L of 1 / (k + rank_L(d))
+        // Default k=60 (canonical). When BM25 has a distinctive lexical
+        // top-1 (e.g. unique imported-document term), give BM25 a smaller k
+        // so its rank-1 dominates. Without this, BM25's confident match
+        // gets RRF'd to rank-2 behind a semantically-adjacent conversation
+        // snippet — exactly the Bug 2a failure mode where imported docs
+        // show up below conversation echoes of their own content.
+        let rrfKSemantic: Double = 60.0
+        let rrfKBM25: Double = bm25Distinctive ? 10.0 : 60.0
         var rrfScored: [(id: String, score: Double, inSemantic: Bool, inBM25: Bool)] = []
         let unionIds = Set(semanticRanks.keys).union(Set(bm25Ranks.keys))
         for rowId in unionIds {
             var rrf = 0.0
             let sRank = semanticRanks[rowId]
             let bRank = bm25Ranks[rowId]
-            if let r = sRank { rrf += 1.0 / (rrfK + Double(r)) }
-            if let r = bRank { rrf += 1.0 / (rrfK + Double(r)) }
+            if let r = sRank { rrf += 1.0 / (rrfKSemantic + Double(r)) }
+            if let r = bRank { rrf += 1.0 / (rrfKBM25 + Double(r)) }
             rrfScored.append((rowId, rrf, sRank != nil, bRank != nil))
         }
         rrfScored.sort { $0.score > $1.score }
-        halLog("HALDEBUG-SEARCH: RRF fused \(unionIds.count) unique rows (\(semanticRanks.count) semantic + \(bm25Ranks.count) BM25, k=\(Int(rrfK)))")
+        halLog("HALDEBUG-SEARCH: RRF fused \(unionIds.count) unique rows (\(semanticRanks.count) semantic + \(bm25Ranks.count) BM25, kSem=\(Int(rrfKSemantic)) kBM25=\(Int(rrfKBM25))\(bm25Distinctive ? " [distinctive BM25 boost]" : ""))")
 
         // --- 4. Build UnifiedSearchResult list from RRF order ---
         var allResults: [UnifiedSearchResult] = []
@@ -6629,6 +6665,22 @@ struct iOSChatView: View {
                 SelfReflectionView()
                     .environmentObject(chatViewModel)
             }
+            .sheet(isPresented: $chatViewModel.apiNavPowerUser) {
+                PowerUserView()
+                    .environmentObject(chatViewModel)
+                    .environmentObject(MLXModelDownloader.shared)
+            }
+            .sheet(isPresented: $chatViewModel.apiNavSalonSettings) {
+                SalonModeView()
+                    .environmentObject(chatViewModel)
+            }
+            .sheet(isPresented: $chatViewModel.apiNavModelLibrary) {
+                NavigationView {
+                    ModelLibraryView()
+                        .environmentObject(chatViewModel)
+                        .environmentObject(MLXModelDownloader.shared)
+                }
+            }
         }
     }
 
@@ -6852,10 +6904,14 @@ struct ActionsView: View {
 
     var body: some View {
         NavigationView {
+            ScrollViewReader { proxy in
             Form {
                 personalitySection
+                    .id("personality")
                 importExportSection
+                    .id("importexport")
                 modelSection
+                    .id("ai")
                 // watchSection — frozen May-14, 2026. Apple Watch feature is
                 // not user-visible in v1.x. The underlying code remains intact
                 // (AppDelegate bridge, processWatchIncomingMessage, the
@@ -6868,6 +6924,7 @@ struct ActionsView: View {
                 // in a way that violates Mark's "never silently fail"
                 // principle.
                 powerUserSection
+                    .id("poweruser")
             }
             .navigationTitle("Settings")
             .toolbar {
@@ -6875,6 +6932,15 @@ struct ActionsView: View {
                     Button("Done") { dismiss() }
                 }
             }
+            .onChange(of: chatViewModel.apiScrollSettingsTarget) { _, newTarget in
+                guard !newTarget.isEmpty else { return }
+                withAnimation { proxy.scrollTo(newTarget, anchor: .top) }
+                // Clear so the same target can be re-driven later.
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) {
+                    chatViewModel.apiScrollSettingsTarget = ""
+                }
+            }
+            } // ScrollViewReader
         }
         .onAppear {
             // v1.x release: force Salon Mode off in the live ChatViewModel state
@@ -7177,26 +7243,30 @@ struct ActionsView: View {
             // render at slightly different heights, which propagated through
             // Form re-layout as a visible scroll/flash jump above the
             // picker. Verified on iPhone 17 Pro sim before/after.
-            HStack {
+            HStack(alignment: .top) {
                 if chatViewModel.salonConfig.isEnabled {
                     Text("Salon Mode")
                         .font(.subheadline)
                         .fontWeight(.medium)
                     Spacer()
-                    HStack(spacing: 6) {
+                    HStack(alignment: .top, spacing: 6) {
                         Image(systemName: "person.2.fill")
                             .foregroundColor(.accentColor)
                             .imageScale(.small)
-                        // Show the actual seat names ("Gemma · Llama · Qwen
-                        // · Dolphin") so the user can see which models are
-                        // in the active configuration without opening the
-                        // salon picker. Previously this was "N voices",
-                        // which obscured the configuration. 2026-05-18.
+                            .padding(.top, 2)
+                        // Show all active seat names ("Gemma · Llama · Qwen
+                        // · Dolphin"). Bug-fix 2026-05-19: previously
+                        // .lineLimit(1) truncated the summary at the first
+                        // model name on narrower widths, so a 2+ seat
+                        // configuration looked like only seat 1 was
+                        // running. Allow up to 3 lines and right-align so
+                        // long names wrap cleanly instead of disappearing.
                         Text(chatViewModel.salonSeatSummary)
                             .font(.subheadline)
                             .foregroundColor(.secondary)
-                            .lineLimit(1)
-                            .truncationMode(.tail)
+                            .multilineTextAlignment(.trailing)
+                            .lineLimit(3)
+                            .fixedSize(horizontal: false, vertical: true)
                     }
                 } else {
                     Text("Active Model")
@@ -7297,8 +7367,17 @@ struct ActionsView: View {
                         .font(.subheadline)
                         .fontWeight(.medium)
 
-                    Picker("", selection: Binding(
-                        get: { powerUserMode },
+                    Picker("", selection: Binding<PowerUserMode>(
+                        get: {
+                            // Bug-fix 2026-05-19: read directly from
+                            // salonConfig so API-driven salon toggles
+                            // are reflected in the picker even when
+                            // Settings is already open. Local @State
+                            // was only synced in onAppear, which left
+                            // the picker showing stale "Multi" after
+                            // `SALON_SET_ENABLED:false` via the API.
+                            chatViewModel.salonConfig.isEnabled ? .multi : .single
+                        },
                         set: { newMode in
                             powerUserMode = newMode
                             // Route through `setSalonEnabled` so the
@@ -7321,9 +7400,9 @@ struct ActionsView: View {
                     // fixed frame (full width + line limit) so toggling
                     // single <-> multi doesn't change how the text wraps,
                     // which would push everything below up/down.
-                    Text(powerUserMode == .single ?
-                         "Advanced settings for single model operation" :
-                         "Configure multiple models for collaborative conversations")
+                    Text(chatViewModel.salonConfig.isEnabled ?
+                         "Configure multiple models for collaborative conversations" :
+                         "Advanced settings for single model operation")
                         .font(.caption)
                         .foregroundColor(.secondary)
                         .lineLimit(1)
@@ -7356,15 +7435,15 @@ struct ActionsView: View {
 
             // Settings button — in v1.x, always opens Single LLM Settings.
             Button {
-                if Self.salonModeExposedInUI && powerUserMode == .multi {
+                if Self.salonModeExposedInUI && chatViewModel.salonConfig.isEnabled {
                     showingSalonModeSheet = true
                 } else {
                     showingPowerUserSheet = true
                 }
             } label: {
                 HStack {
-                    Image(systemName: (Self.salonModeExposedInUI && powerUserMode == .multi) ? "person.3" : "wrench.and.screwdriver")
-                    Text((Self.salonModeExposedInUI && powerUserMode == .multi) ? "Salon Mode Settings" : "Single LLM Settings")
+                    Image(systemName: (Self.salonModeExposedInUI && chatViewModel.salonConfig.isEnabled) ? "person.3" : "wrench.and.screwdriver")
+                    Text((Self.salonModeExposedInUI && chatViewModel.salonConfig.isEnabled) ? "Salon Mode Settings" : "Single LLM Settings")
                     Spacer()
                     Image(systemName: "chevron.right")
                         .font(.caption)
@@ -7373,7 +7452,7 @@ struct ActionsView: View {
             }
             .foregroundColor(.primary)
         } footer: {
-            Text(Self.salonModeExposedInUI && powerUserMode == .multi ?
+            Text(Self.salonModeExposedInUI && chatViewModel.salonConfig.isEnabled ?
                  "Configure multi-model conversation orchestration" :
                  "Advanced memory settings and data management")
                 .font(.caption2)
@@ -9792,7 +9871,11 @@ struct WidgetTestView: View {
         // visual marker on private rows) when on.
         @State private var allReflections: [(id: String, conversationId: String, timestamp: Int, reflectionType: Int, freeFormText: String, turnNumber: Int, modelId: String, shareable: Bool, shareabilityDecidedByModel: String?)] = []
         @State private var allTraits: [(category: String, key: String, value: String, confidence: Double, reinforcementCount: Int, lastReinforced: Int, shareable: Bool, shareabilityDecidedByModel: String?)] = []
-        @State private var showPrivate: Bool = false
+        // Hoisted to @AppStorage so the LocalAPIServer can flip it via
+        // SET_UI_STATE:showPrivateReflections and so the toggle survives
+        // sheet dismiss/re-open. Local @State previously made it both
+        // un-driveable by automation and reset on every reopen.
+        @AppStorage("selfModelShowPrivateReflections") private var showPrivate: Bool = false
         @State private var showingPrivacyPopup: Bool = false
         // Persisted once-per-install: the first time the user toggles
         // "show private" on, we surface a short explanatory popup.
@@ -11071,6 +11154,15 @@ class ChatViewModel: ObservableObject {
     @Published var apiNavSystemPrompt: Bool = false
     @Published var apiNavModelFraming: Bool = false
     @Published var apiNavSelfModel: Bool = false
+    @Published var apiNavPowerUser: Bool = false
+    @Published var apiNavSalonSettings: Bool = false
+    @Published var apiNavModelLibrary: Bool = false
+
+    // API-driven scroll inside the open Settings sheet. Set to "personality",
+    // "importexport", or "ai" via SET_UI_STATE; the ActionsView observes and
+    // calls ScrollViewReader.scrollTo. Auto-clears after each scroll so the
+    // same target can be re-driven repeatedly.
+    @Published var apiScrollSettingsTarget: String = ""
     
     // Lightweight mirrors of downloader state for binding
     var mlxIsDownloading: Bool { MLXModelDownloader.shared.isDownloading }
@@ -19409,21 +19501,64 @@ class HalTestConsole: ObservableObject {
                 vm.showingThreadPanel = value
                 if value { vm.showingSettings = false }
             case "systemprompt":
+                // Sub-sheets can't co-exist with the Settings sheet —
+                // SwiftUI only presents one .sheet at a time from a given
+                // view. When activating a sub-sheet, dismiss Settings
+                // first; reverse on deactivation isn't needed because
+                // the sub-sheet dismissal just leaves the underlying
+                // chat view visible.
+                if value { vm.showingSettings = false }
                 vm.apiNavSystemPrompt = value
             case "modelframing":
+                if value { vm.showingSettings = false }
                 vm.apiNavModelFraming = value
             case "selfmodel":
+                if value { vm.showingSettings = false }
                 vm.apiNavSelfModel = value
+            case "poweruser":
+                if value { vm.showingSettings = false }
+                vm.apiNavPowerUser = value
+            case "salonsettings":
+                if value { vm.showingSettings = false }
+                vm.apiNavSalonSettings = value
+            case "modellibrary":
+                if value { vm.showingSettings = false }
+                vm.apiNavModelLibrary = value
+            case "selfmodelshowprivate":
+                // Mirror the @AppStorage key flipped by the SelfReflectionView
+                // toggle. Driving it via UserDefaults lets the API set it
+                // without the view being on-screen, and on-screen views
+                // observe the change because @AppStorage is KVO-backed.
+                UserDefaults.standard.set(value, forKey: "selfModelShowPrivateReflections")
+            case "scrollsettings":
+                // Scroll the open Settings sheet to a section. `value` is
+                // unused; the section name comes from parts[1] (already
+                // lowercased). Valid: "personality", "importexport", "ai",
+                // "poweruser". Settings sheet observes apiScrollSettingsTarget
+                // and uses ScrollViewReader.scrollTo on change.
+                vm.apiScrollSettingsTarget = parts[1].lowercased()
             case "none":
                 vm.showingSettings = false
                 vm.showingThreadPanel = false
                 vm.apiNavSystemPrompt = false
                 vm.apiNavModelFraming = false
                 vm.apiNavSelfModel = false
+                vm.apiNavPowerUser = false
+                vm.apiNavSalonSettings = false
+                vm.apiNavModelLibrary = false
             default:
                 return "{\"status\":\"error\",\"message\":\"Unknown target '\(target)' (use settings|threadPanel|systemPrompt|modelFraming|selfModel|none)\"}"
             }
             return "{\"status\":\"ok\",\"command\":\"SET_UI_STATE\",\"target\":\"\(target)\",\"value\":\(value)}"
+
+        } else if trimmed == "EXPORT_THREAD" {
+            // Returns the same text that the UI's "Export Thread" button
+            // hands to UIActivityViewController. Lets CC verify export
+            // content correctness without having to capture the system
+            // share sheet (which renders identically on sim and device
+            // anyway, so pixels add nothing).
+            let text = vm.exportChatHistory()
+            return "{\"status\":\"ok\",\"command\":\"EXPORT_THREAD\",\"length\":\(text.count),\"text\":\"\(jsonStringEscape(text))\"}"
 
         } else if trimmed == "SCREENSHOT" {
             // Capture the current key window as a PNG and write to the app's
