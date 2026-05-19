@@ -5105,6 +5105,38 @@ class MLXWrapper: ObservableObject {
                     let promptTokenCount = lmInput.text.tokens.size
                     halLog("HALDEBUG-MLX-CHAT: Input prepared in \(String(format: "%.2f", Date.timeIntervalSinceReferenceDate - generateStart))s; prompt tokens: \(promptTokenCount)")
 
+                    // Per-turn memory pre-flight (Item 11 follow-up, 2026-05-18).
+                    // The load-time check in loadModel covers model weights but
+                    // can't anticipate KV-cache growth as the conversation
+                    // accumulates. Each prompt token costs ~per-model KV bytes
+                    // during prefill; multiply by the actual token count, add a
+                    // safety margin, and refuse the turn cleanly if the process
+                    // can't afford it. Without this check Gemma 4 E2B's runtime
+                    // working memory eventually crosses the iOS dirty-memory
+                    // cliff and Hal gets jetsam-killed mid-generation. With
+                    // this check Hal stays alive, posts a friendly explanation
+                    // in chat, and keeps the conversation intact.
+                    let kvBytesPerToken = self.currentModelConfig?.kvCacheBytesPerPromptToken ?? (80 * 1024)
+                    let kvBytesNeeded = Int64(promptTokenCount) * Int64(kvBytesPerToken)
+                    let scratchBytes: Int64 = 200 * 1024 * 1024   // generation scratch buffers
+                    let safetyBytes: Int64 = 200 * 1024 * 1024    // headroom above iOS dirty cliff
+                    let neededBytes = kvBytesNeeded + scratchBytes + safetyBytes
+                    let availableBytes = Int64(os_proc_available_memory())
+                    let neededMB = Int(neededBytes / (1024 * 1024))
+                    let availableMB = availableBytes <= 0 ? Int.max : Int(availableBytes / (1024 * 1024))
+                    halLog("HALDEBUG-MEMORY: per-turn pre-flight model=\(self.currentModelConfig?.displayName ?? "?") promptTokens=\(promptTokenCount) kvBytesPerToken=\(kvBytesPerToken) neededMB=\(neededMB) availableMB=\(availableMB == Int.max ? -1 : availableMB)")
+                    if availableBytes > 0 && availableBytes < neededBytes {
+                        let modelDisplayName = self.currentModelConfig?.displayName ?? "this model"
+                        halLog("HALDEBUG-MEMORY: per-turn pre-flight REFUSED — \(modelDisplayName) prompt=\(promptTokenCount) tokens needs ~\(neededMB)MB but only \(availableMB)MB available")
+                        continuation.finish(throwing: LLMService.LLMError.insufficientMemoryForTurn(
+                            promptTokens: promptTokenCount,
+                            neededMB: neededMB,
+                            availableMB: availableMB,
+                            modelDisplayName: modelDisplayName
+                        ))
+                        return
+                    }
+
                     // Per-model repetition-penalty tuning. Values live in each
                     // ModelConfiguration's `defaultSettings: ModelSettings` field.
                     // Some models (Qwen 3.5 2B) need a mild penalty to avoid
@@ -5717,6 +5749,12 @@ class LLMService: ObservableObject {
         case modelNotLoaded
         case predictionFailed(Error)
         case sessionInitializationFailed
+        /// Insufficient process memory headroom for the upcoming turn's
+        /// KV cache + generation scratch. Caught by the per-turn pre-flight
+        /// in MLXWrapper.generateChatStream (Item 11 follow-up, 2026-05-18).
+        /// The .userFacingMessage flavor is shown directly in chat as
+        /// Hal's reply; the conversation continues without crashing.
+        case insufficientMemoryForTurn(promptTokens: Int, neededMB: Int, availableMB: Int, modelDisplayName: String)
 
         var errorDescription: String? {
             switch self {
@@ -5726,6 +5764,10 @@ class LLMService: ObservableObject {
                 return "LLM operation failed: \(error.localizedDescription)"
             case .sessionInitializationFailed:
                 return "Failed to initialize a fresh language model session."
+            case .insufficientMemoryForTurn(let promptTokens, let neededMB, let availableMB, let modelDisplayName):
+                let neededGB = Double(neededMB) / 1024.0
+                let availableGB = Double(availableMB) / 1024.0
+                return "I don't have enough memory to process this turn. The conversation has grown to \(promptTokens) prompt tokens, which \(modelDisplayName) needs roughly \(String(format: "%.1f", neededGB)) GB of working memory to attend to — and I only have \(String(format: "%.1f", availableGB)) GB available right now. Start a new thread to free up the conversation history, or switch to a lighter model: Qwen 3.5 2B uses about half the per-token memory."
             }
         }
     }
@@ -13677,6 +13719,24 @@ class ChatViewModel: ObservableObject {
                                                                                     messages[i].content = chunk
                                                                                 }
                                                                             }
+                                                                        } catch let memError as LLMService.LLMError {
+                                                                            // Per-turn memory refusal (Item 11 follow-up, 2026-05-18).
+                                                                            // The MLX wrapper estimated the upcoming KV cache
+                                                                            // wouldn't fit and refused before starting prefill.
+                                                                            // Convert into Hal's reply text so the conversation
+                                                                            // continues — the user sees an honest explanation,
+                                                                            // the model stays loaded, and the history is intact.
+                                                                            // Any other LLMError is rethrown for the outer handler.
+                                                                            modelTime = Date().timeIntervalSince(t0)
+                                                                            if case .insufficientMemoryForTurn = memError {
+                                                                                halLog("HALDEBUG-LLM: Per-turn memory refusal surfaced as chat message.")
+                                                                                finalText = memError.errorDescription ?? "I don't have enough memory to process this turn."
+                                                                                if let i = messages.firstIndex(where: { $0.id == pid }) {
+                                                                                    messages[i].content = finalText
+                                                                                }
+                                                                            } else {
+                                                                                throw memError
+                                                                            }
                                                                         } catch {
                                                                             // Rethrow so the existing catch block handles the error state
                                                                             modelTime = Date().timeIntervalSince(t0)
@@ -14162,6 +14222,22 @@ class ChatViewModel: ObservableObject {
                                                                                 if let i = messages.firstIndex(where: { $0.id == pid }) {
                                                                                     messages[i].content = chunk
                                                                                 }
+                                                                            }
+                                                                        } catch let memError as LLMService.LLMError {
+                                                                            // Salon-side mirror of the single-model memory-refusal
+                                                                            // handler. If a seat's model can't fit the upcoming
+                                                                            // turn's KV cache, surface the explanation as that
+                                                                            // seat's reply text instead of failing the whole
+                                                                            // salon round. Item 11 follow-up, 2026-05-18.
+                                                                            modelTime = Date().timeIntervalSince(t0)
+                                                                            if case .insufficientMemoryForTurn = memError {
+                                                                                halLog("HALDEBUG-SALON: Seat \(seatPosition) memory refusal surfaced as seat reply.")
+                                                                                finalText = memError.errorDescription ?? "I don't have enough memory to process this turn."
+                                                                                if let i = messages.firstIndex(where: { $0.id == pid }) {
+                                                                                    messages[i].content = finalText
+                                                                                }
+                                                                            } else {
+                                                                                throw memError
                                                                             }
                                                                         } catch {
                                                                             modelTime = Date().timeIntervalSince(t0)
@@ -17553,6 +17629,35 @@ struct ModelConfiguration: Identifiable, Codable, Equatable, Hashable {
     var prefillTokensPerSec: Double?
     var maximCompliance: MaximScorecard?
 
+    // MARK: - KV-cache footprint per prompt token (Item 11 follow-up, 2026-05-18)
+    //
+    // Conservative estimate of how many bytes of process working memory
+    // each prompt token costs at generation time, dominated by the
+    // attention K + V cache (one entry per layer per head). MLXWrapper's
+    // per-turn pre-flight (`generateChatStream`) multiplies this by the
+    // actual prompt token count to predict whether the upcoming turn
+    // will fit in the process's remaining dirty-memory budget.
+    //
+    // The first cut of Item 11 (commit 30b651b) only checked memory at
+    // *load* time. That caught the worst case (model can't even load)
+    // but missed the failure mode Mark hit during stress testing: load
+    // succeeds with ~330 MB headroom, then by turn 5-6 the KV cache for
+    // an 8000-token prompt has eaten 600+ MB, the process crosses the
+    // iOS dirty-memory cliff, and Hal gets jetsam-killed mid-generation.
+    //
+    // Values are intentionally conservative — better to refuse a turn
+    // that would have squeezed in than to crash one that wouldn't.
+    // Calibrate empirically as data accumulates.
+    //   - Gemma 4 E2B:   ~120 KB/token (large hidden dim, FP16 KV cache)
+    //   - Qwen 3.5 2B:    ~50 KB/token (smaller architecture)
+    //   - Llama 3.2 3B:   ~60 KB/token
+    //   - Dolphin 3.0:    ~60 KB/token (Llama 3.2 3B base)
+    //   - Phi-4 Mini:     ~70 KB/token
+    // Unknown / catalog-discovered models: 80 KB/token default.
+    //
+    // Codable-optional so older persisted configs decode cleanly.
+    var kvCacheBytesPerPromptToken: Int?
+
     var isLocal: Bool { source == .mlx }
     var requiresDownload: Bool { source == .mlx && !isDownloaded }
 
@@ -17574,7 +17679,8 @@ struct ModelConfiguration: Identifiable, Codable, Equatable, Hashable {
         voiceTag: String? = nil,
         generationTokensPerSec: Double? = nil,
         prefillTokensPerSec: Double? = nil,
-        maximCompliance: MaximScorecard? = nil
+        maximCompliance: MaximScorecard? = nil,
+        kvCacheBytesPerPromptToken: Int? = nil
     ) {
         self.id = id
         self.displayName = displayName
@@ -17591,6 +17697,7 @@ struct ModelConfiguration: Identifiable, Codable, Equatable, Hashable {
         self.generationTokensPerSec = generationTokensPerSec
         self.prefillTokensPerSec = prefillTokensPerSec
         self.maximCompliance = maximCompliance
+        self.kvCacheBytesPerPromptToken = kvCacheBytesPerPromptToken
     }
     
     func hash(into hasher: inout Hasher) {
@@ -17687,9 +17794,18 @@ struct ModelConfiguration: Identifiable, Codable, Equatable, Hashable {
         // penalty cleanly. Large RAG budget — Gemma's prefill speed and
         // 128K context comfortably absorb richer retrieved context, which
         // supports stronger Maxim #2 / #3 behavior.
+        //
+        // Memory-depth note (Item 11 follow-up, 2026-05-18): the previous
+        // default was 8 turns of history, but stress testing on iPhone 16
+        // Plus showed Gemma jetsam-killing the app after ~5 substantive
+        // turns. By turn 5, the prompt was ~8000 tokens; Gemma's
+        // 120 KB/token KV cost put working memory over the dirty-memory
+        // cliff. Lowered to 4 turns to bound worst-case KV footprint;
+        // the per-turn pre-flight in MLXWrapper.generateChatStream is
+        // the safety net for whatever still sneaks past.
         defaultSettings: ModelSettings(
             temperature: 0.7,
-            effectiveMemoryDepth: 8,
+            effectiveMemoryDepth: 4,
             recencyWeight: 0.3,
             recencyHalfLifeDays: 90,
             maxRagSnippetsCharacters: 1400,
@@ -17712,7 +17828,14 @@ struct ModelConfiguration: Identifiable, Codable, Equatable, Hashable {
             m3Memory:      .pass,
             m4Refusal:     .mixed,
             m5Evolution:   .standout
-        )
+        ),
+        // Item 11 follow-up (2026-05-18): Gemma 4 E2B's architecture has
+        // the largest per-token KV-cache footprint of the catalog —
+        // empirically observed jetsam-killing after ~5 substantive turns
+        // on iPhone 16 Plus during stress testing. 120 KB/token is a
+        // conservative estimate; the per-turn pre-flight will refuse a
+        // turn cleanly rather than letting the process crash.
+        kvCacheBytesPerPromptToken: 120 * 1024
     )
 
     /// Phi-4 Mini Instruct 4-bit — the reasoner voice. Microsoft's late-2025
@@ -17743,7 +17866,12 @@ struct ModelConfiguration: Identifiable, Codable, Equatable, Hashable {
             ragDedupThreshold: 0.85,
             repetitionPenalty: nil,
             repetitionContextSize: nil
-        )
+        ),
+        // Per-token KV cost (Item 11 follow-up): 3.8B-param model,
+        // slightly heavier than Llama 3B. 70 KB/token is a conservative
+        // estimate; Phi-4 is demoted so this rarely activates but keeps
+        // the catalog consistent.
+        kvCacheBytesPerPromptToken: 70 * 1024
     )
 
     /// Qwen 3.5 2B 4-bit — the versatile generalist voice. Alibaba's March 2026
@@ -17806,7 +17934,13 @@ struct ModelConfiguration: Identifiable, Codable, Equatable, Hashable {
             m3Memory:      .pass,
             m4Refusal:     .fail,
             m5Evolution:   .pass
-        )
+        ),
+        // Per-token KV cost (Item 11 follow-up): Qwen 3.5 2B's smaller
+        // architecture has the lightest per-token footprint of the
+        // catalog. 50 KB/token leaves plenty of headroom even at long
+        // prompts; in stress testing Qwen handled 8000-token prompts
+        // on iPhone 16 Plus without jetsam risk.
+        kvCacheBytesPerPromptToken: 50 * 1024
     )
 
     /// Llama 3.2 3B Instruct 4-bit — the workhorse voice. Meta's proven small
@@ -17851,7 +17985,12 @@ struct ModelConfiguration: Identifiable, Codable, Equatable, Hashable {
             m3Memory:      .pass,
             m4Refusal:     .standout,
             m5Evolution:   .pass
-        )
+        ),
+        // Per-token KV cost (Item 11 follow-up): 3B Llama architecture
+        // sits between Qwen and Gemma. 60 KB/token is conservative
+        // enough to refuse turns that would push the 3B model over the
+        // dirty-memory cliff on iPhone 16 Plus.
+        kvCacheBytesPerPromptToken: 60 * 1024
     )
 
     /// Dolphin 3.0 Llama 3.2 3B 4-bit — the unhedged voice. Cognitive
@@ -17927,7 +18066,10 @@ struct ModelConfiguration: Identifiable, Codable, Equatable, Hashable {
             m3Memory:      .pass,
             m4Refusal:     .mixed,
             m5Evolution:   .pass
-        )
+        ),
+        // Per-token KV cost (Item 11 follow-up): same Llama 3.2 3B base
+        // as the workhorse Llama config, so same footprint.
+        kvCacheBytesPerPromptToken: 60 * 1024
     )
 
 
