@@ -711,6 +711,68 @@ def main():
             sys.exit(1)
         cmd_ui_state(config)
 
+    elif subcommand == "screenshot":
+        if not config:
+            print("ERROR: HTTP config required. Run setup first.")
+            sys.exit(1)
+        # Optional second arg: local output path. If on device (host is not
+        # 127.0.0.1 / localhost), pull the file back via devicectl. Otherwise
+        # the file is already on the local Mac filesystem (sim sandbox).
+        out_path = args[1] if len(args) > 1 else None
+        result = send_command("SCREENSHOT", config)
+        if result.get("status") != "ok":
+            print(json.dumps(result, indent=2))
+            sys.exit(1)
+        device_path = result["path"]
+        host = config.get("host", "")
+        is_local = host in ("127.0.0.1", "localhost") or host.endswith(".local") is False and host.replace(".", "").isdigit() is False
+        # Heuristic: simulator paths live on this Mac's filesystem already;
+        # device paths live in an iOS container we have to pull. The mDNS
+        # ".local" host is the iPhone. Treat anything that isn't the sim
+        # localhost as a device.
+        is_sim = host in ("127.0.0.1", "localhost")
+        if is_sim:
+            local_path = out_path or device_path
+            if out_path and out_path != device_path:
+                import shutil
+                shutil.copy(device_path, out_path)
+            print(json.dumps({"status": "ok", "path": local_path, "width": result["width"], "height": result["height"], "source": "sim"}))
+        else:
+            # Pull via devicectl. Need bundle ID and device UDID.
+            import subprocess
+            device_udid = os.environ.get("HAL_DEVICE_UDID", "D24FB384-9C55-5D33-9B0D-DAEBFA6528D6")
+            bundle_id = "com.MarkFriedlander.Hal-Universal"
+            local_path = out_path or f"/tmp/hal_device_{device_path.rsplit('/', 1)[-1]}"
+            # Path inside the container is relative to Documents/. devicectl
+            # expects domain-relative path.
+            rel_path = device_path.split("/Documents/", 1)[-1] if "/Documents/" in device_path else device_path
+            pull_cmd = [
+                "xcrun", "devicectl", "device", "copy", "from",
+                "--device", device_udid,
+                "--domain-type", "appDataContainer",
+                "--domain-identifier", bundle_id,
+                "--source", f"Documents/{rel_path}",
+                "--destination", local_path,
+            ]
+            proc = subprocess.run(pull_cmd, capture_output=True, text=True)
+            if proc.returncode != 0:
+                print(json.dumps({"status": "error", "stderr": proc.stderr, "stdout": proc.stdout, "device_path": device_path}, indent=2))
+                sys.exit(1)
+            print(json.dumps({"status": "ok", "path": local_path, "width": result["width"], "height": result["height"], "source": "device", "device_path": device_path}))
+
+    elif subcommand == "navigate":
+        if not config:
+            print("ERROR: HTTP config required. Run setup first.")
+            sys.exit(1)
+        if len(args) < 2:
+            print("Usage: hal_test.py navigate <target> [true|false]")
+            print("  targets: settings, threadPanel, systemPrompt, modelFraming, selfModel, none")
+            sys.exit(1)
+        target = args[1]
+        value = args[2] if len(args) > 2 else "true"
+        result = send_command(f"SET_UI_STATE:{target}:{value}", config)
+        print(json.dumps(result, indent=2))
+
     elif subcommand == "logs":
         if not config:
             print("ERROR: HTTP config required. Run setup first.")

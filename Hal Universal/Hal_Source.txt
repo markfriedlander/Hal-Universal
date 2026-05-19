@@ -12156,6 +12156,21 @@ struct iOSChatView: View {
                     .environmentObject(chatViewModel)
                     .environmentObject(DocumentImportManager.shared)
             }
+
+            // API-driven sub-sheet navigation (root-level so SET_UI_STATE
+            // can present these without Settings being open).
+            .sheet(isPresented: $chatViewModel.apiNavSystemPrompt) {
+                SystemPromptEditorView()
+                    .environmentObject(chatViewModel)
+            }
+            .sheet(isPresented: $chatViewModel.apiNavModelFraming) {
+                ModelFramingDetailView()
+                    .environmentObject(chatViewModel)
+            }
+            .sheet(isPresented: $chatViewModel.apiNavSelfModel) {
+                SelfReflectionView()
+                    .environmentObject(chatViewModel)
+            }
         }
     }
 
@@ -16590,6 +16605,14 @@ class ChatViewModel: ObservableObject {
     @Published var showingSettings: Bool = false
     @Published var showingThreadPanel: Bool = false
     @Published var showingDocumentPicker: Bool = false
+
+    // Sub-sheet navigation hoisted onto ChatViewModel so the LocalAPIServer
+    // can present them via SET_UI_STATE without going through SettingsView.
+    // Root iOSChatView presents these as top-level sheets, so they work
+    // whether Settings is open or not.
+    @Published var apiNavSystemPrompt: Bool = false
+    @Published var apiNavModelFraming: Bool = false
+    @Published var apiNavSelfModel: Bool = false
     
     // Lightweight mirrors of downloader state for binding
     var mlxIsDownloading: Bool { MLXModelDownloader.shared.isDownloading }
@@ -24927,13 +24950,31 @@ class HalTestConsole: ObservableObject {
             case "threadpanel":
                 vm.showingThreadPanel = value
                 if value { vm.showingSettings = false }
+            case "systemprompt":
+                vm.apiNavSystemPrompt = value
+            case "modelframing":
+                vm.apiNavModelFraming = value
+            case "selfmodel":
+                vm.apiNavSelfModel = value
             case "none":
                 vm.showingSettings = false
                 vm.showingThreadPanel = false
+                vm.apiNavSystemPrompt = false
+                vm.apiNavModelFraming = false
+                vm.apiNavSelfModel = false
             default:
-                return "{\"status\":\"error\",\"message\":\"Unknown target '\(target)' (use settings|threadPanel|none)\"}"
+                return "{\"status\":\"error\",\"message\":\"Unknown target '\(target)' (use settings|threadPanel|systemPrompt|modelFraming|selfModel|none)\"}"
             }
             return "{\"status\":\"ok\",\"command\":\"SET_UI_STATE\",\"target\":\"\(target)\",\"value\":\(value)}"
+
+        } else if trimmed == "SCREENSHOT" {
+            // Capture the current key window as a PNG and write to the app's
+            // Documents directory. Returns the on-device path. The Python
+            // test runner pulls it back via `devicectl device file pull` on
+            // device, or reads the sim path directly. Added so CC can do
+            // visual-correctness verification on the physical device, where
+            // simulator MCP tooling doesn't apply.
+            return await captureScreenshotJSON()
 
         } else if trimmed == "GET_RENDERED_MESSAGES" {
             return buildRenderedMessagesJSON(vm: vm)
@@ -25759,6 +25800,45 @@ class HalTestConsole: ObservableObject {
           "mlxLoadingMessage": "\(mlxLoadingMessage)"
         }
         """
+    }
+
+    // Capture the current key window as a PNG, write to Documents/api_screenshots/,
+    // and return the on-device path. CC test tooling pulls the file back via
+    // `devicectl device file pull` (device) or reads it directly (simulator —
+    // sim sandbox is reachable from the Mac).
+    //
+    // Runs on the main actor since UIKit's snapshotting requires it.
+    @MainActor
+    func captureScreenshotJSON() async -> String {
+        let scenes = UIApplication.shared.connectedScenes
+            .compactMap { $0 as? UIWindowScene }
+        guard let keyWindow = scenes
+            .flatMap({ $0.windows })
+            .first(where: { $0.isKeyWindow }) ?? scenes.first?.windows.first else {
+            return "{\"status\":\"error\",\"message\":\"SCREENSHOT: no key window\"}"
+        }
+        let bounds = keyWindow.bounds
+        let format = UIGraphicsImageRendererFormat.default()
+        format.scale = keyWindow.screen.scale
+        let renderer = UIGraphicsImageRenderer(bounds: bounds, format: format)
+        let image = renderer.image { ctx in
+            keyWindow.drawHierarchy(in: bounds, afterScreenUpdates: true)
+        }
+        guard let png = image.pngData() else {
+            return "{\"status\":\"error\",\"message\":\"SCREENSHOT: pngData failed\"}"
+        }
+        let docs = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first!
+        let dir = docs.appendingPathComponent("api_screenshots", isDirectory: true)
+        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        let ts = Int(Date().timeIntervalSince1970 * 1000)
+        let file = dir.appendingPathComponent("sc_\(ts).png")
+        do {
+            try png.write(to: file)
+        } catch {
+            return "{\"status\":\"error\",\"message\":\"SCREENSHOT: write failed: \(jsonStringEscape(error.localizedDescription))\"}"
+        }
+        let w = Int(bounds.width), h = Int(bounds.height)
+        return "{\"status\":\"ok\",\"command\":\"SCREENSHOT\",\"path\":\"\(jsonStringEscape(file.path))\",\"width\":\(w),\"height\":\(h),\"bytes\":\(png.count)}"
     }
 
     // Returns the most recent log entries captured by RuntimeLog. Useful for
