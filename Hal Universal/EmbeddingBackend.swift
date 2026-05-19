@@ -204,14 +204,34 @@ nonisolated enum EmbeddingBackend: String, Sendable, CaseIterable {
             // unrelated thoughts).
             return 0.85
         case .nomicSwift:
-            // PLACEHOLDER — needs calibration from real corpus data on
-            // Nomic. The 0.85 number is NOT calibrated for Nomic; it's a
-            // safe starting value that will likely produce too many false
-            // negatives (Nomic's "clearly related" band is typically
-            // 0.7-0.9, not 0.85-0.99). CC should calibrate from the
-            // first sustained Nomic corpus we get and update this number.
-            // Leaving the same as NLContextual until then to avoid
-            // accidental over-merging.
+            // Calibrated 2026-05-18 via tests/nomic_calibration_probe.py —
+            // 18 of 30 planned pairs measured on device (10 SAME + 8 RELATED;
+            // UNREL class was cut short by repeated iOS suspension of the
+            // app during the long probe run — see commit message + HISTORY).
+            //
+            // Measured distribution under Nomic Embed Text v1.5 on
+            // reflection-shaped sentences:
+            //   SAME    (same thought, different words):  0.73 – 0.93  (mean 0.84)
+            //   RELATED (same topic, distinct ideas):     0.71 – 0.83  (mean 0.76)
+            //
+            // The bands OVERLAP. Nomic does not crisply separate "exact
+            // duplicate" from "same topic / same subject" — both look very
+            // close in embedding space. Concrete example: "Mark likes
+            // morning walks" vs "Mark sometimes runs marathons" scored
+            // 0.83 (RELATED, not SAME).
+            //
+            // 0.85 sits at the safe edge ABOVE the observed RELATED tail
+            // (max 0.8311 + 0.02 headroom). It captures the top half of
+            // SAME pairs (those Nomic agrees are most-duplicate) and
+            // avoids all observed RELATED false positives. Weaker SAME
+            // pairs get stored separately; reinforcement_count bumps when
+            // a stronger duplicate arrives later. Conservative bias is
+            // correct because synthesis is destructive.
+            //
+            // Same numeric value as NLContextual but for a different
+            // reason: NLContextual's 0.85 sits high in its 0.69–0.91
+            // range; Nomic's 0.85 sits at the floor of its safe-merge
+            // zone.
             return 0.85
         case .embeddingGemma:
             // PLACEHOLDER — same situation as Nomic. EmbeddingGemma is

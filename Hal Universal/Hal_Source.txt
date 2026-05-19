@@ -205,14 +205,34 @@ nonisolated enum EmbeddingBackend: String, Sendable, CaseIterable {
             // unrelated thoughts).
             return 0.85
         case .nomicSwift:
-            // PLACEHOLDER — needs calibration from real corpus data on
-            // Nomic. The 0.85 number is NOT calibrated for Nomic; it's a
-            // safe starting value that will likely produce too many false
-            // negatives (Nomic's "clearly related" band is typically
-            // 0.7-0.9, not 0.85-0.99). CC should calibrate from the
-            // first sustained Nomic corpus we get and update this number.
-            // Leaving the same as NLContextual until then to avoid
-            // accidental over-merging.
+            // Calibrated 2026-05-18 via tests/nomic_calibration_probe.py —
+            // 18 of 30 planned pairs measured on device (10 SAME + 8 RELATED;
+            // UNREL class was cut short by repeated iOS suspension of the
+            // app during the long probe run — see commit message + HISTORY).
+            //
+            // Measured distribution under Nomic Embed Text v1.5 on
+            // reflection-shaped sentences:
+            //   SAME    (same thought, different words):  0.73 – 0.93  (mean 0.84)
+            //   RELATED (same topic, distinct ideas):     0.71 – 0.83  (mean 0.76)
+            //
+            // The bands OVERLAP. Nomic does not crisply separate "exact
+            // duplicate" from "same topic / same subject" — both look very
+            // close in embedding space. Concrete example: "Mark likes
+            // morning walks" vs "Mark sometimes runs marathons" scored
+            // 0.83 (RELATED, not SAME).
+            //
+            // 0.85 sits at the safe edge ABOVE the observed RELATED tail
+            // (max 0.8311 + 0.02 headroom). It captures the top half of
+            // SAME pairs (those Nomic agrees are most-duplicate) and
+            // avoids all observed RELATED false positives. Weaker SAME
+            // pairs get stored separately; reinforcement_count bumps when
+            // a stronger duplicate arrives later. Conservative bias is
+            // correct because synthesis is destructive.
+            //
+            // Same numeric value as NLContextual but for a different
+            // reason: NLContextual's 0.85 sits high in its 0.69–0.91
+            // range; Nomic's 0.85 sits at the floor of its safe-merge
+            // zone.
             return 0.85
         case .embeddingGemma:
             // PLACEHOLDER — same situation as Nomic. EmbeddingGemma is
@@ -25003,6 +25023,76 @@ class HalTestConsole: ObservableObject {
             let (threads, facts, messages) = vm.memoryStore.clearAllConversationData()
             vm.startNewConversation()
             return "{\"status\":\"ok\",\"command\":\"CLEAR_TEST_DATA\",\"threadsDeleted\":\(threads),\"factsDeleted\":\(facts),\"messagesDeleted\":\(messages),\"newConversationId\":\"\(vm.conversationId)\"}"
+
+        } else if trimmed.hasPrefix("EMBED_SIM_BATCH:") {
+            // EMBED_SIM_BATCH:<t1a>|||<t2a>~~~<t1b>|||<t2b>~~~...
+            //
+            // Like EMBED_SIM but takes many pairs in one round trip, to
+            // avoid iOS suspending the app between probe calls. Pairs
+            // separated by `~~~`, texts within a pair separated by `|||`.
+            // Returns one JSON array of {sim, dim} entries in input order.
+            //
+            // Added 2026-05-18 for batch Nomic threshold calibration.
+            let payload = String(trimmed.dropFirst("EMBED_SIM_BATCH:".count))
+            let pairs = payload.components(separatedBy: "~~~")
+            var results: [String] = []
+            for pair in pairs {
+                let halves = pair.components(separatedBy: "|||")
+                if halves.count != 2 {
+                    results.append("{\"sim\":null,\"error\":\"bad pair\"}")
+                    continue
+                }
+                guard let v1 = EmbeddingProvider.shared.embed(halves[0], as: .document),
+                      let v2 = EmbeddingProvider.shared.embed(halves[1], as: .document),
+                      v1.count == v2.count, !v1.isEmpty else {
+                    results.append("{\"sim\":null,\"error\":\"embed failed\"}")
+                    continue
+                }
+                var dot = 0.0, n1 = 0.0, n2 = 0.0
+                for i in 0..<v1.count {
+                    dot += v1[i] * v2[i]
+                    n1 += v1[i] * v1[i]
+                    n2 += v2[i] * v2[i]
+                }
+                let denom = (n1.squareRoot() * n2.squareRoot())
+                let sim = denom > 0 ? dot / denom : 0
+                results.append("{\"sim\":\(sim),\"dim\":\(v1.count)}")
+            }
+            let backend = EmbeddingProvider.shared.activeBackend.rawValue
+            return "{\"status\":\"ok\",\"backend\":\"\(backend)\",\"count\":\(results.count),\"results\":[\(results.joined(separator: ","))]}"
+
+        } else if trimmed.hasPrefix("EMBED_SIM:") {
+            // EMBED_SIM:<text1>|||<text2>
+            //
+            // Diagnostic: returns cosine similarity between embeddings of
+            // two texts under the active backend. Used for threshold
+            // calibration probes (see EmbeddingBackend.recommendedSynthesisThreshold).
+            // Both texts embedded with `.document` purpose to match
+            // reflection-storage semantics.
+            //
+            // Added 2026-05-18 for Nomic synthesis threshold calibration.
+            let payload = String(trimmed.dropFirst("EMBED_SIM:".count))
+            let parts = payload.components(separatedBy: "|||")
+            guard parts.count == 2 else {
+                return "{\"status\":\"error\",\"message\":\"EMBED_SIM: payload must be <text1>|||<text2>\"}"
+            }
+            let t1 = parts[0]
+            let t2 = parts[1]
+            guard let v1 = EmbeddingProvider.shared.embed(t1, as: .document),
+                  let v2 = EmbeddingProvider.shared.embed(t2, as: .document),
+                  v1.count == v2.count, !v1.isEmpty else {
+                return "{\"status\":\"error\",\"message\":\"EMBED_SIM: embed failed or dim mismatch\"}"
+            }
+            var dot = 0.0, n1 = 0.0, n2 = 0.0
+            for i in 0..<v1.count {
+                dot += v1[i] * v2[i]
+                n1 += v1[i] * v1[i]
+                n2 += v2[i] * v2[i]
+            }
+            let denom = (n1.squareRoot() * n2.squareRoot())
+            let sim = denom > 0 ? dot / denom : 0
+            let backend = EmbeddingProvider.shared.activeBackend.rawValue
+            return "{\"status\":\"ok\",\"backend\":\"\(backend)\",\"dim\":\(v1.count),\"sim\":\(sim),\"t1Len\":\(t1.count),\"t2Len\":\(t2.count)}"
 
         } else if trimmed == "EMBEDDING_STATUS" {
             // Read-only diagnostic for the active embedding backend.

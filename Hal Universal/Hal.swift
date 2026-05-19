@@ -19482,6 +19482,76 @@ class HalTestConsole: ObservableObject {
             vm.startNewConversation()
             return "{\"status\":\"ok\",\"command\":\"CLEAR_TEST_DATA\",\"threadsDeleted\":\(threads),\"factsDeleted\":\(facts),\"messagesDeleted\":\(messages),\"newConversationId\":\"\(vm.conversationId)\"}"
 
+        } else if trimmed.hasPrefix("EMBED_SIM_BATCH:") {
+            // EMBED_SIM_BATCH:<t1a>|||<t2a>~~~<t1b>|||<t2b>~~~...
+            //
+            // Like EMBED_SIM but takes many pairs in one round trip, to
+            // avoid iOS suspending the app between probe calls. Pairs
+            // separated by `~~~`, texts within a pair separated by `|||`.
+            // Returns one JSON array of {sim, dim} entries in input order.
+            //
+            // Added 2026-05-18 for batch Nomic threshold calibration.
+            let payload = String(trimmed.dropFirst("EMBED_SIM_BATCH:".count))
+            let pairs = payload.components(separatedBy: "~~~")
+            var results: [String] = []
+            for pair in pairs {
+                let halves = pair.components(separatedBy: "|||")
+                if halves.count != 2 {
+                    results.append("{\"sim\":null,\"error\":\"bad pair\"}")
+                    continue
+                }
+                guard let v1 = EmbeddingProvider.shared.embed(halves[0], as: .document),
+                      let v2 = EmbeddingProvider.shared.embed(halves[1], as: .document),
+                      v1.count == v2.count, !v1.isEmpty else {
+                    results.append("{\"sim\":null,\"error\":\"embed failed\"}")
+                    continue
+                }
+                var dot = 0.0, n1 = 0.0, n2 = 0.0
+                for i in 0..<v1.count {
+                    dot += v1[i] * v2[i]
+                    n1 += v1[i] * v1[i]
+                    n2 += v2[i] * v2[i]
+                }
+                let denom = (n1.squareRoot() * n2.squareRoot())
+                let sim = denom > 0 ? dot / denom : 0
+                results.append("{\"sim\":\(sim),\"dim\":\(v1.count)}")
+            }
+            let backend = EmbeddingProvider.shared.activeBackend.rawValue
+            return "{\"status\":\"ok\",\"backend\":\"\(backend)\",\"count\":\(results.count),\"results\":[\(results.joined(separator: ","))]}"
+
+        } else if trimmed.hasPrefix("EMBED_SIM:") {
+            // EMBED_SIM:<text1>|||<text2>
+            //
+            // Diagnostic: returns cosine similarity between embeddings of
+            // two texts under the active backend. Used for threshold
+            // calibration probes (see EmbeddingBackend.recommendedSynthesisThreshold).
+            // Both texts embedded with `.document` purpose to match
+            // reflection-storage semantics.
+            //
+            // Added 2026-05-18 for Nomic synthesis threshold calibration.
+            let payload = String(trimmed.dropFirst("EMBED_SIM:".count))
+            let parts = payload.components(separatedBy: "|||")
+            guard parts.count == 2 else {
+                return "{\"status\":\"error\",\"message\":\"EMBED_SIM: payload must be <text1>|||<text2>\"}"
+            }
+            let t1 = parts[0]
+            let t2 = parts[1]
+            guard let v1 = EmbeddingProvider.shared.embed(t1, as: .document),
+                  let v2 = EmbeddingProvider.shared.embed(t2, as: .document),
+                  v1.count == v2.count, !v1.isEmpty else {
+                return "{\"status\":\"error\",\"message\":\"EMBED_SIM: embed failed or dim mismatch\"}"
+            }
+            var dot = 0.0, n1 = 0.0, n2 = 0.0
+            for i in 0..<v1.count {
+                dot += v1[i] * v2[i]
+                n1 += v1[i] * v1[i]
+                n2 += v2[i] * v2[i]
+            }
+            let denom = (n1.squareRoot() * n2.squareRoot())
+            let sim = denom > 0 ? dot / denom : 0
+            let backend = EmbeddingProvider.shared.activeBackend.rawValue
+            return "{\"status\":\"ok\",\"backend\":\"\(backend)\",\"dim\":\(v1.count),\"sim\":\(sim),\"t1Len\":\(t1.count),\"t2Len\":\(t2.count)}"
+
         } else if trimmed == "EMBEDDING_STATUS" {
             // Read-only diagnostic for the active embedding backend.
             // Reports backend name and whether it's loaded yet. Only
