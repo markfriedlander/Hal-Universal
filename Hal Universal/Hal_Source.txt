@@ -8272,9 +8272,33 @@ extension MemoryStore {
             // Nomic's, so the gate engages only when semantic has
             // enough room to be the deciding factor.
             let semanticConfidenceThreshold: Double = 0.15
-            let applyGate = semanticRelativeSpread >= semanticConfidenceThreshold
+            //
+            // BUG 2a fix (2026-05-19): also bypass the gate when BM25 has
+            // a STRONG top-1 score. Rare / distinctive / made-up words
+            // (e.g. "periwinkle", "Berkenia", a product name from an
+            // imported document) produce strong BM25 matches because the
+            // token is lexically dominant — almost no other row contains
+            // it. In that regime, semantic embedding doesn't actually
+            // know what the word means (out-of-vocab or rare) so it
+            // ranks something else high based on shape/recency, giving
+            // an inflated "confidence" spread that's not about
+            // correctness. Without this bypass, the gate kills BM25
+            // exactly when BM25 is the right signal, and imported-
+            // document content becomes unfindable by its distinctive
+            // terms. Threshold 1.5 derived from observed BM25 scores:
+            // distinctive single-token matches in our corpus score
+            // 2.5-3.0; common-word matches score 0.5-1.2. 1.5 cleanly
+            // separates them.
+            let bm25DistinctiveThreshold: Double = 1.5
+            let bm25Top1 = bm25Scores.first ?? 0
+            let bm25HasStrongMatch = bm25Top1 >= bm25DistinctiveThreshold
+            let applyGate = semanticRelativeSpread >= semanticConfidenceThreshold && !bm25HasStrongMatch
             if !applyGate {
-                halLog("HALDEBUG-SEARCH: BM25 quality gate SKIPPED — semantic relative spread \(semSpreadStr) < \(semanticConfidenceThreshold); semantic is in a narrow band (embedder uncertain), letting BM25 carry retrieval.")
+                if bm25HasStrongMatch {
+                    halLog("HALDEBUG-SEARCH: BM25 quality gate SKIPPED — BM25 top-1 score \(String(format: "%.2f", bm25Top1)) >= \(bm25DistinctiveThreshold); distinctive lexical match dominates, trusting BM25.")
+                } else {
+                    halLog("HALDEBUG-SEARCH: BM25 quality gate SKIPPED — semantic relative spread \(semSpreadStr) < \(semanticConfidenceThreshold); semantic is in a narrow band (embedder uncertain), letting BM25 carry retrieval.")
+                }
             }
             if applyGate, !bm25Ordered.isEmpty {
                 let k = min(5, bm25Ordered.count)
@@ -12521,18 +12545,29 @@ struct ActionsView: View {
         Section {
             // Salon-mode banner — placed at the top of the personality
             // section so the user sees the lockout reason BEFORE the
-            // disabled controls. Only renders when salon is active.
-            if isSalonActive {
-                HStack(alignment: .top, spacing: 6) {
-                    Image(systemName: "person.3.fill")
-                        .foregroundColor(.orange)
-                        .imageScale(.small)
-                    Text("Individual model settings are locked during Salon conversations. Exit Salon Mode to adjust.")
-                        .font(.caption)
-                        .foregroundColor(.secondary)
-                }
-                .padding(.vertical, 4)
+            // disabled controls.
+            //
+            // BUG 4 fix (2026-05-19): banner is now ALWAYS rendered with
+            // the same height, but invisible (opacity 0 + disabled) when
+            // salon is inactive. Previously this was a conditional `if
+            // isSalonActive` block which added ~50pt to the section
+            // height when salon toggled on, pushing everything below
+            // (including the Power User picker further down the form)
+            // off the visible screen — the user just tapped the picker
+            // and now couldn't see it. Reserving the height keeps the
+            // Form layout stable across the toggle. Verified on iPhone
+            // 17 Pro sim before/after.
+            HStack(alignment: .top, spacing: 6) {
+                Image(systemName: "person.3.fill")
+                    .foregroundColor(.orange)
+                    .imageScale(.small)
+                Text("Individual model settings are locked during Salon conversations. Exit Salon Mode to adjust.")
+                    .font(.caption)
+                    .foregroundColor(.secondary)
             }
+            .padding(.vertical, 4)
+            .opacity(isSalonActive ? 1 : 0)
+            .allowsHitTesting(isSalonActive)
 
             // Per Strategic §4: per-model Layer 1 framing.
             //
@@ -12672,6 +12707,14 @@ struct ActionsView: View {
             //   - Single-model: "Active Model • [Name]" with unified status dot
             //   - Salon Mode: "Salon Mode • N voices" with a person.2 indicator
             // The Browse Model Library link below is unchanged in either mode.
+            //
+            // BUG 4 fix (2026-05-19): pinned the outer HStack to a fixed
+            // minHeight so toggling Multi LLM <-> Single LLM via the picker
+            // below doesn't cause this row to change intrinsic height. The
+            // two variants (person.2.fill icon vs. modelStatusDot Circle)
+            // render at slightly different heights, which propagated through
+            // Form re-layout as a visible scroll/flash jump above the
+            // picker. Verified on iPhone 17 Pro sim before/after.
             HStack {
                 if chatViewModel.salonConfig.isEnabled {
                     Text("Salon Mode")
@@ -12710,6 +12753,7 @@ struct ActionsView: View {
                     }
                 }
             }
+            .frame(minHeight: 28)
 
             NavigationLink(destination: ModelLibraryView()
                 .environmentObject(chatViewModel)
@@ -12811,11 +12855,17 @@ struct ActionsView: View {
                     }
                     .pickerStyle(.segmented)
 
+                    // BUG 4 fix (2026-05-19): pinned this caption to a
+                    // fixed frame (full width + line limit) so toggling
+                    // single <-> multi doesn't change how the text wraps,
+                    // which would push everything below up/down.
                     Text(powerUserMode == .single ?
                          "Advanced settings for single model operation" :
                          "Configure multiple models for collaborative conversations")
                         .font(.caption)
                         .foregroundColor(.secondary)
+                        .lineLimit(1)
+                        .frame(maxWidth: .infinity, alignment: .leading)
                 }
             }
 
@@ -25505,6 +25555,19 @@ class HalTestConsole: ObservableObject {
             }
             halLog("HALDEBUG-SETTINGS: Applied effective settings for \(newModel.displayName) via VM props: temp=\(effective.temperature.map { "\($0)" } ?? "—"), depth=\(vm.memoryDepth), maxRag=\(effective.maxRagSnippetsCharacters.map { "\($0)" } ?? "—")")
         }
+
+        // BUG 3 fix (2026-05-19): wait for the MLX load to actually
+        // complete before returning. setupLLM(for:) kicks the load off
+        // on a background Task captured in
+        // `LLMService.pendingMLXLoadTask`; without awaiting it, the API
+        // returns SWITCH_MODEL ok before the model is loaded, and the
+        // user's immediate next /chat call hits the not-loaded gate
+        // and returns "Error: The selected language model could not be
+        // loaded or is not available." For ~3 GB MLX models like Gemma
+        // 4 E2B and Dolphin 3.0 this fails reliably; smaller MLX
+        // models win the race by accident. AFM has no load step so
+        // awaiting is a no-op for it.
+        await vm.llmService.awaitPendingMLXLoad()
     }
 
     private func buildModelListJSON(vm: ChatViewModel) -> String {
