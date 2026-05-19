@@ -52,26 +52,42 @@ before the next push.
 
 ### Deferred — needs decisions or hands
 
-- **`SET_MEMORY_DEPTH` persistence bug.** Reproduced isolated:
-  SET to 2, terminate + launch, next chat runs at depth=5 because
-  `ChatViewModel` init calls `ModelSettingsStore.shared.applyEffectiveSettings(for: initialModel)`
-  (Hal.swift:11402) which silently overwrites the user override.
-  Smoking gun: `HALDEBUG-SETTINGS: Applied effective settings for
-  Gemma 4 E2B: ... depth=5` log line during init. Two reasonable
-  fixes; both are product calls. See HISTORY 2026-05-19 entry.
+**Ship-blockers found late-night reactive testing:**
 
-- **First-turn-after-swap race for 3 GB MLX models.** Gemma +
-  Dolphin reliably fail the first chat after a SWITCH_MODEL.
-  Hypothesis: `SWITCH_MODEL` returns before MLX has finished
-  loading, and the immediate chat hits the not-loaded gate.
-  Proposed fix: have SWITCH_MODEL block on model-ready before
-  returning, or have `/chat` queue behind in-flight loads.
+- **Bug 2a — Document RAG misses non-final chunks.** Imported 2-chunk
+  document; unique words from earlier chunk (Berkenia, Veldros,
+  periwinkle, armadillo) return zero document hits in semantic search;
+  only words from the LAST chunk (lighthouse) surface the document.
+  Real users importing docs will only get the last third retrievable.
 
-- **Unscripted-reactive Item 1 follow-up.** SC asked for
-  "improvised reactively" prompts on Item 1; I went scripted-
-  for-comparability. Mark agreed scripted-first for settings
-  derivation, then unscripted as the realism check. The
-  unscripted pass did not happen tonight.
+- **Bug 2b — Confabulation when RAG misses target.** When the target
+  content isn't in the prompt, Hal makes up plausible content rather
+  than saying "I don't have that." AFM does this more confidently
+  than Gemma. Combination with 2a is the ship-blocker for documents.
+
+**Carried over:**
+
+- **Bug 1 — `SET_MEMORY_DEPTH` persistence.** SET to N, app re-inits,
+  silently reverts to per-model default via applyEffectiveSettings.
+  Two proposed fixes in NEXT.md, both product calls.
+
+- **Bug 3 — First-turn-after-swap race for 3 GB MLX models.** Gemma +
+  Dolphin reliably fail the first chat after SWITCH_MODEL. Fix
+  options in NEXT.md.
+
+- **Bug 4 — Salon toggle scroll/flash.** Visual artifact, needs
+  reproduction on device + video for targeted fix.
+
+- **Bug 5 — PromptDetailView visual verification.** Code-side healthy;
+  Mark to confirm classification on real device.
+
+- **Bug 6 — Stress test probe-assertion bugs.** Three false-positives
+  in `tests/stress_test.py`; cleanup task.
+
+- **Item 1 unscripted-reactive — partial.** CC ran a reactive pass at
+  depth=5 (12 turns) and depth=2 (6 turns) catching the confabulation
+  failure mode the scripted probes missed. Mark to do a genuine
+  human-driven pass for the realism final check.
 
 - **Screenshots, version bump, archive, ASC submit.** Mechanical,
   gated on Mark + Xcode UI. See NEXT.md.

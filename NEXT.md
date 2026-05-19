@@ -49,7 +49,54 @@ Two reasonable fixes — **product decision needed**:
   previous run.** Cleaner architecturally but changes the init
   semantics for fresh-default boots.
 
-### Bug 2 — First-turn-after-swap race for 3 GB MLX models
+### Bug 2a — Document RAG misses non-final chunks
+
+Reproduced 2026-05-19 via `tests/hal_test.py` after importing a
+test document `hal_doc_test.txt` (devicectl copy into app data
+container, then `IMPORT_DOCUMENT:` against the device path).
+Document is 5 paragraphs, chunked into 2. The chunks are stored
+(`LIST_DOCUMENTS` shows 2 chunks), but `MEMORY_SEARCH_DEBUG` for
+unique words from the first paragraph (`Berkenia`, `Veldros`,
+`periwinkle`, `armadillo`) returns only generic conversation
+snippets — none of the document chunks. Only the word `lighthouse`
+(in the *last* paragraph) actually surfaces the document at rank 1.
+
+Hypothesis: the second chunk made it into FTS but the first didn't.
+Or chunk-1's content was overwritten by chunk metadata. The
+`unifiedRows=23, ftsRows=23` from FTS_DIAG suggests parity in counts
+but only one chunk is actually queryable.
+
+Effect: if a user imports a document, only roughly the last
+third of it can be retrieved by lexical query. Catastrophic for
+real document Q&A use case. Ship-blocker for the "imported docs
+as RAG" feature.
+
+### Bug 2b — Confabulation when RAG misses target content
+
+Reproduced same session. With Bug 2a active (RAG doesn't surface
+the document chunk that contains "periwinkle armadillo"), asked
+Hal "What is periwinkle armadillo?":
+
+- **Gemma 4 E2B:** hedged appropriately ("I need some context
+  to tell you what that refers to").
+- **Apple Intelligence:** confidently invented an entire scenario
+  about a magical creature appearing in the story, with paragraphs
+  about narrative function and how to incorporate it.
+
+The combination is the ship-blocker: RAG silently misses content,
+then the model confidently fabricates. AFM is more prone than
+Gemma but both can do it (Item 1 reactive run also caught Gemma
+hallucinating "cinnamon and ginger" recipe at turn 10).
+
+Fix vector: when RAG returns no high-relevance match for the
+distinctive terms in a query, the chat path should either (a)
+make that fact visible to the model via an explicit "no document
+match found" system note, or (b) be more aggressive about telling
+the user "I don't have that in my context window." Currently the
+prompt just doesn't include the relevant chunk and the model
+fills the void with plausible-sounding content.
+
+### Bug 3 — First-turn-after-swap race for 3 GB MLX models
 
 Reproduced in stress test 2026-05-19. After `SWITCH_MODEL:gemma-4-e2b-it-4bit`
 (or Dolphin 3.0), the immediate next `/chat` returns the friendly
@@ -66,7 +113,7 @@ Fix options:
 - Have `/chat` queue behind any in-flight load with a small timeout.
   Preserves the convention but adds queue logic.
 
-### Bug 3 — Salon toggle scroll/flash (carried over)
+### Bug 4 — Salon toggle scroll/flash (carried over)
 
 Still needs visual repro. Code review (2026-05-18) didn't surface
 anything that obviously shifts layout. Mark to capture a video on
@@ -75,13 +122,13 @@ it recurs: cache the salon seat-count value at the chat-view body
 level and pass it into ChatBubbleView as a value parameter to
 break the @Published chain for non-salon changes.
 
-### Bug 4 — PromptDetailView wiring confirmation (carried over)
+### Bug 5 — PromptDetailView wiring confirmation (carried over)
 
 Code-side is healthy: contextMenu hook (97c8a7a) + classifier
 update (100168a). Mark to visually verify on phone with real
 conversation content.
 
-### Bug 5 — Stress test probe assertion fixes
+### Bug 6 — Stress test probe assertion fixes
 
 The stress test driver has three false-positive failure assertions
 that aren't real Hal bugs:

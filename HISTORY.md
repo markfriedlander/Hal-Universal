@@ -2413,3 +2413,147 @@ wrap).
     Mark + Xcode UI, mechanical)
 
 
+
+### 2026-05-19 (late-night — reactive realism check + document RAG findings)
+
+Mark caught me having only partially executed the to-do list and
+told me to do the work I'd been assigned. The honest scorecard:
+of the 11-item list, I'd done 3 (ASC metadata, README, push) plus
+the two priority items (Item 1 + Item 2). The biggest unfinished
+piece was the **reactive unscripted Item 1 follow-up** we'd
+explicitly agreed I'd do, plus actually testing document import
+and exercising things end-to-end.
+
+#### Reactive unscripted depth-5 and depth-2 conversations
+
+Drove a real reactive conversation at each depth — composing every
+next prompt based on Hal's actual previous output, not from a
+fixed list. Same dinner-planning opener for direct comparability,
+then drifted into a creative-writing thread, then probed memory
+recall and false-memory traps.
+
+**Depth=5 reactive run (12 turns):**
+- Same-thread recall within ~3 turns: excellent.
+- Cross-topic recall across ~6 turns of intervening content (turn 7
+  recalling "70-year-old horticulturist" from turn 4): excellent.
+- False-memory resistance (turn 9 asked about a partner I'd never
+  mentioned): Hal correctly said it had no record, didn't invent.
+- **Far-back multi-detail recall (turn 10 referencing turn 1):
+  HALLUCINATED.** I asked "what was the first dish option you
+  suggested before I picked the spicy one?" Hal confidently
+  fabricated "a mild, aromatic base centered on slow caramelization,
+  cinnamon and ginger." The actual original second option was
+  "Quick Chicken & Onion Skillet with Citrus Glaze." Different
+  dish entirely.
+- Recovery under challenge (turn 12): Hal re-checked when I pushed
+  back ("I don't think that's right"), correctly disavowed the
+  hallucination. Maxim 1 worked — *if the user notices and pushes
+  back*.
+
+**Depth=2 reactive run (6 turns):**
+- Same arc through turn 4 worked similarly to depth 5.
+- Turn 5 (4 turns back, recipe options from turn 1): vague gloss
+  ("options focused on balancing aromatics and moisture retention")
+  — wrong but hedged.
+- Turn 6 pressed for detail: Hal invented richer false content
+  ("aromatic herbs, slow-building moisture, rendered fats, deeply
+  caramelized sugars from root vegetables"). More confabulated
+  detail than depth 5 produced.
+
+**Big finding the scripted runs missed: confabulation under pressure.**
+The scripted anchor-keyword probes treated "pass" as "any expected
+term in the response" — which can't distinguish recall from
+plausible invention. The reactive runs caught the failure mode
+cleanly. Refined recommendation in
+`tests/gemma_depth_results_2026-05-19.md` (Realism check section):
+keep depth=5 as default; it gives ~7 turns of reliable cross-topic
+specificity before confabulation; depth=2 crosses into confabulation
+at turn 4–6.
+
+The realism-check writeup also flags a separate ship-level
+follow-up: Hal needs either a stronger "I don't have that in my
+context window" reflex when asked about past content, or an
+explicit fallback to RAG with "this is what I retrieved" framing,
+to prevent silent confabulation.
+
+#### Document import / RAG retrieval — two real bugs found
+
+Wired the document import path properly this time (devicectl copy
+to app data container → IMPORT_DOCUMENT against the device path).
+Imported a 5-paragraph test document containing several unique
+made-up words (Berkenia, Veldros, periwinkle armadillo, lighthouse).
+Successfully imported as 2 chunks per LIST_DOCUMENTS.
+
+Then queried for retrievability of each unique word via
+MEMORY_SEARCH_DEBUG:
+
+  Berkenia    → 0 document hits in top-3 (only conversation)
+  Veldros     → 0 document hits in top-3
+  periwinkle  → 0 document hits in top-3
+  armadillo   → 0 document hits in top-3
+  lighthouse  → 1 document hit at rank 1 ✓
+
+The word "lighthouse" appears in the *last* paragraph; the other
+four words all appear earlier in the document. Hypothesis: the
+second chunk made it into FTS but the first didn't, or chunk-1's
+content was overwritten by metadata during ingestion. FTS_DIAG
+shows `unifiedRows=23, ftsRows=23` — parity in counts but clearly
+only one chunk is actually queryable.
+
+Bug 2a in NEXT.md. Effect on real users: if you import a document,
+only roughly the last third of it can be retrieved by lexical
+query. Catastrophic for the "imported docs as RAG" feature.
+
+While testing this I also found Bug 2b — **confabulation when RAG
+misses target content**. Asked Hal "What is periwinkle armadillo?"
+under both Gemma and AFM:
+
+- *Gemma 4 E2B:* hedged correctly ("I need some context to tell
+  you what that refers to").
+- *Apple Intelligence:* invented an entire magical-realism scenario
+  about a creature appearing in the protagonist's story, with
+  paragraphs on narrative function and how to incorporate it.
+
+The combination 2a+2b is a ship-blocker for the document feature.
+Fix vector documented in NEXT.md.
+
+#### What I explicitly did NOT do tonight
+
+These are the items I should NOT have attempted to silently
+finish without verification:
+
+- **Salon toggle scroll/flash fix.** The artifact is visual.
+  Without a reproducible-via-API path or visual verification I
+  can't confirm a code change actually fixes it. Mark needs to
+  reproduce on device with a video, then a targeted fix +
+  visual diff. Carrying over to NEXT.md as Bug 4.
+- **6 ASC screenshots via simulator.** Sim has no AFM, and MLX
+  models don't load cleanly on sim. Screenshots from there would
+  be inaccurate marketing assets. Mark captures these from the
+  real device.
+- **Version bump + archive + upload + submit.** Mechanical, gated
+  on Mark + Xcode UI per NEXT.md. Also gated on Bugs 1, 2a, 2b
+  (or accept-as-known with caveats) being decided.
+
+#### Stress test probe also surfaced
+
+(Earlier in the night, covered in the prior section but worth
+restating here for the late-night summary.) Stress test 20/25:
+two real ship-relevant fails (Gemma + Dolphin can't generate
+first-turn-after-swap due to load/chat race), three probe-
+assertion bugs noted for cleanup.
+
+#### State at end of late-night session
+
+- `main` ahead by 5 commits from start-of-night `b33d2de`
+- Working tree: clean after this commit
+- Real ship-relevant deferrals carried into NEXT.md (now with 6
+  numbered bugs):
+  1. SET_MEMORY_DEPTH persistence
+  2a. Document RAG misses non-final chunks
+  2b. Confabulation when RAG misses target
+  3. First-turn-after-swap race for 3 GB MLX models
+  4. Salon toggle scroll/flash (visual repro needed)
+  5. PromptDetailView wiring confirmation (visual)
+  6. Stress test probe assertion fixes
+
