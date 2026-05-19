@@ -7001,31 +7001,14 @@ struct ActionsView: View {
 
     private var personalitySection: some View {
         Section {
-            // Salon-mode banner — placed at the top of the personality
-            // section so the user sees the lockout reason BEFORE the
-            // disabled controls.
-            //
-            // BUG 4 fix (2026-05-19): banner is now ALWAYS rendered with
-            // the same height, but invisible (opacity 0 + disabled) when
-            // salon is inactive. Previously this was a conditional `if
-            // isSalonActive` block which added ~50pt to the section
-            // height when salon toggled on, pushing everything below
-            // (including the Power User picker further down the form)
-            // off the visible screen — the user just tapped the picker
-            // and now couldn't see it. Reserving the height keeps the
-            // Form layout stable across the toggle. Verified on iPhone
-            // 17 Pro sim before/after.
-            HStack(alignment: .top, spacing: 6) {
-                Image(systemName: "person.3.fill")
-                    .foregroundColor(.orange)
-                    .imageScale(.small)
-                Text("Individual model settings are locked during Salon conversations. Exit Salon Mode to adjust.")
-                    .font(.caption)
-                    .foregroundColor(.secondary)
-            }
-            .padding(.vertical, 4)
-            .opacity(isSalonActive ? 1 : 0)
-            .allowsHitTesting(isSalonActive)
+            // Salon-mode banner used to live at the top of this
+            // Personality section. Moved to the Power User Mode section
+            // (below the picker) per BUG 4 v2 fix (2026-05-19): the
+            // earlier opacity-reservation fix kept the Personality
+            // section's height stable but left visible empty space when
+            // salon was inactive. The right semantic home for this
+            // banner is next to the picker the user just toggled —
+            // see modelSection.
 
             // Per Strategic §4: per-model Layer 1 framing.
             //
@@ -7048,7 +7031,7 @@ struct ActionsView: View {
                 showingModelFramingDetail = true
             } label: {
                 HStack {
-                    Text("Model framing for \(chatViewModel.selectedModel.displayName)")
+                    Text("Model framing")
                     Spacer()
                     Image(systemName: "chevron.right")
                         .font(.caption)
@@ -7071,7 +7054,13 @@ struct ActionsView: View {
                 }
             }
             .foregroundColor(.primary)
-            
+            // BUG 4 v2 follow-up (2026-05-19): System Prompt is one of
+            // the per-model settings the salon banner says are locked.
+            // Was visually un-dimmed in salon mode, which contradicted
+            // the banner. Now matches Model framing + Temperature.
+            .disabled(isSalonActive)
+            .opacity(isSalonActive ? 0.45 : 1.0)
+
             VStack(alignment: .leading, spacing: 8) {
                 Toggle("Self-Knowledge", isOn: Binding(
                     get: { chatViewModel.enableSelfKnowledge },
@@ -7324,6 +7313,29 @@ struct ActionsView: View {
                         .foregroundColor(.secondary)
                         .lineLimit(1)
                         .frame(maxWidth: .infinity, alignment: .leading)
+
+                    // BUG 4 v2 fix (2026-05-19): salon-mode banner moved
+                    // here from the top of the Personality section. The
+                    // earlier opacity-reservation fix left visible empty
+                    // space when salon was inactive. Putting the banner
+                    // adjacent to the picker the user just toggled is
+                    // both better UX (action and explanation co-located)
+                    // and structurally safe — adding/removing rows from
+                    // THIS section doesn't shift the picker itself,
+                    // since the picker is above the banner in the same
+                    // section.
+                    if isSalonActive {
+                        HStack(alignment: .top, spacing: 6) {
+                            Image(systemName: "person.3.fill")
+                                .foregroundColor(.orange)
+                                .imageScale(.small)
+                            Text("Individual model settings (Personality section) are locked while Salon Mode is active. Exit Salon Mode to adjust.")
+                                .font(.caption)
+                                .foregroundColor(.secondary)
+                                .fixedSize(horizontal: false, vertical: true)
+                        }
+                        .padding(.top, 4)
+                    }
                 }
             }
 

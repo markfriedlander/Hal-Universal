@@ -2703,3 +2703,45 @@ casing. Worth a small fix in `getModel(byID:)` (case-
 insensitive comparison) but adding to NEXT.md as Bug 7 rather
 than patching now without further design review.
 
+
+### 2026-05-19 (very late afternoon — banner relocation + label fix + System Prompt dim)
+
+Mark flagged two real misses from the v3 wrap:
+
+1. The opacity-reservation salon banner fix solved the flash but left
+   visible empty space at the top of the Personality section in
+   single mode. "Not acceptable."
+2. "Model framing for Dolphin 3.0" should not include the model
+   name — inconsistent with other rows like "System Prompt."
+
+Both fixed:
+
+- **Banner relocated** from the top of the Personality section to a
+  conditional footer inside the Power User Mode section, below the
+  picker. Two wins: (a) no dead zone in single mode because the
+  Personality section's first row is now the actual first control
+  again; (b) the banner appears adjacent to the picker the user
+  just toggled — better UX (action + explanation co-located) and
+  structurally safe because adding/removing rows from THIS section
+  doesn't shift the picker above it. The earlier defensive
+  `.frame(minHeight: 28)` on the AI Model row HStack and the
+  `.lineLimit(1)` + `.frame(maxWidth: .infinity)` on the picker
+  caption stay — they handle the row-variant-height edge case.
+  Hal.swift:6980 (banner removed from Personality), Hal.swift:7312
+  (banner added to Power User Mode section).
+- **"Model framing for X" → "Model framing"** at Hal.swift:7051.
+  Now matches the naming of System Prompt etc.
+
+While re-checking the Personality section under salon mode, noticed
+**System Prompt was visually un-dimmed** even though the banner
+explicitly says "individual model settings are locked." Inconsistent.
+Added `.disabled(isSalonActive)` + `.opacity(isSalonActive ? 0.45 : 1.0)`
+on the System Prompt button to match Model framing and Temperature.
+Self-Knowledge toggle deliberately stays interactive — it's a global
+setting, not per-model, so the salon-locks-individual-settings rule
+doesn't apply.
+
+All three verified on iPhone 17 Pro sim. Power User Mode label
+position stable at y=746 across single→multi→single→multi→single
+toggles.
+

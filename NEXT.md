@@ -113,7 +113,24 @@ Fix options:
 - Have `/chat` queue behind any in-flight load with a small timeout.
   Preserves the convention but adds queue logic.
 
-### Bug 4 — Salon toggle scroll/flash ✓ REPRODUCED + diagnosed
+### Bug 4 — Salon toggle scroll/flash ✓ FIXED + VERIFIED
+
+v3 (banner relocation, 2026-05-19 late afternoon):
+Banner moved from top of Personality section to a conditional
+footer inside the Power User Mode section, below the picker. No
+dead zone in single mode (the earlier opacity-reserved version
+left visible empty space) and no shift of the picker when
+toggling (banner is below picker in the same section, so toggle-
+adding/removing it doesn't move the picker). Verified Power User
+Mode label stable at y=746 across multiple toggles on iPhone 17
+Pro sim. Plus: System Prompt now visually dimmed in salon mode
+to match the banner's "individual model settings are locked"
+promise. "Model framing for X" renamed to just "Model framing"
+to match the naming of other rows.
+
+Original investigation (v1, kept for historical reference):
+
+### Bug 4 — Salon toggle scroll/flash (v1 investigation log)
 
 Reproduced 2026-05-19 on iPhone 17 Pro simulator via the UI
 picker tap (NOT via the API `SALON_SET_ENABLED:` command — that
