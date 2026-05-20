@@ -6901,6 +6901,17 @@ struct ActionsView: View {
     @EnvironmentObject var documentImportManager: DocumentImportManager
     @EnvironmentObject var mlxDownloader: MLXModelDownloader
 
+    /// "Version 2.0 (6)" — formatted CFBundleShortVersionString + CFBundleVersion
+    /// from Info.plist for the About row in Settings. Static so the row body
+    /// doesn't recompute on every redraw. Reviewers and users can read this
+    /// without digging into Apple's Settings → Hal.
+    static var versionLine: String {
+        let info = Bundle.main.infoDictionary
+        let short = info?["CFBundleShortVersionString"] as? String ?? "?"
+        let build = info?["CFBundleVersion"] as? String ?? "?"
+        return "Version \(short) (\(build))"
+    }
+
     @Binding var showingDocumentPicker: Bool
     @State private var showingExportSheet = false
     @State private var showingPowerUserSheet = false
@@ -6935,6 +6946,26 @@ struct ActionsView: View {
                 // principle.
                 powerUserSection
                     .id("poweruser")
+
+                // About — version + build at the bottom of Settings.
+                // Plain footer rather than a Section{} so it doesn't get a
+                // header chrome. Reviewers + users should be able to read
+                // this without digging. Added 2026-05-19.
+                Section {
+                    HStack {
+                        Text("Hal Universal")
+                            .font(.subheadline)
+                        Spacer()
+                        Text(ActionsView.versionLine)
+                            .font(.subheadline)
+                            .foregroundColor(.secondary)
+                            .monospacedDigit()
+                            .textSelection(.enabled)
+                    }
+                } header: {
+                    Label("About", systemImage: "info.circle")
+                }
+                .id("about")
             }
             .navigationTitle("Settings")
             .toolbar {
