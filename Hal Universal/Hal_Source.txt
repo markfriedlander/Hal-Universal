@@ -1037,7 +1037,25 @@ struct EmbedderBackendRow: View {
     @ViewBuilder
     private var actionRow: some View {
         HStack(spacing: 12) {
-            if isActive {
+            // EmbeddingGemma is gated behind the HAL_ENABLE_EMBEDDING_GEMMA
+            // compile flag (Debug-only). Even in Debug, we present the row
+            // as read-only — Mark explicitly asked for a tap-proof guard
+            // here so a Debug-install user can't accidentally trigger the
+            // 210 MB download or the destructive re-embed migration. The
+            // row still expands so the description / dimensions / blurb
+            // remain visible for inspection. To re-enable for genuine
+            // testing, change the early-return branch below to fall through.
+            if backend == .embeddingGemma {
+                HStack(spacing: 6) {
+                    Image(systemName: "wrench.adjustable")
+                        .foregroundColor(.orange)
+                        .imageScale(.small)
+                    Text("Disabled in this build — pending upstream MLX fix")
+                        .font(.caption)
+                        .foregroundColor(.secondary)
+                }
+                Spacer()
+            } else if isActive {
                 // "Active" reads as a disabled button (matches LLM row's
                 // Select/Active state). Same icon, same text style.
                 Button(action: {}) {
