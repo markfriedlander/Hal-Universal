@@ -31,6 +31,7 @@ FILES=(
   "Hal Universal/MLXModelDownloader.swift"
   "Hal Universal/ModelCatalogService.swift"
   "Hal Universal/LocalAPIServer.swift"
+  "Hal Universal/DocumentImportManager.swift"
   "Hal Universal/Hal.swift"
 )
 
