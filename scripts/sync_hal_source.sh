@@ -30,6 +30,7 @@ FILES=(
   "Hal Universal/MaintenanceTasks.swift"
   "Hal Universal/MLXModelDownloader.swift"
   "Hal Universal/ModelCatalogService.swift"
+  "Hal Universal/LocalAPIServer.swift"
   "Hal Universal/Hal.swift"
 )
 
