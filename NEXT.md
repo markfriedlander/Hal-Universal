@@ -108,60 +108,51 @@ preserved inside every extracted file as internal section landmarks.
 - ✅ Refactor #2 (2026-05-26 PM): `ModelCatalogService` (LEGO 30)
 - ✅ Refactor #3 (2026-05-26 EVE): `LocalAPIServer + HalTestConsole` (LEGO 32)
 - ✅ Refactor #4 (2026-05-26 NIGHT): `DocumentImportManager + DocxParser + import models` (LEGO 27 + 27.1 + 28)
+- ✅ Refactor #5 (2026-05-26 LATE): `SettingsViews` (LEGO 10.1, 10.2, 10.3, 10.3.5, 10.4)
 
-### Next extraction: `SettingsView / ActionsView` (LEGO 10.x family)
+### Next candidate: assess `ChatView + composer + bubble views`
 
-By the three criteria above this is the clearest remaining win:
+Verdict on this one was "maybe" before the refactor run started; now
+that #1-#5 have proved the pattern out, the next decision is whether
+to take the chat-UI layer too. Probable scope:
 
-- **Read:** Settings UI is its own conceptual layer — pulling
-  MainSettingsView, PowerUserView, SystemPromptEditorView,
-  ModelFramingDetailView, and SalonModeView out clears Hal.swift's
-  midsection of UI code that has nothing to do with model
-  inference, memory, or chat.
-- **Extend:** every new setting in v2.1 (the Proposals review
-  surface, soul-document toggles, salon-seat tweaks) will be a
-  SettingsView edit. Isolating it cuts blast radius.
-- **Diagnose:** Settings bugs are almost always visual/binding
-  issues; making "the settings file" a single clearly-named place
-  makes them easier to localize.
+- **LEGO 09** App Entry & iOSChatView (UI Shell) — ~390 lines
+- **LEGO 09.5** ThreadPanelView — ~125 lines
+- **LEGO 13** ChatBubbleView & TimerView — ~570 lines
+- **LEGO 13.5** MarkdownView — ~180 lines
 
-LEGO blocks expected in scope: 10.1 MainSettingsView, 10.2
-PowerUserView, 10.3 SystemPromptEditorView, 10.3.5
-ModelFramingDetailView, 10.4 SalonModeView. Rough total ~2,500
-lines, all View structs (no ObservableObjects to migrate).
+Rough total ~1,270 lines. Plus possible UI helper blocks (11.6 UI
+Helper Components ~480 lines, 12.6 SelfReflectionView ~325 lines)
+that may travel with them depending on coupling.
 
-**Same approach as prior refactors:**
+**The honest "maybe" gating question:** do these blocks reach into
+ChatViewModel in ways that would make chat bugs *harder* to diagnose
+after extraction? Two flavors of crossing matter:
 
-1. Re-locate the LEGO 10.x markers in current Hal.swift.
-2. Verify no extensions on the View structs elsewhere.
-3. Identify any helper view structs / view modifiers used only by
-   the settings views — those move too.
-4. Slice via the Python boundary-cut. Tricky bit: 10.x is not a
-   contiguous range — there may be other blocks interleaved
-   (LEGO 11.x Model Library UI, for example). Read the whole
-   neighborhood before slicing.
-5. Create `Hal Universal/SettingsViews.swift` with header + imports
-   (Foundation, SwiftUI, Combine; possibly UIKit if any UIViewRepresentables).
-6. Preserve LEGO markers verbatim inside the new file.
-7. Pointer comments in Hal.swift at each extracted slot.
-8. Update `sync_hal_source.sh`.
-9. Build clean (zero warnings).
-10. Functional smoke test: open Settings on device, navigate through
-    each major view, change a value, verify it persists.
-11. Commit + push.
+1. **Direct state access** — if ChatBubbleView passes back
+   substantial mutations to ChatViewModel, the binding seam moves
+   from "in the same file" to "across files" without gaining
+   isolation. Need to read the actual code before deciding.
+2. **Composer flow** — message-send flow goes UI → ChatViewModel
+   sendMessage path. If the composer is sufficiently encapsulated
+   (just calls vm.sendMessage and observes the published reply),
+   it's a clean lift. If it reaches into mid-flow state, less so.
 
-### After that — remaining candidates evaluated by the three criteria
+**Recommended next action:** read LEGO 09 + 13 end-to-end with that
+question in mind, then make the call. If clean lift, extract as
+`ChatViews.swift`. If muddier than expected, defer and either (a)
+do a smaller targeted extraction of just ChatBubbleView + MarkdownView
+(the rendering-only blocks), or (b) call the refactor sprint done.
+
+### Remaining lower-priority candidates
 
 | Subsystem | Approx lines | Read | Extend | Diagnose | Verdict |
 |---|---|---|---|---|---|
-| ChatView + composer + bubble views (LEGO 09 et al) | ~2,000 | Med | Med | Low-Med | **Maybe** — depends on whether it crosses ChatViewModel state heavily |
-| MemoryStore SQLite layer (LEGO 1-7 ish) | ~3,000 | Low (interleaved with ChatViewModel; schema knowledge essential context) | Low (extensions almost always touch both sides) | **Could make memory bugs HARDER to trace** | **Defer or skip** unless a separate need surfaces |
+| MemoryStore SQLite layer (LEGO 02-07 ish) | ~3,000 | Low (interleaved with ChatViewModel; schema knowledge essential context) | Low (extensions almost always touch both sides) | **Could make memory bugs HARDER to trace** | **Defer or skip** unless a separate force requires it |
+| Other small blocks (LEGO 26 DocumentPicker, LEGO 31 HalWatchBridge, LEGO 11.5 Model Library UI) | varies | Mixed | Mixed | Mixed | Evaluate individually when/if they become a friction point |
 
-The natural sequence is: SettingsView → assess ChatView → leave
-MemoryStore alone unless a separate force requires it. That ordering
-also has the property that each extraction isolates a concept v2.1
-will actively touch (Proposals system needs Settings UI; soul
-document needs memory; salon polish needs chat views).
+By v2.1 startup we should have settled the chat-UI question. After
+that, MemoryStore stays in Hal.swift unless a specific need surfaces.
 
 ---
 

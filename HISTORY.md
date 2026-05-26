@@ -3281,3 +3281,73 @@ pre-extraction.
 
 Cumulative: 21,266 → 15,424 (-5,842, ~27%). No artificial target;
 remaining extractions evaluated on the three criteria above.
+
+---
+
+## 2026-05-26 (night — refactor #5)
+
+### LEGO numbering: keep as-is for now
+
+Before starting #5 I surfaced the current LEGO numbering quirks (half-
+numbers like 07.5, 10.3.5, 27.1; inconsistent leading-zero on 8.5 vs
+07.5; cross-file references at 27/29/30/32 instead of a clean
+sequence). Mark's call: "lets stick with the current numbers and we'll
+renumber after if it makes sense to do so." Pragmatic — the
+inconsistencies are cosmetic, not functional, and a global renumbering
+pass would touch every extracted file plus Hal.swift. Defer until
+either (a) the inconsistencies start actually slowing navigation, or
+(b) a natural break point arrives where the cleanup fits.
+
+### SettingsViews extraction (commit `be727e4`)
+
+The LEGO 10.x family — PowerUserMode + ActionsView + PowerUserView +
+SystemPromptEditorView + ModelFramingDetailView + SalonModeView —
+lifted to `SettingsViews.swift`. Five LEGO blocks lifted together
+because they're all surfaces in the same conceptual area: "how the
+user configures Hal." They share EnvironmentObject bindings
+(ChatViewModel / DocumentImportManager / MLXModelDownloader) and
+helper sub-views; reading them side-by-side is clearer than
+scattered.
+
+Naming note worth flagging for future-CC: LEGO 10.1's title is
+"MainSettingsView" but the actual entry-point struct is
+`ActionsView`. The name dates back to v1.x when Hal's settings sheet
+was titled "Actions" in the UI. The struct kept its original name
+through subsequent UI reorganizations. Added a comment block at the
+top of SettingsViews.swift and in Hal.swift's pointer stub so this
+mismatch can't trip anyone up.
+
+External coupling was the cleanest of any refactor so far: pure
+same-module pass-through. No private methods to widen, no missing
+imports beyond the standard SwiftUI / Combine /
+UniformTypeIdentifiers set. Clean Debug build first try, zero
+warnings.
+
+### Smoke test
+
+NAVIGATE settings via the API → screenshot via the SCREENSHOT API.
+The Settings sheet renders correctly: "Personality" section visible
+with Model framing row, System Prompt row, Self-Knowledge toggle
+(on, with the descriptive paragraph about Hal's persistent
+self-knowledge), Temperature slider at 0.70 with helper text, and
+the start of the Import/Export section showing "Upload Document to
+Memory." Every visible binding is reading correctly from
+ChatViewModel through the relocated views. That's a stronger smoke
+test than just checking the API surface — it confirms the actual UI
+hierarchy renders end-to-end with environment objects properly
+injected.
+
+### Numbers
+
+| Refactor | Date       | Subsystem                | Δ lines | Hal.swift remaining |
+|----------|------------|--------------------------|--------:|--------------------:|
+| #1       | 2026-05-20 | MLXModelDownloader       | -1,664  | 19,602              |
+| #2       | 2026-05-26 PM | ModelCatalogService   | -1,375  | 18,252              |
+| #3       | 2026-05-26 EVE | LocalAPIServer+console | -1,954 | 16,298              |
+| #4       | 2026-05-26 NIGHT | DocumentImportManager | -881  | 15,424              |
+| #5       | 2026-05-26 LATE  | SettingsViews         | -1,531 | 13,893              |
+
+Cumulative: 21,266 → 13,893 (-7,373, ~35%). Five extractions, one
+day. By Mark's three criteria each one earned its place — every
+extracted subsystem is now an obvious file to open when its concern
+is the work at hand.

@@ -1,6 +1,6 @@
 # Hal Universal — Handoff Brief
-**Updated:** May 26, 2026 (refactor #4 DocumentImportManager landed; goal reframed away from line-count target)
-**Branch:** `main` @ `f0ef901` (clean tree, all pushed)
+**Updated:** May 26, 2026 (refactor #5 SettingsViews landed; Hal.swift down ~35% in one day's refactor sprint)
+**Branch:** `main` @ `be727e4` (clean tree, all pushed)
 **Production:** Hal Universal **v2.0 is live on the App Store** since 2026-05-19. Non-EU markets only (DSA non-trader; see HISTORY).
 
 ## Where Hal is right now
@@ -10,23 +10,33 @@ verified** — sim + device — but **deferred to v2.1** per Mark's call
 on 2026-05-26: the orphan-weights bug is bandwidth-leaky but
 crash-safe, so it can ride with the next bigger release.
 
-Refactor sprint: four extractions landed —
+Refactor sprint: five extractions landed —
 MLXModelDownloader (#1, 2026-05-20), ModelCatalogService (#2,
 2026-05-26 PM), LocalAPIServer + HalTestConsole (#3, 2026-05-26
-EVE), DocumentImportManager (#4, 2026-05-26 NIGHT). Hal.swift is
-now **15,424 lines, down from 21,266** at the start of the refactor
-run (-5,842, ~27%).
+EVE), DocumentImportManager (#4, 2026-05-26 NIGHT), SettingsViews
+(#5, 2026-05-26 LATE). Hal.swift is now **13,893 lines, down from
+21,266** at the start of the refactor run (-7,373, ~35%).
 
 **Goal framing (clarified 2026-05-26):** the old "under 10k before
 v2.1" target is retired. Per Mark, refactor work continues for as
 long as each candidate extraction improves on (1) readability,
 (2) safety/ease of extension, (3) stability/diagnosability. Line
 counts are a proxy that drifts; the three criteria are the real
-test. Next candidate by that lens: SettingsView / ActionsView.
+test. Next candidate by that lens: assess ChatView root + composer
++ bubble views (LEGO 09, 09.5, 13, 13.5) — the verdict is "maybe,"
+gated on whether the extraction would cross ChatViewModel state in
+a way that hurts diagnosability.
+
+**LEGO numbering:** keeping current as-is for now per Mark on
+2026-05-26 ("we'll renumber after if it makes sense to do so").
+Half-numbers and cross-file gaps exist but are cosmetic, not
+functional.
 
 ### Most recent commits
 
 ```
+be727e4  Refactor: extract SettingsViews (LEGO 10.1-10.4)
+ec38519  Docs: refactor #4 DocumentImportManager + goal reframing
 f0ef901  Restore LEGO 29 and 30 markers in earlier extracted files
 0bb0a81  Refactor: extract DocumentImportManager (LEGO 27 + 27.1 + 28)
 94578e2  Refactor: extract LocalAPIServer + HalTestConsole to own file
@@ -109,7 +119,7 @@ to flip the toggle by hand. Two cross-referenced comment blocks
 constant is flipped to `false` before archive. Single unified build,
 no Debug/Release drift — consistent with new SOP #12.
 
-### Refactor — four extractions landed
+### Refactor — five extractions landed
 
 **#1 (2026-05-20):** `MLXModelDownloader` (LEGO 29) lifted to
 `MLXModelDownloader.swift`, 1,717 lines. Holds
@@ -143,21 +153,31 @@ import models` (LEGO 27 + 27.1 + 28) lifted to
 via NLTagger → chunking → MemoryStore), the iOS-native
 MiniZip+XMLParser docx reader shipped in v2.0, and the value types
 `ProcessedDocument` / `DocumentImportSummary`. Smallest external
-coupling of any extraction so far — only halLog, ChatViewModel
-pass-through, MemoryStore as write target, NamedEntity (Hal.swift
-top-level), and the LocalAPIServer extension already-internal call
-sites from refactor #3. Build clean first try. Hal.swift 16,305 →
-15,424 (-881).
+coupling of any extraction at the time. Build clean first try.
+Hal.swift 16,305 → 15,424 (-881).
 
-**Cumulative:** Hal.swift down **5,842 lines (~27%)**. Pointer
-comments at every extracted LEGO slot in Hal.swift; LEGO markers
-preserved verbatim inside every extracted file (refactor #1 and #2
-had stripped them — restored uniformly in commit `f0ef901`).
-`sync_hal_source.sh` extended on each extraction. Every extraction
-so far has needed `import Combine` in the new file (SwiftUI
-re-exports some but not all of what `@AppStorage` / `@Published` /
-`ObservableObject` resolve through — bake into the extraction
-template).
+**#5 (2026-05-26 LATE):** `SettingsViews` (LEGO 10.1, 10.2, 10.3,
+10.3.5, 10.4) lifted to `SettingsViews.swift`, 1,618 lines. Holds
+`PowerUserMode` enum + `ActionsView` (the user-facing entry sheet
+the gear icon opens) + `PowerUserView` + `SystemPromptEditorView`
++ `ModelFramingDetailView` + `SalonModeView`. Naming note baked
+into the file header + Hal.swift pointer stub: LEGO 10.1's title is
+"MainSettingsView" but the actual entry struct is `ActionsView`
+(v1.x holdover). Pure same-module pass-through coupling — no
+private methods to widen, no exotic imports. Build clean first try.
+Smoke test: NAVIGATE settings + SCREENSHOT confirms the Personality
+section renders end-to-end with every binding flowing through the
+relocated views. Hal.swift 15,424 → 13,893 (-1,531).
+
+**Cumulative:** Hal.swift down **7,373 lines (~35%)** across five
+extractions in one day. Pointer comments at every extracted LEGO
+slot in Hal.swift; LEGO markers preserved verbatim inside every
+extracted file (refactor #1 and #2 had stripped them — restored
+uniformly in commit `f0ef901`). `sync_hal_source.sh` extended on
+each extraction. Every extraction so far has needed `import
+Combine` in the new file (SwiftUI re-exports some but not all of
+what `@AppStorage` / `@Published` / `ObservableObject` resolve
+through — bake into the extraction template).
 
 ---
 
@@ -196,7 +216,13 @@ Hal Universal/
 │                                     DocxParser (MiniZip + XMLParser),
 │                                     ProcessedDocument + DocumentImportSummary
 │                                     value types.
-└── Hal.swift                       — Everything else (~15.4k lines, down
+├── SettingsViews.swift             — Refactor #5 (2026-05-26 LATE).
+│                                     PowerUserMode enum + ActionsView +
+│                                     PowerUserView + SystemPromptEditorView +
+│                                     ModelFramingDetailView + SalonModeView.
+│                                     "MainSettingsView" → ActionsView naming
+│                                     note in the file header.
+└── Hal.swift                       — Everything else (~13.9k lines, down
                                       from 21.3k pre-refactor).
 ```
 
