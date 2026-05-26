@@ -32,6 +32,7 @@ FILES=(
   "Hal Universal/ModelCatalogService.swift"
   "Hal Universal/LocalAPIServer.swift"
   "Hal Universal/DocumentImportManager.swift"
+  "Hal Universal/SettingsViews.swift"
   "Hal Universal/Hal.swift"
 )
 
