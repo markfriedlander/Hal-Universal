@@ -28,6 +28,7 @@ FILES=(
   "Hal Universal/TraitCrystallizer.swift"
   "Hal Universal/ProcessMemoryGuard.swift"
   "Hal Universal/MaintenanceTasks.swift"
+  "Hal Universal/MLXModelDownloader.swift"
   "Hal Universal/Hal.swift"
 )
 
