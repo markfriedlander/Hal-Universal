@@ -5,26 +5,86 @@
 // refactor-as-you-go directive. Lives separately so the embedder backend
 // system has a clearly named home and doesn't bloat Hal.swift further.
 //
-// Two switchable embedding backends:
+// Two switchable embedding backends in v2.0.1+:
 //   - "nlcontextual" (default): NLContextualEmbedding, Apple's transformer-
 //     based replacement for the older NLEmbedding.sentenceEmbedding API.
 //     iOS 17+, on-device via Neural Engine, 512-dim, lazy asset download.
-//   - "embeddinggemma" (Proposal A, 2026-05-17): Google's EmbeddingGemma
-//     300M, MLX 4-bit quantized via `mlx-community/embeddinggemma-300m-4bit`.
-//     Loaded through MLXEmbedders (already linked via mlx-swift-lm). MTEB
-//     SOTA for open models under 500M; ~210 MB on disk after download.
-//     768-dim with optional Matryoshka truncation (we use full 768).
+//   - "nomicswift": Nomic AI's Nomic Embed Text v1.5, 137M params, 768-dim,
+//     via Apple's MLTensor (no MLX). Asymmetric retrieval, 522 MB on disk.
 //
 // The backend is selected via UserDefaults key "embeddingBackend"; default
 // is "nlcontextual". When the backend changes, wipeStaleEmbeddingsIfNeeded
 // detects the version mismatch (via systemVersion) and NULLs all stored
 // embeddings — the re-embed happens via reEmbedAllNullRows.
 //
-// Crash guard: if a previous launch attempted to load EmbeddingGemma and
-// didn't reset the counter (i.e. the load crashed the process before
-// completing), current() forces NLContextual on this launch. The user can
-// manually re-enable via SET_EMBEDDING_BACKEND once the underlying issue
-// is fixed. Keeps the app launchable even when a backend load is unstable.
+// =====================================================================
+// HISTORY — EmbeddingGemma (removed 2026-05-20 as part of v2.0.1 hotfix)
+// =====================================================================
+//
+// A third backend, "embeddinggemma" (Google EmbeddingGemma 300M, MLX 4-bit,
+// 768-dim, ~210 MB), was added 2026-05-17 (Proposal A). It hit a hard wall:
+// the upstream MLX iOS Metal initializer crashes on iOS 26.5 the first
+// time the model loads. The crash is in MLX's framework code, not ours;
+// upstream fix is pending.
+//
+// We initially compile-gated it behind `HAL_ENABLE_EMBEDDING_GEMMA` so
+// Debug builds could iterate while Release shipped without it. That gate
+// allowed a subtle bug: `EmbedderMigrationCoordinator.startDownload()` was
+// hardcoded to download EmbeddingGemma's weights regardless of which
+// backend row the user actually tapped. In Release builds where the
+// Gemma row was filtered out of the UI, tapping Download on Nomic still
+// downloaded Gemma's weights (210 MB wasted, status messages mislabeled
+// "EmbeddingGemma already downloaded"). The mismatch between the
+// compile-gated UI surface and the un-gated download path is exactly the
+// kind of build-config drift the compile flag introduced.
+//
+// 2026-05-20 hotfix decision: remove the flag entirely. Comment out all
+// Gemma code so it's discoverable but completely inert in all builds.
+// No flag, no Debug/Release gap, no possibility of accidental Gemma
+// activation. Orphaned weights from prior installs are cleaned up by
+// MaintenanceTasks.runAtLaunch().
+//
+// =====================================================================
+// HOW TO RE-ENABLE EMBEDDINGGEMMA WHEN THE UPSTREAM FIX LANDS
+// =====================================================================
+//
+// All Gemma code is preserved as comments. To re-enable:
+//
+//  1. Uncomment in this file:
+//     - The `case embeddingGemma = "embeddinggemma"` enum case.
+//     - Each commented `case .embeddingGemma:` switch arm (10 sites).
+//     - The crash-guard block in `applyCrashGuardAtLaunch()`.
+//     - `crashGuardKey` if you want crash-guard semantics back.
+//
+//  2. Uncomment in EmbeddingProvider.swift:
+//     - The `import MLX / MLXEmbedders / MLXLMCommon / MLXHuggingFace /
+//       Tokenizers` block at the top.
+//     - The `gemmaContainer` / `gemmaLoadAttempted` stored properties.
+//     - The `.embeddingGemma:` arms in `embed()`, `isLoaded`, `warmUp()`.
+//     - The entire `embedEmbeddingGemma(_:)` + `ensureGemmaLoadedBlocking()`
+//       block at the bottom of the file.
+//
+//  3. Uncomment in EmbedderMigrationCoordinator.swift:
+//     - The Gemma-specific UI label fallback in `EmbedderMigrationStatusRow`
+//       (currently uses `activeBackend.displayName`, no change needed).
+//
+//  4. Uncomment in Hal.swift:
+//     - `import MLXEmbedders`.
+//     - The boot-time Gemma-specific warm-up delay (`if backendAtBoot ==
+//       .embeddingGemma { ... }`).
+//     - The `.embeddingGemma: sizeGB = 0.21` arm in DOWNLOAD_EMBEDDING_MODEL.
+//
+//  5. Run: search the codebase for `// REMOVED 2026-05-20:` — that
+//     prefix marks every commented-out region, so you can find them all
+//     with a single search and uncomment in one pass.
+//
+//  6. Remove this history block and rev the file header back to the
+//     three-backend prose at the top.
+//
+// The crash guard / `crashGuardKey` / `recordLoadAttempt` machinery was
+// specifically about Gemma's load instability. If a future third backend
+// has the same risk profile, the guard can be generalized.
+// =====================================================================
 
 import Foundation
 
@@ -46,28 +106,30 @@ nonisolated enum EmbeddingPurpose: Sendable {
 
 nonisolated enum EmbeddingBackend: String, Sendable, CaseIterable {
     case nlContextual = "nlcontextual"
-    case embeddingGemma = "embeddinggemma"
+    // REMOVED 2026-05-20: case embeddingGemma = "embeddinggemma"
     case nomicSwift = "nomicswift"
 
     nonisolated static let defaultsKey = "embeddingBackend"
-    nonisolated static let crashGuardKey = "embeddingGemmaCrashAttempts"
+    // REMOVED 2026-05-20: nonisolated static let crashGuardKey = "embeddingGemmaCrashAttempts"
 
-    /// Is this backend available in the current build? Used to compile out
-    /// the Gemma path in App Store builds (pending the upstream MLX Metal
-    /// init crash fix on iOS 26.5). Selecting an unavailable backend via
-    /// API or stale UserDefaults falls back to NLContextual on load.
+    /// Is this backend available in the current build? The defensive scaffold
+    /// that lets us hide a backend without removing the enum case. Today all
+    /// remaining backends are available; the property stays so future
+    /// temporary removals don't have to reinvent the gate.
     ///
-    /// Build flag: HAL_ENABLE_EMBEDDING_GEMMA (Debug-only by default).
+    /// Callers (Model Library row filter, startDownload guard, etc.) MUST
+    /// check this before exposing a backend to the user or initiating
+    /// network operations on its behalf.
     nonisolated var isAvailableInThisBuild: Bool {
         switch self {
         case .nlContextual: return true
         case .nomicSwift: return true
-        case .embeddingGemma:
-            #if HAL_ENABLE_EMBEDDING_GEMMA
-            return true
-            #else
-            return false
-            #endif
+        // REMOVED 2026-05-20: case .embeddingGemma:
+        //     #if HAL_ENABLE_EMBEDDING_GEMMA
+        //     return true
+        //     #else
+        //     return false
+        //     #endif
         }
     }
 
@@ -87,42 +149,41 @@ nonisolated enum EmbeddingBackend: String, Sendable, CaseIterable {
         return EmbeddingBackend(rawValue: raw) ?? .nlContextual
     }
 
-    /// Called once at AppDelegate launch BEFORE any embed() call. If the
-    /// previous run left `crashGuardKey` set, the load crashed before
-    /// completing — force NLContextual and persist that choice so any
-    /// readers see a stable backend for this launch. Returns the resolved
-    /// backend so the caller can log it.
+    /// Called once at AppDelegate launch BEFORE any embed() call. Today
+    /// this is a passthrough — the only backend that needed crash-guard
+    /// protection (EmbeddingGemma) was removed 2026-05-20. The function
+    /// is preserved so AppDelegate doesn't need to change shape, and so
+    /// a future unstable backend can drop crash-guard logic back in here.
     @discardableResult
     nonisolated static func applyCrashGuardAtLaunch() -> EmbeddingBackend {
-        let selected = current()
-        guard selected == .embeddingGemma else { return selected }
-        let crashed = UserDefaults.standard.bool(forKey: crashGuardKey)
-        if crashed {
-            halLog("HALDEBUG-EMBEDDING: Crash guard tripped — previous Gemma load crashed before completing. Reverting to NLContextual. To re-try, call SET_EMBEDDING_BACKEND:embeddinggemma again after the fix.")
-            UserDefaults.standard.set(EmbeddingBackend.nlContextual.rawValue, forKey: defaultsKey)
-            UserDefaults.standard.removeObject(forKey: crashGuardKey)
-            return .nlContextual
-        }
-        return selected
+        return current()
+        // REMOVED 2026-05-20: Gemma-specific crash-guard logic.
+        //   let selected = current()
+        //   guard selected == .embeddingGemma else { return selected }
+        //   let crashed = UserDefaults.standard.bool(forKey: crashGuardKey)
+        //   if crashed {
+        //       halLog("HALDEBUG-EMBEDDING: Crash guard tripped — previous Gemma load crashed before completing. Reverting to NLContextual.")
+        //       UserDefaults.standard.set(EmbeddingBackend.nlContextual.rawValue, forKey: defaultsKey)
+        //       UserDefaults.standard.removeObject(forKey: crashGuardKey)
+        //       return .nlContextual
+        //   }
+        //   return selected
     }
 
-    /// Mark a Gemma load as in-flight. Stored as a Bool so reads are cheap
-    /// and idempotent — repeated attempts during the same launch are a no-op.
-    nonisolated static func recordLoadAttempt() {
-        UserDefaults.standard.set(true, forKey: crashGuardKey)
-    }
-
-    /// Load completed without crashing — clear the in-flight flag.
-    nonisolated static func recordLoadSuccess() {
-        UserDefaults.standard.removeObject(forKey: crashGuardKey)
-    }
+    // REMOVED 2026-05-20: Gemma-specific load-attempt counter.
+    //   nonisolated static func recordLoadAttempt() {
+    //       UserDefaults.standard.set(true, forKey: crashGuardKey)
+    //   }
+    //   nonisolated static func recordLoadSuccess() {
+    //       UserDefaults.standard.removeObject(forKey: crashGuardKey)
+    //   }
 
     /// Integer used by `wipeStaleEmbeddingsIfNeeded` so a backend change
     /// triggers wipe-and-re-embed. Bump this when adding a new backend.
     nonisolated var systemVersion: Int {
         switch self {
         case .nlContextual: return 2  // matches original (post-NLEmbedding migration)
-        case .embeddingGemma: return 3
+        // REMOVED 2026-05-20: case .embeddingGemma: return 3
         case .nomicSwift: return 4
         }
     }
@@ -131,7 +192,7 @@ nonisolated enum EmbeddingBackend: String, Sendable, CaseIterable {
     nonisolated var dimension: Int {
         switch self {
         case .nlContextual: return 512
-        case .embeddingGemma: return 768
+        // REMOVED 2026-05-20: case .embeddingGemma: return 768
         case .nomicSwift: return 768
         }
     }
@@ -140,7 +201,7 @@ nonisolated enum EmbeddingBackend: String, Sendable, CaseIterable {
     nonisolated var modelID: String? {
         switch self {
         case .nlContextual: return nil
-        case .embeddingGemma: return "mlx-community/embeddinggemma-300m-4bit"
+        // REMOVED 2026-05-20: case .embeddingGemma: return "mlx-community/embeddinggemma-300m-4bit"
         case .nomicSwift: return "nomic-ai/nomic-embed-text-v1.5"
         }
     }
@@ -151,7 +212,7 @@ nonisolated enum EmbeddingBackend: String, Sendable, CaseIterable {
     var displayName: String {
         switch self {
         case .nlContextual: return "Apple NLContextual"
-        case .embeddingGemma: return "EmbeddingGemma 300M"
+        // REMOVED 2026-05-20: case .embeddingGemma: return "EmbeddingGemma 300M"
         case .nomicSwift: return "Nomic Embed Text v1.5"
         }
     }
@@ -161,8 +222,9 @@ nonisolated enum EmbeddingBackend: String, Sendable, CaseIterable {
         switch self {
         case .nlContextual:
             return "Built into iOS 26+. Runs on the Neural Engine. 512-dim sentence vectors. No download, always available."
-        case .embeddingGemma:
-            return "Google's open embedding model, 308M params, MLX 4-bit quantized. 768-dim, state-of-the-art on MTEB Multilingual v2 among models under 500M. Adds ~210 MB on disk. (Currently unavailable in App Store builds pending an upstream MLX iOS Metal fix.)"
+        // REMOVED 2026-05-20:
+        // case .embeddingGemma:
+        //     return "Google's open embedding model, 308M params, MLX 4-bit quantized. 768-dim, state-of-the-art on MTEB Multilingual v2 among models under 500M. Adds ~210 MB on disk."
         case .nomicSwift:
             return "Nomic AI's open embedding model, 137M params, 768-dim, purpose-built for asymmetric retrieval (query vs document). Runs via Apple's MLTensor framework (no MLX). Adds ~522 MB on disk."
         }
@@ -172,7 +234,7 @@ nonisolated enum EmbeddingBackend: String, Sendable, CaseIterable {
     var sizeBlurb: String? {
         switch self {
         case .nlContextual: return nil
-        case .embeddingGemma: return "~210 MB"
+        // REMOVED 2026-05-20: case .embeddingGemma: return "~210 MB"
         case .nomicSwift: return "~522 MB"
         }
     }
@@ -233,11 +295,10 @@ nonisolated enum EmbeddingBackend: String, Sendable, CaseIterable {
             // range; Nomic's 0.85 sits at the floor of its safe-merge
             // zone.
             return 0.85
-        case .embeddingGemma:
-            // PLACEHOLDER — same situation as Nomic. EmbeddingGemma is
-            // currently compile-out behind HAL_ENABLE_EMBEDDING_GEMMA;
-            // when re-enabled, calibrate from real corpus data.
-            return 0.85
+        // REMOVED 2026-05-20:
+        // case .embeddingGemma:
+        //     // PLACEHOLDER — calibrate from real corpus data when re-enabled.
+        //     return 0.85
         }
     }
 
@@ -272,9 +333,10 @@ nonisolated enum EmbeddingBackend: String, Sendable, CaseIterable {
             // distribution likely wants a lower threshold here (maybe
             // 0.4-0.5), but we'll know after observing real evolutions.
             return 0.6
-        case .embeddingGemma:
-            // PLACEHOLDER — same situation as Nomic. Compile-out today.
-            return 0.6
+        // REMOVED 2026-05-20:
+        // case .embeddingGemma:
+        //     // PLACEHOLDER — calibrate when re-enabled.
+        //     return 0.6
         }
     }
 }

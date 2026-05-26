@@ -4,15 +4,15 @@
 // Single-instance wrapper around whichever embedding backend is active.
 // Lazy-loaded on first use; subsequent calls are synchronous and fast.
 //
-// Three switchable backends:
+// Two switchable backends (v2.0.1+):
 //   - NLContextualEmbedding (default, built-in, 512-dim)
-//   - EmbeddingGemma via MLXEmbedders (768-dim, ~210 MB) — gated behind
-//     HAL_ENABLE_EMBEDDING_GEMMA build flag because of an upstream MLX
-//     Metal init crash on iOS 26.5. Compiled out for App Store builds.
 //   - Nomic Embed Text v1.5 via swift-embeddings (768-dim, ~522 MB,
 //     uses Apple's MLTensor — no MLX, no Metal init crash). Asymmetric-
 //     retrieval tuned (requires "search_query:" / "search_document:"
 //     prefixes; handled here via EmbeddingPurpose).
+//
+// EmbeddingGemma was removed 2026-05-20. See EmbeddingBackend.swift's
+// header for full history and the recipe for re-enabling.
 //
 // Thread safety: locked around the one-time backend load; subsequent
 // embed() calls are reentrant and serialize through the backend's own
@@ -27,13 +27,12 @@ import CoreML
 import NaturalLanguage
 import Embeddings
 
-#if HAL_ENABLE_EMBEDDING_GEMMA
-import MLX
-import MLXEmbedders
-import MLXLMCommon
-import MLXHuggingFace
-import Tokenizers
-#endif
+// REMOVED 2026-05-20: MLXEmbedders + companions for EmbeddingGemma backend.
+//   import MLX
+//   import MLXEmbedders
+//   import MLXLMCommon
+//   import MLXHuggingFace
+//   import Tokenizers
 
 final class EmbeddingProvider: @unchecked Sendable {
     nonisolated static let shared = EmbeddingProvider()
@@ -44,10 +43,9 @@ final class EmbeddingProvider: @unchecked Sendable {
     nonisolated(unsafe) private var nomicBundle: NomicBert.ModelBundle?
     nonisolated(unsafe) private var nomicLoadAttempted: Bool = false
 
-    #if HAL_ENABLE_EMBEDDING_GEMMA
-    nonisolated(unsafe) private var gemmaContainer: EmbedderModelContainer?
-    nonisolated(unsafe) private var gemmaLoadAttempted: Bool = false
-    #endif
+    // REMOVED 2026-05-20: Gemma-backed container + load-attempt flag.
+    //   nonisolated(unsafe) private var gemmaContainer: EmbedderModelContainer?
+    //   nonisolated(unsafe) private var gemmaLoadAttempted: Bool = false
 
     private init() {}
 
@@ -55,8 +53,8 @@ final class EmbeddingProvider: @unchecked Sendable {
     /// backend isn't loaded.
     ///
     /// `purpose` is honored by retrieval-asymmetric backends (Nomic adds
-    /// "search_query:" / "search_document:" prefixes). NLContextual and
-    /// Gemma ignore it.
+    /// "search_query:" / "search_document:" prefixes). NLContextual
+    /// ignores it.
     nonisolated func embed(_ text: String, as purpose: EmbeddingPurpose) -> [Double]? {
         let cleanText = text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !cleanText.isEmpty else { return nil }
@@ -64,8 +62,9 @@ final class EmbeddingProvider: @unchecked Sendable {
         switch EmbeddingBackend.current() {
         case .nlContextual:
             return embedNLContextual(cleanText)
-        case .embeddingGemma:
-            return embedEmbeddingGemma(cleanText)
+        // REMOVED 2026-05-20:
+        // case .embeddingGemma:
+        //     return embedEmbeddingGemma(cleanText)
         case .nomicSwift:
             return embedNomicSwift(cleanText, purpose: purpose)
         }
@@ -83,12 +82,13 @@ final class EmbeddingProvider: @unchecked Sendable {
         lock.lock(); defer { lock.unlock() }
         switch EmbeddingBackend.current() {
         case .nlContextual: return nlModel != nil
-        case .embeddingGemma:
-            #if HAL_ENABLE_EMBEDDING_GEMMA
-            return gemmaContainer != nil
-            #else
-            return false
-            #endif
+        // REMOVED 2026-05-20:
+        // case .embeddingGemma:
+        //     #if HAL_ENABLE_EMBEDDING_GEMMA
+        //     return gemmaContainer != nil
+        //     #else
+        //     return false
+        //     #endif
         case .nomicSwift: return nomicBundle != nil
         }
     }
@@ -106,12 +106,13 @@ final class EmbeddingProvider: @unchecked Sendable {
             guard let self = self else { return }
             switch EmbeddingBackend.current() {
             case .nlContextual: self.ensureNLLoadedBlocking()
-            case .embeddingGemma:
-                #if HAL_ENABLE_EMBEDDING_GEMMA
-                self.ensureGemmaLoadedBlocking()
-                #else
-                halLog("HALDEBUG-EMBEDDING: warmUp() skipped — EmbeddingGemma is not enabled in this build (HAL_ENABLE_EMBEDDING_GEMMA flag).")
-                #endif
+            // REMOVED 2026-05-20:
+            // case .embeddingGemma:
+            //     #if HAL_ENABLE_EMBEDDING_GEMMA
+            //     self.ensureGemmaLoadedBlocking()
+            //     #else
+            //     halLog("HALDEBUG-EMBEDDING: warmUp() skipped — EmbeddingGemma not enabled.")
+            //     #endif
             case .nomicSwift: self.ensureNomicLoadedBlocking()
             }
         }
@@ -340,124 +341,15 @@ final class EmbeddingProvider: @unchecked Sendable {
         halLog("HALDEBUG-EMBEDDING: Nomic Embed Text v1.5 loaded (\(modelID)) — dimension=\(EmbeddingBackend.nomicSwift.dimension)")
     }
 
-    // MARK: - EmbeddingGemma path (compiled out unless HAL_ENABLE_EMBEDDING_GEMMA)
+    // REMOVED 2026-05-20: EmbeddingGemma path (embedEmbeddingGemma +
+    // ensureGemmaLoadedBlocking + all MLX-flavored loading logic). The
+    // ~120-line block followed an upstream MLX iOS Metal init crash on
+    // iOS 26.5 that we couldn't work around. To re-enable, restore from
+    // git history of this file at commit `e30c888` (or earlier) along
+    // with the import block at the top and the `gemmaContainer` stored
+    // properties. See EmbeddingBackend.swift's header for the full
+    // re-enable recipe.
 
-    private nonisolated func embedEmbeddingGemma(_ cleanText: String) -> [Double]? {
-        #if HAL_ENABLE_EMBEDDING_GEMMA
-        ensureGemmaLoadedBlocking()
-
-        lock.lock()
-        let loaded = gemmaContainer
-        lock.unlock()
-
-        guard let container = loaded else { return nil }
-
-        let sem = DispatchSemaphore(value: 0)
-        var resultVec: [Double]?
-
-        Task.detached {
-            let embedding: [Float]? = await container.perform { ctx in
-                let tokens = ctx.tokenizer.encode(text: cleanText, addSpecialTokens: true)
-                let truncated = Array(tokens.prefix(2048))
-                guard !truncated.isEmpty else { return nil }
-
-                let inputArray = MLXArray(truncated).reshaped(1, truncated.count)
-                let attentionMask = MLXArray.ones(like: inputArray)
-                let tokenTypeIds = MLXArray.zeros(like: inputArray)
-
-                let modelOutput = ctx.model(
-                    inputArray,
-                    positionIds: nil,
-                    tokenTypeIds: tokenTypeIds,
-                    attentionMask: attentionMask
-                )
-                let pooled = ctx.pooling(
-                    modelOutput,
-                    mask: attentionMask,
-                    normalize: false,
-                    applyLayerNorm: false
-                )
-                pooled.eval()
-                let asFloats: [Float] = pooled.asArray(Float.self)
-                return asFloats
-            }
-            if let asFloats = embedding {
-                resultVec = asFloats.map { Double($0) }
-            }
-            sem.signal()
-        }
-        sem.wait()
-        return resultVec
-        #else
-        halLog("HALDEBUG-EMBEDDING: embedEmbeddingGemma called but HAL_ENABLE_EMBEDDING_GEMMA is off (App Store build). Returning nil.")
-        return nil
-        #endif
-    }
-
-    #if HAL_ENABLE_EMBEDDING_GEMMA
-    private nonisolated func ensureGemmaLoadedBlocking() {
-        lock.lock()
-        if gemmaContainer != nil { lock.unlock(); return }
-        if gemmaLoadAttempted { lock.unlock(); return }
-        gemmaLoadAttempted = true
-        lock.unlock()
-
-        guard let modelID = EmbeddingBackend.embeddingGemma.modelID else {
-            halLog("HALDEBUG-EMBEDDING: EmbeddingGemma has no modelID — programming error")
-            return
-        }
-
-        let cacheDir = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask)[0]
-        let modelDirectory = cacheDir
-            .appendingPathComponent("huggingface", isDirectory: true)
-            .appendingPathComponent("models", isDirectory: true)
-            .appendingPathComponent(modelID, isDirectory: true)
-
-        let configURL = modelDirectory.appendingPathComponent("config.json")
-        guard FileManager.default.fileExists(atPath: configURL.path) else {
-            halLog("HALDEBUG-EMBEDDING: EmbeddingGemma model not present at \(modelDirectory.path) — user must download it via the Model Library first")
-            lock.lock(); gemmaLoadAttempted = false; lock.unlock()  // allow retry after download
-            return
-        }
-
-        // Crash guard: see EmbeddingBackend.recordLoadAttempt for context.
-        EmbeddingBackend.recordLoadAttempt()
-
-        halLog("HALDEBUG-EMBEDDING: Loading EmbeddingGemma from \(modelDirectory.path)...")
-        let sem = DispatchSemaphore(value: 0)
-        var loadedContainer: EmbedderModelContainer?
-        var loadError: Error?
-
-        Task.detached {
-            do {
-                loadedContainer = try await EmbedderModelFactory.shared.loadContainer(
-                    from: modelDirectory,
-                    using: #huggingFaceTokenizerLoader()
-                )
-            } catch {
-                loadError = error
-            }
-            sem.signal()
-        }
-        sem.wait()
-
-        if let e = loadError {
-            halLog("HALDEBUG-EMBEDDING: EmbeddingGemma load failed: \(e.localizedDescription) — semantic search unavailable on this backend until next attempt")
-            lock.lock(); gemmaLoadAttempted = false; lock.unlock()
-            return
-        }
-        guard let container = loadedContainer else {
-            halLog("HALDEBUG-EMBEDDING: EmbeddingGemma load returned nil container")
-            lock.lock(); gemmaLoadAttempted = false; lock.unlock()
-            return
-        }
-        lock.lock()
-        self.gemmaContainer = container
-        lock.unlock()
-        EmbeddingBackend.recordLoadSuccess()
-        halLog("HALDEBUG-EMBEDDING: EmbeddingGemma container loaded (\(modelID)) — dimension=\(EmbeddingBackend.embeddingGemma.dimension)")
-    }
-    #endif
 }
 
 // MARK: - MemoryStore embedding helpers

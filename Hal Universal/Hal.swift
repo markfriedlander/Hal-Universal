@@ -58,7 +58,8 @@ import NaturalLanguage // For entity extraction and NLEmbedding
 import PDFKit // For PDF document processing
 import MLX // Import MLX framework (conceptual, requires actual framework link)
 import MLXLLM
-import MLXEmbedders // EmbeddingGemma backend (Proposal A, 2026-05-17)
+// REMOVED 2026-05-20: import MLXEmbedders — EmbeddingGemma backend removed
+//                     in v2.0.1 hotfix. See EmbeddingBackend.swift header.
 import Hub
 import HuggingFace // For #hubDownloader macro (HubClient type)
 import MLXLMCommon // FIXED: Added missing import for proper MLX API access
@@ -6427,6 +6428,12 @@ final class HalAppDelegate: NSObject, UIApplicationDelegate {
         let resolvedBackend = EmbeddingBackend.applyCrashGuardAtLaunch()
         halLog("HALDEBUG-EMBEDDING: Crash guard resolved backend=\(resolvedBackend.rawValue).")
 
+        // Maintenance: garbage-collect cached files for embedding backends
+        // that have been removed since this device last installed the app.
+        // Added 2026-05-20 (v2.0.1 hotfix) to clean up orphaned
+        // EmbeddingGemma weights from pre-removal installs. Idempotent.
+        MaintenanceTasks.runAtLaunch()
+
         // Build the bridge against the shared VM singleton. Touching
         // ChatViewModel.shared here triggers its lazy `static let` init —
         // happens once, on the main thread, exactly when we need it.
@@ -6442,20 +6449,13 @@ final class HalAppDelegate: NSObject, UIApplicationDelegate {
         // lazily on the first chat turn) keeps the first turn responsive
         // once the assets are in place.
         //
-        // For Gemma backend we delay the warm-up by 2 seconds to avoid
-        // racing with MLXModelDownloader.init() and BackgroundDownloadCoordinator
-        // setup — both touch MLX/HuggingFace state at launch and we hit
-        // a libc++ string nullptr crash when they overlap (2026-05-17).
-        let backendAtBoot = EmbeddingBackend.current()
-        if backendAtBoot == .embeddingGemma {
-            halLog("HALDEBUG-EMBEDDING: AppDelegate scheduling delayed EmbeddingProvider warm-up (gemma, +2s).")
-            DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + 2.0) {
-                EmbeddingProvider.shared.warmUp()
-            }
-        } else {
-            EmbeddingProvider.shared.warmUp()
-            halLog("HALDEBUG-EMBEDDING: AppDelegate triggered EmbeddingProvider warm-up.")
-        }
+        // REMOVED 2026-05-20: Gemma-specific delayed warm-up branch.
+        // Previously: `if backendAtBoot == .embeddingGemma` → +2s delay
+        // to avoid racing MLXModelDownloader init. Gemma backend removed
+        // in v2.0.1 hotfix; the remaining backends (NLContextual, Nomic)
+        // don't need the delay.
+        EmbeddingProvider.shared.warmUp()
+        halLog("HALDEBUG-EMBEDDING: AppDelegate triggered EmbeddingProvider warm-up.")
 
         return true
     }
@@ -8538,7 +8538,7 @@ struct ModelLibraryView: View {
                 } header: {
                     Label("Embedding (Memory)", systemImage: "brain")
                 } footer: {
-                    Text("The embedding model powers memory recall during chat. Apple NLContextual is built in. EmbeddingGemma is a stronger model — better discrimination on semantic similarity, but adds ~210 MB. Switching backends re-embeds your stored memories.")
+                    Text("The embedding model powers memory recall during chat. Apple NLContextual is built in. Nomic Embed Text v1.5 is a stronger model — better discrimination on semantic similarity, especially asymmetric query/document retrieval. Adds ~522 MB. Switching backends re-embeds your stored memories.")
                         .font(.caption2)
                 }
 
@@ -20143,8 +20143,16 @@ class HalTestConsole: ObservableObject {
             // Added 2026-05-17 for Proposal A.
             let raw = String(trimmed.dropFirst("SET_EMBEDDING_BACKEND:".count))
                 .trimmingCharacters(in: .whitespaces)
+            // Hard-reject the removed "embeddinggemma" backend with a clean
+            // error (per Mark's direction 2026-05-20). EmbeddingBackend.init
+            // would already fail with "unknown backend" since the case is
+            // commented out, but the dedicated message saves anyone running
+            // an old test script some confusion.
+            if raw == "embeddinggemma" {
+                return "{\"status\":\"error\",\"message\":\"embeddinggemma backend is not available in this build\"}"
+            }
             guard let newBackend = EmbeddingBackend(rawValue: raw) else {
-                let valid = "nlcontextual, embeddinggemma"
+                let valid = "nlcontextual, nomicswift"
                 return "{\"status\":\"error\",\"message\":\"unknown backend '\(raw)'; valid: \(valid)\"}"
             }
             UserDefaults.standard.set(newBackend.rawValue, forKey: EmbeddingBackend.defaultsKey)
@@ -20214,7 +20222,7 @@ class HalTestConsole: ObservableObject {
             // Size estimate — approximate, used for pre-flight disk space check.
             let sizeGB: Double
             switch backend {
-            case .embeddingGemma: sizeGB = 0.21
+            // REMOVED 2026-05-20: case .embeddingGemma: sizeGB = 0.21
             case .nomicSwift: sizeGB = 0.55
             case .nlContextual: sizeGB = 0  // unreachable; built-in
             }

@@ -5,13 +5,14 @@
 // refactor-as-you-go directive.
 //
 // Drives the user-facing flow for upgrading the embedding backend:
-//   1. Download EmbeddingGemma (~210MB) via the existing
-//      MLXModelDownloader / BackgroundDownloadCoordinator pipeline.
+//   1. Download a non-built-in backend's model files (e.g. Nomic Embed
+//      Text v1.5, 522 MB) via the existing MLXModelDownloader /
+//      BackgroundDownloadCoordinator pipeline.
 //   2. Switch the active backend (UserDefaults + wipe existing embeddings).
 //   3. Re-embed all stored rows in the background (the migration).
 //
-// Two-way: every step is reversible. Switching from Gemma back to
-// Apple NLContextual goes through the same wipe + re-embed flow.
+// Two-way: every step is reversible. Switching back to Apple NLContextual
+// goes through the same wipe + re-embed flow.
 //
 // State is a single @Published `phase`. The UI observes it to render
 // the appropriate label + progress (download progress bar, then migration
@@ -38,6 +39,11 @@ final class EmbedderMigrationCoordinator: ObservableObject {
     @Published var phase: Phase = .idle
     @Published var activeBackend: EmbeddingBackend = EmbeddingBackend.current()
 
+    /// Backend currently being downloaded (drives the progress-row label).
+    /// Set when `startDownload(for:)` accepts a request; cleared when the
+    /// phase transitions to .done or .error.
+    @Published var downloadingBackend: EmbeddingBackend? = nil
+
     private var pollTask: Task<Void, Never>?
 
     private init() {}
@@ -48,17 +54,50 @@ final class EmbedderMigrationCoordinator: ObservableObject {
         activeBackend = EmbeddingBackend.current()
     }
 
-    /// Trigger the Gemma download via the existing catalog downloader.
-    /// Returns immediately; polls progress until done or error.
-    func startDownload() {
-        guard let modelID = EmbeddingBackend.embeddingGemma.modelID else { return }
-        if MLXModelDownloader.shared.isModelDownloaded(modelID) {
-            phase = .done(message: "EmbeddingGemma already downloaded.")
+    /// Trigger a download for the given backend's model files.
+    ///
+    /// Was previously hardcoded to download EmbeddingGemma regardless of
+    /// which backend the user tapped — the bug Mark hit on the App Store
+    /// install of v2.0 (clicking Download on Nomic actually downloaded
+    /// Gemma). Now parameterized + defensively guarded so:
+    ///   - Built-in backends (NLContextual: modelID == nil) are a no-op.
+    ///   - Backends marked unavailable in this build are refused with
+    ///     a logged error rather than silently downloading the wrong model.
+    ///   - All status messages substitute backend.displayName instead of
+    ///     a hardcoded model name.
+    /// Caller passes the backend whose row was tapped.
+    func startDownload(for backend: EmbeddingBackend) {
+        guard let modelID = backend.modelID else {
+            // Built-in backend (NLContextual) — nothing to download.
+            halLog("HALDEBUG-EMBEDDING: startDownload(for: \(backend.rawValue)) no-op — backend has no downloadable model.")
             return
         }
+        guard backend.isAvailableInThisBuild else {
+            // Defensive guard per Mark's 2026-05-20 directive: no disabled
+            // backend can receive a download call regardless of how the
+            // UI got there. Belt + suspenders against future drift.
+            halLog("HALDEBUG-EMBEDDING: startDownload(for: \(backend.rawValue)) refused — backend not available in this build.")
+            phase = .error("\(backend.displayName) is not available in this build.")
+            return
+        }
+        if MLXModelDownloader.shared.isModelDownloaded(modelID) {
+            phase = .done(message: "\(backend.displayName) already downloaded.")
+            return
+        }
+        downloadingBackend = backend
         phase = .downloading(progress: 0, message: "Starting download…")
+        // Use the backend's own size hint via its sizeBlurb if needed.
+        // Hardcoded sizeGB only feeds the pre-flight disk-space check;
+        // 0.55 is the right ballpark for Nomic. Update if other downloadable
+        // backends are added.
+        let sizeGB: Double
+        switch backend {
+        case .nomicSwift: sizeGB = 0.55
+        // REMOVED 2026-05-20: case .embeddingGemma: sizeGB = 0.21
+        case .nlContextual: sizeGB = 0  // unreachable: modelID == nil above
+        }
         Task {
-            await MLXModelDownloader.shared.startDownload(modelID: modelID, repoID: modelID, sizeGB: 0.21)
+            await MLXModelDownloader.shared.startDownload(modelID: modelID, repoID: modelID, sizeGB: sizeGB)
         }
         // Poll the downloader state on the main actor so SwiftUI updates.
         // Strong self capture (coordinator is a singleton; lifetime is the app).
@@ -69,11 +108,13 @@ final class EmbedderMigrationCoordinator: ObservableObject {
                 let state = MLXModelDownloader.shared.downloadStates[modelID]
                 let downloaded = MLXModelDownloader.shared.isModelDownloaded(modelID)
                 if downloaded {
-                    self.phase = .done(message: "EmbeddingGemma downloaded.")
+                    self.phase = .done(message: "\(backend.displayName) downloaded.")
+                    self.downloadingBackend = nil
                     return
                 }
                 if let s = state, let err = s.error, !err.isEmpty {
                     self.phase = .error("Download failed: \(err)")
+                    self.downloadingBackend = nil
                     return
                 }
                 if let s = state {
@@ -251,25 +292,14 @@ struct EmbedderBackendRow: View {
     @ViewBuilder
     private var actionRow: some View {
         HStack(spacing: 12) {
-            // EmbeddingGemma is gated behind the HAL_ENABLE_EMBEDDING_GEMMA
-            // compile flag (Debug-only). Even in Debug, we present the row
-            // as read-only — Mark explicitly asked for a tap-proof guard
-            // here so a Debug-install user can't accidentally trigger the
-            // 210 MB download or the destructive re-embed migration. The
-            // row still expands so the description / dimensions / blurb
-            // remain visible for inspection. To re-enable for genuine
-            // testing, change the early-return branch below to fall through.
-            if backend == .embeddingGemma {
-                HStack(spacing: 6) {
-                    Image(systemName: "wrench.adjustable")
-                        .foregroundColor(.orange)
-                        .imageScale(.small)
-                    Text("Disabled in this build — pending upstream MLX fix")
-                        .font(.caption)
-                        .foregroundColor(.secondary)
-                }
-                Spacer()
-            } else if isActive {
+            // REMOVED 2026-05-20: explicit `.embeddingGemma` tap-proof guard.
+            // The Gemma case is commented out of EmbeddingBackend.swift entirely,
+            // so the row can no longer render. Guard kept logically by
+            // `backend.isAvailableInThisBuild` (defensive scaffold) — if a
+            // backend ever returns false, the Download button below still calls
+            // startDownload(for:) which refuses with an error phase rather than
+            // initiating a download. No need for a UI-side block.
+            if isActive {
                 // "Active" reads as a disabled button (matches LLM row's
                 // Select/Active state). Same icon, same text style.
                 Button(action: {}) {
@@ -306,7 +336,7 @@ struct EmbedderBackendRow: View {
                     }
                     .buttonStyle(.plain)
                 } else {
-                    Button(action: { coordinator.startDownload() }) {
+                    Button(action: { coordinator.startDownload(for: backend) }) {
                         HStack(spacing: 4) {
                             Image(systemName: "arrow.down.circle.fill")
                             Text("Download")
@@ -365,7 +395,13 @@ struct EmbedderMigrationStatusRow: View {
             EmptyView()
         case .downloading(let progress, let message):
             VStack(alignment: .leading, spacing: 4) {
-                Label("Downloading EmbeddingGemma…", systemImage: "arrow.down.circle")
+                // Use the coordinator's downloadingBackend if set, otherwise
+                // fall back to a generic label. Was previously hardcoded
+                // "Downloading EmbeddingGemma…" regardless of which backend
+                // was downloading — part of the same bug class fixed in
+                // startDownload(for:) on 2026-05-20.
+                Label("Downloading \(coordinator.downloadingBackend?.displayName ?? "embedding model")…",
+                      systemImage: "arrow.down.circle")
                     .font(.subheadline)
                 ProgressView(value: progress).progressViewStyle(.linear)
                 Text(message).font(.caption2).foregroundColor(.secondary)

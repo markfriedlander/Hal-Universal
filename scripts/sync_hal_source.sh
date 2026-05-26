@@ -27,6 +27,7 @@ FILES=(
   "Hal Universal/SelfKnowledgeEngine.swift"
   "Hal Universal/TraitCrystallizer.swift"
   "Hal Universal/ProcessMemoryGuard.swift"
+  "Hal Universal/MaintenanceTasks.swift"
   "Hal Universal/Hal.swift"
 )
 
