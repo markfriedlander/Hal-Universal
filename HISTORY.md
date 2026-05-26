@@ -2745,3 +2745,230 @@ All three verified on iPhone 17 Pro sim. Power User Mode label
 position stable at y=746 across single→multi→single→multi→single
 toggles.
 
+
+---
+
+## 2026-05-19 / 20 (ship v2.0, then immediately discover v2.0 has a bug, then 2.0.1 hotfix)
+
+### Setting
+
+The day v2.0 went to the App Store. The morning was: fix two specific
+visual bugs Mark flagged ("empty gray space at top of Personality" and
+"Model framing for Dolphin 3.0" labeling); do a full visual walkthrough
+on both sim and device; archive and submit. The afternoon was an ASC
+submission fight — the screenshot dimension dance, the DSA non-trader
+question, the two-step Add-for-Review-then-Submit-for-Review flow that
+ate an hour on its own. The evening was acceptance: Mark hit Submit,
+Apple approved within 24 hours, Hal v2.0 went live in 90% of global iOS
+markets (everywhere except the EU, per the deliberate non-trader
+choice — see DSA discussion below).
+
+Then immediately: a clean App Store install of v2.0 surfaced a real bug.
+Mark tapped Download on the Nomic Embed Text v1.5 row in the Model
+Library. The UI showed "EmbeddingGemma already downloaded." This was
+wrong in two ways at once: EmbeddingGemma is supposed to be compile-out
+of Release builds entirely (HAL_ENABLE_EMBEDDING_GEMMA flag undefined),
+and Mark hadn't tapped anything labeled Gemma. Tag the alarm — if the
+backend selection logic was mislabeling Nomic as EmbeddingGemma, or
+if EmbeddingGemma could be triggered on a build it should have been
+excluded from, that was a real problem. EmbeddingGemma crashes on iOS
+26.5 due to an upstream MLX Metal init bug — the whole reason we
+flag-gated it in the first place was that crash.
+
+CC's investigation report (run before touching code, per the standing
+rule) found the actual root cause: `EmbedderMigrationCoordinator.
+startDownload()` was hardcoded to download EmbeddingGemma's modelID
+regardless of which backend's row was tapped. The status messages
+inside that function were hardcoded "EmbeddingGemma…" strings. The
+HAL_ENABLE_EMBEDDING_GEMMA compile flag gated the UI row (so Gemma
+didn't appear in the Model Library on Release builds) AND the runtime
+embed path (so even if `.embeddingGemma` somehow got set as active
+backend, the embed() function would return nil). It did NOT gate the
+download path. So in the Release build: tapping Download on Nomic
+called `coordinator.startDownload()` which downloaded ~210 MB of
+EmbeddingGemma's MLX weights to disk, files Hal can never use because
+the runtime path is dead. The "EmbeddingGemma already downloaded"
+message appeared on the second tap because Gemma's modelID was now
+genuinely present in the cache directory.
+
+### Crash risk, audit
+
+The Metal init crash only fires when MLX *loads* the EmbeddingGemma
+model — which requires `activeBackend == .embeddingGemma` at the time
+embed() is called. The active backend can only be set to `.embeddingGemma`
+via `switchAndMigrate(to: .embeddingGemma, ...)`, which only fires from
+a Select button on the EmbeddingGemma row, which doesn't render in
+Release. So: the App Store build is bandwidth-leaky (210 MB of dead
+weights on disk for users who tapped Download even once) but
+crash-safe. No App Store user has crashed from this.
+
+But the bug class — compile-flag gates the UI but not the download — is
+exactly the kind of build-config drift Mark identified as the systemic
+risk. The fix needed to be structural, not surgical.
+
+### Decision: comment-out everything, no flag
+
+Mark's call: remove HAL_ENABLE_EMBEDDING_GEMMA entirely. Comment out
+all EmbeddingGemma code so it's discoverable for future re-enable but
+completely inert in all builds. No flag, no Debug/Release gap, no gap
+between what gets tested and what ships. The flag was the problem;
+removing the flag closes the bug class.
+
+CC pushed back gently on one part of this: should the
+`isAvailableInThisBuild` property survive? Today it would always return
+true (no disabled backends after Gemma is removed), so it's a no-op
+property. But Mark wanted the defensive scaffold preserved — if a
+future backend needs to be temporarily removed, the property is the
+hook that already exists. Kept it. Same call on the `MaintenanceTasks.
+removedEmbeddingBackendModelIDs` array — extensible list with one
+entry today; one-line add when another backend retires.
+
+### The fix (v2.0.1 hotfix, commit `90479cc`)
+
+Three coordinated changes:
+
+1. **EmbeddingGemma fully commented out.** Compiler-enforced. Commenting
+   `case embeddingGemma` in the enum surfaced every switch arm that
+   needed treatment (ten sites across EmbeddingBackend.swift,
+   EmbeddingProvider.swift, and Hal.swift). Marked each with a
+   `// REMOVED 2026-05-20:` prefix so a single grep finds them all when
+   the upstream MLX fix lands. Deleted ~120 lines of
+   `embedEmbeddingGemma()` + `ensureGemmaLoadedBlocking()` — preserved
+   in git at commit `e30c888` if anyone needs to restore. The
+   `import MLXEmbedders` + its companions came out too. The
+   HAL_ENABLE_EMBEDDING_GEMMA flag came out of project.pbxproj
+   (line 586: `SWIFT_ACTIVE_COMPILATION_CONDITIONS` no longer mentions
+   it). Re-enable recipe documented at the top of EmbeddingBackend.swift
+   as a 6-step checklist.
+
+2. **`startDownload(for backend:)` parameterized.** Was hardcoded to
+   `EmbeddingBackend.embeddingGemma.modelID` with hardcoded status
+   strings. Now takes the backend the user tapped, derives the modelID
+   from it, uses `backend.displayName` in every status message, has
+   two defensive guards: `backend.modelID != nil` (built-in backends
+   like NLContextual are a no-op) and `backend.isAvailableInThisBuild`
+   (refuses any future-disabled backend with an error phase rather than
+   silently downloading the wrong model). The Download button in
+   EmbedderBackendRow.actionRow now calls
+   `coordinator.startDownload(for: backend)`. Added a `downloadingBackend`
+   @Published property so the status row label correctly shows the
+   model being downloaded instead of the hardcoded "Downloading
+   EmbeddingGemma…" the old code had.
+
+3. **MaintenanceTasks.swift** — new file. `runAtLaunch()` deletes
+   orphan cache directories for backends in
+   `removedEmbeddingBackendModelIDs`. Idempotent — logs only when an
+   actual deletion happens. Wired into HalAppDelegate boot right after
+   the embedding crash-guard call. Existing App Store v2.0 users who
+   downloaded the orphaned Gemma weights get them cleaned up on next
+   launch without any user action.
+
+Test plan: 8 steps on iPhone 17 Pro sim. All green. Pre-planted sentinel
+cache directory was removed at launch (log line
+`HALDEBUG-CLEANUP: removed orphaned embedding cache for
+mlx-community/embeddinggemma-300m-4bit` fired). Model Library shows
+only NLContextual + Nomic. Tapping Download on Nomic now downloads
+Nomic (verified by log stream — every byte of network activity went to
+`nomic-ai/nomic-embed-text-v1.5`, zero to embeddinggemma). Progress
+labels said "Downloading Nomic Embed Text v1.5…" and "Nomic Embed Text
+v1.5 downloaded." API rejection paths verified: `SET_EMBEDDING_BACKEND:
+embeddinggemma` returns the explicit "not available in this build"
+error; `DOWNLOAD_EMBEDDING_MODEL:embeddinggemma` returns
+"unknown backend" because the enum case is gone.
+
+### DSA non-trader question, briefly
+
+During ASC submission, the EU's Digital Services Act surfaced its
+"trader status" gate. Hal is a free app from an individual developer.
+Apple gave two choices: declare trader (must publish a verified legal
+name + physical address + phone + email publicly on the App Store
+listing) or non-trader (no EU distribution). Mark went non-trader.
+This means Hal v2.0 ships in US, UK, Canada, Australia, Japan, most of
+Asia, Latin America, Middle East, Africa — roughly 90% of global iOS
+users — but not in any of the 27 EU member states or the 3 EEA add-ons.
+Reversible later if Mark ever wants to do EU distribution; would
+require providing trader info that gets shown publicly. Reasonable
+trade-off for a free hobby project. Documented here so future-CC knows
+why Hal isn't in France or Belgium.
+
+### Refactor extraction #1 (commit `9f5fdf8`)
+
+After the hotfix landed and tested, Mark gave the go-ahead to begin
+the long-discussed refactor: subsystem-by-subsystem extraction out of
+Hal.swift into properly named files. Standing instruction from
+2026-05-17: refactor-as-you-go. We've extracted nine files so far
+(EmbeddingBackend, EmbeddingProvider, EmbedderMigrationCoordinator,
+QueryExpansion, PromptDetailView, SelfKnowledgeEngine, TraitCrystallizer,
+ProcessMemoryGuard, MaintenanceTasks). Time to chip away at Hal.swift
+properly.
+
+Chose **MLXModelDownloader** as the first extraction because it's
+self-contained, sizable (~1,670 lines = LEGO 29 = ~8% of Hal.swift),
+and the dependencies are minimal: `halLog` (global, accessible
+anywhere), `ModelCatalogService.shared` (lives in LEGO 30, stays in
+Hal.swift, but is reachable from the new file at module scope), and
+`HalAppDelegate` (referenced only in a comment about the iOS
+background-session callback routing — no live link).
+
+The block contains two classes: `BackgroundDownloadCoordinator` (the
+low-level URLSession transport — two sessions, foreground for speed,
+background for resilience, lifecycle-driven migration between them via
+cancel-with-resume-data) and `MLXModelDownloader` (the higher-level
+queue + state machine — one active download, others queued, disk-space
+pre-flight, in-flight markers persisted to UserDefaults for
+resume-after-termination, @Published `downloadStates` dict for UI
+binding). They cooperate via NotificationCenter (.mlxModelDidDownload)
+and a direct call from the coordinator into the downloader's
+`markModelAsDownloadedFromBackground` hook. Considered splitting them
+into two files; decided against — they're too tightly coupled and
+splitting would push the seam into thin interface types without adding
+isolation. One file, two classes, clear header explaining why.
+
+Mechanics: sliced Hal.swift lines 16098–17769 (1,672 lines including
+LEGO markers) via Python into a new
+`Hal Universal/MLXModelDownloader.swift`. Added header comment + four
+imports (Foundation, SwiftUI, Combine, UIKit). Replaced the slice in
+Hal.swift with a 7-line pointer comment so the LEGO numbering chain
+still makes sense to anyone scrolling through. Updated
+`sync_hal_source.sh` to include the new file. The
+`.mlxModelDidDownload` Notification.Name extension moved with the
+downloader since it's the notification the downloader posts and any
+observer was already file-scope-agnostic.
+
+Result: Hal.swift went from 21,266 lines to 19,602 — 1,664 lines
+lighter, ~7% smaller. Build clean (zero errors, zero warnings).
+Functional verification: deleted the previously-downloaded Nomic
+model, re-triggered DOWNLOAD_EMBEDDING_MODEL:nomicswift via API.
+BackgroundDownloadCoordinator enqueued 8 files, byte-tracked through
+`didWriteData`, atomically moved each finished file. model.safetensors
+hit 73 MB/s through the foreground-session path. Same behavior, new
+file location.
+
+### What we didn't do
+
+- **Did not yet verify the v2.0.1 bug fix on physical device.** Mark
+  flagged this for "before we archive 2.0.1." The fix has been
+  validated end-to-end on iPhone 17 Pro sim including the orphan-cache
+  cleanup, but the bug was a live production issue affecting real App
+  Store users. Device-side smoke test is owed before submitting 2.0.1
+  to ASC.
+- **Did not yet extract ModelCatalogService** (LEGO 30, ~1,400 lines).
+  Next in the refactor queue. Same structural shape as
+  MLXModelDownloader — self-contained, one ObservableObject singleton,
+  observable-from-everywhere `.shared`.
+- **Did not archive 2.0.1.** Gated on the device-side verification
+  above.
+
+### Carrying forward
+
+- v2.0 is live on the App Store, deployed to ~90% of global iOS users
+  (non-EU markets).
+- v2.0.1 hotfix is committed, sim-verified, and ready to archive once
+  device-side verification of the fix completes.
+- Refactor is in progress. Hal.swift has been reduced by 1,664 lines
+  via the first extraction. The next obvious candidate is
+  ModelCatalogService.
+- The standing instructions remain: discussion before code, complete
+  implementations only, one logical change per commit, docs current as
+  work lands, warnings = errors, refactor-as-you-go.
+

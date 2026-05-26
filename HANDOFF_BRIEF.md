@@ -1,96 +1,97 @@
 # Hal Universal — Handoff Brief
-**Updated:** May 19, 2026 (overnight autonomous session)
-**Branch:** `main` (4 commits ahead of pre-session `b33d2de`)
-**Working tree:** clean
+**Updated:** May 20, 2026 (post-v2.0-ship, v2.0.1 hotfix committed, refactor begun)
+**Branch:** `main` @ `9f5fdf8` (clean tree, all pushed)
+**Production:** Hal Universal **v2.0 is live on the App Store** since 2026-05-19. Non-EU markets only (DSA non-trader; see HISTORY).
 
 ## Where Hal is right now
 
-The overnight session landed three things that move ship readiness
-forward and produced two deferred-work items that need decisions
-before the next push.
+v2.0 shipped. Then immediately surfaced a real production bug — the
+**EmbeddingGemma mis-download** — fixed and sim-verified as the v2.0.1
+hotfix. Refactor begun, first subsystem extracted. **Not archived for
+ASC yet** — gated on device-side verification of the hotfix.
 
-### Landed
+### Most recent commits
 
-1. **Memory entitlements — Gemma 4 E2B is now actually usable.**
-   Commit `b286429`. Added
-   `Hal Universal/Hal Universal.entitlements` with Increased Memory
-   Limit + Extended Virtual Addressing, registered the capabilities
-   via Xcode UI, wired into both Debug and Release configs of the
-   Hal Universal target. Pre-entitlements: Gemma had ~100-200 MB
-   headroom and the per-turn pre-flight refused almost every chat.
-   Post-entitlements: ~6100 MB headroom, Gemma sustains ~30-turn
-   conversations before the pre-flight kicks in. This is the real
-   fix that unblocks Gemma as a viable MLX model.
+```
+9f5fdf8  Refactor: extract MLXModelDownloader to its own file
+90479cc  v2.0.1 hotfix: remove EmbeddingGemma + parameterize startDownload + cleanup
+03c10c1  EmbedderBackendRow: tap-proof guard around EmbeddingGemma actions
+e30c888  Add About section to Settings showing version + build
+3eb3014  Add SC strategy memo + draft HTML reference copies
+9da09b0  Bug 4 v2: banner relocation + Model framing label + System Prompt dim
+```
 
-2. **Item 2 — Nomic synthesis threshold calibrated.** Commit
-   `7439d4a`. Added `EMBED_SIM` / `EMBED_SIM_BATCH` API + the
-   `tests/nomic_calibration_probe.py` driver. Measured on device
-   (NLContextual SAME 0.73-0.93, RELATED 0.71-0.83 — bands overlap)
-   and set `recommendedSynthesisThreshold` for Nomic to **0.85**.
-   Code comment in `EmbeddingBackend.swift:206-232` documents the
-   measured distribution and the reasoning.
+### v2.0.1 hotfix — sim-verified, device verification owed
 
-3. **Item 1 — Gemma memory-depth tuning done.** 8 runs total
-   (4 depths × 2 replicates). Methodology rebuilt twice after
-   two false starts (see HISTORY for the chronicle). All 8 runs
-   hit the same 30-turn ceiling. Memory recall doesn't track
-   depth meaningfully: depth 2 = 3/16, depth 3 = 2/16, depth 4 =
-   2/16, depth 5 = 4/16. **Recommendation: keep current default
-   of 5.** Full results table:
-   `tests/gemma_depth_results_2026-05-19.md`.
+**The bug.** On the clean App Store v2.0 install, tapping Download on
+the Nomic Embed Text v1.5 row downloaded EmbeddingGemma's 210 MB of
+weights instead. Status messages were hardcoded "EmbeddingGemma…"
+strings. Root cause: `EmbedderMigrationCoordinator.startDownload()`
+hardcoded to `EmbeddingBackend.embeddingGemma.modelID` regardless of
+which row's button was tapped. The `HAL_ENABLE_EMBEDDING_GEMMA` compile
+flag gated the UI row (no Gemma row in Release) and the runtime embed
+path (no Gemma inference) — but NOT the download path. Classic
+build-config drift: flag-gated UI + un-gated download = wrong model
+downloaded.
 
-4. **ASC v2.0 metadata + README rewrite.** Commit `157196b`.
-   `Docs/ASC_v2.0_REVISED.md` is side-by-side with the existing
-   paste-ready — Mark picks which ships. Demotes the over-promised
-   "memory compression" framing, adds Self Model + per-turn
-   pre-flight + Nomic retrieval as real v2.0 features.
+**Crash risk to App Store users:** none. The iOS 26.5 Metal init crash
+only fires when MLX *loads* the Gemma model, which requires Gemma to be
+the active backend, which requires selecting it via the Gemma row,
+which doesn't render in Release. App Store build is bandwidth-leaky
+(210 MB orphan weights on disk for any user who tapped Download even
+once) but crash-safe.
 
-5. **Stress test ran (20 / 25 PASS).** Real ship-relevant fails:
-   first-turn-after-switch fails for Gemma + Dolphin (3 GB MLX
-   models — race between MLX load and chat send). Smaller MLX
-   models (Llama, Qwen) and AFM are fine. See Deferred below.
+**The fix.** Three coordinated changes, all in commit `90479cc`:
 
-### Deferred — needs decisions or hands
+1. **EmbeddingGemma fully commented out + flag removed.** Compiler-
+   enforced cleanup — commenting `case embeddingGemma` surfaced every
+   switch arm needing treatment (10 sites, each marked `// REMOVED
+   2026-05-20:`). `HAL_ENABLE_EMBEDDING_GEMMA` removed from
+   project.pbxproj line 586 (`SWIFT_ACTIVE_COMPILATION_CONDITIONS` is
+   now just `"DEBUG $(inherited)"`). No flag, no Debug/Release drift,
+   no possibility of accidental Gemma activation. Re-enable recipe
+   documented at top of EmbeddingBackend.swift as a 6-step checklist.
 
-**Ship-blockers found late-night reactive testing:**
+2. **`startDownload(for backend:)` parameterized.** Takes the tapped
+   backend; uses `backend.displayName` in all status messages; two
+   defensive guards (`modelID != nil` + `isAvailableInThisBuild`)
+   refuse any invalid call. Download button in EmbedderBackendRow now
+   passes its row's backend.
 
-- **Bug 2a — Document RAG misses non-final chunks.** Imported 2-chunk
-  document; unique words from earlier chunk (Berkenia, Veldros,
-  periwinkle, armadillo) return zero document hits in semantic search;
-  only words from the LAST chunk (lighthouse) surface the document.
-  Real users importing docs will only get the last third retrievable.
+3. **MaintenanceTasks.swift (new file).** `runAtLaunch()` deletes
+   orphan cache directories for backends in
+   `removedEmbeddingBackendModelIDs` (extensible list, just Gemma
+   today). Wired into HalAppDelegate boot. Idempotent. Existing App
+   Store v2.0 users get the orphan Gemma weights cleaned up without
+   any user action.
 
-- **Bug 2b — Confabulation when RAG misses target.** When the target
-  content isn't in the prompt, Hal makes up plausible content rather
-  than saying "I don't have that." AFM does this more confidently
-  than Gemma. Combination with 2a is the ship-blocker for documents.
+**Sim verification:** all 8 test plan steps green on iPhone 17 Pro sim.
+Pre-planted sentinel cache directory removed at launch with the
+correct log line. Model Library shows only NLContextual + Nomic.
+Tapping Download on Nomic downloads Nomic (every byte of log evidence
+hit `nomic-ai/nomic-embed-text-v1.5`, zero to embeddinggemma). Labels
+correct. API rejection paths work.
 
-**Carried over:**
+**Device verification owed.** Mark's directive: device-side verify
+before archive. See `NEXT.md`.
 
-- **Bug 1 — `SET_MEMORY_DEPTH` persistence.** SET to N, app re-inits,
-  silently reverts to per-model default via applyEffectiveSettings.
-  Two proposed fixes in NEXT.md, both product calls.
+### Refactor — first extraction landed
 
-- **Bug 3 — First-turn-after-swap race for 3 GB MLX models.** Gemma +
-  Dolphin reliably fail the first chat after SWITCH_MODEL. Fix
-  options in NEXT.md.
+`MLXModelDownloader` (LEGO 29 from Hal.swift) lifted to its own file
+(`Hal Universal/MLXModelDownloader.swift`, 1,717 lines). Holds
+`BackgroundDownloadCoordinator` + `MLXModelDownloader` + the
+`.mlxModelDidDownload` Notification.Name extension. Two classes in one
+file because they're tightly coupled — splitting would push the seam
+into thin interface types without isolation gain.
 
-- **Bug 4 — Salon toggle scroll/flash.** Visual artifact, needs
-  reproduction on device + video for targeted fix.
+Hal.swift: **21,266 → 19,602 lines** (1,664 lighter, ~7% smaller).
 
-- **Bug 5 — PromptDetailView visual verification.** Code-side healthy;
-  Mark to confirm classification on real device.
-
-- **Bug 6 — Stress test probe-assertion bugs.** Three false-positives
-  in `tests/stress_test.py`; cleanup task.
-
-- **Item 1 unscripted-reactive — partial.** CC ran a reactive pass at
-  depth=5 (12 turns) and depth=2 (6 turns) catching the confabulation
-  failure mode the scripted probes missed. Mark to do a genuine
-  human-driven pass for the realism final check.
-
-- **Screenshots, version bump, archive, ASC submit.** Mechanical,
-  gated on Mark + Xcode UI. See NEXT.md.
+Pointer comment left in Hal.swift at the old LEGO 29 slot so the
+numbering chain still reads. `sync_hal_source.sh` updated. Clean
+Debug build, zero warnings. Functional smoke test: deleted Nomic and
+re-downloaded; BackgroundDownloadCoordinator enqueued 8 files,
+byte-tracked through `didWriteData`, atomically moved each finished
+file, hit 73 MB/s. Same behavior, new file.
 
 ---
 
@@ -98,35 +99,24 @@ before the next push.
 
 ```
 Hal Universal/
-├── Hal Universal.entitlements         — NEW (b286429): memory caps
-├── EmbeddingBackend.swift             — backend enum + thresholds
-│                                          (Nomic synthesis threshold
-│                                          calibrated tonight)
-├── EmbeddingProvider.swift            — 3-backend dispatch
-├── EmbedderMigrationCoordinator.swift — migration state machine
-├── QueryExpansion.swift               — async query expansion
-├── PromptDetailView.swift             — color-coded segments viewer
-├── SelfKnowledgeEngine.swift          — self-knowledge CRUD + reflection
-├── TraitCrystallizer.swift            — Phase 2 reinforcement-promotion
-├── ProcessMemoryGuard.swift           — Item 11: os_proc_available_memory
-└── Hal.swift                          — everything else (~19.7k lines)
-
-tests/
-├── hal_test.py                        — HTTP+file API test runner
-├── nomic_calibration_probe.py         — NEW: SAME/RELATED/UNREL probe
-├── gemma_depth_probe.py               — NEW: per-depth conversation driver
-│                                          with ground-truth verification
-├── gemma_depth_all.sh                 — NEW: 8-replicate orchestrator
-├── gemma_depth_summary.py             — NEW: per-run results parser
-├── gemma_depth_results_2026-05-19.md  — NEW: Item 1 final results table
-└── stress_test.py                     — NEW: multi-model + settings + RAG +
-                                          salon probe (5 real findings, see
-                                          HISTORY for breakdown)
-
-scripts/
-└── sync_hal_source.sh                 — concatenates all .swift into
-                                          Hal_Source.txt (run after any
-                                          source change)
+├── EmbeddingBackend.swift          — Enum + per-backend properties. Re-enable
+│                                     recipe for Gemma at top.
+├── EmbeddingProvider.swift         — NLContextual + Nomic backends. Gemma
+│                                     embed path removed.
+├── EmbedderMigrationCoordinator.swift — Migration + per-row UI. Now
+│                                     properly parameterized.
+├── QueryExpansion.swift            — Async LLM query expansion.
+├── PromptDetailView.swift          — Color-coded prompt segment viewer.
+├── SelfKnowledgeEngine.swift       — Reflection + trait CRUD.
+├── TraitCrystallizer.swift         — Phase 2 reinforcement promotion.
+├── ProcessMemoryGuard.swift        — Item 11 os_proc_available_memory.
+├── MaintenanceTasks.swift          — NEW (2026-05-20). Orphan-cache cleanup
+│                                     at launch. Extensible list.
+├── MLXModelDownloader.swift        — NEW (2026-05-20, refactor #1).
+│                                     BackgroundDownloadCoordinator +
+│                                     MLXModelDownloader + Notification.Name.
+└── Hal.swift                       — Everything else (~19.6k lines, down
+                                      from 21.3k pre-refactor).
 ```
 
 ---
@@ -147,68 +137,40 @@ xcrun devicectl device process launch --device D24FB384-9C55-5D33-9B0D-DAEBFA652
 ```
 
 - iPhone 16 Plus: `D24FB384-9C55-5D33-9B0D-DAEBFA6528D6`
-- API host: `marks-bigger-ass-fon-16.local` (mDNS — phone awake + on WiFi)
-- API port: 8766
-- API token: `e9ee9ec5b315467fa655bd4296873f43` (in `tests/.hal_api_config.json`)
 - iPhone 17 Pro sim UDID: `10C6DB49-2723-4F95-8F81-AECB9CD72BD0`
-  - sim token: `950c39cf55574c3180734785ec3c52da` (in `tests/.hal_api_config_sim.json`)
-
-For sim runs: `HAL_API_CONFIG=.hal_api_config_sim.json python3 tests/hal_test.py …`
+- API host (device): `marks-bigger-ass-fon-16.local` port 8766
+- API token (device): `e9ee9ec5b315467fa655bd4296873f43` (in `tests/.hal_api_config.json`)
+- Sim API config: `HAL_API_CONFIG=.hal_api_config_sim.json python3 tests/hal_test.py …`
+- SCREENSHOT/NAVIGATE: `tests/hal_test.py screenshot|navigate <target>` — already-shipped tooling for device-side visual verification.
 
 ---
 
-## SOP (unchanged — refactor-as-you-go is mandatory)
+## SOP (unchanged from prior sessions, one new lesson)
 
 1. **After any change to Hal's source, sync `Hal_Source.txt`:**
    ```bash
    ./scripts/sync_hal_source.sh
    ```
-2. **Significant changes to a section of Hal.swift → extract into a
-   dedicated file.** Use any of the existing extracted files as a
-   template.
-3. New enum case → sweep all switches.
+2. **Refactor-as-you-go is mandatory.** Significant changes to a
+   section → extract into a dedicated file with a header explaining
+   structure. See `MLXModelDownloader.swift` as the template.
+3. New enum case → sweep all switches (compiler-enforced).
 4. New AppStorage key → `defaults write com.MarkFriedlander.Hal10000 [key] "[value]"`.
-5. App build number bump happens at App Store submission (currently 5).
+5. App build number bump happens at App Store submission (currently at 6 in production; bump to 7 for v2.0.1).
 6. Never `NUCLEAR_RESET` between plant and recall in a memory test.
 7. **Update HISTORY/HANDOFF/NEXT as work lands** (CLAUDE.md Golden Rule #8).
 8. **Warnings = errors** (CLAUDE.md Golden Rule #7).
-9. **API > asking the human** — expand the API if a question can't be
-   answered through it.
-10. **Don't bail on a probe based on ambiguous telemetry.** Add
-    instrumentation, not exit doors. (Lesson from tonight.)
-11. **Confirm any deviation from a stated directive before executing
-    it.** (Lesson from tonight — scripted-vs-improvised.)
-
----
-
-## New diagnostic / API commands this session
-
-| Command | Purpose |
-|---|---|
-| `EMBED_SIM:<t1>\|\|\|<t2>` | Cosine sim between two texts under active backend |
-| `EMBED_SIM_BATCH:<t1a>\|\|\|<t2a>~~~<t1b>\|\|\|<t2b>~~~…` | Batched form |
-| `GET_LOGS:<N>` | Pull the last N HALDEBUG-* lines from the in-process buffer |
-
-(Tonight's probes also lean heavily on the already-existing
-`HALDEBUG-CHAT … depth=N` log line at Hal.swift:12910 as ground
-truth for what depth a chat actually ran at.)
+9. **API > asking the human** — expand the API if a question can't be answered through it.
+10. **Don't bail on a probe based on ambiguous telemetry.** Add instrumentation, not exit doors.
+11. **Confirm any deviation from a stated directive before executing it.**
+12. **Comment-out, don't compile-flag.** New lesson from v2.0.1: flag-gating creates Debug/Release drift. Comment-out keeps code preserved + discoverable without behavioral drift.
 
 ---
 
 ## Known caveats
 
-- **EmbeddingGemma is compile-out in Release builds** — upstream MLX
-  Metal init crash on iOS 26.5. Code stays behind
-  `HAL_ENABLE_EMBEDDING_GEMMA` ready to re-enable.
-- **Nomic load takes ~10–15 s on iPhone 16+** (MMAP-loading 546 MB
-  safetensors + tokenizer JSON). Subsequent embeds are fast (~80 ms).
-- **`SET_MEMORY_DEPTH` doesn't survive app re-init** — see
-  Deferred above. Workaround: re-SET after every relaunch (the
-  probe drivers do this).
-- **First chat after SWITCH_MODEL to Gemma/Dolphin fails reliably** —
-  see Deferred above. Workaround: wait 10-15 s before sending,
-  or send a chat that's OK to throw away.
-- **`xcrun devicectl device process launch` does NOT unload MLX
-  weights** — iOS keeps the prior process state warm. To actually
-  free memory, hard `terminate --pid <pid>` first, then launch.
-  (The probe drivers do this.)
+- **`SET_MEMORY_DEPTH` doesn't survive app re-init** (Bug 1 from 2026-05-19; deferred). Workaround: re-SET after every relaunch.
+- **First chat after SWITCH_MODEL to Gemma/Dolphin fails reliably** (Bug 3 from 2026-05-19; deferred). Workaround: wait 10-15 s before sending.
+- **EmbeddingGemma is fully commented out.** Re-enable recipe at top of EmbeddingBackend.swift.
+- **No EU distribution.** DSA non-trader choice. Switchable later if Mark wants.
+- **Mark's iPhone may still have orphan Gemma weights from pre-fix testing.** Will be cleaned up automatically when the v2.0.1 Debug build is installed for device verification (MaintenanceTasks.runAtLaunch fires).
