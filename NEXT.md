@@ -83,58 +83,85 @@ ship; nice for transparency. Defer if context is tight.
 self-contained subsystems one at a time. Pattern is stable; just keep
 going.
 
+### Goal framing (clarified 2026-05-26)
+
+Per Mark, refactor work continues for as long as each candidate
+extraction improves on:
+
+1. **Easier to read and understand** — does pulling this out into
+   its own file make the boundary between "what this does" and
+   "what it touches" clearer?
+2. **Easier and safer to extend** — when v2.1 work starts, will the
+   extracted subsystem be the obvious file to open?
+3. **More stable, easier to diagnose** — when something breaks,
+   does the file structure point at the suspect quickly?
+
+The previous "under 10k lines before v2.1" target is retired. Line
+counts are a proxy that drifts; the three criteria above are the
+real test. Also a standing rule: **LEGO blocks stay** — preserved
+inside Hal.swift via pointer comments at each extracted slot, AND
+preserved inside every extracted file as internal section landmarks.
+
 ### Done
 
 - ✅ Refactor #1 (2026-05-20): `MLXModelDownloader` (LEGO 29)
 - ✅ Refactor #2 (2026-05-26 PM): `ModelCatalogService` (LEGO 30)
 - ✅ Refactor #3 (2026-05-26 EVE): `LocalAPIServer + HalTestConsole` (LEGO 32)
+- ✅ Refactor #4 (2026-05-26 NIGHT): `DocumentImportManager + DocxParser + import models` (LEGO 27 + 27.1 + 28)
 
-### Next extraction: `DocumentImportManager + DocxParser` (LEGO 27 + 27.1)
+### Next extraction: `SettingsView / ActionsView` (LEGO 10.x family)
 
-~860 lines (LEGO 27 at Hal.swift 15235-15823, plus LEGO 27.1 at
-15826-16096 — though the line numbers will have shifted after
-refactor #3). High isolation — DocumentImportManager is a focused
-ingest pipeline (PDF/txt/md/rtf/csv/json/xml/html) and the docx
-parser is a pure MiniZip + XMLParser unit with zero outward
-references. Three small consumer-side touchpoints:
-`processDocumentImmediatelyWithEntities` (already widened to
-internal in refactor #3), the path-based importer extension (already
-moved to LocalAPIServer.swift in refactor #3), and the
-`DocumentImportManager.shared` singleton.
+By the three criteria above this is the clearest remaining win:
 
-**Same approach:**
+- **Read:** Settings UI is its own conceptual layer — pulling
+  MainSettingsView, PowerUserView, SystemPromptEditorView,
+  ModelFramingDetailView, and SalonModeView out clears Hal.swift's
+  midsection of UI code that has nothing to do with model
+  inference, memory, or chat.
+- **Extend:** every new setting in v2.1 (the Proposals review
+  surface, soul-document toggles, salon-seat tweaks) will be a
+  SettingsView edit. Isolating it cuts blast radius.
+- **Diagnose:** Settings bugs are almost always visual/binding
+  issues; making "the settings file" a single clearly-named place
+  makes them easier to localize.
 
-1. Re-locate LEGO 27 + 27.1 markers in current Hal.swift.
-2. Verify no extensions on `DocumentImportManager` / `DocxParser` /
-   `ProcessedDocument` elsewhere.
-3. Slice via the Python boundary-cut.
-4. Create `Hal Universal/DocumentImportManager.swift` with header +
-   imports (Foundation, SwiftUI, Combine, NaturalLanguage, PDFKit,
-   UniformTypeIdentifiers, Compression for MiniZip).
-5. Pointer comment in Hal.swift at the old slot.
-6. Update `sync_hal_source.sh`.
-7. Build clean (zero warnings).
-8. Functional smoke test: `IMPORT_DOC` via the API on a small text
-   file and a docx file; verify chunks land in MemoryStore.
-9. Commit + push.
+LEGO blocks expected in scope: 10.1 MainSettingsView, 10.2
+PowerUserView, 10.3 SystemPromptEditorView, 10.3.5
+ModelFramingDetailView, 10.4 SalonModeView. Rough total ~2,500
+lines, all View structs (no ObservableObjects to migrate).
 
-Note: Refactor #3 retired the LEGO numbering chain — new top-level
-subsystems go into their own files going forward, not new LEGO
-blocks. Hal.swift's remaining LEGO sections will get drained over
-the next few extractions until the file is small enough that the
-internal landmarks aren't necessary anymore.
+**Same approach as prior refactors:**
 
-### After that — remaining extraction candidates
+1. Re-locate the LEGO 10.x markers in current Hal.swift.
+2. Verify no extensions on the View structs elsewhere.
+3. Identify any helper view structs / view modifiers used only by
+   the settings views — those move too.
+4. Slice via the Python boundary-cut. Tricky bit: 10.x is not a
+   contiguous range — there may be other blocks interleaved
+   (LEGO 11.x Model Library UI, for example). Read the whole
+   neighborhood before slicing.
+5. Create `Hal Universal/SettingsViews.swift` with header + imports
+   (Foundation, SwiftUI, Combine; possibly UIKit if any UIViewRepresentables).
+6. Preserve LEGO markers verbatim inside the new file.
+7. Pointer comments in Hal.swift at each extracted slot.
+8. Update `sync_hal_source.sh`.
+9. Build clean (zero warnings).
+10. Functional smoke test: open Settings on device, navigate through
+    each major view, change a value, verify it persists.
+11. Commit + push.
 
-| Order | Subsystem | Approx lines | Isolation |
-|---|---|---|---|
-| 4 (next) | DocumentImportManager + DocxParser (LEGO 27 + 27.1) | ~860 | High |
-| 5 | MemoryStore SQLite layer (LEGO 1-ish, very large) | ~3,000 | Low (interleaved with ChatViewModel) — defer |
-| 6 | SettingsView / ActionsView (LEGO 10.x) | ~2,500 | Medium |
-| 7 | ChatView root + composer + bubble views (LEGO 09 et al) | ~2,000 | Low — leave for last |
+### After that — remaining candidates evaluated by the three criteria
 
-After Round 4 (DocumentImportManager), Hal.swift would be ~15,400.
-Goal: get under 10k before v2.1 work begins.
+| Subsystem | Approx lines | Read | Extend | Diagnose | Verdict |
+|---|---|---|---|---|---|
+| ChatView + composer + bubble views (LEGO 09 et al) | ~2,000 | Med | Med | Low-Med | **Maybe** — depends on whether it crosses ChatViewModel state heavily |
+| MemoryStore SQLite layer (LEGO 1-7 ish) | ~3,000 | Low (interleaved with ChatViewModel; schema knowledge essential context) | Low (extensions almost always touch both sides) | **Could make memory bugs HARDER to trace** | **Defer or skip** unless a separate need surfaces |
+
+The natural sequence is: SettingsView → assess ChatView → leave
+MemoryStore alone unless a separate force requires it. That ordering
+also has the property that each extraction isolates a concept v2.1
+will actively touch (Proposals system needs Settings UI; soul
+document needs memory; salon polish needs chat views).
 
 ---
 

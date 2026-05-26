@@ -3191,3 +3191,93 @@ NEXT.md originally framed LEGO 32 as "~3,500 lines" — that estimate
 was off because executeCommand was tallied separately even though
 it lives inside HalTestConsole. Worth updating future estimates to
 count by actual byte range, not assumed responsibility boundaries.
+
+---
+
+## 2026-05-26 (late evening — refactor #4 + course correction)
+
+### Mark's framing for the goal
+
+After refactor #3 I floated three paths: keep refactoring, pivot to
+v2.1 design, or pause to ship v2.0.1. Mark answered with a goal
+clarification I wanted to capture verbatim, because it reframes the
+whole sprint cleanly:
+
+> "we shouldn't be using a number as the target. we should refactor
+> all that makes sense in the service of making Hal's code base
+> 1) easier to read and understand, 2) easier and safer to extend,
+> 3) more stable and easier to diagnose and fix problems."
+
+The "under-10k lines" goal from older versions of NEXT.md is retired
+by this framing — line counts are a proxy that drifts. The real test
+for each candidate extraction is whether it improves on those three
+criteria. By that lens, #1–#3 all earned their place, and the
+remaining candidates separate into "clear win" (DocumentImportManager,
+SettingsView/ActionsView), "maybe" (ChatView), and "leave alone unless
+something else forces it" (MemoryStore — interleaved with ChatViewModel,
+splitting could make memory bugs *harder* to trace).
+
+### LEGO chain stays — course correction (commits `0bb0a81` + `f0ef901`)
+
+In refactor #3's commit message I claimed the LEGO numbering chain
+was retiring with the move to per-file extraction. Mark course-
+corrected: "lets also make sure we are continuing to use lego blocks
+and comment thoroughly with evergreen information on how the code
+works." Right answer. LEGO markers are cheap landmarks that make
+grep-based navigation predictable, and inside a 1,500-2,000-line
+extracted file they still help even though the file is dedicated to
+one subsystem.
+
+Going forward:
+- LEGO blocks preserved inside every extracted file, not just inside
+  Hal.swift.
+- Hal.swift retains the chain via pointer comments at each extracted
+  slot.
+- Refactors #1 and #2 had stripped the markers from
+  MLXModelDownloader.swift and ModelCatalogService.swift —
+  inconsistent with #3 (LocalAPIServer.swift) which kept them.
+  Commit `f0ef901` reverses that, restoring LEGO 29 and 30 markers
+  uniformly across all four extracted files. The numbering chain
+  now reads end-to-end through Hal_Source.txt without gaps.
+
+### DocumentImportManager extraction (commit `0bb0a81`)
+
+LEGO 27 (DocumentImportManager class, ~596 lines) + 27.1 (DocxParser,
+~270 lines) + 28 (ProcessedDocument + DocumentImportSummary value
+types, ~20 lines) all lifted together to
+`DocumentImportManager.swift` (967 lines incl. header). Three blocks,
+one file, because they describe one user-visible feature: "Hal can
+read a document I give it." DocxParser is the pure utility that only
+DocumentImportManager calls; the value types are the pipeline's
+input/output. Splitting them would have produced a three-file unit
+with no isolation gain.
+
+External coupling is the smallest of any extraction so far:
+- `halLog` — global
+- `ChatViewModel` passed through, never observed
+- `MemoryStore` as a write target
+- `NamedEntity` (Hal.swift top-level value type)
+- `LocalAPIServer.swift`'s `importFromPath` extension — already
+  module-internal, already calling the three methods broadened to
+  internal in refactor #3
+
+Build clean on first try. Smoke test on iPhone 16 Plus:
+`LIST_DOCUMENTS` returns Mark's previously-imported `multi_docx.docx`
+with 6 chunks. That single command exercises the full stack — the
+MemoryStore document API extension from refactor #3 finds the rows,
+the source_id resolves to chunks the DocxParser produced earlier,
+and the singleton `DocumentImportManager.shared` instantiates cleanly
+from the new file location. Functional behavior identical to
+pre-extraction.
+
+### Numbers
+
+| Refactor | Date       | Subsystem                | Δ lines | Hal.swift remaining |
+|----------|------------|--------------------------|--------:|--------------------:|
+| #1       | 2026-05-20 | MLXModelDownloader       | -1,664  | 19,602              |
+| #2       | 2026-05-26 PM | ModelCatalogService   | -1,375  | 18,252              |
+| #3       | 2026-05-26 EVE | LocalAPIServer+console | -1,954 | 16,298              |
+| #4       | 2026-05-26 NIGHT | DocumentImportManager | -881  | 15,424              |
+
+Cumulative: 21,266 → 15,424 (-5,842, ~27%). No artificial target;
+remaining extractions evaluated on the three criteria above.

@@ -1,6 +1,6 @@
 # Hal Universal — Handoff Brief
-**Updated:** May 26, 2026 (refactor #3 LocalAPIServer landed; v2.0.1 hotfix deferred to v2.1 per Mark)
-**Branch:** `main` @ `94578e2` (clean tree, all pushed)
+**Updated:** May 26, 2026 (refactor #4 DocumentImportManager landed; goal reframed away from line-count target)
+**Branch:** `main` @ `f0ef901` (clean tree, all pushed)
 **Production:** Hal Universal **v2.0 is live on the App Store** since 2026-05-19. Non-EU markets only (DSA non-trader; see HISTORY).
 
 ## Where Hal is right now
@@ -10,20 +10,27 @@ verified** — sim + device — but **deferred to v2.1** per Mark's call
 on 2026-05-26: the orphan-weights bug is bandwidth-leaky but
 crash-safe, so it can ride with the next bigger release.
 
-Refactor sprint in progress: three extractions landed today —
+Refactor sprint: four extractions landed —
 MLXModelDownloader (#1, 2026-05-20), ModelCatalogService (#2,
-2026-05-26 afternoon), and LocalAPIServer (#3, 2026-05-26 evening).
-Hal.swift is now **16,298 lines, down from 21,266** at the start of
-the refactor run (-4,968, ~23%). Goal of under 10k before v2.1 work
-begins is within line-of-sight.
+2026-05-26 PM), LocalAPIServer + HalTestConsole (#3, 2026-05-26
+EVE), DocumentImportManager (#4, 2026-05-26 NIGHT). Hal.swift is
+now **15,424 lines, down from 21,266** at the start of the refactor
+run (-5,842, ~27%).
+
+**Goal framing (clarified 2026-05-26):** the old "under 10k before
+v2.1" target is retired. Per Mark, refactor work continues for as
+long as each candidate extraction improves on (1) readability,
+(2) safety/ease of extension, (3) stability/diagnosability. Line
+counts are a proxy that drifts; the three criteria are the real
+test. Next candidate by that lens: SettingsView / ActionsView.
 
 ### Most recent commits
 
 ```
+f0ef901  Restore LEGO 29 and 30 markers in earlier extracted files
+0bb0a81  Refactor: extract DocumentImportManager (LEGO 27 + 27.1 + 28)
 94578e2  Refactor: extract LocalAPIServer + HalTestConsole to own file
-135e73a  Docs: refactor #2 ModelCatalogService landed
 95a05f1  Refactor: extract ModelCatalogService to its own file
-70adb5e  Docs: device verify v2.0.1 passed + ship blocker recorded
 93cf4ba  Force local API antenna ON at every launch (dev default)
 9f5fdf8  Refactor: extract MLXModelDownloader to its own file
 90479cc  v2.0.1 hotfix: remove EmbeddingGemma + parameterize startDownload + cleanup
@@ -102,7 +109,7 @@ to flip the toggle by hand. Two cross-referenced comment blocks
 constant is flipped to `false` before archive. Single unified build,
 no Debug/Release drift — consistent with new SOP #12.
 
-### Refactor — three extractions landed
+### Refactor — four extractions landed
 
 **#1 (2026-05-20):** `MLXModelDownloader` (LEGO 29) lifted to
 `MLXModelDownloader.swift`, 1,717 lines. Holds
@@ -124,19 +131,33 @@ MemoryStore` + `extension DocumentImportManager` (API helpers),
 `HalTestConsole` (file-channel test harness with the shared
 `executeCommand` dispatcher), and `LocalAPIServer` (HTTP server,
 NWListener on port 8766). Two compile fixes needed during the cut:
-(a) add `import WatchConnectivity` to the new file because the
-original Hal.swift had it mid-file at line 16156 inside the LEGO 31
-HalWatchBridge block, (b) broaden three `private` methods on
-`DocumentImportManager` to module-internal so the path-based-import
-extension can still reach them from a different file. Hal.swift
-18,252 → 16,298 (-1,954).
+(a) `import WatchConnectivity`, (b) broaden three `private` methods
+on `DocumentImportManager` to module-internal so the path-based
+import extension can still reach them from a different file.
+Hal.swift 18,252 → 16,298 (-1,954).
 
-**Cumulative:** Hal.swift down **4,968 lines (~23%)**. Pointer
-comments left at all three old LEGO slots. `sync_hal_source.sh`
-extended on each extraction. Every extraction so far has needed
-`import Combine` in the new file (SwiftUI re-exports some but not
-all of what `@AppStorage` / `@Published` / `ObservableObject`
-resolve through — worth surfacing as a pattern in CLAUDE.md SOP).
+**#4 (2026-05-26 NIGHT):** `DocumentImportManager + DocxParser +
+import models` (LEGO 27 + 27.1 + 28) lifted to
+`DocumentImportManager.swift`, 967 lines. Holds the ingest pipeline
+(PDF/RTF/docx/txt/md/csv/json/xml/html extractors → entity tagging
+via NLTagger → chunking → MemoryStore), the iOS-native
+MiniZip+XMLParser docx reader shipped in v2.0, and the value types
+`ProcessedDocument` / `DocumentImportSummary`. Smallest external
+coupling of any extraction so far — only halLog, ChatViewModel
+pass-through, MemoryStore as write target, NamedEntity (Hal.swift
+top-level), and the LocalAPIServer extension already-internal call
+sites from refactor #3. Build clean first try. Hal.swift 16,305 →
+15,424 (-881).
+
+**Cumulative:** Hal.swift down **5,842 lines (~27%)**. Pointer
+comments at every extracted LEGO slot in Hal.swift; LEGO markers
+preserved verbatim inside every extracted file (refactor #1 and #2
+had stripped them — restored uniformly in commit `f0ef901`).
+`sync_hal_source.sh` extended on each extraction. Every extraction
+so far has needed `import Combine` in the new file (SwiftUI
+re-exports some but not all of what `@AppStorage` / `@Published` /
+`ObservableObject` resolve through — bake into the extraction
+template).
 
 ---
 
@@ -170,7 +191,12 @@ Hal Universal/
 │                                     API-helper extensions, HalTestConsole
 │                                     (file-channel + shared executeCommand
 │                                     dispatcher), LocalAPIServer (HTTP, port 8766).
-└── Hal.swift                       — Everything else (~16.3k lines, down
+├── DocumentImportManager.swift     — Refactor #4 (2026-05-26 NIGHT).
+│                                     Document ingest pipeline, iOS-native
+│                                     DocxParser (MiniZip + XMLParser),
+│                                     ProcessedDocument + DocumentImportSummary
+│                                     value types.
+└── Hal.swift                       — Everything else (~15.4k lines, down
                                       from 21.3k pre-refactor).
 ```
 
