@@ -80,48 +80,53 @@ ship; nice for transparency. Defer if context is tight.
 ## Refactor work — in progress
 
 **Goal:** continue chipping Hal.swift down to a sane size by extracting
-self-contained subsystems one at a time. First extraction
-(`MLXModelDownloader`) landed 2026-05-20. Pattern is stable; just keep
+self-contained subsystems one at a time. Pattern is stable; just keep
 going.
 
-### Next extraction: `ModelCatalogService` (LEGO 30)
+### Done
 
-Self-contained ~1,400-line block right after the just-extracted
-LEGO 29. Holds the HuggingFace catalog fetching, license tracking, the
-in-memory `availableModels` array, and the model-status refresh hook.
-External coupling: minimal — accessed via `.shared`, observable from
-anywhere in the target.
+- ✅ Refactor #1 (2026-05-20): `MLXModelDownloader` (LEGO 29)
+- ✅ Refactor #2 (2026-05-26): `ModelCatalogService` (LEGO 30)
 
-**Same approach as `MLXModelDownloader` extraction:**
+### Next extraction: `LocalAPIServer + executeCommand handlers` (LEGO 32 et al)
 
-1. Read the full block end-to-end (LEGO 30 markers).
-2. Identify external references (other classes/types this block uses).
-3. Verify nothing extends `ModelCatalogService` from elsewhere in
-   Hal.swift (`grep -n "extension ModelCatalogService"`).
-4. Slice via the same Python boundary-cut trick used for LEGO 29.
-5. Create `Hal Universal/ModelCatalogService.swift` with header
-   matching the MLXModelDownloader pattern + appropriate imports.
-6. Leave a pointer comment in Hal.swift at the old slot.
+~3,500 lines, biggest single extraction yet. Holds the HTTP server,
+auth, JSON encoding, and the executeCommand dispatcher that maps API
+verbs to ChatViewModel methods. Coupling is medium — the dispatcher
+calls into everything via `chatViewModel.*` but the read/write seam
+is one place (the server class boundary). Risk: SWITCH_MODEL, /chat,
+DOWNLOAD_MODEL, EMBEDDING_STATUS and every other command path must
+keep working unchanged. Plan to verify by running the existing test
+harness (`tests/hal_test.py`) after the cut.
+
+**Same approach:**
+
+1. Find LEGO 32 markers + any related blocks the server depends on.
+2. Verify no `extension LocalAPIServer` elsewhere in Hal.swift.
+3. Confirm executeCommand and all its handlers move together as one
+   unit (no half-moves).
+4. Slice via the Python boundary-cut.
+5. Create `Hal Universal/LocalAPIServer.swift` with the header
+   matching the MLXModelDownloader / ModelCatalogService pattern +
+   needed imports (Foundation + SwiftUI + Combine + Network).
+6. Pointer comment in Hal.swift at the old slot.
 7. Update `sync_hal_source.sh`.
-8. Build (zero errors, zero warnings).
-9. Functional smoke test: trigger a catalog refresh via API, verify
-   it still populates `availableModels` and the Model Library renders
-   the Community Models list.
+8. Build clean (zero warnings).
+9. Functional smoke test: `python3 tests/hal_test.py state`,
+   `LIST_MODELS`, a SWITCH_MODEL round-trip, and one /chat turn.
 10. Commit + push.
 
-### After that — other extraction candidates ranked by size and isolation
+### After that — remaining extraction candidates ranked by size and isolation
 
 | Order | Subsystem | Approx lines | Isolation |
 |---|---|---|---|
-| 2 | ModelCatalogService (LEGO 30) | ~1,400 | High |
-| 3 | LocalAPIServer + executeCommand handlers (LEGO 32 + supporting) | ~3,500 | Medium (touches everything via dispatch but is one read/write boundary) |
+| 3 (next) | LocalAPIServer + executeCommand handlers (LEGO 32 + supporting) | ~3,500 | Medium (touches everything via dispatch but is one read/write boundary) |
 | 4 | DocumentImportManager + DocxParser (LEGO 27 + 27.1) | ~900 | High |
 | 5 | MemoryStore SQLite layer (LEGO 1-ish, very large) | ~3,000 | Low (interleaved with ChatViewModel) — defer |
 | 6 | SettingsView / ActionsView | ~2,500 | Medium |
 | 7 | ChatView root + composer + bubble views | ~2,000 | Low — leave for last |
 
-After Round 2 (ModelCatalogService), Hal.swift would be ~18,200 lines.
-After Round 3 (LocalAPIServer), ~14,700. Goal: get under 10k before
+After Round 3 (LocalAPIServer), Hal.swift would be ~14,700. Goal: get under 10k before
 v2.1 work begins.
 
 ---

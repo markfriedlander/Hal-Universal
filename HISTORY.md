@@ -3049,3 +3049,52 @@ remaining sequence:
 
 ModelCatalogService extraction (refactor #2) deferred — substantial
 work that warrants a fresh context window. Picked up next session.
+
+---
+
+## 2026-05-26 (afternoon — refactor #2 landed)
+
+### ModelCatalogService extraction (commit `95a05f1`)
+
+Second extraction following the MLXModelDownloader pattern. LEGO 30 in
+Hal.swift held the entire model-catalog subsystem: `ModelSource` enum,
+`MaximScorecard` rating struct, `ModelSettings` value type +
+`ModelSettingsStore` singleton, `ModelConfiguration` struct carrying
+both the Apple Foundation static instance and the four curated MLX
+seeds with all their empirically-tuned defaults and per-Maxim
+scorecards, the HuggingFace API DTOs, `ModelCatalogService`
+singleton, and `CatalogError`. Eight types, 1,385 lines, all
+internally cohesive ("what models exist, and what do we know about
+each one") and externally well-bounded — only halLog + MLXModelDownloader
+crossed the seam.
+
+The cut went through the same Python boundary script used for #1.
+Verified up front that no `extension ModelCatalogService` /
+`extension ModelConfiguration` / etc. existed elsewhere in Hal.swift,
+so the lift was clean. One snag during first build: the file needed
+`import Combine` because `@AppStorage` / `@Published` / the
+`ObservableObject` conformance machinery resolve through Combine;
+SwiftUI re-exports some of it but not enough for these uses. Same lesson
+MLXModelDownloader.swift carried — added `import Combine` and the build
+went green.
+
+Hal.swift: 19,627 → 18,252 lines (-1,375). Six refactor candidates
+remain (LocalAPIServer next at ~3,500 lines, then
+DocumentImportManager+DocxParser at ~900, MemoryStore at ~3,000,
+SettingsView/ActionsView at ~2,500, ChatView at ~2,000). Goal of
+under 10k before v2.1 work is still in reach.
+
+### Smoke test
+
+Built Debug for both sim and iPhone 16 Plus, installed on device,
+launched, queried via the API. `HALDEBUG-CATALOG: ModelCatalogService
+initialized with 5 seeded models; refreshed download states from disk.`
+fired on launch — singleton init, AFM + four curated seeds, disk
+reconciliation through MLXModelDownloader.shared all flowing through
+the relocated module. `LIST_MODELS` returned the right catalog. State
+lookup through `getModel(byID:)` resolved Gemma 4 E2B's active config
+correctly. Functional behavior identical to pre-extraction.
+
+Yesterday's `kLocalAPIEnabledOnLaunch` change also paid off: device
+came up with the API antenna already live, no manual toggle flip
+needed before `python3 tests/hal_test.py state` worked.

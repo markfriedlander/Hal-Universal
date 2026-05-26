@@ -1,6 +1,6 @@
 # Hal Universal — Handoff Brief
-**Updated:** May 26, 2026 (v2.0.1 device-verified, dev-API default landed, archive pending one-line ship blocker flip)
-**Branch:** `main` @ `93cf4ba` (clean tree, all pushed)
+**Updated:** May 26, 2026 (refactor #2 ModelCatalogService landed; archive pending one-line ship blocker flip)
+**Branch:** `main` @ `95a05f1` (clean tree, all pushed)
 **Production:** Hal Universal **v2.0 is live on the App Store** since 2026-05-19. Non-EU markets only (DSA non-trader; see HISTORY).
 
 ## Where Hal is right now
@@ -9,18 +9,19 @@ v2.0 shipped. v2.0.1 hotfix (EmbeddingGemma mis-download) is **fully
 verified** — sim + device — and ready to archive. One ship blocker
 remains: a one-line flip of `kLocalAPIEnabledOnLaunch` from `true` to
 `false` in `Hal.swift` before archiving. Refactor #1
-(MLXModelDownloader) landed. Refactor #2 (ModelCatalogService) is
-queued for the next session.
+(MLXModelDownloader) and refactor #2 (ModelCatalogService) both
+landed; Hal.swift is now 18,252 lines, down from 21,266 at the start
+of the refactor run. Next candidate: LocalAPIServer (LEGO 32).
 
 ### Most recent commits
 
 ```
+95a05f1  Refactor: extract ModelCatalogService to its own file
+70adb5e  Docs: device verify v2.0.1 passed + ship blocker recorded
 93cf4ba  Force local API antenna ON at every launch (dev default)
 0c2ac21  Docs: HISTORY/HANDOFF/NEXT/MEMORY for post-v2.0-ship state
 9f5fdf8  Refactor: extract MLXModelDownloader to its own file
 90479cc  v2.0.1 hotfix: remove EmbeddingGemma + parameterize startDownload + cleanup
-03c10c1  EmbedderBackendRow: tap-proof guard around EmbeddingGemma actions
-e30c888  Add About section to Settings showing version + build
 ```
 
 ### v2.0.1 hotfix — fully verified, archive pending
@@ -96,23 +97,36 @@ to flip the toggle by hand. Two cross-referenced comment blocks
 constant is flipped to `false` before archive. Single unified build,
 no Debug/Release drift — consistent with new SOP #12.
 
-### Refactor — first extraction landed
+### Refactor — first two extractions landed
 
-`MLXModelDownloader` (LEGO 29 from Hal.swift) lifted to its own file
-(`Hal Universal/MLXModelDownloader.swift`, 1,717 lines). Holds
+**#1 (2026-05-20):** `MLXModelDownloader` (LEGO 29) lifted to
+`MLXModelDownloader.swift`, 1,717 lines. Holds
 `BackgroundDownloadCoordinator` + `MLXModelDownloader` + the
-`.mlxModelDidDownload` Notification.Name extension. Two classes in one
-file because they're tightly coupled — splitting would push the seam
-into thin interface types without isolation gain.
+`.mlxModelDidDownload` Notification.Name extension. Two classes in
+one file because they're tightly coupled — splitting would push the
+seam into thin interface types without isolation gain. Hal.swift
+21,266 → 19,602 (-1,664). Smoke-tested with a full Nomic re-download
+(8 files, 73 MB/s, atomic moves, completion notification all firing).
 
-Hal.swift: **21,266 → 19,602 lines** (1,664 lighter, ~7% smaller).
+**#2 (2026-05-26):** `ModelCatalogService` (LEGO 30) lifted to
+`ModelCatalogService.swift`, 1,434 lines. Holds `ModelSource`,
+`MaximScorecard`, `ModelSettings`, `ModelSettingsStore` (singleton),
+`ModelConfiguration` (with AFM + four curated MLX seeds), the
+HuggingFace API DTOs, `ModelCatalogService` (singleton), and
+`CatalogError`. Eight types in one file because all describe "what
+models exist and what we know about each one" — the cluster is
+internally tight and externally well-bounded (only halLog +
+MLXModelDownloader cross the seam). Hal.swift 19,627 → 18,252
+(-1,375). Smoke-tested via API on iPhone 16 Plus: singleton init
+fires, LIST_MODELS returns the right catalog, model lookup through
+`getModel(byID:)` resolves correctly.
 
-Pointer comment left in Hal.swift at the old LEGO 29 slot so the
-numbering chain still reads. `sync_hal_source.sh` updated. Clean
-Debug build, zero warnings. Functional smoke test: deleted Nomic and
-re-downloaded; BackgroundDownloadCoordinator enqueued 8 files,
-byte-tracked through `didWriteData`, atomically moved each finished
-file, hit 73 MB/s. Same behavior, new file.
+**Cumulative:** Hal.swift down 3,014 lines (~14%). Pointer comments
+left at the old LEGO 29 and 30 slots so the numbering chain still
+reads end-to-end. `sync_hal_source.sh` extended on each extraction.
+Both extractions needed `import Combine` in the new file (SwiftUI
+re-exports some but not all of what `@AppStorage` / `@Published` /
+`ObservableObject` resolve through).
 
 ---
 
@@ -133,10 +147,15 @@ Hal Universal/
 ├── ProcessMemoryGuard.swift        — Item 11 os_proc_available_memory.
 ├── MaintenanceTasks.swift          — NEW (2026-05-20). Orphan-cache cleanup
 │                                     at launch. Extensible list.
-├── MLXModelDownloader.swift        — NEW (2026-05-20, refactor #1).
+├── MLXModelDownloader.swift        — Refactor #1 (2026-05-20).
 │                                     BackgroundDownloadCoordinator +
 │                                     MLXModelDownloader + Notification.Name.
-└── Hal.swift                       — Everything else (~19.6k lines, down
+├── ModelCatalogService.swift       — Refactor #2 (2026-05-26).
+│                                     ModelSource, MaximScorecard,
+│                                     ModelSettings(+Store), ModelConfiguration
+│                                     (with AFM + curated MLX seeds), HF API
+│                                     DTOs, ModelCatalogService, CatalogError.
+└── Hal.swift                       — Everything else (~18.3k lines, down
                                       from 21.3k pre-refactor).
 ```
 
