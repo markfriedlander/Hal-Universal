@@ -102,57 +102,86 @@ real test. Also a standing rule: **LEGO blocks stay** — preserved
 inside Hal.swift via pointer comments at each extracted slot, AND
 preserved inside every extracted file as internal section landmarks.
 
-### Done
+### Done — full refactor sprint complete
 
 - ✅ Refactor #1 (2026-05-20): `MLXModelDownloader` (LEGO 29)
 - ✅ Refactor #2 (2026-05-26 PM): `ModelCatalogService` (LEGO 30)
 - ✅ Refactor #3 (2026-05-26 EVE): `LocalAPIServer + HalTestConsole` (LEGO 32)
 - ✅ Refactor #4 (2026-05-26 NIGHT): `DocumentImportManager + DocxParser + import models` (LEGO 27 + 27.1 + 28)
 - ✅ Refactor #5 (2026-05-26 LATE): `SettingsViews` (LEGO 10.1, 10.2, 10.3, 10.3.5, 10.4)
+- ✅ Refactor #6 (2026-05-26 DEEP NIGHT): `ChatViews` (LEGO 09, 09.5, 13, 13.5)
 
-### Next candidate: assess `ChatView + composer + bubble views`
+**Cumulative:** Hal.swift 21,266 → 12,650 (-8,616, ~40.5%). Six
+extractions in one day. Every candidate evaluated against Mark's
+three criteria (readability / extensibility / diagnosability)
+earned its place.
 
-Verdict on this one was "maybe" before the refactor run started; now
-that #1-#5 have proved the pattern out, the next decision is whether
-to take the chat-UI layer too. Probable scope:
+### Why we're stopping here
 
-- **LEGO 09** App Entry & iOSChatView (UI Shell) — ~390 lines
-- **LEGO 09.5** ThreadPanelView — ~125 lines
-- **LEGO 13** ChatBubbleView & TimerView — ~570 lines
-- **LEGO 13.5** MarkdownView — ~180 lines
+What's left in Hal.swift after refactor #6:
 
-Rough total ~1,270 lines. Plus possible UI helper blocks (11.6 UI
-Helper Components ~480 lines, 12.6 SelfReflectionView ~325 lines)
-that may travel with them depending on coupling.
+| Block | Subsystem | Why it stays |
+|---|---|---|
+| 02-07 | MemoryStore (schema, encryption, stats, self-knowledge, search) | Interleaved with ChatViewModel state knowledge; extracting would make memory bugs harder to trace, not easier — fails criterion 3. |
+| 07.5 / 07.6 | Prompt budgeting + segment compression | Heart of how Hal stays within model context windows; tightly bound to the LLM-routing path below. |
+| 08 | MLXWrapper + LLMService | The inference path itself. Splitting MLX routing from the wrappers it consumes would push the seam through generation flow. |
+| 8.5 | Summarization utilities | Used by both prompt compression and memory summarization; sits between the two. |
+| 11.5 / 11.6 | Model Library UI + UI helpers | Small (~1,500 lines total). View-only; could be extracted alongside ChatViews later if needed, but not pulling its weight today. |
+| 12.6 | SelfReflectionView | Already a single self-contained read-only viewer; ~325 lines isn't enough mass to merit its own file yet. |
+| 14 / 15 / 16 | Stubs + ShareSheet + View extensions | Tiny utilities, no value to extract. |
+| 17-25 | ChatViewModel (the whole thing) | The conceptual heart of Hal. Every other subsystem talks to it. Splitting it would worsen all three criteria. |
+| 26 | DocumentPicker UIKit bridge | ~60 lines. Lives near its consumers in Hal.swift. |
+| 31 | HalWatchBridge | ~140 lines. Single class, tied to the WCSession lifecycle in HalAppDelegate (which is in ChatViews.swift). Could move with ChatViews someday if friction surfaces. |
 
-**The honest "maybe" gating question:** do these blocks reach into
-ChatViewModel in ways that would make chat bugs *harder* to diagnose
-after extraction? Two flavors of crossing matter:
+By Mark's three criteria the natural pause is here. Further
+splitting would either fail diagnosability (MemoryStore) or be
+cosmetic (smaller blocks that aren't pulling their weight).
 
-1. **Direct state access** — if ChatBubbleView passes back
-   substantial mutations to ChatViewModel, the binding seam moves
-   from "in the same file" to "across files" without gaining
-   isolation. Need to read the actual code before deciding.
-2. **Composer flow** — message-send flow goes UI → ChatViewModel
-   sendMessage path. If the composer is sufficiently encapsulated
-   (just calls vm.sendMessage and observes the published reply),
-   it's a clean lift. If it reaches into mid-flow state, less so.
+### What's queued for whenever Hal returns to active development
 
-**Recommended next action:** read LEGO 09 + 13 end-to-end with that
-question in mind, then make the call. If clean lift, extract as
-`ChatViews.swift`. If muddier than expected, defer and either (a)
-do a smaller targeted extraction of just ChatBubbleView + MarkdownView
-(the rendering-only blocks), or (b) call the refactor sprint done.
+1. **v2.0.1 hotfix ship.** Sim+device verified, deferred to v2.1
+   per Mark on 2026-05-26 (orphan-weights bug is bandwidth-leaky
+   but crash-safe). When v2.1 is ready to archive, this rides
+   along: flip `kLocalAPIEnabledOnLaunch` to `false`, bump
+   CFBundleVersion to 7, archive + submit. What's-New text drafted
+   below.
 
-### Remaining lower-priority candidates
+2. **v2.1 design work.** Per Mark on 2026-05-26: "No design work
+   until we do the full refactor." The full refactor is done.
+   Three major arcs on the design horizon (from
+   HAL_CC_BRIEFING.md):
+   - **Proposals system** — settings additions go to
+     SettingsViews.swift, new SQLite table goes in MemoryStore
+     (Hal.swift), API verbs extend LocalAPIServer.swift's
+     executeCommand.
+   - **Soul Document** — three-layer memory architecture, new
+     persistent record in MemoryStore.
+   - **Salon Mode polish** — visible moderator seat option,
+     attribution UI improvements, transcript export (touches
+     SettingsViews + ChatViews).
 
-| Subsystem | Approx lines | Read | Extend | Diagnose | Verdict |
-|---|---|---|---|---|---|
-| MemoryStore SQLite layer (LEGO 02-07 ish) | ~3,000 | Low (interleaved with ChatViewModel; schema knowledge essential context) | Low (extensions almost always touch both sides) | **Could make memory bugs HARDER to trace** | **Defer or skip** unless a separate force requires it |
-| Other small blocks (LEGO 26 DocumentPicker, LEGO 31 HalWatchBridge, LEGO 11.5 Model Library UI) | varies | Mixed | Mixed | Mixed | Evaluate individually when/if they become a friction point |
+3. **Deferred bugs.** Bug 1 (SET_MEMORY_DEPTH doesn't survive
+   re-init), Bug 2b (RAG-miss confabulation), Bug 3 (first-turn-
+   after-swap race for 3 GB MLX models). Product decisions pending
+   on all three.
 
-By v2.1 startup we should have settled the chat-UI question. After
-that, MemoryStore stays in Hal.swift unless a specific need surfaces.
+4. **Small cosmetic cleanup candidates** (no urgency):
+   - HistoricalContext logically belongs with MemoryStore — left
+     in ChatViews.swift for now.
+   - LEGO numbering inconsistencies (07.5 vs 8.5, 10.3.5, 27.1) —
+     keep as-is per Mark; renumber later if it makes sense.
+
+### v2.0.1 What's New text (drafted, ready to use)
+
+```
+Bug fix: downloading the optional Nomic Embed Text v1.5 retrieval model
+now correctly downloads Nomic instead of an unrelated model file. Any
+orphan files from the v2.0 install are removed automatically on launch.
+
+Internal refactor: ~40% of the main source file extracted into focused
+subsystem modules (model downloads, model catalog, API server, document
+ingest, settings UI, chat UI). No user-visible change.
+```
 
 ---
 

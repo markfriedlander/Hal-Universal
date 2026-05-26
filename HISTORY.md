@@ -3351,3 +3351,96 @@ Cumulative: 21,266 → 13,893 (-7,373, ~35%). Five extractions, one
 day. By Mark's three criteria each one earned its place — every
 extracted subsystem is now an obvious file to open when its concern
 is the work at hand.
+
+---
+
+## 2026-05-26 (deep night — refactor #6, the chat surface)
+
+### Recon first
+
+Before doing the cut I ran end-to-end recon on LEGO 09, 09.5, 13,
+and 13.5. The gating question was whether the chat-UI blocks reached
+into ChatViewModel state in ways that would make chat bugs harder
+to diagnose after extraction. Verdict: clean lift. Every coupling
+is surface-level — reads of @Published properties, calls into
+explicit entry points (`sendMessage`, `startNewConversation`,
+`switchToThread`, `loadThreads`, `exportChatHistory*`), one UI-state
+toggle (`showInlineDetails.toggle` from a context menu), and one
+reach-through (`chatViewModel.memoryStore.deleteThread` in
+ThreadPanelView's resetThread). No mid-flow state access anywhere.
+After extraction, the debugging path for any chat-UI bug is
+unchanged from before.
+
+Two findings worth flagging surfaced during the recon:
+
+- **Stray indentation in LEGO 13.** Every line of LEGO 13's contents
+  was indented 4 spaces for no structural reason — orphan indentation
+  from a long-ago refactor that removed an outer wrapper without
+  unindenting. Cosmetic, but ugly to propagate. Fixed during the
+  lift (548 lines de-indented).
+- **HistoricalContext is logically a MemoryStore concept** that
+  happens to be defined in LEGO 09 for historical reasons. Used by
+  `MemoryStore.currentHistoricalContext` + one ChatBubbleView writer.
+  Left it with LEGO 09 for now to keep the unit intact; flagged in
+  the file header as a candidate for a small future cleanup.
+
+Mark approved both: one file (`ChatViews.swift`), fix the indentation
+during the lift.
+
+### The extraction (commit `41c0601`)
+
+Two ranges joined into one file because the slice is discontiguous —
+LEGO 09 + 09.5 lived at lines 6362-6878 and LEGO 13 + 13.5 at
+8700-9443, with ~1,820 lines of unrelated UI between them (the
+extracted SettingsViews stub, ModelLibraryUI, UI helpers,
+SelfReflectionView). Python script handled both ranges in one cut:
+read range A, read range B, de-indent LEGO 13's body, concatenate
+with a blank separator, write the new file. Pointer comments
+inserted at both old slots in Hal.swift in B-then-A order so the
+line indices stayed valid through the splice.
+
+The four LEGO markers preserved verbatim inside the new file.
+Coupling profile confirmed by the build (clean first try, zero
+warnings) and by the smoke test: SCREENSHOT of the device main
+chat surface shows title bar with thread title, hamburger + gear
+toolbar buttons, three message bubbles with proper user/assistant
+differentiation and full footer attribution
+("May 21, 2026 at 2:54 AM, Turn 14, Inference 3.0 sec, Gemma 4
+E2B"), MarkdownView rendering the text bodies, and the composer
+at the bottom with paperplane button. Every component flowing
+through the relocated file.
+
+### The numbers, end of day
+
+| Refactor | Date       | Subsystem                | Δ lines | Hal.swift remaining |
+|----------|------------|--------------------------|--------:|--------------------:|
+| #1       | 2026-05-20 | MLXModelDownloader       | -1,664  | 19,602              |
+| #2       | 2026-05-26 PM | ModelCatalogService   | -1,375  | 18,252              |
+| #3       | 2026-05-26 EVE | LocalAPIServer+console | -1,954 | 16,298              |
+| #4       | 2026-05-26 NIGHT | DocumentImportManager | -881  | 15,424              |
+| #5       | 2026-05-26 LATE  | SettingsViews         | -1,531 | 13,893              |
+| #6       | 2026-05-26 DEEP NIGHT | ChatViews        | -1,243 | 12,650              |
+
+**Cumulative: 21,266 → 12,650 (-8,616, ~40.5%).** Six extractions in
+one day. Hal.swift is now ~60% of what it was at the start of the
+day. The big files all have natural homes: model downloads, model
+catalog, API server + test console, document ingest, settings UI,
+chat UI. What's left in Hal.swift is the conceptual heart of Hal —
+ChatMessage / MemoryStore (LEGO 02-07), the prompt-budgeting
+machinery (07.5/07.6), LLM routing (08), summarization utilities
+(8.5), ModelLibraryView + UI helpers (11.5/11.6), SelfReflectionView
+(12.6), helper view extensions (15/16), and ChatViewModel itself
+(17 through 25) plus the watch bridge (31). By Mark's three criteria
+the natural pause is here. MemoryStore + ChatViewModel are
+interleaved enough that further splitting would likely hurt
+diagnosability rather than help.
+
+### What this enables
+
+Every v2.1 piece on the design horizon — Proposals system,
+soul-document architecture, salon polish — now has an obvious file
+to land in. Settings additions go to SettingsViews.swift. Chat-UI
+affordances go to ChatViews.swift. Memory architecture work happens
+in Hal.swift where the schema knowledge already lives. New API verbs
+extend the executeCommand dispatcher in LocalAPIServer.swift. The
+refactor was scaffolding for the work that comes next.
