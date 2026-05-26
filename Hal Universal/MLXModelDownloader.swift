@@ -46,6 +46,8 @@ import Combine
 import UIKit
 
 
+// ==== LEGO START: 29 BackgroundDownloadCoordinator + MLXModelDownloader ====
+
 // MARK: - Background Download Coordinator
 //
 // True iOS-style background downloader for HuggingFace MLX models. Replaces
@@ -1715,3 +1717,5 @@ class MLXModelDownloader: ObservableObject {
 extension Notification.Name {
     static let mlxModelDidDownload = Notification.Name("mlxModelDidDownload")
 }
+
+// ==== LEGO END: 29 BackgroundDownloadCoordinator + MLXModelDownloader ====

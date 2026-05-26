@@ -5678,6 +5678,8 @@ import Combine
 import UIKit
 
 
+// ==== LEGO START: 29 BackgroundDownloadCoordinator + MLXModelDownloader ====
+
 // MARK: - Background Download Coordinator
 //
 // True iOS-style background downloader for HuggingFace MLX models. Replaces
@@ -7348,6 +7350,8 @@ extension Notification.Name {
     static let mlxModelDidDownload = Notification.Name("mlxModelDidDownload")
 }
 
+// ==== LEGO END: 29 BackgroundDownloadCoordinator + MLXModelDownloader ====
+
 // ==== FILE: ModelCatalogService.swift ====
 // ModelCatalogService.swift
 // Hal Universal
@@ -7402,6 +7406,8 @@ extension Notification.Name {
 import Foundation
 import SwiftUI
 import Combine
+
+// ==== LEGO START: 30 Model Catalog Service (Hugging Face Integration) ====
 
 // MARK: - Model Source Enum
 enum ModelSource: String, Codable {
@@ -8784,6 +8790,8 @@ enum CatalogError: LocalizedError {
         }
     }
 }
+
+// ==== LEGO END: 30 Model Catalog Service (Hugging Face Integration) ====
 
 // ==== FILE: LocalAPIServer.swift ====
 // LocalAPIServer.swift

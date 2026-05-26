@@ -52,6 +52,8 @@ import Foundation
 import SwiftUI
 import Combine
 
+// ==== LEGO START: 30 Model Catalog Service (Hugging Face Integration) ====
+
 // MARK: - Model Source Enum
 enum ModelSource: String, Codable {
     case appleFoundation = "apple"
@@ -1433,3 +1435,5 @@ enum CatalogError: LocalizedError {
         }
     }
 }
+
+// ==== LEGO END: 30 Model Catalog Service (Hugging Face Integration) ====
