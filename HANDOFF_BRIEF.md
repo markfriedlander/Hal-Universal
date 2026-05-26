@@ -1,27 +1,29 @@
 # Hal Universal — Handoff Brief
-**Updated:** May 20, 2026 (post-v2.0-ship, v2.0.1 hotfix committed, refactor begun)
-**Branch:** `main` @ `9f5fdf8` (clean tree, all pushed)
+**Updated:** May 26, 2026 (v2.0.1 device-verified, dev-API default landed, archive pending one-line ship blocker flip)
+**Branch:** `main` @ `93cf4ba` (clean tree, all pushed)
 **Production:** Hal Universal **v2.0 is live on the App Store** since 2026-05-19. Non-EU markets only (DSA non-trader; see HISTORY).
 
 ## Where Hal is right now
 
-v2.0 shipped. Then immediately surfaced a real production bug — the
-**EmbeddingGemma mis-download** — fixed and sim-verified as the v2.0.1
-hotfix. Refactor begun, first subsystem extracted. **Not archived for
-ASC yet** — gated on device-side verification of the hotfix.
+v2.0 shipped. v2.0.1 hotfix (EmbeddingGemma mis-download) is **fully
+verified** — sim + device — and ready to archive. One ship blocker
+remains: a one-line flip of `kLocalAPIEnabledOnLaunch` from `true` to
+`false` in `Hal.swift` before archiving. Refactor #1
+(MLXModelDownloader) landed. Refactor #2 (ModelCatalogService) is
+queued for the next session.
 
 ### Most recent commits
 
 ```
+93cf4ba  Force local API antenna ON at every launch (dev default)
+0c2ac21  Docs: HISTORY/HANDOFF/NEXT/MEMORY for post-v2.0-ship state
 9f5fdf8  Refactor: extract MLXModelDownloader to its own file
 90479cc  v2.0.1 hotfix: remove EmbeddingGemma + parameterize startDownload + cleanup
 03c10c1  EmbedderBackendRow: tap-proof guard around EmbeddingGemma actions
 e30c888  Add About section to Settings showing version + build
-3eb3014  Add SC strategy memo + draft HTML reference copies
-9da09b0  Bug 4 v2: banner relocation + Model framing label + System Prompt dim
 ```
 
-### v2.0.1 hotfix — sim-verified, device verification owed
+### v2.0.1 hotfix — fully verified, archive pending
 
 **The bug.** On the clean App Store v2.0 install, tapping Download on
 the Nomic Embed Text v1.5 row downloaded EmbeddingGemma's 210 MB of
@@ -72,8 +74,27 @@ Tapping Download on Nomic downloads Nomic (every byte of log evidence
 hit `nomic-ai/nomic-embed-text-v1.5`, zero to embeddinggemma). Labels
 correct. API rejection paths work.
 
-**Device verification owed.** Mark's directive: device-side verify
-before archive. See `NEXT.md`.
+**Device verification DONE (2026-05-26).** Built Debug from main @
+`0c2ac21`, installed on iPhone 16 Plus. `DOWNLOAD_EMBEDDING_MODEL:
+nomicswift` → all 8 background tasks wrote into
+`Caches/huggingface/models/nomic-ai/nomic-embed-text-v1.5/`, 521.6 MB
+safetensors at 73 MB/s, `.mlxModelDidDownload` fired, coordinator
+finalized. Grep across 500 log lines for `embeddinggemma` /
+`gemma-300m` returned empty — zero Gemma surface. `HALDEBUG-CLEANUP`
+correctly quiet (device never had the orphan dir; idempotent skip).
+`EMBEDDING_STATUS` confirms nomicswift active at 768 dim. Bug is dead.
+
+### Local API antenna default-on (commit `93cf4ba`)
+
+`Hal.swift` now carries a `kLocalAPIEnabledOnLaunch` constant
+force-applied to UserDefaults in init() STEP 0. This boots the dev
+antenna ON at every launch regardless of persisted preference, so
+device test tooling works on every fresh install without Mark having
+to flip the toggle by hand. Two cross-referenced comment blocks
+(above the constant + above the AppStorage) point at the same
+`SHIP_BLOCKER` marker. Production users get the antenna off when the
+constant is flipped to `false` before archive. Single unified build,
+no Debug/Release drift — consistent with new SOP #12.
 
 ### Refactor — first extraction landed
 

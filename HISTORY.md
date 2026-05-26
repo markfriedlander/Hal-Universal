@@ -2972,3 +2972,80 @@ file location.
   implementations only, one logical change per commit, docs current as
   work lands, warnings = errors, refactor-as-you-go.
 
+
+---
+
+## 2026-05-26 (short session — device verify + dev-API default)
+
+### Device verification of the v2.0.1 EmbeddingGemma hotfix — passed
+
+Mark's directive from the prior session was unambiguous: the bug was a
+live production issue on App Store v2.0, so even though all eight sim
+test-plan steps were green, the fix had to be device-verified before
+archiving the hotfix. Today CC built Debug from `main` @ `0c2ac21`,
+installed to the iPhone 16 Plus, and ran the seven-step check from
+`NEXT.md`.
+
+The launch did not emit a `HALDEBUG-CLEANUP` line. Initially that looked
+like a miss, but the cleanup helper is idempotent and only logs when the
+orphan directory actually exists; Mark's device had never tapped the
+buggy Download path on the App Store build, so there was nothing to
+remove. Correct quiet behavior.
+
+The interesting part was the download itself. `DOWNLOAD_EMBEDDING_MODEL:
+nomicswift` via the API returned the right backend + modelID
+(`nomic-ai/nomic-embed-text-v1.5`). All eight background download tasks
+wrote into `Caches/huggingface/models/nomic-ai/nomic-embed-text-v1.5/`,
+the 521.6 MB safetensors finished at ~73 MB/s, `.mlxModelDidDownload`
+fired, the coordinator finalized. A grep across 500 log lines for
+`embeddinggemma` or `gemma-300m` returned empty — zero Gemma surface
+anywhere in the download path, exactly the property the fix was supposed
+to guarantee. `EMBEDDING_STATUS` afterward confirmed Nomic was the
+active backend with the expected 768-dim vector size.
+
+The hotfix is now device-verified. Archive is unblocked, gated only on
+CFBundleVersion bump and Mark's go-ahead.
+
+### Local API antenna: default-on at every launch (commit `93cf4ba`)
+
+A papercut surfaced during the device verify: Mark had to physically
+flip the in-app "Developer API" toggle before CC's test tooling could
+reach the device. The `@AppStorage("localAPIEnabled")` default was
+already `true`, but `@AppStorage` only consults its default on a key's
+first read; the persisted `false` from prior Release-build sessions kept
+winning on every Debug reinstall.
+
+Two ways to fix this without violating the new SOP #12 (comment-out,
+don't compile-flag):
+
+- **(a)** Wrap a Debug-only forced-on in `#if DEBUG`. Mark rejected
+  this on first mention — explicit reasoning: "I only want one unified
+  build so we don't end up asking which code install we are looking at,
+  at any given point in time."
+- **(b)** Force the value at every init() unconditionally, with a
+  clearly-marked `SHIP_BLOCKER` constant a human (or future CC) must
+  flip to `false` before archiving.
+
+Took (b). New private static `kLocalAPIEnabledOnLaunch` constant at the
+top of `ChatViewModel`, force-applied to `UserDefaults` as STEP 0 of
+init() before any of the existing migration / setup steps. Two
+prominent comment blocks point at each other so the relationship is
+discoverable from either side. Build clean, no warnings.
+
+The cost of this approach is the same one Mark accepted up front: one
+manual line-flip before each archive. The benefit is no Debug/Release
+behavioral drift, which is exactly the kind of seam that produced the
+EmbeddingGemma mis-download bug in the first place. Worth the trade.
+
+### What's left to ship v2.0.1
+
+`NEXT.md` is rewritten in this commit to reflect the new state. The
+remaining sequence:
+
+1. Flip `kLocalAPIEnabledOnLaunch` to `false` (SHIP_BLOCKER).
+2. Bump CFBundleVersion to 7 in project.pbxproj.
+3. Archive + upload + submit (no screenshot work needed — the v2.0
+   6.3" tier screenshots still apply).
+
+ModelCatalogService extraction (refactor #2) deferred — substantial
+work that warrants a fresh context window. Picked up next session.

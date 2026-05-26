@@ -22,53 +22,31 @@ For how we got here: `HISTORY.md` (especially the 2026-05-19/20 entry).
 
 ## v2.0.1 ship sequence (in order)
 
-### 1. Device-side verification of the EmbeddingGemma hotfix — REQUIRED BEFORE ARCHIVE
+### 1. ~~Device-side verification of the EmbeddingGemma hotfix~~ — DONE 2026-05-26
 
-The bug was a live App Store production issue. Sim verification passed
-all 8 test plan steps, but Mark's directive is unambiguous: device-side
-verify the fix before submitting 2.0.1.
+Verified on iPhone 16 Plus from `main` @ `93cf4ba`. Nomic download
+landed in `Caches/huggingface/models/nomic-ai/nomic-embed-text-v1.5/`
+at 73 MB/s, `.mlxModelDidDownload` fired, EMBEDDING_STATUS confirms
+nomicswift active at 768 dim. Grep across 500 log lines for
+`embeddinggemma` / `gemma-300m` returned empty. `HALDEBUG-CLEANUP`
+quiet because the device never had the orphan dir (idempotent skip).
+Bug is dead. See HISTORY 2026-05-26 entry.
 
-**Minimum checks (15 min):**
+### 2. **SHIP_BLOCKER**: flip the local-API antenna OFF before archive
 
-1. Build + install the latest Debug from `main` to iPhone 16 Plus:
-   ```bash
-   xcodebuild build -project "Hal Universal.xcodeproj" \
-     -scheme "Hal Universal" \
-     -destination "id=D24FB384-9C55-5D33-9B0D-DAEBFA6528D6" \
-     -configuration Debug
-   xcrun devicectl device install app --device D24FB384-9C55-5D33-9B0D-DAEBFA6528D6 \
-     "/Users/markfriedlander/Library/Developer/Xcode/DerivedData/Hal_Universal-cchnecnyhpxmoeczheicasvhbcqp/Build/Products/Debug-iphoneos/Hal Universal.app"
-   xcrun devicectl device process launch --device D24FB384-9C55-5D33-9B0D-DAEBFA6528D6 com.MarkFriedlander.Hal-Universal
-   ```
-2. **Check launch log for `HALDEBUG-CLEANUP: removed orphaned embedding
-   cache for mlx-community/embeddinggemma-300m-4bit`.** This fires only
-   if the orphan weights are present (likely on Mark's device from
-   pre-fix testing). One-shot — won't fire on the next launch.
-3. Pull the logs via API:
-   ```bash
-   python3 tests/hal_test.py logs 200 | grep -iE "HALDEBUG-CLEANUP|HALDEBUG-EMBEDDING"
-   ```
-4. Open Model Library → expand the **Nomic Embed Text v1.5** row. If
-   already downloaded (Mark had it from the prior session), use
-   `DELETE_MODEL:nomic-ai/nomic-embed-text-v1.5` via API first to get
-   back to the Download state.
-5. Tap **Download**. Verify the in-row label says "Downloading Nomic
-   Embed Text v1.5…" and the status footer matches.
-6. Pull live logs while download runs:
-   ```bash
-   python3 tests/hal_test.py logs 200 | grep -iE "HALDEBUG-BGDL|HALDEBUG-DOWNLOAD"
-   ```
-   Confirm every line references `nomic-ai/nomic-embed-text-v1.5`; zero
-   lines mention `embeddinggemma-300m-4bit`.
-7. Wait for completion. Verify status banner reads "Nomic Embed Text
-   v1.5 downloaded."
+`Hal.swift` carries a `private static let kLocalAPIEnabledOnLaunch:
+Bool = true` constant (search the file for `SHIP_BLOCKER`). It force-
+applies to UserDefaults on every init() so device-side test tooling
+works without needing the in-app toggle flip on every reinstall.
+Production users should boot with the antenna OFF, matching v2.0
+behavior. **One-line flip to `false` before archive.** Two comment
+blocks (above the constant + above the AppStorage) cross-reference
+each other so this can't be missed. The runtime toggle in Settings >
+Power User > Developer API still works — users can opt in mid-session.
 
-**If all green:** proceed to step 2 (archive). If any step fails or
-surfaces a Gemma reference, STOP, screenshot/log, and report back.
+### 3. Archive + ASC submit v2.0.1
 
-### 2. Archive + ASC submit v2.0.1
-
-When step 1 passes:
+When the SHIP_BLOCKER is flipped:
 
 1. Bump `CFBundleVersion` to **7** in `project.pbxproj` (was 6 for the
    v2.0 production build).
@@ -90,7 +68,7 @@ When step 1 passes:
    source file into its own module. No user-visible change.
    ```
 
-### 3. (Optional) Surface a brief release-note in-app
+### 4. (Optional) Surface a brief release-note in-app
 
 Hal v2.0 added an About section to Settings with version + build.
 Consider a tiny "What's new in 2.0.1" link in the About row that opens
