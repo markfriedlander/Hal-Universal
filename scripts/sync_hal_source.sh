@@ -33,6 +33,7 @@ FILES=(
   "Hal Universal/LocalAPIServer.swift"
   "Hal Universal/DocumentImportManager.swift"
   "Hal Universal/SettingsViews.swift"
+  "Hal Universal/ChatViews.swift"
   "Hal Universal/Hal.swift"
 )
 
