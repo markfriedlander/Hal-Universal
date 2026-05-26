@@ -18885,7 +18885,18 @@ class ChatViewModel: ObservableObject {
     // MARK: - Local API Server (Developer API)
     // HTTP server for automated testing — see Block 32 LocalAPIServer.
     // Controlled by toggle in Settings > Power User > Developer API.
-    // Default OFF — no port opens unless explicitly enabled.
+    //
+    // SHIP_BLOCKER (2026-05-26): `kLocalAPIEnabledOnLaunch` below is the
+    // single source of truth for whether each launch boots with the
+    // local API antenna live. We keep this ON during development so
+    // device-side test tooling (tests/hal_test.py) works on every fresh
+    // install without Mark having to flip the in-app toggle by hand. The
+    // value is force-applied to UserDefaults in init() so it overrides
+    // whatever was persisted from a prior session/build. Before any App
+    // Store archive, flip kLocalAPIEnabledOnLaunch to false (one-line
+    // change) so production users boot with the API off, matching
+    // historical behavior. The user can still flip it on at runtime via
+    // Settings > Power User > Developer API.
     @AppStorage("localAPIEnabled") var localAPIEnabled: Bool = true
     var localAPIServer: LocalAPIServer = LocalAPIServer()
 
@@ -18899,7 +18910,21 @@ class ChatViewModel: ObservableObject {
         localAPIServer.stop()
     }
 
+    /// SHIP_BLOCKER (2026-05-26): set to `false` before any App Store
+    /// archive. See note on `localAPIEnabled` AppStorage above. Forcing
+    /// this in init() means every launch overrides whatever was
+    /// persisted previously, so a fresh install/reinstall always boots
+    /// with the antenna in the dev-friendly default state.
+    private static let kLocalAPIEnabledOnLaunch: Bool = true
+
     init() {
+        // STEP 0: Apply launch-time default for the Local API antenna.
+        // See SHIP_BLOCKER notes on kLocalAPIEnabledOnLaunch /
+        // localAPIEnabled. This intentionally clobbers any prior
+        // persisted value so device test tooling works on every fresh
+        // install without requiring a manual toggle flip.
+        UserDefaults.standard.set(Self.kLocalAPIEnabledOnLaunch, forKey: "localAPIEnabled")
+
         // STEP 1: Check for legacy LLMType and migrate to ModelConfiguration
         if let oldTypeRaw = UserDefaults.standard.string(forKey: "selectedLLMType") {
             let modelID: String
