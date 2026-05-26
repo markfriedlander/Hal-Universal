@@ -1,25 +1,30 @@
 # Hal Universal — Handoff Brief
-**Updated:** May 26, 2026 (refactor #2 ModelCatalogService landed; archive pending one-line ship blocker flip)
-**Branch:** `main` @ `95a05f1` (clean tree, all pushed)
+**Updated:** May 26, 2026 (refactor #3 LocalAPIServer landed; v2.0.1 hotfix deferred to v2.1 per Mark)
+**Branch:** `main` @ `94578e2` (clean tree, all pushed)
 **Production:** Hal Universal **v2.0 is live on the App Store** since 2026-05-19. Non-EU markets only (DSA non-trader; see HISTORY).
 
 ## Where Hal is right now
 
 v2.0 shipped. v2.0.1 hotfix (EmbeddingGemma mis-download) is **fully
-verified** — sim + device — and ready to archive. One ship blocker
-remains: a one-line flip of `kLocalAPIEnabledOnLaunch` from `true` to
-`false` in `Hal.swift` before archiving. Refactor #1
-(MLXModelDownloader) and refactor #2 (ModelCatalogService) both
-landed; Hal.swift is now 18,252 lines, down from 21,266 at the start
-of the refactor run. Next candidate: LocalAPIServer (LEGO 32).
+verified** — sim + device — but **deferred to v2.1** per Mark's call
+on 2026-05-26: the orphan-weights bug is bandwidth-leaky but
+crash-safe, so it can ride with the next bigger release.
+
+Refactor sprint in progress: three extractions landed today —
+MLXModelDownloader (#1, 2026-05-20), ModelCatalogService (#2,
+2026-05-26 afternoon), and LocalAPIServer (#3, 2026-05-26 evening).
+Hal.swift is now **16,298 lines, down from 21,266** at the start of
+the refactor run (-4,968, ~23%). Goal of under 10k before v2.1 work
+begins is within line-of-sight.
 
 ### Most recent commits
 
 ```
+94578e2  Refactor: extract LocalAPIServer + HalTestConsole to own file
+135e73a  Docs: refactor #2 ModelCatalogService landed
 95a05f1  Refactor: extract ModelCatalogService to its own file
 70adb5e  Docs: device verify v2.0.1 passed + ship blocker recorded
 93cf4ba  Force local API antenna ON at every launch (dev default)
-0c2ac21  Docs: HISTORY/HANDOFF/NEXT/MEMORY for post-v2.0-ship state
 9f5fdf8  Refactor: extract MLXModelDownloader to its own file
 90479cc  v2.0.1 hotfix: remove EmbeddingGemma + parameterize startDownload + cleanup
 ```
@@ -97,36 +102,41 @@ to flip the toggle by hand. Two cross-referenced comment blocks
 constant is flipped to `false` before archive. Single unified build,
 no Debug/Release drift — consistent with new SOP #12.
 
-### Refactor — first two extractions landed
+### Refactor — three extractions landed
 
 **#1 (2026-05-20):** `MLXModelDownloader` (LEGO 29) lifted to
 `MLXModelDownloader.swift`, 1,717 lines. Holds
 `BackgroundDownloadCoordinator` + `MLXModelDownloader` + the
-`.mlxModelDidDownload` Notification.Name extension. Two classes in
-one file because they're tightly coupled — splitting would push the
-seam into thin interface types without isolation gain. Hal.swift
-21,266 → 19,602 (-1,664). Smoke-tested with a full Nomic re-download
-(8 files, 73 MB/s, atomic moves, completion notification all firing).
+`.mlxModelDidDownload` Notification.Name extension. Hal.swift
+21,266 → 19,602 (-1,664).
 
-**#2 (2026-05-26):** `ModelCatalogService` (LEGO 30) lifted to
+**#2 (2026-05-26 PM):** `ModelCatalogService` (LEGO 30) lifted to
 `ModelCatalogService.swift`, 1,434 lines. Holds `ModelSource`,
-`MaximScorecard`, `ModelSettings`, `ModelSettingsStore` (singleton),
-`ModelConfiguration` (with AFM + four curated MLX seeds), the
-HuggingFace API DTOs, `ModelCatalogService` (singleton), and
-`CatalogError`. Eight types in one file because all describe "what
-models exist and what we know about each one" — the cluster is
-internally tight and externally well-bounded (only halLog +
-MLXModelDownloader cross the seam). Hal.swift 19,627 → 18,252
-(-1,375). Smoke-tested via API on iPhone 16 Plus: singleton init
-fires, LIST_MODELS returns the right catalog, model lookup through
-`getModel(byID:)` resolves correctly.
+`MaximScorecard`, `ModelSettings`, `ModelSettingsStore`,
+`ModelConfiguration` (with AFM + four curated MLX seeds), the HF
+DTOs, `ModelCatalogService`, and `CatalogError`. Hal.swift 19,627
+→ 18,252 (-1,375).
 
-**Cumulative:** Hal.swift down 3,014 lines (~14%). Pointer comments
-left at the old LEGO 29 and 30 slots so the numbering chain still
-reads end-to-end. `sync_hal_source.sh` extended on each extraction.
-Both extractions needed `import Combine` in the new file (SwiftUI
-re-exports some but not all of what `@AppStorage` / `@Published` /
-`ObservableObject` resolve through).
+**#3 (2026-05-26 EVE):** `LocalAPIServer + HalTestConsole` (LEGO 32
+plus the unmarked API-helper extensions sitting just above it)
+lifted to `LocalAPIServer.swift`, 2,025 lines. Holds `extension
+MemoryStore` + `extension DocumentImportManager` (API helpers),
+`HalTestConsole` (file-channel test harness with the shared
+`executeCommand` dispatcher), and `LocalAPIServer` (HTTP server,
+NWListener on port 8766). Two compile fixes needed during the cut:
+(a) add `import WatchConnectivity` to the new file because the
+original Hal.swift had it mid-file at line 16156 inside the LEGO 31
+HalWatchBridge block, (b) broaden three `private` methods on
+`DocumentImportManager` to module-internal so the path-based-import
+extension can still reach them from a different file. Hal.swift
+18,252 → 16,298 (-1,954).
+
+**Cumulative:** Hal.swift down **4,968 lines (~23%)**. Pointer
+comments left at all three old LEGO slots. `sync_hal_source.sh`
+extended on each extraction. Every extraction so far has needed
+`import Combine` in the new file (SwiftUI re-exports some but not
+all of what `@AppStorage` / `@Published` / `ObservableObject`
+resolve through — worth surfacing as a pattern in CLAUDE.md SOP).
 
 ---
 
@@ -150,12 +160,17 @@ Hal Universal/
 ├── MLXModelDownloader.swift        — Refactor #1 (2026-05-20).
 │                                     BackgroundDownloadCoordinator +
 │                                     MLXModelDownloader + Notification.Name.
-├── ModelCatalogService.swift       — Refactor #2 (2026-05-26).
+├── ModelCatalogService.swift       — Refactor #2 (2026-05-26 PM).
 │                                     ModelSource, MaximScorecard,
 │                                     ModelSettings(+Store), ModelConfiguration
 │                                     (with AFM + curated MLX seeds), HF API
 │                                     DTOs, ModelCatalogService, CatalogError.
-└── Hal.swift                       — Everything else (~18.3k lines, down
+├── LocalAPIServer.swift            — Refactor #3 (2026-05-26 EVE).
+│                                     MemoryStore + DocumentImportManager
+│                                     API-helper extensions, HalTestConsole
+│                                     (file-channel + shared executeCommand
+│                                     dispatcher), LocalAPIServer (HTTP, port 8766).
+└── Hal.swift                       — Everything else (~16.3k lines, down
                                       from 21.3k pre-refactor).
 ```
 

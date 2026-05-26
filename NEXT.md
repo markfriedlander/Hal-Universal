@@ -86,48 +86,55 @@ going.
 ### Done
 
 - ✅ Refactor #1 (2026-05-20): `MLXModelDownloader` (LEGO 29)
-- ✅ Refactor #2 (2026-05-26): `ModelCatalogService` (LEGO 30)
+- ✅ Refactor #2 (2026-05-26 PM): `ModelCatalogService` (LEGO 30)
+- ✅ Refactor #3 (2026-05-26 EVE): `LocalAPIServer + HalTestConsole` (LEGO 32)
 
-### Next extraction: `LocalAPIServer + executeCommand handlers` (LEGO 32 et al)
+### Next extraction: `DocumentImportManager + DocxParser` (LEGO 27 + 27.1)
 
-~3,500 lines, biggest single extraction yet. Holds the HTTP server,
-auth, JSON encoding, and the executeCommand dispatcher that maps API
-verbs to ChatViewModel methods. Coupling is medium — the dispatcher
-calls into everything via `chatViewModel.*` but the read/write seam
-is one place (the server class boundary). Risk: SWITCH_MODEL, /chat,
-DOWNLOAD_MODEL, EMBEDDING_STATUS and every other command path must
-keep working unchanged. Plan to verify by running the existing test
-harness (`tests/hal_test.py`) after the cut.
+~860 lines (LEGO 27 at Hal.swift 15235-15823, plus LEGO 27.1 at
+15826-16096 — though the line numbers will have shifted after
+refactor #3). High isolation — DocumentImportManager is a focused
+ingest pipeline (PDF/txt/md/rtf/csv/json/xml/html) and the docx
+parser is a pure MiniZip + XMLParser unit with zero outward
+references. Three small consumer-side touchpoints:
+`processDocumentImmediatelyWithEntities` (already widened to
+internal in refactor #3), the path-based importer extension (already
+moved to LocalAPIServer.swift in refactor #3), and the
+`DocumentImportManager.shared` singleton.
 
 **Same approach:**
 
-1. Find LEGO 32 markers + any related blocks the server depends on.
-2. Verify no `extension LocalAPIServer` elsewhere in Hal.swift.
-3. Confirm executeCommand and all its handlers move together as one
-   unit (no half-moves).
-4. Slice via the Python boundary-cut.
-5. Create `Hal Universal/LocalAPIServer.swift` with the header
-   matching the MLXModelDownloader / ModelCatalogService pattern +
-   needed imports (Foundation + SwiftUI + Combine + Network).
-6. Pointer comment in Hal.swift at the old slot.
-7. Update `sync_hal_source.sh`.
-8. Build clean (zero warnings).
-9. Functional smoke test: `python3 tests/hal_test.py state`,
-   `LIST_MODELS`, a SWITCH_MODEL round-trip, and one /chat turn.
-10. Commit + push.
+1. Re-locate LEGO 27 + 27.1 markers in current Hal.swift.
+2. Verify no extensions on `DocumentImportManager` / `DocxParser` /
+   `ProcessedDocument` elsewhere.
+3. Slice via the Python boundary-cut.
+4. Create `Hal Universal/DocumentImportManager.swift` with header +
+   imports (Foundation, SwiftUI, Combine, NaturalLanguage, PDFKit,
+   UniformTypeIdentifiers, Compression for MiniZip).
+5. Pointer comment in Hal.swift at the old slot.
+6. Update `sync_hal_source.sh`.
+7. Build clean (zero warnings).
+8. Functional smoke test: `IMPORT_DOC` via the API on a small text
+   file and a docx file; verify chunks land in MemoryStore.
+9. Commit + push.
 
-### After that — remaining extraction candidates ranked by size and isolation
+Note: Refactor #3 retired the LEGO numbering chain — new top-level
+subsystems go into their own files going forward, not new LEGO
+blocks. Hal.swift's remaining LEGO sections will get drained over
+the next few extractions until the file is small enough that the
+internal landmarks aren't necessary anymore.
+
+### After that — remaining extraction candidates
 
 | Order | Subsystem | Approx lines | Isolation |
 |---|---|---|---|
-| 3 (next) | LocalAPIServer + executeCommand handlers (LEGO 32 + supporting) | ~3,500 | Medium (touches everything via dispatch but is one read/write boundary) |
-| 4 | DocumentImportManager + DocxParser (LEGO 27 + 27.1) | ~900 | High |
+| 4 (next) | DocumentImportManager + DocxParser (LEGO 27 + 27.1) | ~860 | High |
 | 5 | MemoryStore SQLite layer (LEGO 1-ish, very large) | ~3,000 | Low (interleaved with ChatViewModel) — defer |
-| 6 | SettingsView / ActionsView | ~2,500 | Medium |
-| 7 | ChatView root + composer + bubble views | ~2,000 | Low — leave for last |
+| 6 | SettingsView / ActionsView (LEGO 10.x) | ~2,500 | Medium |
+| 7 | ChatView root + composer + bubble views (LEGO 09 et al) | ~2,000 | Low — leave for last |
 
-After Round 3 (LocalAPIServer), Hal.swift would be ~14,700. Goal: get under 10k before
-v2.1 work begins.
+After Round 4 (DocumentImportManager), Hal.swift would be ~15,400.
+Goal: get under 10k before v2.1 work begins.
 
 ---
 

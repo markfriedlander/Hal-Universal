@@ -3098,3 +3098,96 @@ correctly. Functional behavior identical to pre-extraction.
 Yesterday's `kLocalAPIEnabledOnLaunch` change also paid off: device
 came up with the API antenna already live, no manual toggle flip
 needed before `python3 tests/hal_test.py state` worked.
+
+---
+
+## 2026-05-26 (evening — refactor #3, the big one)
+
+### Context
+
+Mark gave the green light with "No Sleep till Brooklyn" energy: ship
+the v2.0.1 hotfix later, bundle it with v2.1, do the big refactor
+now. His read on the v2.0.1 deferral: the EmbeddingGemma mis-download
+is bandwidth waste, not a runtime hazard — every Gemma execution
+path is commented out, so the orphan weights just sit on disk doing
+nothing. Bundling it with v2.1 is fine.
+
+### LocalAPIServer extraction (commit `94578e2`)
+
+Third extraction, biggest yet. The original NEXT.md plan estimated
+~3,500 lines; the actual unit was 1,961 lines because the
+executeCommand handlers live inside `HalTestConsole` (the dispatcher
+is shared between the file watcher and HTTP server), so the count
+came in closer than expected.
+
+The natural cut: two unmarked `extension MemoryStore` / `extension
+DocumentImportManager` blocks (the API-helper extensions that back
+LIST_DOCS / DELETE_DOC / IMPORT_DOC) sitting between LEGO 31 and 32,
+plus all of LEGO 32 itself (HalTestConsole + LocalAPIServer). They
+move together because `executeCommand(_:vm:)` is shared infrastructure
+the HTTP and file channels both dispatch through — splitting them
+would have pushed the seam through that shared function.
+
+Two compile errors after the first build, both expected for a cross-
+file lift this size:
+
+1. **`WCSession` not in scope.** Hal.swift has `import
+   WatchConnectivity` mid-file at line 16156 (inside the LEGO 31
+   HalWatchBridge block); HalTestConsole referenced WCSession through
+   that file-scoped import. Fix: add `import WatchConnectivity` to
+   the new file's import block.
+
+2. **Three `private` methods on `DocumentImportManager` inaccessible
+   across files.** `processURLImmediatelyWithEntities`,
+   `storeDocumentsInMemoryWithEntities`, `generateImportMessages` —
+   the path-based-import extension that wraps them used to share a
+   file with the manager and now doesn't. Two ways out: pull the
+   extension back into Hal.swift, or broaden the three methods'
+   visibility from `private` to module-internal (default). Took the
+   latter — fragmenting the extension would just create a
+   bidirectional dependency between Hal.swift and LocalAPIServer.swift
+   for no isolation gain. Same module, no public surface change. A
+   comment on each method now records the date and rationale.
+
+### Numbers
+
+| Refactor | Date       | Subsystem                | Δ lines | Hal.swift remaining |
+|----------|------------|--------------------------|--------:|--------------------:|
+| #1       | 2026-05-20 | MLXModelDownloader       | -1,664  | 19,602              |
+| #2       | 2026-05-26 | ModelCatalogService      | -1,375  | 18,252              |
+| #3       | 2026-05-26 | LocalAPIServer + console | -1,954  | 16,298              |
+
+Cumulative: 21,266 → 16,298 (-4,968, ~23%). The under-10k goal Mark
+set is now within line-of-sight. Remaining candidates:
+DocumentImportManager + DocxParser (~900 lines, high isolation),
+SettingsView/ActionsView (~2,500), ChatView (~2,000), MemoryStore
+SQLite (~3,000 but interleaved with ChatViewModel — defer).
+
+### Smoke test
+
+Three distinct API paths verified on iPhone 16 Plus, all flowing
+through the relocated dispatcher:
+
+- `GET /state` returns the full ChatViewModel snapshot
+- `LIST_MODELS` enumerates AFM + the four curated MLX seeds
+- `EMBEDDING_STATUS` returns nomic backend loaded at 768 dim
+
+The fact that the API responded at all is proof the NWListener bound
+to port 8766 from the relocated module and the bearer-auth path
+worked end-to-end — there's no way to fake those responses without
+the server actually running.
+
+### Pattern observation
+
+Every extraction so far has needed `import Combine` in the new file
+because SwiftUI re-exports only part of it — not enough for `@AppStorage`,
+`@Published`, or `ObservableObject` to resolve. This is the third
+time in a row the pattern surfaced. Worth noting in CLAUDE.md SOP as
+a heads-up for future extractions.
+
+### A side note
+
+NEXT.md originally framed LEGO 32 as "~3,500 lines" — that estimate
+was off because executeCommand was tallied separately even though
+it lives inside HalTestConsole. Worth updating future estimates to
+count by actual byte range, not assumed responsibility boundaries.
