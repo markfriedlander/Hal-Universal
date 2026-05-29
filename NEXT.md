@@ -259,6 +259,171 @@ document, not yet built).
 
 ---
 
+## Cross-app infrastructure: shared model storage with Posey
+
+**Context.** Mark is developing a sibling app called **Posey** — a
+reading companion that uses TTS to read documents aloud with an
+onboard AI companion for interpretation. Posey reuses a lot of Hal
+code, including the curated MLX model lineup. Users who run both
+apps would otherwise have to download every model twice (3-6+ GB
+duplicated). Goal: a single shared model store both apps read from.
+
+### Mechanism: iOS App Groups
+
+Apple's standard way to let two same-developer apps share files is
+**App Groups** — a shared container directory both apps see at a
+known URL. Accessed via:
+
+```
+FileManager.default.containerURL(
+    forSecurityApplicationGroupIdentifier: "group.com.MarkFriedlander.shared"
+)
+```
+
+That URL is a normal directory the OS makes visible to every app
+that has the matching entitlement. From there it's plain file I/O.
+
+### Three setup steps (same for both apps)
+
+1. **Register the App Group identifier** in the Apple Developer
+   portal (one-time). Pick the group ID; current working name
+   `group.com.MarkFriedlander.shared` but any reverse-DNS-style id
+   works.
+2. **Enable the App Group capability** in each Xcode project
+   (Signing & Capabilities → +Capability → App Groups → add the
+   group ID to both Hal and Posey). This writes an entitlement.
+3. **Point the model path resolver at the shared container.**
+   Currently `MLXModelDownloader.swift` writes to
+   `Library/Caches/huggingface/models/<repoID>/`. Change the base
+   directory to `<sharedContainer>/huggingface/models/<repoID>/`.
+
+That's the architectural change. The download machinery, the file
+walker, the "is this model present?" check — none of it needs new
+logic, just a different base directory.
+
+### Three concerns that need addressing
+
+**1. Migration for existing Hal users.** v2.0 users have Gemma /
+Nomic in per-app `Caches/`. When v2.1 ships with the shared-container
+change, a one-shot launch helper (same pattern as
+`MaintenanceTasks.runAtLaunch()`) needs to copy/move existing
+models from `Caches/` to the shared container. Idempotent — once
+moved, subsequent launches see them in the new location and do
+nothing. Roughly 50 lines in a new helper inside
+`MaintenanceTasks.swift` or alongside `MLXModelDownloader.swift`.
+
+**2. Concurrency between Hal and Posey.** If both apps are open and
+both try to download Gemma at the same time, naive parallel writes
+would corrupt each other. Simple fix: a per-model lock file
+(`<modelID>/.downloading-by-<bundleID>-<PID>`). Before starting a
+download, write the marker; before any download, check for an
+existing marker and wait/poll if present. ~50 lines, fits naturally
+in `BackgroundDownloadCoordinator`. The fancier alternative
+(`NSDistributedNotificationCenter` / Darwin notifications) is
+overkill for a user-triggered download — don't over-engineer it.
+
+**3. iCloud backup exclusion — MANDATORY, not optional.** Currently
+models live in `Caches/`, which iOS auto-excludes from iCloud
+backup. App Group shared containers are NOT auto-excluded — they're
+treated more like `Application Support/`, which IS backed up.
+Without intervention, every user of the shared-container version
+would suddenly burn 3-6 GB of their iCloud quota.
+
+The fix: set `URLResourceValues.isExcludedFromBackup = true` on
+every model directory the moment after it lands.
+
+```
+var values = URLResourceValues()
+values.isExcludedFromBackup = true
+try modelDir.setResourceValues(values)
+```
+
+This is a single filesystem attribute, persistent across reboots,
+survives modifications. App Store Review Guideline 2.5.1 explicitly
+requires re-downloadable content (which HuggingFace models always
+are) to be excluded from backup — so shipping v2.1 without this
+flag would risk a review rejection on top of being hostile to
+users. Five-ish lines of code, applied in two places:
+
+- After every new download completes in
+  `BackgroundDownloadCoordinator`'s move-finished-file path.
+- During the v2.1 migration helper, on each model directory it
+  copies to the shared container, *before* anything else can touch
+  it.
+
+A nice side benefit: when a user restores their iPhone from an
+iCloud backup, the models don't come along (they'd be slow/expensive
+to restore anyway). Catalog correctly shows them as "not downloaded,
+tap to download," and the user pulls fresh from HuggingFace on the
+new device — the correct UX.
+
+### Why Posey should be built for sharing from day one
+
+Posey isn't shipped yet, which makes it the easier side: no
+migration to write. If Posey ships pointing at the shared container
+and setting `isExcludedFromBackup` from the start, when Hal v2.1
+catches up there's literally nothing to update on the Posey side.
+Whereas if Posey ships with per-app paths and adds sharing later,
+Posey will need its own migration helper too.
+
+Between now and Hal v2.1 shipping, Posey would effectively be the
+only writer to the shared container. That's fine — the
+infrastructure is in place and idle, waiting for Hal to join. No
+behavioral cost.
+
+### App Store considerations
+
+- **Hal:** Already shipped, so adding the App Group capability is
+  a v2.1 entitlement change that goes through normal App Review.
+  Apple routinely approves these — "two of my apps share large
+  downloaded model files" is exactly the use case App Groups were
+  designed for. Not a review risk. The `isExcludedFromBackup`
+  attribute reinforces the App Review story (guideline 2.5.1
+  compliance).
+- **Posey:** Not yet shipped, so the capability ships with the
+  initial submission. Same story — straightforward review.
+
+### Estimated lift
+
+- **Posey side (greenfield):** ~half a day. Path resolver +
+  entitlements + `isExcludedFromBackup` calls. No migration.
+- **Hal side (v2.1):** ~one focused day. Path resolver change +
+  migration helper for existing users + concurrency lock +
+  `isExcludedFromBackup` on the migration + entitlements + device
+  testing with both apps installed and downloading concurrently.
+
+Net across both apps: ~1.5 focused days of work to ship cross-app
+model sharing end-to-end. The MLXModelDownloader extraction we just
+did (refactor #1) is exactly the file most of the Hal-side work
+happens in — that refactor pays off here directly.
+
+### Notes for the Posey team conversation
+
+When briefing the Posey team on this, the key points:
+
+1. **Bake App Group support into Posey now, before App Store
+   submission.** Cheaper than retrofitting later.
+2. **Pick the App Group identifier with Mark.** Both apps must use
+   the same string; once chosen, changing it on either side
+   strands the other's users until the next update.
+3. **Set `isExcludedFromBackup` on every model directory write.**
+   Mandatory for App Review compliance. Cheap to do, expensive to
+   skip.
+4. **The model path resolver should be a single function.** Both
+   apps will need it; making it the only place that knows about
+   the shared container keeps the rest of the model-handling code
+   identical between apps.
+5. **Concurrency model: optimistic lock files.** Before downloading
+   model X, write `<X>/.downloading-by-<bundleID>-<PID>`. If a
+   marker for another app exists when you go to start, wait and
+   poll. Cheap, robust, no inter-process communication needed.
+6. **Test the failure modes deliberately:** both apps open, both
+   tap Download on the same model, one app force-quit mid-download,
+   one app deleted while the other still uses the shared model.
+   These are the cases that catch bugs.
+
+---
+
 ## Stress test — additional categories not yet covered
 
 The driver in `tests/stress_test.py` covers model switching, settings,
