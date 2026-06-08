@@ -259,6 +259,233 @@ document, not yet built).
 
 ---
 
+## WWDC26 implications (captured 2026-06-08, exploratory)
+
+WWDC26 opened with major announcements in the
+Machine Learning + Apple Intelligence stack. Below is the
+Hal-relevant analysis from a CC + Mark exploratory pass. To be
+revisited in ~1-2 weeks when there's time to act on the highest-
+value items. Standing decision so far: Hal does not adopt anything
+from WWDC26 reflexively — every change is evaluated against the
+Five Maxims and the on-device-first product position.
+
+### Operating principles (Mark, 2026-06-08)
+
+- **Minimum iOS stays at 26** for the foreseeable future. We do not
+  require iOS 27 for any Hal feature. New OS-gated capabilities
+  land as conditional enhancements, not requirements.
+- **AFM is the out-of-the-box default.** Hal must work automatically
+  on first launch with no model download. AFM is non-negotiable.
+- **PCC is the user's choice via Airplane Mode.** We don't try to
+  block Apple's routing decisions; we update privacy messaging so
+  the user understands when cloud might be involved, and we honor
+  Airplane Mode as the user's "force on-device" escape hatch. If
+  Apple ships a `processingLocation: .onDeviceOnly`-style API in
+  the new Foundation Models framework, that becomes a Power User
+  toggle — but it's an enhancement, not a requirement.
+
+### 1. Core AI vs MLX — wait and measure
+
+**Announcement.** New "Core AI" framework: memory-safe Swift API,
+Apple-Silicon-tuned, ahead-of-time compilation, zero-copy data
+paths, stateful execution. Targets compact vision models through
+large-scale generative AI. Sibling/competitor to MLX from a
+system-integration angle.
+
+**MLX is NOT deprecated.** Apple announced enhancements to MLX in
+the same breath — Metal 4, GPU Neural Accelerator, distributed
+inference over Thunderbolt RDMA, expanded Swift support.
+
+**Decision.** Don't migrate without measurement. The killer
+question is whether Hal's four curated models
+(`mlx-community/gemma-4-e2b-it-4bit`, `Qwen3.5-2B-MLX-4bit`,
+`Llama-3.2-3B-Instruct-4bit`, `dolphin3.0-llama3.2-3B-4Bit`) are
+available in Core AI's format. Until that's true, switching is
+theoretical.
+
+**Action when we return:** build a one-model Core AI prototype.
+Measure load time, generation tok/s, KV-cache memory profile,
+context handling. Compare to MLX on the same hardware. Migration
+decision follows from measurement. The MLXModelDownloader file
+extracted today is the right home if it ever happens.
+
+**Side bet to watch:** Core AI's "fine-grained inference memory
+control" + "stateful execution" might address Hal's specific pain
+points (Gemma 4 E2B KV-cache footprint, per-turn pre-flight
+refusal). Worth understanding even if we don't migrate.
+
+### 2. AFM routing + PCC — the honesty pass
+
+**Reframed from the original CC analysis.** Mark's correction
+(2026-06-08): Hal already uses AFM, AFM may already route through
+PCC under the hood today, and Hal has no control over that
+routing. So this isn't "should Hal add PCC?" — it's "do we need an
+honesty pass on the AFM row's description, and is there a new API
+that gives us an on-device-only knob?"
+
+**Action: privacy-messaging update for AFM.** Current
+`ModelCatalogService.swift` AFM description is misleadingly silent
+about PCC. v2.1 update: clarify that Apple Intelligence routes some
+queries to PCC; Airplane Mode is the user's guaranteed on-device-
+only escape hatch. Draft wording:
+
+> "Routed through Apple Intelligence. Most queries process
+> on-device; some may use Apple's Private Cloud Compute for
+> capability or capacity reasons. Use Airplane Mode for guaranteed
+> on-device-only operation."
+
+**Open question — does iOS 26 silently get the new PCC backend?**
+Likely a layered story:
+
+- **Layer 1 (standard AFM API, iOS 26-callable):** Apple may
+  quietly upgrade the cloud model behind PCC-routed requests
+  without touching the device. Operational simplicity favors one
+  cloud model over two. Possible quality bump for free.
+- **Layer 2 (next-gen PCC AFM, Small Business Program-gated):**
+  Almost certainly requires the new Foundation Models framework
+  API, which ships with the next OS. iOS 26 can't reach this.
+
+**Empirical test (low cost, when we have time):** re-run the
+`Maxim_Suite_AFM` baselines from May 13 against current AFM. If
+quality materially shifts without Hal code changes, Layer 1 was
+silently upgraded — answer to Mark's question. If quality is
+identical, the bump is gated behind Layer 2 and requires iOS
+upgrade. Either result is informative.
+
+**Action when we return — investigate `LanguageModelSession`
+options.** Read the actual Foundation Models API docs. If Apple
+exposes a `processingLocation: .onDeviceOnly` (or equivalent)
+knob, surface it as a Power User toggle: "Force Apple Intelligence
+to on-device only — may be slower, never uses cloud." Aligns with
+the on-device-first product position and the Airplane Mode escape
+hatch.
+
+### 3. New AFM models — auto-upgrade, OS-gated
+
+**Mechanism.** Hal uses `import FoundationModels` and
+`LanguageModelSession`. Apple routes calls to whatever AFM the
+current OS ships. When a future iOS release brings a new AFM, Hal
+picks it up for free — no code change on Hal's side. **But: AFM
+versions are tied to OS versions.** iOS 26 keeps iOS 26's AFM
+forever; Apple does not backport new AFMs to older OSes (the
+on-device model files live inside the OS).
+
+**Decision.** Hal stays minimum-iOS-26. We don't force users
+forward. Users who update iOS to whatever WWDC26 lines up with
+automatically get the new AFM when running Hal. The catalog
+description for AFM can stay general ("Apple Intelligence — uses
+whatever model the current OS ships").
+
+### 4. Multimodal AFM + Vision tool calling — v2.1/v2.2 direction
+
+**Announcement.** Foundation Models can take images alongside text
++ call Vision framework tools (OCR, barcode readers) during
+generation.
+
+**Hal opportunities (Mark approved direction 2026-06-08):**
+
+- **Document import OCR.** Image-bearing PDFs and scanned
+  documents currently fall through Hal's text-extraction pipeline
+  with poor results. Vision-tool OCR via AFM would extract text
+  better than the current path. Extends DocumentImportManager
+  rather than replaces it — text-extractable docs stay on the
+  current path, image-bearing pages route through Vision tools.
+- **Chat-level image attachment.** Tap a photo, ask Hal about it.
+  Routes to AFM only (MLX models stay text-only). New composer UI
+  in ChatViews.swift.
+
+**Gating.** Both features OS-gated to whichever iOS ships the new
+Foundation Models framework. Use availability checks so iOS 26
+users see a graceful "this feature requires a newer iOS" message,
+not a crash.
+
+**Salon Mode angle.** When user attaches an image, only multimodal-
+capable seats can respond. Need attribution UI updates so the user
+understands why some seats are silent.
+
+### 5. Language Model protocol — design toward it
+
+**Announcement.** Standard protocol for AI model providers
+(Claude, Gemini, etc.) to conform to. One protocol covers both
+sides:
+
+- **Outbound (Hal as provider).** Hal could expose its MLX models
+  via LMP so other LMP-aware apps consume them as a backend.
+  Already conceptually similar to what `LocalAPIServer.swift`
+  does today — LMP is the formalized version of that interface.
+- **Inbound (Hal as consumer).** If Hal ever adds cloud-LLM seats
+  for Salon Mode (deferred because of on-device-first
+  positioning), LMP is the right shape. Same plumbing for any
+  LMP-conformant provider; no per-provider code.
+
+**Decision.** Don't ship LMP support immediately. But design
+toward it — when building new model-interaction code in v2.1,
+prefer shapes that could conform to LMP later without major
+rework. The MLXWrapper + LLMService boundary (LEGO 08) is
+probably the right interface to align.
+
+### 6. Apple Evaluations Framework — additive experiment
+
+**Announcement.** New framework for validating AI behavior;
+includes "hill-climbing" prompt optimization.
+
+**Decision (Mark, 2026-06-08).** Use as *additive*, not
+replacement, for the Maxim suite. The Maxim suite encodes Hal's
+Five Maxims specifically and Apple's framework can't know about
+those. But Apple's hill climbing could find better Layer 1 prompt
+wordings than CC + Mark did manually.
+
+**Action when we return.** Run Apple's hill climbing against
+AFM's Maxim #1 layer-1 prompt (the anti-deflection prompt the §11
+experiment landed on). If it surfaces measurably better wording,
+that's data. If not, confirms manual tuning was near-optimal.
+
+### 7. App Intents / View Annotations — not pursuing now
+
+**Announcement.** User can reference on-screen Hal content via
+Siri ("ask Hal about this paragraph"). System-level integration.
+
+**Decision.** File as "maybe someday." Tangential to Hal's
+mission unless we want a Siri surface. Not blocking, not
+prioritized.
+
+### 8. fm CLI + Python SDK — track but not adopt
+
+**Announcement.** Command-line tool + Python SDK for AI-powered
+scripts using Foundation Models.
+
+**Hal angle.** Hal already has `tests/hal_test.py` driving the
+local API. Apple's tools serve a different use case (driving AFM
+directly without an app surface). Worth knowing they exist; no
+adoption planned.
+
+### What stays the same — the embedding stack
+
+- **CoreML and NaturalLanguage not deprecated.**
+- **Hal's Nomic-via-CoreML path is stable.** Nomic via
+  `swift-embeddings` package using `NomicBert.ModelBundle` (CoreML
+  under the hood).
+- **NLContextual via NaturalLanguage is stable.**
+- The 6-step `EmbeddingBackend` re-enable recipe in the source is
+  still the correct shape for adding any future embedder.
+
+### Standing decision summary (for the next session to confirm)
+
+| Item | Decision | Action |
+|---|---|---|
+| Core AI migration | Wait, measure first | One-model POC when time permits |
+| AFM privacy messaging | Update for honesty | v2.1 string change in ModelCatalogService |
+| AFM on-device-only toggle | Investigate API, surface if exists | Read Foundation Models docs |
+| New AFM auto-upgrade | Free, OS-gated | No code change; stay min-iOS-26 |
+| Multimodal AFM | Adopt with availability check | v2.1 or v2.2 |
+| Vision tool OCR | Adopt for document import | v2.1 or v2.2 |
+| Language Model protocol | Design toward, don't ship yet | Align interfaces in v2.1 work |
+| Evaluations / hill climbing | Additive experiment on Layer 1 prompts | Try against AFM Maxim #1 |
+| App Intents | File for later | No action |
+| Empirical PCC backend test | Re-run Maxim Suite AFM, compare | When we have time |
+
+---
+
 ## Cross-app infrastructure: shared model storage with Posey
 
 **Context.** Mark is developing a sibling app called **Posey** — a
