@@ -245,6 +245,98 @@ through use. Distinct from system prompt: system prompt is external
 instruction, soul document is internal identity. Should emerge from
 experience including the earliest experiences of being built.
 
+### Privacy Lock indicator (toolbar)
+
+The user-facing complement to the WWDC26 §2 honesty-messaging pass.
+A small lock glyph in the iOSChatView toolbar (right side, next to
+the existing gear icon) that visually communicates whether Hal is
+currently operating in a state where data could possibly leave the
+device.
+
+**States and visual language (Mark prefers lock over color):**
+
+| State | Glyph | Meaning |
+|---|---|---|
+| Active model is MLX (any of the curated four) | `lock.fill` (locked) | All inference on-device. No possible egress regardless of network. |
+| Active model is AFM AND no network available (airplane mode, no wifi, no cellular) | `lock.fill` (locked) | AFM exists on-device. With no network, PCC routing is impossible. |
+| Active model is AFM AND any network is available | `lock.open.fill` (unlocked) | Apple Intelligence may route some queries to PCC. Privacy not guaranteed. |
+| Salon Mode with any AFM seat + network available | `lock.open.fill` (unlocked) | Worst-case attribution — any cloud-capable seat unlocks the indicator. |
+| Salon Mode with all-MLX seats OR no network | `lock.fill` (locked) | Honors the same rules per-seat. |
+
+Optionally a subtle color hint reinforces the glyph (green tint when
+locked, amber tint when unlocked), but the lock metaphor carries the
+meaning on its own — Mark's stated preference.
+
+**Tap behavior.** Opens a small popover that explains the current
+state in plain language. Two example bodies:
+
+- *Locked, MLX model active:*
+  "Hal is fully on-device right now. The active model is Gemma 4
+  E2B running on this iPhone. No request you send and no response
+  you receive leaves your phone."
+
+- *Unlocked, AFM + network:*
+  "Apple Intelligence may route some queries to Apple's Private
+  Cloud Compute. To guarantee fully on-device operation, switch to
+  Airplane Mode or pick a downloaded local model from the Model
+  Library."
+
+The popover includes a small "Model Library →" link that opens
+ActionsView / Model Library so the user can switch with one tap.
+
+**Reactivity.** The lock should update visibly within ~1s of any
+state change — model switch, network coming up/down, salon
+reconfiguration. The user toggling Airplane Mode should visibly
+flip the icon while they watch.
+
+**Architecture sketch.**
+
+- New small `ObservableObject` — `PrivacyMonitor` (probably in its
+  own file, ~150 lines). Wraps `Network.NWPathMonitor` with a
+  `@Published isNetworkAvailable: Bool`. Uses
+  `NWPathMonitor.start(queue:)` with a serial queue, updates the
+  published flag from the path handler.
+- `ChatViewModel` (or PrivacyMonitor) exposes a `@Published var
+  privacyLocked: Bool` computed from the active model + network
+  state + salon config. Combine sink updates it on any input
+  change.
+- `iOSChatView` adds a ToolbarItem to the right of the gear
+  showing `Image(systemName: privacyLocked ? "lock.fill" :
+  "lock.open.fill")`, tappable to present the popover.
+- Salon-mode awareness: read `chatViewModel.salonConfig.activeSeats`
+  and check each seat's modelID against `ModelConfiguration.source`.
+  If any active seat is `.appleFoundation` AND network is up →
+  unlocked.
+
+**Edge cases worth handling explicitly:**
+
+- **First-launch state-determination race.** `NWPathMonitor`'s first
+  update can be a few hundred ms after construction. Show locked
+  ("we don't know yet, default to safe") while determining, then
+  flip if network is up. Don't show "unknown" or "checking."
+- **VPN active.** VPN is still cloud-capable; treat as
+  network-available (unlocked if AFM is active).
+- **Cellular off / WiFi on but unreachable.** `NWPathMonitor`
+  reports `.unsatisfied` — treat as no network, locked.
+- **Model switch in flight.** Show the destination state once the
+  switch begins, not the source state. Matches user mental model
+  ("I clicked AFM, now it's AFM" — indicator should agree
+  immediately).
+- **PCC opt-out API (if Apple exposes one — see WWDC26 §2).** When
+  that ships, AFM + network + opt-out-enabled should show locked.
+  The privacyLocked computation accounts for it.
+
+**Settings tie-in.** The privacy-messaging update on the AFM row in
+`ModelCatalogService.swift` (WWDC26 §2 action) shares vocabulary
+with this indicator's popover. Both should ship together so the
+user gets consistent language across the catalog row and the
+toolbar lock.
+
+**Cross-reference.** This feature operationalizes the standing
+WWDC26 principle: *"PCC is the user's choice via Airplane Mode. We
+don't try to block Apple's routing decisions; we make the state
+visible so the user can choose."*
+
 ### Salon Mode polish
 
 Salon Mode shipped in v2.0 but with rough edges. Worth a pass: visible
