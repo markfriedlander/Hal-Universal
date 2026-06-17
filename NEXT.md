@@ -587,6 +587,86 @@ code, including the curated MLX model lineup. Users who run both
 apps would otherwise have to download every model twice (3-6+ GB
 duplicated). Goal: a single shared model store both apps read from.
 
+### Status (2026-06-08)
+
+**Posey is establishing the shared space in its v1 release.** The
+App Group identifier is now committed:
+
+> **`group.com.MarkFriedlander.aifamily`**
+
+The `aifamily` suffix is deliberately generic so the same App Group
+covers any future AI sibling app Mark builds, not just Hal+Posey.
+
+**Confirmed from Posey's Xcode project (screenshot 2026-06-08):**
+
+| Setting | Value |
+|---|---|
+| App Group identifier | `group.com.MarkFriedlander.aifamily` |
+| Posey bundle ID | `com.MarkFriedlander.Posey` |
+| Hal bundle ID (for reference) | `com.MarkFriedlander.Hal-Universal` |
+| Team | Mark Friedlander (same team — App Groups requirement met) |
+| Signing | Automatic, Apple Development cert |
+| Capability | App Groups enabled on Posey target |
+
+**MLX runtime version compatibility — clean.** Posey's package
+manifest shows the same MLX-family versions Hal uses today:
+
+| Package | Posey version | Hal version | Status |
+|---|---|---|---|
+| mlx-swift | 0.31.3 | 0.31.x | Same family ✅ |
+| mlx-swift-lm | 3.31.3 | 3.31.3 | Exact match ✅ |
+| swift-embeddings | 0.0.27 | 0.0.27 | Exact match ✅ (Nomic format compatible) |
+| swift-huggingface | 0.9.0 | 0.9.0 | Exact match ✅ |
+
+Implication: **models downloaded by either app will load cleanly in
+the other.** No format conversion needed; the on-disk safetensors
++ tokenizer + config layout is identical. The shared container can
+serve both apps verbatim.
+
+Posey also pulls some packages Hal doesn't: `EventSource 1.4.1`
+(probably SSE streaming), `Jinja 2.3.6` (prompt templating likely),
+`swift-readability 0.3.0` (the reader's text-cleanup pipeline),
+`swift-nio 2.100.0`. None of these affect the shared model story.
+
+### Posey ships first; Hal v2.1 migrates
+
+**Sequence:**
+
+1. Posey v1 ships with the App Group capability + shared-container
+   path resolver. Posey downloads models directly to
+   `<sharedContainer>/huggingface/models/<repoID>/` from day one.
+   No migration needed on Posey's side — greenfield.
+2. Hal v2.1 ships with: (a) the App Group capability, (b) the
+   shared-container path resolver, (c) a migration helper that
+   moves any existing Hal-v2.0 models from `Library/Caches/...` to
+   the shared container, (d) `isExcludedFromBackup` calls on every
+   moved + every newly-downloaded model directory, (e) the
+   per-model concurrency lock.
+
+**Hal-side migration logic (sketch for v2.1):**
+
+```
+At launch (MaintenanceTasks.runAtLaunch):
+  1. Resolve shared container URL via the new App Group entitlement.
+  2. For each repoID Hal expects (curated four + Nomic):
+     a. If <sharedContainer>/huggingface/models/<repoID>/ exists
+        with valid files → it's already there (Posey may have put
+        it there, or a prior Hal v2.1 launch did). Set
+        isExcludedFromBackup; nothing else to do.
+     b. Elif <halCaches>/huggingface/models/<repoID>/ exists →
+        move it atomically to the shared container. Set
+        isExcludedFromBackup on the destination before anything
+        else can touch it. Log the migration with file count + size.
+     c. Else → model isn't downloaded on this device; nothing to do.
+  3. Refresh ModelCatalogService.shared.refreshDownloadStates() so
+     the catalog reflects the new locations.
+```
+
+The "Posey already put it there" case is the elegant part — when a
+user installs Hal after already using Posey, Hal sees Posey's
+downloaded models on first launch and treats them as already
+present. Zero redundant downloads.
+
 ### Mechanism: iOS App Groups
 
 Apple's standard way to let two same-developer apps share files is
@@ -595,22 +675,24 @@ known URL. Accessed via:
 
 ```
 FileManager.default.containerURL(
-    forSecurityApplicationGroupIdentifier: "group.com.MarkFriedlander.shared"
+    forSecurityApplicationGroupIdentifier: "group.com.MarkFriedlander.aifamily"
 )
 ```
 
 That URL is a normal directory the OS makes visible to every app
 that has the matching entitlement. From there it's plain file I/O.
 
-### Three setup steps (same for both apps)
+### Setup steps (Posey done; Hal remaining)
 
-1. **Register the App Group identifier** in the Apple Developer
-   portal (one-time). Pick the group ID; current working name
-   `group.com.MarkFriedlander.shared` but any reverse-DNS-style id
-   works.
-2. **Enable the App Group capability** in each Xcode project
-   (Signing & Capabilities → +Capability → App Groups → add the
-   group ID to both Hal and Posey). This writes an entitlement.
+1. ✅ **Register the App Group identifier in Apple Developer
+   Portal.** Done by Posey-side work — `group.com.MarkFriedlander.
+   aifamily` is registered. Hal just needs to add the same group
+   to its target's capabilities; the portal-side registration is
+   shared because both apps live under the same team.
+2. ⏳ **Enable the App Group capability on Hal's target.** Signing &
+   Capabilities → +Capability → App Groups → check
+   `group.com.MarkFriedlander.aifamily`. Writes
+   `com.apple.security.application-groups` to Hal's entitlements.
 3. **Point the model path resolver at the shared container.**
    Currently `MLXModelDownloader.swift` writes to
    `Library/Caches/huggingface/models/<repoID>/`. Change the base
@@ -721,10 +803,14 @@ happens in — that refactor pays off here directly.
 When briefing the Posey team on this, the key points:
 
 1. **Bake App Group support into Posey now, before App Store
-   submission.** Cheaper than retrofitting later.
-2. **Pick the App Group identifier with Mark.** Both apps must use
-   the same string; once chosen, changing it on either side
-   strands the other's users until the next update.
+   submission.** Cheaper than retrofitting later. (Done — Posey
+   has the capability wired with the agreed identifier as of
+   2026-06-08.)
+2. **The App Group identifier is `group.com.MarkFriedlander.
+   aifamily`.** Same string for every sibling app. Once shipped,
+   changing it strands users until the next update — so this
+   value is now permanent across Hal, Posey, and any future
+   sibling.
 3. **Set `isExcludedFromBackup` on every model directory write.**
    Mandatory for App Review compliance. Cheap to do, expensive to
    skip.
