@@ -56,8 +56,29 @@ When the SHIP_BLOCKER is flipped:
 5. In ASC, on the existing v2.0 listing or a new v2.0.1 page (Apple's
    choice — they usually create v2.0.1 automatically when build 7
    arrives), select build 7, add it for review, submit.
-6. **Skip the screenshot step** — the v2.0 screenshots in the 6.3"
-   tier are still accurate for v2.0.1 (no UI changed).
+6. **Audit the existing App Store screenshots before assuming "skip
+   the screenshot step."** Per Mark 2026-06-20: at least one screenshot
+   currently on the v2.0 ASC listing may still reference **Phi** as the
+   AFM alternative. Phi-4 Mini was demoted from curated on 2026-05-13
+   after baseline-stability testing (33% paragraph-loop failure on
+   Maxim #1, verbatim RLHF deflection on consciousness). The shipping
+   curated tier is **Gemma 4 E2B, Qwen 3.5 2B, Llama 3.2 3B, Dolphin
+   3.0** — no Phi. Action when we return to ASC submission:
+   - Open each screenshot currently uploaded to the v2.0 listing.
+   - Look for any frame mentioning Phi, Phi-3, Phi-4 Mini, or "alternative
+     to AFM" copy that names a specific model.
+   - If found, retake the screenshot from the current Hal build (using
+     `tests/hal_test.py screenshot`) showing the actual curated tier and
+     re-upload. 6.3" tier dimensions (1242 × 2688) confirmed compatible
+     during v2.0 submission; same dimensions apply for v2.0.1.
+   - If the Phi-naming screenshot is the System Prompt / AFM-fallback-
+     copy view, the AFM row description from `ModelCatalogService.swift`
+     is now authoritative — make the screenshot match it.
+
+   Only then proceed to step 7. The original assumption that "the v2.0
+   screenshots in the 6.3" tier are still accurate" was made when we
+   thought no UI changed; the Phi-naming finding shows at least one
+   piece of UI copy IS stale even though the binary didn't change.
 7. **What's New text for v2.0.1:**
    ```
    Bug fix: downloading the optional Nomic Embed Text v1.5 retrieval model
@@ -217,6 +238,51 @@ before MLX has finished mapping weights. Fix options:
 
 - Have SWITCH_MODEL block on model-ready before returning.
 - Have /chat queue behind any in-flight load with a small timeout.
+
+### Bug 4 — Recency / age-decay scoring is orphaned (CC verified 2026-06-20)
+
+**Found by Posey CC while studying Hal's memory model to port it into
+Posey.** Full breadcrumb at
+`Docs/Recency_Orphaned_Finding_2026-06-20.md`. CC (Hal) verified
+2026-06-20: the diagnosis is correct.
+
+**What's broken:** Hal's recency / time-decay machinery is wired at the
+UI but disconnected from the live retrieval ranking. The Settings
+sliders for `recencyWeight` (0.3), `recencyHalfLifeDays` (90), and
+`recencyFloor` (0.15) still write their values to UserDefaults and
+per-model overrides correctly. But **`calculateRecencyScore()` at
+Hal.swift ~3005 has zero callers** — the function exists and is
+mathematically correct (half-life decay) but is never invoked during
+RRF fusion or anywhere else in the retrieval pipeline.
+
+**The only "recency" the model actually sees** is a cosmetic
+`[3 days ago]` text label prepended to each snippet's content
+(Hal.swift ~2867 via `formatAgeLabel`). The model can *read*
+freshness from the label, but ranking order is recency-agnostic.
+
+**Almost certainly caused by the RRF refactor** dropping the line that
+multiplied the recency weight into the score, with no regression
+test asserting "recency still changes order" to catch the
+disconnect.
+
+**Fix vector when revisited:** the clean spot is the RRF fusion at
+Hal.swift ~2855. Either blend a recency multiplier into each rank
+term, or add a recency-ranked list as a third RRF input alongside
+semantic and BM25. Use the existing `recencyWeight` /
+`recencyHalfLifeDays` / `recencyFloor` settings (they're already
+piped through). **Then add a regression test** that asserts a
+more-recent item with equal semantic+BM25 ranks sorts higher —
+otherwise this can silently re-orphan on the next retrieval refactor.
+
+**Posey deliberately does NOT port this:** Posey is a document-scoped
+reading companion with no temporal selfhood, so it uses no age label
+and no recency ranking. This finding is Hal-only.
+
+**Priority:** moderate. Hal works fine without recency ranking; it's
+not a crash or correctness regression, just a quality-loss the user
+can't currently feel because the UI suggests the setting is doing
+something it isn't. Worth fixing as part of the model-sharing update
+or whenever the retrieval path is next touched.
 
 ---
 
