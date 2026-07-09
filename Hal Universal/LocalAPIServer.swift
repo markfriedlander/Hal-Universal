@@ -454,6 +454,7 @@ class HalTestConsole: ObservableObject {
             if let depth = Int(depthStr), depth >= 1 {
                 let clamped = min(depth, vm.maxMemoryDepth)
                 vm.memoryDepth = clamped
+                ModelSettingsStore.shared.persistCurrentOverrides(for: vm.selectedModel)
                 writeStateJSON(vm: vm)
                 return "{\"status\":\"ok\",\"memoryDepth\":\(clamped)}"
             }
@@ -463,6 +464,7 @@ class HalTestConsole: ObservableObject {
             let valStr = String(trimmed.dropFirst("SET_TEMPERATURE:".count)).trimmingCharacters(in: .whitespaces)
             if let val = Double(valStr), val >= 0.0, val <= 1.0 {
                 vm.temperature = val
+                ModelSettingsStore.shared.persistCurrentOverrides(for: vm.selectedModel)
                 writeStateJSON(vm: vm)
                 return "{\"status\":\"ok\",\"temperature\":\(val)}"
             }
@@ -481,6 +483,7 @@ class HalTestConsole: ObservableObject {
             let valStr = String(trimmed.dropFirst("SET_MAX_RAG_CHARS:".count)).trimmingCharacters(in: .whitespaces)
             if let val = Double(valStr), val >= 200 {
                 vm.maxRagSnippetsCharacters = val
+                ModelSettingsStore.shared.persistCurrentOverrides(for: vm.selectedModel)
                 writeStateJSON(vm: vm)
                 return "{\"status\":\"ok\",\"maxRagSnippetsCharacters\":\(Int(val))}"
             }
@@ -490,6 +493,7 @@ class HalTestConsole: ObservableObject {
             let valStr = String(trimmed.dropFirst("SET_RAG_DEDUP:".count)).trimmingCharacters(in: .whitespaces)
             if let val = Double(valStr), val >= 0.0, val <= 1.0 {
                 vm.ragDedupSimilarityThreshold = val
+                ModelSettingsStore.shared.persistCurrentOverrides(for: vm.selectedModel)
                 writeStateJSON(vm: vm)
                 return "{\"status\":\"ok\",\"ragDedupThreshold\":\(val)}"
             }
@@ -499,6 +503,7 @@ class HalTestConsole: ObservableObject {
             let valStr = String(trimmed.dropFirst("SET_RECENCY_WEIGHT:".count)).trimmingCharacters(in: .whitespaces)
             if let val = Double(valStr), val >= 0.0, val <= 1.0 {
                 vm.memoryStore.recencyWeight = val
+                ModelSettingsStore.shared.persistCurrentOverrides(for: vm.selectedModel)
                 writeStateJSON(vm: vm)
                 return "{\"status\":\"ok\",\"recencyWeight\":\(val)}"
             }
@@ -508,6 +513,7 @@ class HalTestConsole: ObservableObject {
             let valStr = String(trimmed.dropFirst("SET_RECENCY_HALFLIFE:".count)).trimmingCharacters(in: .whitespaces)
             if let val = Double(valStr), val >= 1.0 {
                 vm.memoryStore.recencyHalfLifeDays = val
+                ModelSettingsStore.shared.persistCurrentOverrides(for: vm.selectedModel)
                 writeStateJSON(vm: vm)
                 return "{\"status\":\"ok\",\"recencyHalfLifeDays\":\(val)}"
             }

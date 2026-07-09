@@ -3544,3 +3544,76 @@ docs are stale — the sims were recreated as iPhone 17 Pro
 `80B63D38-7F94-4E88-B4B5-0CD0D8EE3B6F` / iPhone 17
 `68E7C970-6FE1-477E-A41E-349CF24E388E`. The device UUID
 `D24FB384-9C55-5D33-9B0D-DAEBFA6528D6` is unchanged and correct.
+
+---
+
+## 2026-07-09 (continued — Bug 1: per-model settings didn't survive a restart)
+
+### The bug
+
+Changing a per-model setting (memory depth, temperature, recency, RAG
+limits) wrote the live `@AppStorage` value but did NOT persist a per-model
+override — the override was only ever captured on a model *switch*
+(`snapshotCurrentSettings`, called from the two switch paths). So a
+set-then-quit with no intervening switch was clobbered on relaunch: at
+launch `applyEffectiveSettings` re-derived each of the six managed keys
+from defaults+overrides, found no override, and wrote the model's curated
+default back over the user's value. Reported as "memory depth resets on
+restart," but structurally it hit all six managed per-model settings.
+(Global settings — Self-Knowledge on/off, Identity Half-Life/Floor, system
+prompt — were never affected: `applyEffectiveSettings` doesn't touch them,
+and plain `@AppStorage` persists them on its own.)
+
+Two settings tiers were clarified with Mark during diagnosis, and matter
+going forward: **per-model** (the six: temperature, memoryDepth,
+recencyWeight, recencyHalfLifeDays, maxRagSnippetsCharacters,
+ragDedupThreshold) vs **global** (Self-Knowledge + Identity + system
+prompt + salon). Self-Knowledge is deliberately global — Hal's identity is
+singular, not per-processor. Also clarified: "RAG Dedup" is a *threshold*
+(0.85, drop a retrieved snippet whose cosine similarity to what's already
+in the prompt exceeds it), not an on/off, and has no UI — it's an
+API-only calibration knob.
+
+### The fix
+
+New `ModelSettingsStore.persistCurrentOverrides(for:)`: records the active
+model's edits as **deltas from the curated default** (only fields that
+differ; removes the entry entirely if all match). This is the edit-time
+counterpart to the switch-time `snapshotCurrentSettings`. Recording only
+deltas (not a full snapshot) matches the store's documented contract and
+keeps untouched settings tracking curated defaults, so a future default
+retune still propagates and Reset still returns to our tuning. Called from:
+the six API setters, the settings-sheet `.onDisappear` (one call covers
+every slider), and a `scenePhase == .background` handler on the `@main`
+app (catch-all for editing then backgrounding without closing the sheet).
+`saveOverrides` now `synchronize()`s so an override survives an abrupt
+termination (a crash, or the test's hard kill). No change to
+`applyEffectiveSettings`, the launch merge, the switch snapshot, the clamp
+logic, or the reset path — the launch code already does the right thing
+once the override exists.
+
+Clamping was confirmed intact and un-bypassable: depth is clamped at
+set-time and, decisively, on every runtime read
+(`effectiveMemoryDepth = min(stored, max)`), so no persisted value can ever
+feed the model an over-limit depth. Reset stays via `RESET_MODEL_SETTINGS`
+/ the Settings "Reset" button (clears overrides → curated defaults).
+
+### Regression test + device verification
+
+`tests/memory_depth_persistence.py` drives the LIVE path (a unit test of the
+store would not have caught the original orphaning — the write path simply
+wasn't called). It sets a depth, **actually terminates and cold-relaunches
+the app via devicectl**, and asserts survival — twice with two different
+depths so it's decisive without knowing the curated default (an unfixed
+build collapses both restarts to the same default). It also flips the global
+Self-Knowledge flag across a restart (proves global settings still persist),
+checks the reset escape hatch returns to and holds the curated default, and
+checks an over-max set is clamped. Non-destructive: saves/restores all six
+managed values + the global flag.
+
+Device run (iPhone 16 Plus, AFM active, maxDepth 3): **all green** — depths
+1 and 3 both survived restart distinctly; Self-Knowledge flag survived;
+custom depth reset to default 3 and held; over-max clamped to 3. One
+first-run failure was a test-logic artifact (the reset probe used
+`a2 = max = 3`, which equals AFM's default) — fixed by learning the default
+via a reset before probing; not a code issue.

@@ -226,7 +226,13 @@ struct ActionsView: View {
         }
         .onDisappear {
             chatViewModel.isInSettingsFlow = false
-            
+
+            // Bug 1 fix: capture the user's per-model setting edits the moment
+            // the settings sheet closes, so a change made here (with no model
+            // switch afterward) survives an app restart. Covers every slider in
+            // one place; idempotent — records only deltas from curated defaults.
+            ModelSettingsStore.shared.persistCurrentOverrides(for: chatViewModel.selectedModel)
+
             guard !skipComparisonOnDismiss else {
                 skipComparisonOnDismiss = false
                 return

@@ -223,6 +223,7 @@ struct Hal10000App: App {
     @StateObject private var chatViewModel = ChatViewModel.shared
     @StateObject private var documentImportManager = DocumentImportManager.shared
     @StateObject private var mlxDownloader = MLXModelDownloader.shared // Inject MLXModelDownloader
+    @Environment(\.scenePhase) private var scenePhase
 
     init() {
         // Eagerly construct the background download coordinator so its URLSession
@@ -237,6 +238,15 @@ struct Hal10000App: App {
                 .environmentObject(chatViewModel)
                 .environmentObject(documentImportManager)
                 .environmentObject(mlxDownloader) // Pass MLXModelDownloader
+                .onChange(of: scenePhase) { _, phase in
+                    // Bug 1 catch-all: if the user edits a per-model setting and
+                    // backgrounds the app WITHOUT closing the settings sheet (so
+                    // the sheet's onDisappear never fires), persist on the way to
+                    // the background so the edit survives a later cold relaunch.
+                    if phase == .background {
+                        ModelSettingsStore.shared.persistCurrentOverrides(for: chatViewModel.selectedModel)
+                    }
+                }
         }
         // Mac support is via "Designed for iPad" (automatic for any iPad-targeted
         // app on Apple Silicon Macs) — NOT Mac Catalyst. The OS chooses the window

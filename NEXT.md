@@ -288,17 +288,20 @@ ingest, settings UI, chat UI). No user-visible change.
 
 ## Deferred bugs from earlier sessions (carried forward)
 
-### Bug 1 — `SET_MEMORY_DEPTH` doesn't survive app re-init
+### Bug 1 — per-model settings didn't survive app re-init — ✅ FIXED 2026-07-09
 
-Reproduced 2026-05-19. `ModelSettingsStore.applyEffectiveSettings(for:)`
-at Hal.swift init silently overwrites memoryDepth back to the active
-model's per-model default. Two fix options (still not picked):
-
-- **(a)** Persist a "user-overridden" boolean alongside `memoryDepth`.
-- **(b)** `applyEffectiveSettings` only fires on actual model change,
-  not on every init when the model is unchanged.
-
-Product decision still pending.
+**RESOLVED.** Root cause: per-model overrides were only captured on a
+model *switch*, so a set-then-quit (no switch) left no override and
+`applyEffectiveSettings` wrote the curated default back at launch. Hit all
+six managed per-model settings, not just depth. Fix: new
+`ModelSettingsStore.persistCurrentOverrides(for:)` records edits as deltas
+at edit time — from the six API setters, the settings-sheet `.onDisappear`,
+and a `scenePhase == .background` catch-all — plus a `synchronize()` flush.
+Clamping (set-time + read-time `min(stored,max)`) and Reset unchanged.
+Guarded by `tests/memory_depth_persistence.py` (terminates + relaunches the
+app on device); device-verified on iPhone 16 Plus. See HISTORY 2026-07-09.
+(The old (a)/(b) options were superseded — the delta-at-edit-time approach
+keeps untouched settings tracking curated defaults, which neither did.)
 
 ### Bug 2 — Document RAG / confabulation (PARTIALLY FIXED in v2.0)
 

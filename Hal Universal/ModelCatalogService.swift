@@ -228,6 +228,13 @@ final class ModelSettingsStore {
     private func saveOverrides(_ dict: [String: ModelSettings]) {
         guard let data = try? JSONEncoder().encode(dict) else { return }
         UserDefaults.standard.set(data, forKey: userDefaultsKey)
+        // Force an immediate flush to disk. Normal app flows persist on
+        // backgrounding, but a per-model edit could be the last thing that
+        // happens before an abrupt termination (a crash, or a hard kill in
+        // testing) — without a flush, the override would be lost and the
+        // setting would appear to "not survive restart," which is the very
+        // bug this store exists to prevent.
+        UserDefaults.standard.synchronize()
     }
 
     // MARK: Public API
@@ -259,6 +266,69 @@ final class ModelSettingsStore {
         saveOverrides(dict)
         halLog("HALDEBUG-SETTINGS: Snapshotted current settings for \(modelID): temp=\(snapshot.temperature.map { "\($0)" } ?? "nil"), depth=\(snapshot.effectiveMemoryDepth.map { "\($0)" } ?? "nil")")
         return snapshot
+    }
+
+    /// Persist the active model's current managed settings as per-model
+    /// overrides, recording ONLY the fields that differ from the model's
+    /// curated defaults (and removing the model's entry entirely if every
+    /// managed field matches its default). This is the edit-time counterpart
+    /// to `snapshotCurrentSettings`:
+    ///
+    ///   - `snapshotCurrentSettings` captures ALL current values into the
+    ///     override at model-switch time (right before the active model
+    ///     changes, so edits attach to the model they were made on).
+    ///   - This captures the user's edit the moment it happens — from an API
+    ///     setter, the settings-sheet dismiss, or app backgrounding — so a
+    ///     set-then-quit with NO model switch survives relaunch. That gap
+    ///     (an edit that was never followed by a switch) is exactly what let
+    ///     the memory-depth-resets-on-restart bug through: at launch,
+    ///     `applyEffectiveSettings` re-derived each managed key from
+    ///     defaults+overrides, and with no override captured, it wrote the
+    ///     curated default back over the user's value.
+    ///
+    /// Recording only *deltas* (not a full snapshot) is deliberate and matches
+    /// this store's contract — "each entry holds only the user's deltas." An
+    /// untouched setting stays nil in the override, so it keeps tracking the
+    /// model's curated default even if that default is retuned in a later
+    /// release. Setting a value back to its default drops the delta, which is
+    /// what makes it equivalent to a reset. Clamping is unaffected: values are
+    /// clamped at set time and re-clamped on every runtime read.
+    func persistCurrentOverrides(for model: ModelConfiguration) {
+        let defaults = model.defaultSettings ?? ModelSettings()
+        let live = readCurrentUserDefaults()
+
+        // "differs" for optional Doubles, with an epsilon so a value that
+        // round-tripped through UserDefaults isn't mistaken for a change from
+        // an identical default.
+        func differs(_ a: Double?, _ b: Double?) -> Bool {
+            guard let a else { return false }   // no live value → not a delta
+            guard let b else { return true }    // live value, no default → delta
+            return abs(a - b) > 1e-6
+        }
+
+        var delta = ModelSettings()
+        delta.temperature              = differs(live.temperature, defaults.temperature) ? live.temperature : nil
+        delta.effectiveMemoryDepth     = (live.effectiveMemoryDepth != defaults.effectiveMemoryDepth) ? live.effectiveMemoryDepth : nil
+        delta.recencyWeight            = differs(live.recencyWeight, defaults.recencyWeight) ? live.recencyWeight : nil
+        delta.recencyHalfLifeDays      = differs(live.recencyHalfLifeDays, defaults.recencyHalfLifeDays) ? live.recencyHalfLifeDays : nil
+        delta.maxRagSnippetsCharacters = (live.maxRagSnippetsCharacters != defaults.maxRagSnippetsCharacters) ? live.maxRagSnippetsCharacters : nil
+        delta.ragDedupThreshold        = differs(live.ragDedupThreshold, defaults.ragDedupThreshold) ? live.ragDedupThreshold : nil
+
+        var dict = loadOverrides()
+        // Preserve a separately-managed layerOnePromptEnabled override — it is
+        // NOT one of the six readCurrentUserDefaults keys, so rebuilding the
+        // entry from `delta` alone would silently drop it.
+        delta.layerOnePromptEnabled = dict[model.id]?.layerOnePromptEnabled
+
+        // If nothing differs from defaults (and no framing override), remove
+        // the entry so the model falls straight through to curated defaults.
+        if delta == ModelSettings() {
+            dict.removeValue(forKey: model.id)
+        } else {
+            dict[model.id] = delta
+        }
+        saveOverrides(dict)
+        halLog("HALDEBUG-SETTINGS: Persisted per-model deltas for \(model.displayName): temp=\(delta.temperature.map { "\($0)" } ?? "—"), depth=\(delta.effectiveMemoryDepth.map { "\($0)" } ?? "—"), recW=\(delta.recencyWeight.map { "\($0)" } ?? "—"), recHL=\(delta.recencyHalfLifeDays.map { "\($0)" } ?? "—"), maxRag=\(delta.maxRagSnippetsCharacters.map { "\($0)" } ?? "—"), dedup=\(delta.ragDedupThreshold.map { "\($0)" } ?? "—")")
     }
 
     /// Write a model's effective settings into UserDefaults so the

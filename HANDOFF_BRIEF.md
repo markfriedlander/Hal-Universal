@@ -29,6 +29,19 @@ unchanged, fresh ranked above old. Next up per the roadmap: item 1
 (v2.0.1 hotfix ship — needs the SHIP_BLOCKER flip + Mark's ASC action)
 and item 3 (Privacy Lock indicator).
 
+**Bug 1 (per-model settings didn't survive app restart) is DONE and
+device-verified** (2026-07-09), fixed opportunistically alongside Bug 4.
+New `ModelSettingsStore.persistCurrentOverrides(for:)` records per-model
+edits as deltas at edit time (six API setters + settings-sheet
+`.onDisappear` + `scenePhase .background`), so a set-then-quit with no
+model switch survives relaunch. Clamping + Reset unchanged; guarded by
+`tests/memory_depth_persistence.py` (terminates + relaunches on device).
+Two settings tiers clarified: **per-model** (the six — temperature,
+memoryDepth, recencyWeight, recencyHalfLifeDays, maxRagSnippetsCharacters,
+ragDedupThreshold) vs **global** (Self-Knowledge, Identity, system prompt,
+salon; these never had the bug). "RAG Dedup" is an API-only threshold
+(0.85), not a UI on/off.
+
 **v2.0.1 hotfix** (EmbeddingGemma mis-download) remains **fully verified
 — sim + device — deferred to ride with v2.1** per Mark 2026-05-26 (the
 orphan-weights bug is bandwidth-leaky but crash-safe).
