@@ -3617,3 +3617,52 @@ custom depth reset to default 3 and held; over-max clamped to 3. One
 first-run failure was a test-logic artifact (the reset probe used
 `a2 = max = 3`, which equals AFM's default) — fixed by learning the default
 via a reset before probing; not a code issue.
+
+---
+
+## 2026-07-09 (continued — download disclosure sheet race: "I Understand" did nothing)
+
+### The bug (Mark hit it live, downloading Qwen)
+
+The first time a user downloads or selects an MLX model, the flow is a
+two-sheet sequence: the "Before You Continue" hardware disclosure → the
+license sheet → download. Both are separate `.sheet` modifiers on the SAME
+view in `ModelLibraryView`, and SwiftUI can't present two sheets from one
+view at once. Tapping **"I Understand"** ran `resumeAfterDisclosure()`,
+which set `selectedModelForLicense = model` to bring up the license sheet —
+but never set `showingHardwareDisclosure = false`. So the license
+presentation was fired while the disclosure was still up (silently dropped),
+AND the disclosure never dismissed. The tap looked dead. (Cancel worked,
+because it *did* set the flag false — that asymmetry was the tell.) Only
+bites on the very first MLX action, since `hasSeenHardwareDisclosure` then
+gates it off.
+
+### The fix
+
+Canonical SwiftUI sequential-sheet pattern: dismiss first, present the next
+in `onDismiss`. "I Understand" now just records intent
+(`disclosureAcknowledged = true`) and dismisses; the
+`.sheet(isPresented: $showingHardwareDisclosure, onDismiss:)` callback runs
+`resumeAfterDisclosure()` only after the sheet is fully gone, so the license
+sheet presents cleanly. A swipe-to-dismiss (neither Continue nor Cancel) now
+safely cancels instead of half-proceeding. Fixes both the download and the
+first-time-select paths (both funnel through `resumeAfterDisclosure`).
+
+### Verification
+
+Build clean (warning-free for Hal's code). The disclosure fires only on a
+real UI tap and the local API can't press a button inside a sheet, so this
+was verified by Mark on device: reset `hasSeenHardwareDisclosure` via
+`RESET_HARDWARE_DISCLOSURE`, tapped Download on an undownloaded model, tapped
+"I Understand" → the license sheet now advances cleanly. Confirmed working.
+
+### Adjacent finding (not a bug): the Delete button
+
+While clearing space, Mark couldn't find the Delete button for Qwen. Not
+broken — `ModelLibraryRow`'s Delete is gated `model.source == .mlx &&
+!isActive` (and lives in the expanded row), so it's hidden for the *active*
+model (you can't delete the model you're using). Qwen was active only
+because CC had switched to it for testing; switching back to AFM restored the
+Delete affordance. Flagged as a UX-legibility candidate for later: showing a
+*disabled* Delete with a "switch models to delete" hint would be clearer than
+silently hiding it. Not actioned.

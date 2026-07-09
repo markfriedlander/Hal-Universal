@@ -21395,6 +21395,11 @@ struct ModelLibraryView: View {
     @State private var showingDeleteConfirmation = false
     @State private var showingHardwareDisclosure = false
     @State private var pendingModelAfterDisclosure: ModelConfiguration?
+    // True only when the user tapped "I Understand" (vs Cancel / swipe-away),
+    // so the disclosure sheet's onDismiss knows whether to resume the pending
+    // download/select. See the .sheet(isPresented: $showingHardwareDisclosure)
+    // modifier for why the resume must happen in onDismiss, not onContinue.
+    @State private var disclosureAcknowledged = false
     @State private var librarySearchText: String = ""
 
     // Surfaces a one-time hardware-compatibility warning the first time the
@@ -21559,11 +21564,29 @@ struct ModelLibraryView: View {
                     }
                 )
             }
-            .sheet(isPresented: $showingHardwareDisclosure) {
+            // The hardware disclosure and the license sheet (above) are two
+            // separate `.sheet` modifiers on this same view, and SwiftUI can't
+            // present two at once. So the follow-on step (license sheet, or the
+            // download itself) must be kicked off only AFTER this sheet has
+            // fully dismissed — doing it from inside onContinue, while this
+            // sheet is still up, silently drops the second presentation and the
+            // "I Understand" tap looks dead. onContinue therefore just records
+            // intent + dismisses; onDismiss resumes once the sheet is gone.
+            .sheet(isPresented: $showingHardwareDisclosure, onDismiss: {
+                if disclosureAcknowledged {
+                    disclosureAcknowledged = false
+                    resumeAfterDisclosure()
+                } else {
+                    // Cancelled or swiped away — drop the pending action.
+                    pendingModelAfterDisclosure = nil
+                }
+            }) {
                 HardwareDisclosureSheet(
-                    onContinue: { resumeAfterDisclosure() },
+                    onContinue: {
+                        disclosureAcknowledged = true
+                        showingHardwareDisclosure = false
+                    },
                     onCancel: {
-                        pendingModelAfterDisclosure = nil
                         showingHardwareDisclosure = false
                     }
                 )

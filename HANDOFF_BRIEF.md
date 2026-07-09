@@ -42,6 +42,15 @@ ragDedupThreshold) vs **global** (Self-Knowledge, Identity, system prompt,
 salon; these never had the bug). "RAG Dedup" is an API-only threshold
 (0.85), not a UI on/off.
 
+**Download disclosure sheet race is FIXED and device-verified** (2026-07-09,
+Hal.swift `ModelLibraryView`). "I Understand" on the first-MLX "Before You
+Continue" sheet used to do nothing — two `.sheet` modifiers on one view can't
+present simultaneously, and onContinue presented the license sheet without
+dismissing the disclosure. Fixed with the dismiss-first / resume-in-onDismiss
+pattern. **Open UX candidate (not actioned):** `ModelLibraryRow`'s Delete
+button is hidden for the *active* model (`.mlx && !isActive`), which reads as
+"missing" — consider a disabled Delete + "switch models to delete" hint.
+
 **v2.0.1 hotfix** (EmbeddingGemma mis-download) remains **fully verified
 — sim + device — deferred to ride with v2.1** per Mark 2026-05-26 (the
 orphan-weights bug is bandwidth-leaky but crash-safe).
