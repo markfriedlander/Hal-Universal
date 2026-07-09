@@ -25,10 +25,12 @@ retrieval quality improves regardless of how Bonsai turns out.
    (grep `SHIP_BLOCKER`), bump CFBundleVersion to 7, audit ASC
    screenshots for stale **Phi** naming, archive + submit. Fix is
    written + sim+device verified; see "v2.0.1 ship sequence" below.
-2. **Bug 4 — orphaned recency scoring** — `calculateRecencyScore()` has
-   zero callers; retrieval ranking is recency-agnostic despite live UI
-   sliders. Fix at RRF fusion + add a regression test. Full fix vector
-   under "Bug 4" below. Self-contained.
+2. ~~**Bug 4 — orphaned recency scoring**~~ — **DONE 2026-07-09.**
+   Reconnected recency into the RRF fusion (multiply-blend by
+   recencyWeight) + `tests/recency_regression.py` guards it via the live
+   path. Device-verified on iPhone 16 Plus: old row decayed to 19.25% at
+   weight 0.95, fresh row unchanged, fresh ranks above old. See HISTORY
+   2026-07-09. Two test-only API verbs added (MEMORY_PLANT_AGED[_CLEANUP]).
 3. **Privacy Lock toolbar indicator** — lock/unlock glyph reflecting
    on-device (MLX / AFM-no-network) vs possible-egress (AFM+network).
    New `PrivacyMonitor` (NWPathMonitor). Full spec under "v2.1 design
@@ -317,7 +319,13 @@ before MLX has finished mapping weights. Fix options:
 - Have SWITCH_MODEL block on model-ready before returning.
 - Have /chat queue behind any in-flight load with a small timeout.
 
-### Bug 4 — Recency / age-decay scoring is orphaned (CC verified 2026-06-20)
+### Bug 4 — Recency / age-decay scoring is orphaned — ✅ FIXED 2026-07-09
+
+**RESOLVED.** Reconnected at the RRF fusion via a multiply-blend
+(`rrf *= (1 - recencyWeight) + recencyWeight * calculateRecencyScore(...)`),
+guarded by `tests/recency_regression.py` on the live retrieval path,
+device-verified on iPhone 16 Plus. See HISTORY 2026-07-09. The original
+diagnosis + fix vector are kept below for the record.
 
 **Found by Posey CC while studying Hal's memory model to port it into
 Posey.** Full breadcrumb at

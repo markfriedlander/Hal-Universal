@@ -9309,6 +9309,59 @@ class HalTestConsole: ObservableObject {
             }
             return "{\"status\":\"error\",\"message\":\"SET_RECENCY_HALFLIFE: must be >= 1.0 (days)\"}"
 
+        } else if trimmed.hasPrefix("MEMORY_PLANT_AGED:") {
+            // MEMORY_PLANT_AGED:<days_old>:<content>
+            //
+            // Test-only. Plants one conversation row into unified_content with
+            // a BACKDATED timestamp (now - days_old), fully embedded and
+            // FTS-indexed via the normal store path, so it's retrievable by
+            // MEMORY_SEARCH_DEBUG exactly like organic memory. The only thing
+            // that differs from an organic row is the age.
+            //
+            // Exists so the recency-ranking regression test
+            // (tests/recency_regression.py) can create a controlled age gap
+            // between two otherwise-identical rows and assert that raising
+            // SET_RECENCY_WEIGHT actually reorders retrieval (newer above
+            // older). Without a controllable age, every planted row is "now"
+            // and recency has nothing to sort on. Rows land under
+            // source_id "recency-regression-test" so the test can identify
+            // its own plants. Not for production use.
+            let payload = String(trimmed.dropFirst("MEMORY_PLANT_AGED:".count))
+            let parts = payload.split(separator: ":", maxSplits: 1, omittingEmptySubsequences: false).map(String.init)
+            guard parts.count == 2,
+                  let daysOld = Double(parts[0].trimmingCharacters(in: .whitespaces)),
+                  daysOld >= 0 else {
+                return "{\"status\":\"error\",\"message\":\"MEMORY_PLANT_AGED requires <days_old>:<content>, days_old >= 0\"}"
+            }
+            let content = parts[1]
+            guard !content.trimmingCharacters(in: .whitespaces).isEmpty else {
+                return "{\"status\":\"error\",\"message\":\"MEMORY_PLANT_AGED: content must be non-empty\"}"
+            }
+            let backdated = Date(timeIntervalSinceNow: -daysOld * 86400.0)
+            let contentId = vm.memoryStore.storeUnifiedContentWithEntities(
+                content: content,
+                sourceType: .conversation,
+                sourceId: "recency-regression-test",
+                position: 0,
+                timestamp: backdated,
+                isFromUser: false,
+                turnNumber: nil,
+                deliberationRound: nil
+            )
+            guard !contentId.isEmpty else {
+                return "{\"status\":\"error\",\"message\":\"MEMORY_PLANT_AGED: store failed\"}"
+            }
+            return "{\"status\":\"ok\",\"command\":\"MEMORY_PLANT_AGED\",\"id\":\"\(contentId)\",\"daysOld\":\(daysOld),\"timestamp\":\(Int(backdated.timeIntervalSince1970))}"
+
+        } else if trimmed == "MEMORY_PLANT_AGED_CLEANUP" {
+            // Test-only. Removes every row planted by MEMORY_PLANT_AGED by
+            // deleting the "recency-regression-test" source_id via the same
+            // production thread-deletion path (scoped to that id only — no
+            // other memory is touched). Lets the regression test leave the
+            // real corpus exactly as it found it.
+            vm.memoryStore.deleteThread(id: "recency-regression-test")
+            return "{\"status\":\"ok\",\"command\":\"MEMORY_PLANT_AGED_CLEANUP\"}"
+
         } else if trimmed == "GET_THREADS" {
             let threads = vm.threads
             let activeID = vm.conversationId
@@ -17632,10 +17685,30 @@ extension MemoryStore {
             let bRank = bm25Ranks[rowId]
             if let r = sRank { rrf += 1.0 / (rrfKSemantic + Double(r)) }
             if let r = bRank { rrf += 1.0 / (rrfKBM25 + Double(r)) }
+
+            // Recency re-entry into the live ranking. The half-life decay
+            // score (calculateRecencyScore ∈ [recencyFloor, 1.0]) is blended
+            // into the fused rank score, mixed by recencyWeight:
+            //   factor = (1 - recencyWeight) + recencyWeight * recency
+            // recencyWeight == 0 → factor == 1 (exact rank-only RRF, a true
+            // no-op); recencyWeight == 1 → full multiply by the decay. So a
+            // more-recent row with equal semantic+BM25 rank sorts above an
+            // older one, while an old row still keeps (1-w)+w·floor of its
+            // score (a nudge, not a hard recency sort). This restores the
+            // recencyWeight / recencyHalfLifeDays / recencyFloor settings to
+            // an actual effect on retrieval order — they had been feeding
+            // calculateRecencyScore, which no retrieval path called, so the
+            // sliders were inert. The `> 0` guard keeps the disabled case
+            // byte-identical to pure rank fusion.
+            if recencyWeight > 0, let slot = slotById[rowId] {
+                let recency = calculateRecencyScore(timestamp: slot.timestamp)
+                rrf *= (1.0 - recencyWeight) + recencyWeight * recency
+            }
+
             rrfScored.append((rowId, rrf, sRank != nil, bRank != nil))
         }
         rrfScored.sort { $0.score > $1.score }
-        halLog("HALDEBUG-SEARCH: RRF fused \(unionIds.count) unique rows (\(semanticRanks.count) semantic + \(bm25Ranks.count) BM25, kSem=\(Int(rrfKSemantic)) kBM25=\(Int(rrfKBM25))\(bm25Distinctive ? " [distinctive BM25 boost]" : ""))")
+        halLog("HALDEBUG-SEARCH: RRF fused \(unionIds.count) unique rows (\(semanticRanks.count) semantic + \(bm25Ranks.count) BM25, kSem=\(Int(rrfKSemantic)) kBM25=\(Int(rrfKBM25))\(bm25Distinctive ? " [distinctive BM25 boost]" : ""), recencyW=\(String(format: "%.2f", recencyWeight)) halfLife=\(Int(recencyHalfLifeDays))d floor=\(String(format: "%.2f", recencyFloor)))")
 
         // --- 4. Build UnifiedSearchResult list from RRF order ---
         var allResults: [UnifiedSearchResult] = []

@@ -1,5 +1,12 @@
 # Breadcrumb: the recency / age-decay scoring is ORPHANED (dead code)
 
+> **✅ RESOLVED 2026-07-09.** Recency was reconnected at the RRF fusion in
+> `searchUnifiedContent` via a multiply-blend by `recencyWeight`, and is now
+> guarded by `tests/recency_regression.py` against silent re-orphaning.
+> Device-verified on iPhone 16 Plus (old row decayed to 19.25% at
+> weight 0.95; fresh row unchanged; fresh ranks above old). See HISTORY
+> 2026-07-09. This doc is retained for the diagnostic record.
+
 **Found 2026-06-20** (by CC, while studying Hal's memory model to port it into Posey).
 **Revisit target (Mark):** around the model-sharing update.
 

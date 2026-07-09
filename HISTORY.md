@@ -3444,3 +3444,103 @@ affordances go to ChatViews.swift. Memory architecture work happens
 in Hal.swift where the schema knowledge already lives. New API verbs
 extend the executeCommand dispatcher in LocalAPIServer.swift. The
 refactor was scaffolding for the work that comes next.
+
+---
+
+## 2026-07-09 (new CC onboards; v2.1 roadmap agreed; Bug 4 recency fix landed + device-verified)
+
+### Setting
+
+A fresh CC picked up the project after the prior CC's session was lost
+from the desktop app's recents. ~3.5 weeks had passed since the last
+work (last doc commit 2026-06-20). Onboarding pass over the four living
+docs + code confirmed the rest state: v2.0 live, working tree clean at
+`e4b9aa1`, all post-refactor commits being NEXT.md planning captures.
+
+### The v2.1 roadmap (commit `7edcacb`)
+
+Mark scoped the next release as one coherent "v2.1" — tidy fixes plus a
+little new — explicitly NOT the big philosophical arcs (Proposals system
+and Soul Document are OUT for now; Mark isn't ready). Agreed 7-item plan,
+strict priority order, with Ternary Bonsai as a designated cut line:
+
+1. v2.0.1 hotfix ship · 2. Bug 4 recency fix · 3. Privacy Lock indicator
+· 4. Posey App-Group model sharing · 5. add mxbai embedder · 6. Ternary
+Bonsai 8B eval+calibrate (cut line) · 7. EmbeddingGemma parked.
+
+Two research findings shaped it. **(a) Ternary Bonsai 8B**
+(`prism-ml/Ternary-Bonsai-8B-mlx-2bit`) is a Qwen3-8B trained natively
+ternary, packed as standard MLX 2-bit — so it rides Hal's existing Qwen3
+load path; the only real unknowns are the never-before-exercised 2-bit
+load and the usual Maxim-suite calibration. **(b) mxbai-embed-large-v1**
+runs through swift-embeddings' Bert path — the SAME library Hal already
+uses for Nomic, no MLX/Metal risk — and is device-proven in Posey. That
+made mxbai the right "stronger embedder" to add, and let us PARK
+EmbeddingGemma (still wanted for its quality, but blocked by the
+still-open upstream mlx-swift iOS Metal-init nullptr crash) rather than
+chase it. mxbai sequenced before Bonsai so retrieval quality improves
+regardless of Bonsai's outcome.
+
+### Bug 4 — orphaned recency scoring: fixed
+
+**The bug (diagnosed 2026-06-20 by Posey CC, verified here).**
+`calculateRecencyScore()` (half-life decay, mathematically correct) had
+**zero callers**. The RRF fusion combined semantic + BM25 by rank only;
+no time term re-entered. So the `recencyWeight` / `recencyHalfLifeDays`
+/ `recencyFloor` settings — still live in the UI, still persisted, still
+piped through per-model overrides — were inert. The only recency the
+model saw was the cosmetic `[3 days ago]` text label. Almost certainly
+the RRF refactor dropped the line that multiplied recency into the score,
+with no regression test to catch it.
+
+**The fix (Hal.swift, RRF fusion loop).** Reconnected recency exactly
+where it was lost: after the two rank-reciprocal terms, blend the decay
+multiplier into the fused score, mixed by `recencyWeight`:
+`rrf *= (1 - recencyWeight) + recencyWeight * calculateRecencyScore(...)`.
+`recencyWeight == 0` → factor 1.0 (a true no-op — byte-identical to pure
+rank fusion); `== 1` → full decay multiply. A more-recent row with equal
+semantic+BM25 rank sorts above an older one; an old row keeps
+`(1-w)+w·floor` of its score — a nudge, not a hard recency sort. Chose
+multiply-blend over "recency as a third RRF list" because the settings
+were designed as weight/half-life/floor for exactly this decay
+multiplier, and it restores original intent without inventing a new
+RRF-k. Added the recency knobs to the `HALDEBUG-SEARCH: RRF fused` log.
+
+**The regression test (`tests/recency_regression.py`).** A pure unit
+test of the decay function would NOT have caught the orphaning (the
+function was fine — it just wasn't called), so the test exercises the
+LIVE path. Two test-only API verbs were added to LocalAPIServer:
+`MEMORY_PLANT_AGED:<days>:<content>` (plants a fully embedded + FTS
+row with a backdated timestamp via the existing
+`storeUnifiedContentWithEntities`, under source_id
+"recency-regression-test") and `MEMORY_PLANT_AGED_CLEANUP` (removes them
+via the production `deleteThread` path, scoped to that id only). The
+test plants two rows with identical query tokens but a 365-day age gap,
+queries at recencyWeight 0 then 0.95, and asserts (B, primary guard) the
+old row's blended score decays far below its recency-off score, and (C)
+the fresh row ranks above the old one with recency on. Non-destructive:
+saves/restores the real recency settings and removes its plants in a
+finally block, so it's safe against the live on-device corpus. The
+weight-0 pass is a built-in negative control — it's byte-identical to an
+unfixed build, so on an orphaned build assertion B fails.
+
+**Device verification.** Built via the beta toolchain, installed on the
+iPhone 16 Plus, ran the test on the real corpus: **PASS.** OLD row (365d)
+scored 0.0161 at weight 0 → 0.0031 at weight 0.95 — decayed to exactly
+**19.25%** (matches `0.05 + 0.95·0.15 = 0.1925`); NEW row held at 0.0164
+unchanged; fresh ranked above old. Build was warning-clean for Hal's own
+code (only pre-existing third-party mlx-swift C++17 + Watch `WKExtension`
+warnings remained).
+
+### Environment note (the beta stack, learned mid-session)
+
+During the 3.5-week gap the whole stack moved to beta: **Xcode-beta**
+(`/Applications/Xcode-beta.app`), **iOS 27 beta** on the device, and
+**macOS 27 beta** on the Mac. The stable `Xcode Release.app` is still the
+active `xcode-select`, but it has no iOS 27 platform, so device builds
+must run under `DEVELOPER_DIR=/Applications/Xcode-beta.app/Contents/Developer`
+(no global `xcode-select` change needed). Also: the sim UDIDs in the old
+docs are stale — the sims were recreated as iPhone 17 Pro
+`80B63D38-7F94-4E88-B4B5-0CD0D8EE3B6F` / iPhone 17
+`68E7C970-6FE1-477E-A41E-349CF24E388E`. The device UUID
+`D24FB384-9C55-5D33-9B0D-DAEBFA6528D6` is unchanged and correct.

@@ -1,14 +1,37 @@
 # Hal Universal — Handoff Brief
-**Updated:** May 26, 2026 (refactor #6 ChatViews landed; Hal.swift down ~40.5% in one day's refactor sprint)
-**Branch:** `main` @ `41c0601` (clean tree, all pushed)
+**Updated:** July 9, 2026 (v2.1 roadmap agreed; Bug 4 recency fix landed + device-verified)
+**Branch:** `main` (Bug 4 fix + docs staged; see below)
 **Production:** Hal Universal **v2.0 is live on the App Store** since 2026-05-19. Non-EU markets only (DSA non-trader; see HISTORY).
+
+> **Toolchain (changed during the 2026-06 gap):** the whole stack is on
+> beta — **Xcode-beta** (`/Applications/Xcode-beta.app`), **iOS 27 beta**
+> on the device, **macOS 27 beta** on the Mac. Stable `Xcode Release.app`
+> is still the active `xcode-select` but has no iOS 27 platform, so all
+> device builds must run under
+> `DEVELOPER_DIR=/Applications/Xcode-beta.app/Contents/Developer`. See the
+> Build + Deploy section below.
 
 ## Where Hal is right now
 
-v2.0 shipped. v2.0.1 hotfix (EmbeddingGemma mis-download) is **fully
-verified** — sim + device — but **deferred to v2.1** per Mark's call
-on 2026-05-26: the orphan-weights bug is bandwidth-leaky but
-crash-safe, so it can ride with the next bigger release.
+**v2.1 is in active development.** A new CC onboarded 2026-07-09 (prior
+CC's session was lost from the desktop app). Mark agreed a 7-item v2.1
+roadmap (one release, priority order, Ternary Bonsai as cut line) — full
+list in NEXT.md → "v2.1 roadmap — AGREED 2026-07-09". Proposals system +
+Soul Document are explicitly OUT of scope for now.
+
+**Roadmap item 2 (Bug 4 — orphaned recency scoring) is DONE and
+device-verified** (2026-07-09). Recency was reconnected into the RRF
+fusion in `searchUnifiedContent` via a multiply-blend by `recencyWeight`,
+and is guarded by `tests/recency_regression.py` on the live retrieval
+path (two test-only API verbs added: `MEMORY_PLANT_AGED[_CLEANUP]`).
+Device run: old row (365d) decayed to 19.25% at weight 0.95, fresh row
+unchanged, fresh ranked above old. Next up per the roadmap: item 1
+(v2.0.1 hotfix ship — needs the SHIP_BLOCKER flip + Mark's ASC action)
+and item 3 (Privacy Lock indicator).
+
+**v2.0.1 hotfix** (EmbeddingGemma mis-download) remains **fully verified
+— sim + device — deferred to ride with v2.1** per Mark 2026-05-26 (the
+orphan-weights bug is bandwidth-leaky but crash-safe).
 
 Refactor sprint: six extractions landed in one day —
 MLXModelDownloader (#1, 2026-05-20), ModelCatalogService (#2,
@@ -257,7 +280,13 @@ Hal Universal/
 
 ## Build + Deploy (iPhone 16 Plus)
 
+**Must run under the beta toolchain** (`DEVELOPER_DIR` prefix) — stable
+Xcode has no iOS 27 platform and won't see the device. No global
+`xcode-select` change needed.
+
 ```bash
+export DEVELOPER_DIR=/Applications/Xcode-beta.app/Contents/Developer
+
 xcodebuild build \
   -project "/Users/markfriedlander/Desktop/Fun/Hal Universal/Hal Universal.xcodeproj" \
   -scheme "Hal Universal" \
@@ -270,8 +299,10 @@ xcrun devicectl device install app --device D24FB384-9C55-5D33-9B0D-DAEBFA6528D6
 xcrun devicectl device process launch --device D24FB384-9C55-5D33-9B0D-DAEBFA6528D6 com.MarkFriedlander.Hal-Universal
 ```
 
-- iPhone 16 Plus: `D24FB384-9C55-5D33-9B0D-DAEBFA6528D6`
-- iPhone 17 Pro sim UDID: `10C6DB49-2723-4F95-8F81-AECB9CD72BD0`
+- iPhone 16 Plus (device): `D24FB384-9C55-5D33-9B0D-DAEBFA6528D6`
+- Sim UDIDs (recreated during the 2026-06 beta upgrade; old `10C6DB49…`
+  is dead): iPhone 17 Pro `80B63D38-7F94-4E88-B4B5-0CD0D8EE3B6F`,
+  iPhone 17 `68E7C970-6FE1-477E-A41E-349CF24E388E`
 - API host (device): `marks-bigger-ass-fon-16.local` port 8766
 - API token (device): `e9ee9ec5b315467fa655bd4296873f43` (in `tests/.hal_api_config.json`)
 - Sim API config: `HAL_API_CONFIG=.hal_api_config_sim.json python3 tests/hal_test.py …`

@@ -513,6 +513,59 @@ class HalTestConsole: ObservableObject {
             }
             return "{\"status\":\"error\",\"message\":\"SET_RECENCY_HALFLIFE: must be >= 1.0 (days)\"}"
 
+        } else if trimmed.hasPrefix("MEMORY_PLANT_AGED:") {
+            // MEMORY_PLANT_AGED:<days_old>:<content>
+            //
+            // Test-only. Plants one conversation row into unified_content with
+            // a BACKDATED timestamp (now - days_old), fully embedded and
+            // FTS-indexed via the normal store path, so it's retrievable by
+            // MEMORY_SEARCH_DEBUG exactly like organic memory. The only thing
+            // that differs from an organic row is the age.
+            //
+            // Exists so the recency-ranking regression test
+            // (tests/recency_regression.py) can create a controlled age gap
+            // between two otherwise-identical rows and assert that raising
+            // SET_RECENCY_WEIGHT actually reorders retrieval (newer above
+            // older). Without a controllable age, every planted row is "now"
+            // and recency has nothing to sort on. Rows land under
+            // source_id "recency-regression-test" so the test can identify
+            // its own plants. Not for production use.
+            let payload = String(trimmed.dropFirst("MEMORY_PLANT_AGED:".count))
+            let parts = payload.split(separator: ":", maxSplits: 1, omittingEmptySubsequences: false).map(String.init)
+            guard parts.count == 2,
+                  let daysOld = Double(parts[0].trimmingCharacters(in: .whitespaces)),
+                  daysOld >= 0 else {
+                return "{\"status\":\"error\",\"message\":\"MEMORY_PLANT_AGED requires <days_old>:<content>, days_old >= 0\"}"
+            }
+            let content = parts[1]
+            guard !content.trimmingCharacters(in: .whitespaces).isEmpty else {
+                return "{\"status\":\"error\",\"message\":\"MEMORY_PLANT_AGED: content must be non-empty\"}"
+            }
+            let backdated = Date(timeIntervalSinceNow: -daysOld * 86400.0)
+            let contentId = vm.memoryStore.storeUnifiedContentWithEntities(
+                content: content,
+                sourceType: .conversation,
+                sourceId: "recency-regression-test",
+                position: 0,
+                timestamp: backdated,
+                isFromUser: false,
+                turnNumber: nil,
+                deliberationRound: nil
+            )
+            guard !contentId.isEmpty else {
+                return "{\"status\":\"error\",\"message\":\"MEMORY_PLANT_AGED: store failed\"}"
+            }
+            return "{\"status\":\"ok\",\"command\":\"MEMORY_PLANT_AGED\",\"id\":\"\(contentId)\",\"daysOld\":\(daysOld),\"timestamp\":\(Int(backdated.timeIntervalSince1970))}"
+
+        } else if trimmed == "MEMORY_PLANT_AGED_CLEANUP" {
+            // Test-only. Removes every row planted by MEMORY_PLANT_AGED by
+            // deleting the "recency-regression-test" source_id via the same
+            // production thread-deletion path (scoped to that id only — no
+            // other memory is touched). Lets the regression test leave the
+            // real corpus exactly as it found it.
+            vm.memoryStore.deleteThread(id: "recency-regression-test")
+            return "{\"status\":\"ok\",\"command\":\"MEMORY_PLANT_AGED_CLEANUP\"}"
+
         } else if trimmed == "GET_THREADS" {
             let threads = vm.threads
             let activeID = vm.conversationId

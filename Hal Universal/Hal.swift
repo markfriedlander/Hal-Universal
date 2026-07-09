@@ -2854,10 +2854,30 @@ extension MemoryStore {
             let bRank = bm25Ranks[rowId]
             if let r = sRank { rrf += 1.0 / (rrfKSemantic + Double(r)) }
             if let r = bRank { rrf += 1.0 / (rrfKBM25 + Double(r)) }
+
+            // Recency re-entry into the live ranking. The half-life decay
+            // score (calculateRecencyScore ∈ [recencyFloor, 1.0]) is blended
+            // into the fused rank score, mixed by recencyWeight:
+            //   factor = (1 - recencyWeight) + recencyWeight * recency
+            // recencyWeight == 0 → factor == 1 (exact rank-only RRF, a true
+            // no-op); recencyWeight == 1 → full multiply by the decay. So a
+            // more-recent row with equal semantic+BM25 rank sorts above an
+            // older one, while an old row still keeps (1-w)+w·floor of its
+            // score (a nudge, not a hard recency sort). This restores the
+            // recencyWeight / recencyHalfLifeDays / recencyFloor settings to
+            // an actual effect on retrieval order — they had been feeding
+            // calculateRecencyScore, which no retrieval path called, so the
+            // sliders were inert. The `> 0` guard keeps the disabled case
+            // byte-identical to pure rank fusion.
+            if recencyWeight > 0, let slot = slotById[rowId] {
+                let recency = calculateRecencyScore(timestamp: slot.timestamp)
+                rrf *= (1.0 - recencyWeight) + recencyWeight * recency
+            }
+
             rrfScored.append((rowId, rrf, sRank != nil, bRank != nil))
         }
         rrfScored.sort { $0.score > $1.score }
-        halLog("HALDEBUG-SEARCH: RRF fused \(unionIds.count) unique rows (\(semanticRanks.count) semantic + \(bm25Ranks.count) BM25, kSem=\(Int(rrfKSemantic)) kBM25=\(Int(rrfKBM25))\(bm25Distinctive ? " [distinctive BM25 boost]" : ""))")
+        halLog("HALDEBUG-SEARCH: RRF fused \(unionIds.count) unique rows (\(semanticRanks.count) semantic + \(bm25Ranks.count) BM25, kSem=\(Int(rrfKSemantic)) kBM25=\(Int(rrfKBM25))\(bm25Distinctive ? " [distinctive BM25 boost]" : ""), recencyW=\(String(format: "%.2f", recencyWeight)) halfLife=\(Int(recencyHalfLifeDays))d floor=\(String(format: "%.2f", recencyFloor)))")
 
         // --- 4. Build UnifiedSearchResult list from RRF order ---
         var allResults: [UnifiedSearchResult] = []
