@@ -7,6 +7,84 @@ For how we got here: `HISTORY.md` (especially the 2026-05-19/20 entry).
 
 ---
 
+## v2.1 roadmap — AGREED 2026-07-09 (Mark + CC)
+
+This is the authoritative plan for the next stretch of work. Scoped as
+one release ("v2.1"), NOT the big philosophical arcs. **The Proposals
+system and the Soul Document are explicitly OUT of scope for now — Mark
+is not ready for those yet.** Build in strict priority order.
+
+**Ship model:** one release, in priority order. Item 6 (Ternary Bonsai)
+is the designated **cut line** — if its calibration drags, v2.1 ships
+without it (items 1–5) and Bonsai becomes the headline of a fast v2.2.
+The certain, low-risk items must not be held hostage by the open-ended
+one. mxbai (5) is deliberately sequenced BEFORE Bonsai (6) so Hal's
+retrieval quality improves regardless of how Bonsai turns out.
+
+1. **v2.0.1 hotfix ship** — flip `kLocalAPIEnabledOnLaunch` to `false`
+   (grep `SHIP_BLOCKER`), bump CFBundleVersion to 7, audit ASC
+   screenshots for stale **Phi** naming, archive + submit. Fix is
+   written + sim+device verified; see "v2.0.1 ship sequence" below.
+2. **Bug 4 — orphaned recency scoring** — `calculateRecencyScore()` has
+   zero callers; retrieval ranking is recency-agnostic despite live UI
+   sliders. Fix at RRF fusion + add a regression test. Full fix vector
+   under "Bug 4" below. Self-contained.
+3. **Privacy Lock toolbar indicator** — lock/unlock glyph reflecting
+   on-device (MLX / AFM-no-network) vs possible-egress (AFM+network).
+   New `PrivacyMonitor` (NWPathMonitor). Full spec under "v2.1 design
+   work" below.
+4. **Cross-app model sharing with Posey** — App Group
+   `group.com.MarkFriedlander.aifamily`, shared model store, migration
+   helper, `isExcludedFromBackup`, per-model lock. Full spec under
+   "Cross-app infrastructure" below.
+5. **mxbai third embedding backend** — add `mxbai-embed-large-v1`
+   (Mixedbread, BERT-large, 1024-dim, ~670 MB) as a third embedder.
+   Runs via `swift-embeddings`' Bert path — the SAME library + code
+   path Hal already uses for Nomic, so **no MLX, no Metal-init crash
+   risk**. Device-proven in Posey 2026-06-19 (dim=1024, finite,
+   ~0.66s/encode). Rides in with #4's shared model space (a user who
+   downloaded it in Posey gets it in Hal free). **Then A/B it against
+   Nomic** using `rag_pipeline_eval.py` / `nomic_calibration_probe.py`
+   before deciding whether it becomes the recommended embedder or just
+   an available one — it's stronger but heavier + slower to embed than
+   Nomic, so the tradeoff must be measured, not assumed. Hal already
+   handles variable embedding dims (512 NLContextual / 768 Nomic), so
+   1024 is just another value on the existing switch-and-re-embed path.
+6. **Ternary Bonsai 8B — evaluate + calibrate (CUT LINE).**
+   `prism-ml/Ternary-Bonsai-8B-mlx-2bit`. 1.58-bit ternary weights
+   *trained* ternary (not post-hoc crushed → no usual 2-bit quality
+   penalty), packed as standard MLX 2-bit, **Qwen3-8B architecture**,
+   Apache 2.0, ~2.3 GB, 65k context, ~27 tok/s on iPhone 17 Pro Max.
+   Integration is a new `ModelConfiguration` seed in
+   `ModelCatalogService.swift` on Hal's existing Qwen3 load path.
+   **Two real unknowns:** (a) Hal has only ever loaded 4-BIT MLX —
+   prove the 2-bit load on device first (~30 min gate before anything
+   else); (b) full calibration: temp / KV-cost estimate / layer-1
+   framing / Maxim suite vs the 2026-05-13 baselines (this is what got
+   Phi dropped — Bonsai must earn its slot the same way). Lighter alt
+   exists if ever wanted: `Ternary-Bonsai-1.7B-mlx-2bit` (Qwen3-1.7B,
+   ~0.48 GB, 32k ctx).
+7. **EmbeddingGemma — PARKED watch-item (not dropped).** Mark wants it:
+   EmbeddingGemma 300M is MTEB SOTA for open <500M and "supposed to be
+   unbelievably good." It is blocked only by a documented upstream
+   mlx-swift iOS Metal-init crash (`mlx::core::metal::Device::Device()`
+   reads the Metal architecture name as nullptr → abort), in MLX's own
+   framework code, going back to 2024. As of 2026-07-09 the iOS
+   Metal-crash family is still open upstream — CC found no clean
+   "fixed in version X" PR. **The moment the upstream fix lands,
+   re-enable Gemma via the recipe already preserved in the code**
+   (Side work A below; recipe atop `EmbeddingBackend.swift`). Not
+   blocking any v2.1 work; stays in NEXT until shipped or obsolete.
+
+**Why we're adding mxbai instead of waiting on Gemma:** Gemma's whole
+value proposition (a stronger embedder than the default NLContextual)
+is already served by Nomic and served even better by mxbai — and mxbai
+carries none of Gemma's upstream Metal risk because it never touches
+MLX. So mxbai lands now; Gemma stays parked for when it's unblocked.
+Both can coexist — they're just different backend cases.
+
+---
+
 ## What the next session should do first
 
 1. Read this file, then `HANDOFF_BRIEF.md`, then the **2026-05-19/20** entry
