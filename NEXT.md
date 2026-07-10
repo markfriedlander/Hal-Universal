@@ -172,6 +172,59 @@ Both can coexist — they're just different backend cases.
 
 ---
 
+## Working list — active backlog, in order (agreed 2026-07-11)
+
+Mark's chosen near-term work, ordered by CC's recommendation. The `(0x)` refs point
+to the detailed entries under "Side work"; the Model Library items are detailed in the
+refactor "cosmetic cleanup candidates" list.
+
+1. **Finish the Bonsai concision layer-1 tuning (0f)** — resolves the current
+   UNCOMMITTED WIP in `ModelCatalogService.swift`. Rework so M1 stays clean
+   (anti-deflection must stay dominant), re-verify on device, then commit.
+2. **Reload-on-demand for MLX chat (0c)** — fixes the background-unload "model could
+   not be loaded" error AND closes Bug 3. Highest-value bug; also stabilizes long
+   test/chat sessions. ~20–40 lines at Hal.swift:5955.
+3. **RAG-miss confabulation gate (Bug 2b)** — when retrieval finds no strong match,
+   tell the model to say "I don't have that" instead of inventing. Squarely
+   on-mission (Maxim 1 in the retrieval path). Small–medium.
+4. **Fix the test antenna to navigate/screenshot all screens (0b)** — tooling. Do it
+   BEFORE the cosmetic UI nits below so CC can self-verify them instead of needing a
+   Mark eyeball.
+5. **Model Library: Delete hidden on the ACTIVE model** → show a disabled Delete +
+   "switch models to delete this one" hint (today `.mlx && !isActive` hides it, reads
+   as missing).
+6. **Model Library: dismiss timing on selection** → dismiss immediately + show the
+   load state in chat (today `selectModel` awaits the full MLX load before dismissing,
+   so AFM bounces instantly while MLX appears to "hold").
+7. **Model Library: relabel "Download" → "Add"** for models already present in the
+   shared store (the tap is an instant adopt, not a download). **Use "Add."** Touches
+   Posey — keep the label consistent across both apps.
+8. **Per-embedder RRF tuning (0a)** — heaviest; was "future release," Mark pulled it
+   onto the list. Sweep each backend, keep a per-embedder `kSem` only where it beats
+   the global by a real margin; guard overfitting. Last.
+
+**Parked (not on the working list):** 0d (long-conversation gate latency + Bonsai
+verbosity — revisit after 0c/0f).
+
+**In flight / decisions (2026-07-11):**
+- **Core AI availability** — background research agent running (is the framework real +
+  are our curated models converted?). Report pending; decision (POC vs stay-parked)
+  follows the findings.
+- **Multimodal / images — PARKED, not worth wiring now.** Hal loads all MLX models via
+  the text-only `LLMModelFactory` (string prompts); no image path. Qwen 3.5 + Gemma are
+  multimodal at the model level but unused; AFM images need a newer OS than 26. Wiring a
+  VLM path (VLMModelFactory + image processing + composer UI + per-model formats) is a
+  real feature for 1–2 models, memory-heavy on-device. The document-OCR use case is
+  better served by Vision OCR or Posey's stack. Revisit when multimodal AFM ships or we
+  specifically want "ask Hal about a photo."
+- **Port Posey's document-import stack (future).** Mark: "we will probably port Posey's
+  document import stack over." Supersedes/absorbs the WWDC26 "Vision OCR for document
+  import" item — the better image-bearing/scanned-doc handling likely comes from Posey's
+  reader pipeline (swift-readability etc.), not a from-scratch Vision integration. Not
+  scheduled; logged so it's not lost.
+
+---
+
 ## What the next session should do first
 
 1. Read this file, then `HANDOFF_BRIEF.md`, then the **2026-05-19/20** entry
