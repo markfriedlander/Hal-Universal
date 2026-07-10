@@ -10510,6 +10510,20 @@ class ChatViewModel: ObservableObject {
                                                                                     let resolvedRag = await resolveSegment(.ragRetrieval, rawContent: ragRaw, budgetTokens: limits.maxRagTokens)
                                                                                     contextSections.append(resolvedRag)
                                                                                     halLog("HALDEBUG-CHAT: Folded in \(snippets.count) RAG snippets")
+                                                                                } else if toolResults.toolsUsed.contains("memory_search") {
+                                                                                    // Bug 2b — confabulation gate. A memory search actually
+                                                                                    // RAN (the gate said YES, or the personal-recall bypass
+                                                                                    // forced it) but came back empty. Previously nothing was
+                                                                                    // added here, so the model had no signal the lookup
+                                                                                    // failed and would invent plausible specifics (a cat's
+                                                                                    // name, a date) to satisfy a question that clearly
+                                                                                    // expected stored context. Tell it the search missed so it
+                                                                                    // says "I don't have that" instead — Maxim 1 in the
+                                                                                    // retrieval path. Only on a real search (a gate SKIP means
+                                                                                    // the query didn't need memory, so no note is warranted).
+                                                                                    let missNote = "Memory search: you looked in your stored memory and any imported documents for this and found no relevant match. If the answer isn't already in the current conversation or your general knowledge, tell the user plainly that you don't have that information stored — do not invent names, facts, dates, numbers, or other specifics to fill the gap. Saying you don't know is the correct answer here."
+                                                                                    contextSections.append(missNote)
+                                                                                    halLog("HALDEBUG-CHAT: memory_search ran but found nothing — appended Bug-2b confabulation-gate note")
                                                                                 }
                                                                             }
 

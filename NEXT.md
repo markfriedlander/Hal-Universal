@@ -187,9 +187,14 @@ refactor "cosmetic cleanup candidates" list.
    of erroring. Verified: forced a background-unload, sent a raw chat (no reload-guard)
    → log showed "model not resident … reloading … on demand," it reloaded and answered
    (no error). Closes Bug 3 (same `awaitPendingMLXLoad` path). See 0c detail below.
-3. **RAG-miss confabulation gate (Bug 2b)** — when retrieval finds no strong match,
-   tell the model to say "I don't have that" instead of inventing. Squarely
-   on-mission (Maxim 1 in the retrieval path). Small–medium.
+3. ~~**RAG-miss confabulation gate (Bug 2b)**~~ **DONE + device-verified 2026-07-11.**
+   When `memory_search` RAN but returned nothing (Hal.swift ~10513), a system note now
+   tells the model the lookup missed → say "I don't have that" instead of inventing.
+   Verified: "what's my sister's name?" on an empty DB → "I don't have access to that
+   information — it's not stored in my memory" (was: invents a name); general-knowledge
+   ("capital of France?") gate-skips, no note, normal answer; RAG-HIT (planted "beagle
+   named Rex") still recalls correctly, no false decline. Only the empty-search case is
+   handled; a low-relevance-but-nonempty refinement is a possible future follow-up.
 4. **Fix the test antenna to navigate/screenshot all screens (0b)** — tooling. Do it
    BEFORE the cosmetic UI nits below so CC can self-verify them instead of needing a
    Mark eyeball.
@@ -465,14 +470,16 @@ app on device); device-verified on iPhone 16 Plus. See HISTORY 2026-07-09.
 (The old (a)/(b) options were superseded — the delta-at-edit-time approach
 keeps untouched settings tracking curated defaults, which neither did.)
 
-### Bug 2 — Document RAG / confabulation (PARTIALLY FIXED in v2.0)
+### Bug 2 — Document RAG / confabulation (FIXED)
 
 Bug 2a (Document RAG misses non-final chunks) was fixed end-to-end in
-v2.0. Bug 2b (confabulation when RAG misses target content) remains —
-when the target content isn't in the prompt, models invent plausible
-content rather than saying "I don't have that." AFM is more prone than
-Gemma. Possible fix: explicit "no document match found" system note
-when RAG returns no high-relevance match.
+v2.0. **Bug 2b (confabulation when RAG misses target content) — FIXED +
+device-verified 2026-07-11** (WL3): when a memory search RAN but returned
+nothing, Hal now injects a "found no relevant match — say you don't have that
+rather than inventing" system note (Hal.swift ~10513), so the model declines
+instead of confabulating. The exact fix this note predicted. Only the
+empty-search case is handled (a low-relevance-but-nonempty refinement — the
+scores live in fiddly RRF space — is a possible future follow-up).
 
 ### Bug 3 — First-turn-after-swap race for 3 GB MLX models
 
