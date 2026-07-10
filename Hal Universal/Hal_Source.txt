@@ -23577,23 +23577,14 @@ struct ModelLibraryRow: View {
                 Spacer()
 
                 // Delete is only meaningful for MLX (AFM is system-managed).
-                // For the model you're currently running, show a DISABLED Delete
-                // + a short reason rather than hiding it — a missing button reads
-                // as "this can't be deleted" with no explanation, which looks like
-                // a bug. Disabled-with-a-hint is clearer: you can't delete the
-                // model that's in use; switch away first.
+                // For the model you're currently running, show a short reason IN
+                // PLACE OF the Delete button rather than hiding it silently — a
+                // missing button reads as "this can't be deleted" with no
+                // explanation, which looks like a bug. You can't delete the model
+                // that's in use; switch away first.
                 if model.source == .mlx {
                     if isActive {
-                        Button(action: {}) {
-                            HStack(spacing: 4) {
-                                Image(systemName: "trash")
-                                Text("Delete")
-                            }
-                            .font(.subheadline)
-                        }
-                        .buttonStyle(.plain)
-                        .disabled(true)
-                        Text("switch models to delete")
+                        Text("Switch models to delete")
                             .font(.caption)
                             .foregroundColor(.secondary)
                     } else {
