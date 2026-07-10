@@ -195,9 +195,21 @@ refactor "cosmetic cleanup candidates" list.
    ("capital of France?") gate-skips, no note, normal answer; RAG-HIT (planted "beagle
    named Rex") still recalls correctly, no false decline. Only the empty-search case is
    handled; a low-relevance-but-nonempty refinement is a possible future follow-up.
-4. **Fix the test antenna to navigate/screenshot all screens (0b)** — tooling. Do it
-   BEFORE the cosmetic UI nits below so CC can self-verify them instead of needing a
-   Mark eyeball.
+4. ~~**Fix the test antenna to navigate/screenshot all screens (0b)**~~ **DONE +
+   device-verified 2026-07-11.** Turned out the harness ALREADY navigates to the
+   Model Library (`SET_UI_STATE:modellibrary:true`) and screenshots the device
+   (`SCREENSHOT` verb → `devicectl copy` back), and CC can Read the PNG — so UI is
+   self-verifiable. Added the missing piece: `SET_UI_STATE:expandrow:<id>` (id =
+   model.id or EmbeddingBackend.rawValue) drives a new `@Published apiExpandRowID`
+   that ModelLibraryRow + EmbedderBackendRow observe to expand programmatically.
+   Verified: expanded Bonsai's row via the verb + screenshot → its card renders
+   correctly (the "Deep & self-aware (8B)" tag + full description confirmed on
+   screen). **Follow-up (small):** the action row (Delete/Add buttons) sits at the
+   bottom of a long card, off-screen; a `SET_UI_STATE:scrolllibrary:<id>` scroll
+   (ScrollViewReader around the List, `proxy.scrollTo(id, anchor:.bottom)`) would
+   fully reveal it — deferred (the List's irregular indentation makes a safe wrap
+   fiddly; not worth the risk for the cosmetic nits, which are verifiable by
+   code + a partial screenshot + Mark's eyeball).
 5. **Model Library: Delete hidden on the ACTIVE model** → show a disabled Delete +
    "switch models to delete this one" hint (today `.mlx && !isActive` hides it, reads
    as missing).

@@ -6647,6 +6647,7 @@ struct ModelLibraryView: View {
                             downloader: mlxDownloader,
                             activeModelID: chatViewModel.selectedModelID,
                             includeModelCard: true,
+                            apiExpandRowID: chatViewModel.apiExpandRowID,
                             onSelect: { selectModel(model) },
                             onDownload: { downloadModel(model) },
                             onCancel: { mlxDownloader.cancelDownload(modelID: model.id) },
@@ -6755,6 +6756,7 @@ struct ModelLibraryView: View {
                                 downloader: mlxDownloader,
                                 activeModelID: chatViewModel.selectedModelID,
                                 includeModelCard: false,
+                                apiExpandRowID: chatViewModel.apiExpandRowID,
                                 onSelect: { selectModel(model) },
                                 onDownload: { downloadModel(model) },
                                 onCancel: { mlxDownloader.cancelDownload(modelID: model.id) },
@@ -6980,6 +6982,11 @@ struct ModelLibraryRow: View {
     @ObservedObject var downloader: MLXModelDownloader
     let activeModelID: String
     let includeModelCard: Bool
+    // Mirror of ChatViewModel.apiExpandRowID (test/screenshot automation). When it
+    // equals this row's model.id, the row expands; anything else collapses it. The
+    // user still drives expansion by tapping the chevron; this only adds a
+    // programmatic path so the harness can screenshot the expanded card.
+    var apiExpandRowID: String = ""
 
     let onSelect: () -> Void
     let onDownload: () -> Void
@@ -7056,6 +7063,11 @@ struct ModelLibraryRow: View {
             }
         }
         .padding(.vertical, 4)
+        // Programmatic expansion for test/screenshot automation. Fires when the
+        // VM's apiExpandRowID changes (threaded in from ModelLibraryView).
+        .onChange(of: apiExpandRowID) { _, newID in
+            withAnimation(.easeInOut(duration: 0.18)) { isExpanded = (newID == model.id) }
+        }
     }
 
     // MARK: - Action row
@@ -8628,7 +8640,14 @@ class ChatViewModel: ObservableObject {
     // calls ScrollViewReader.scrollTo. Auto-clears after each scroll so the
     // same target can be re-driven repeatedly.
     @Published var apiScrollSettingsTarget: String = ""
-    
+
+    // API-driven Model Library row expansion (test/screenshot automation). Set to
+    // a model.id (Hal's Picks) or an EmbeddingBackend.rawValue (embedder rows) via
+    // SET_UI_STATE:expandrow:<id>; the matching row observes it and expands (others
+    // collapse), so the harness can screenshot a card's internals (blurb, action
+    // buttons, Delete/Add labels) without a physical tap. "" collapses all.
+    @Published var apiExpandRowID: String = ""
+
     // Lightweight mirrors of downloader state for binding
     var mlxIsDownloading: Bool { MLXModelDownloader.shared.isDownloading }
     var mlxDownloadMessage: String { MLXModelDownloader.shared.downloadMessage }

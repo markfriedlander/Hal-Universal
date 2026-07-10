@@ -277,6 +277,12 @@ struct EmbedderBackendRow: View {
             }
         }
         .padding(.vertical, 4)
+        // Programmatic expansion for test/screenshot automation. Fires when the
+        // VM's apiExpandRowID (SET_UI_STATE:expandrow:<backend.rawValue>) changes,
+        // so the harness can screenshot an embedder card's expanded internals.
+        .onChange(of: chatViewModel.apiExpandRowID) { _, newID in
+            withAnimation(.easeInOut(duration: 0.18)) { isExpanded = (newID == backend.rawValue) }
+        }
         .onAppear { coordinator.refresh() }
         .confirmationDialog(
             "Switch to \(backend.displayName)?",

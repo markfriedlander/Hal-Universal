@@ -835,6 +835,16 @@ class HalTestConsole: ObservableObject {
                 // "poweruser". Settings sheet observes apiScrollSettingsTarget
                 // and uses ScrollViewReader.scrollTo on change.
                 vm.apiScrollSettingsTarget = parts[1].lowercased()
+            case "expandrow":
+                // Expand a Model Library row so its card internals (blurb,
+                // action buttons, Delete/Add labels) become screenshot-able.
+                // `value` = parts[1] is the row id: a model.id for Hal's Picks /
+                // community rows, or an EmbeddingBackend.rawValue for embedder
+                // rows. Case-sensitive (model ids are mixed-case), so NOT
+                // lowercased. The Model Library must already be open
+                // (SET_UI_STATE:modellibrary:true) for the row to exist.
+                // "" collapses all. See ChatViewModel.apiExpandRowID.
+                vm.apiExpandRowID = parts[1].trimmingCharacters(in: .whitespaces)
             case "none":
                 vm.showingSettings = false
                 vm.showingThreadPanel = false
@@ -844,6 +854,7 @@ class HalTestConsole: ObservableObject {
                 vm.apiNavPowerUser = false
                 vm.apiNavSalonSettings = false
                 vm.apiNavModelLibrary = false
+                vm.apiExpandRowID = ""
             default:
                 return "{\"status\":\"error\",\"message\":\"Unknown target '\(target)' (use settings|threadPanel|systemPrompt|modelFraming|selfModel|none)\"}"
             }
