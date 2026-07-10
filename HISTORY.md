@@ -4090,3 +4090,59 @@ contained opt-out. Zero warnings, no cascade.
 Active backend untouched throughout (still NLContextual on device). Step 1 does
 NOT change switching behavior yet — that's step 2 (per-embedder columns replace
 the destructive wipe-and-re-embed). Build clean, no warnings.
+
+### 2026-07-09 (continued) — v2.1 item 5, STEP 2: per-embedder columns (keep-both)
+
+Replaced Hal's destructive wipe-and-re-embed-on-switch with Posey's proven
+"keep-both" per-backend-column design, so multiple embedders coexist in the
+database — the enabler for user choice + model cards + a real A/B (all of which
+Mark asked for). Retrieval-heart change; done carefully + device-verified.
+
+**Before:** `unified_content` had one `embedding` BLOB. Switching embedders
+NULLed every vector (`wipeStaleEmbeddingsIfNeeded`) and re-embedded the whole
+corpus — destructive, slow, and only one backend's vectors ever existed (no A/B
+possible).
+
+**After:** each backend owns a permanent column (`EmbeddingBackend.vectorColumn`
+→ embedding_nl / embedding_nomic / embedding_mxbai). All vector sets coexist;
+switching just reads a different column (instant, non-destructive); a background
+`backfillEmbeddings(for:)` fills an inactive backend's column using the
+explicit-backend embed primitive from step 1.
+
+**The changes (all in the MemoryStore heart):**
+- `migrateEmbeddingsToPerBackendColumns()` replaces the wipe: idempotently adds
+  the three columns and does a ONE-TIME (flag-gated) non-destructive copy of the
+  legacy `embedding` column into the ACTIVE backend's column. The one-shot gate
+  is load-bearing — the legacy column holds whatever backend was active when the
+  rows were written, so the copy is only valid at first migration; running it
+  again after a switch would copy, e.g., 512-dim NL vectors into the 768-dim
+  nomic column. Legacy column left in place (not dropped) as a safety net.
+- Write path (`storeUnifiedContentWithEntities`) writes the vector into the
+  active backend's column; both search SELECTs (`searchUnifiedContent`,
+  `debugSemanticSimilarity`) read the active column with `WHERE <col> IS NOT
+  NULL`; the timestamp-map query now covers all rows (so BM25-only rows keep
+  their timestamp label). Column names are fixed enum-derived identifiers, safe
+  to interpolate.
+- `reEmbedAllNullRows` generalized into `backfillEmbeddings(for:)` (target
+  backend's column, explicit-backend embed); a thin shim keeps existing callers.
+- `SET_EMBEDDING_BACKEND` and the UI swap flow (`switchAndMigrate`) no longer
+  wipe — non-destructive switch + warm-up + optional backfill.
+- API: `EMBEDDING_COVERAGE` (per-column filled/missing/total), `BACKFILL_
+  EMBEDDINGS:<backend|all>`. `systemVersion`/`wipeStaleEmbeddingsIfNeeded`
+  retired (comments updated).
+
+**Device-verified on iPhone 16 Plus** (`tests/embedding_columns_regression.py`
++ existing `recency_regression.py`, both PASS):
+- Retrieval intact — recency regression (live search path) passes under the new
+  active-column read.
+- Plants fill the active column; backfill fills nomic + mxbai independently
+  (4/4 each).
+- Non-destructive switch — switching to nomic left every column's coverage
+  UNCHANGED (the old wipe would have zeroed them), and a semantic search under
+  nomic found the planted phrase.
+- Restored the device to NLContextual. (One pre-existing row was left with
+  additive nomic/mxbai vectors from the backfill test — harmless; the active
+  backend doesn't read them.)
+
+Step 3 (A/B + model cards + choice UI) is next; the backfill + coverage tools
+built here are exactly what the A/B needs.

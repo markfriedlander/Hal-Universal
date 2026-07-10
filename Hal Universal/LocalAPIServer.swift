@@ -1116,15 +1116,15 @@ class HalTestConsole: ObservableObject {
                 return "{\"status\":\"error\",\"message\":\"unknown backend '\(raw)'; valid: \(valid)\"}"
             }
             UserDefaults.standard.set(newBackend.rawValue, forKey: EmbeddingBackend.defaultsKey)
-            // Drop the stored systemVersion so wipeStaleEmbeddingsIfNeeded
-            // triggers on next call. Then call it explicitly so the wipe
-            // happens before any further writes.
-            UserDefaults.standard.removeObject(forKey: "embeddingSystemVersion")
-            vm.memoryStore.wipeStaleEmbeddingsIfNeeded()
-            // Kick off async warm-up of the new backend so the load
-            // starts immediately rather than blocking the next embed() call.
+            // v2.1 step 2: switching is now NON-destructive. Each backend owns a
+            // permanent per-backend column, so we do NOT wipe anything — the
+            // retriever simply reads the new backend's column. Rows whose new
+            // column isn't filled yet fall back to BM25 until backfilled; run
+            // BACKFILL_EMBEDDINGS:<backend> (or :all) to fill existing rows.
             EmbeddingProvider.shared.warmUp()
-            return "{\"status\":\"ok\",\"command\":\"SET_EMBEDDING_BACKEND\",\"backend\":\"\(newBackend.rawValue)\",\"expectedDim\":\(newBackend.dimension),\"note\":\"existing embeddings wiped; warm-up triggered; new rows re-embed on next write; call MIGRATE_EMBEDDINGS_REEMBED to backfill existing rows\"}"
+            let cov = vm.memoryStore.embeddingCoverage()
+            let filledForNew = cov.filled[newBackend.rawValue] ?? 0
+            return "{\"status\":\"ok\",\"command\":\"SET_EMBEDDING_BACKEND\",\"backend\":\"\(newBackend.rawValue)\",\"expectedDim\":\(newBackend.dimension),\"rowsFilled\":\(filledForNew),\"totalRows\":\(cov.total),\"note\":\"non-destructive switch; warm-up triggered; run BACKFILL_EMBEDDINGS:\(newBackend.rawValue) to fill existing rows\"}"
 
         } else if trimmed == "MIGRATE_EMBEDDINGS_REEMBED" {
             // Re-embed every unified_content row with NULL embedding using
@@ -1145,6 +1145,46 @@ class HalTestConsole: ObservableObject {
             }
             let result = vm.memoryStore.reEmbedAllNullRows()
             return "{\"status\":\"ok\",\"command\":\"MIGRATE_EMBEDDINGS_REEMBED\",\"backend\":\"\(backend.rawValue)\",\"updated\":\(result.updated),\"skipped\":\(result.skipped),\"failed\":\(result.failed)}"
+
+        } else if trimmed == "EMBEDDING_COVERAGE" {
+            // v2.1 step 2 diagnostic (read-only): per-backend embedding coverage
+            // across unified_content — total rows and, for each backend, how many
+            // have that backend's column filled. Powers the backfill/A-B workflow.
+            let cov = vm.memoryStore.embeddingCoverage()
+            let perBackend = EmbeddingBackend.allCases.map { b -> String in
+                let filled = cov.filled[b.rawValue] ?? 0
+                let active = (b == EmbeddingProvider.shared.activeBackend)
+                return "{\"backend\":\"\(b.rawValue)\",\"column\":\"\(b.vectorColumn)\",\"filled\":\(filled),\"missing\":\(max(0, cov.total - filled)),\"active\":\(active)}"
+            }
+            return "{\"status\":\"ok\",\"command\":\"EMBEDDING_COVERAGE\",\"totalRows\":\(cov.total),\"backends\":[\(perBackend.joined(separator: ","))]}"
+
+        } else if trimmed.hasPrefix("BACKFILL_EMBEDDINGS") {
+            // v2.1 step 2: fill an INACTIVE (or the active) backend's per-backend
+            // column for every row missing it, embedding with THAT backend. The
+            // prerequisite for instant switch-without-re-embed and for an A/B
+            // (both columns filled). Runs synchronously on the API thread (same
+            // pattern as MIGRATE_EMBEDDINGS_REEMBED) so there is no concurrent DB
+            // access — the caller controls pacing and may need a long timeout on
+            // a large corpus. The target model must be present + loadable.
+            //   BACKFILL_EMBEDDINGS:<backend>   or   BACKFILL_EMBEDDINGS:all
+            let arg = trimmed.hasPrefix("BACKFILL_EMBEDDINGS:")
+                ? String(trimmed.dropFirst("BACKFILL_EMBEDDINGS:".count)).trimmingCharacters(in: .whitespaces)
+                : "all"
+            let targets: [EmbeddingBackend]
+            if arg.isEmpty || arg.lowercased() == "all" {
+                targets = EmbeddingBackend.allCases
+            } else if let b = EmbeddingBackend(rawValue: arg) {
+                targets = [b]
+            } else {
+                return "{\"status\":\"error\",\"command\":\"BACKFILL_EMBEDDINGS\",\"detail\":\"unknown backend \(jsonStringEscape(arg)); use a backend rawValue or 'all'\"}"
+            }
+            var results: [String] = []
+            for b in targets {
+                let r = vm.memoryStore.backfillEmbeddings(for: b)
+                results.append("{\"backend\":\"\(b.rawValue)\",\"updated\":\(r.updated),\"skipped\":\(r.skipped),\"failed\":\(r.failed)}")
+            }
+            let cov = vm.memoryStore.embeddingCoverage()
+            return "{\"status\":\"ok\",\"command\":\"BACKFILL_EMBEDDINGS\",\"results\":[\(results.joined(separator: ","))],\"totalRows\":\(cov.total)}"
 
         } else if trimmed == "DOWNLOAD_EMBEDDING_MODEL" || trimmed.hasPrefix("DOWNLOAD_EMBEDDING_MODEL:") {
             // DOWNLOAD_EMBEDDING_MODEL[:<backend>]

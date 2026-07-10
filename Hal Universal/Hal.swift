@@ -623,116 +623,128 @@ class MemoryStore: ObservableObject {
         // Create all tables using the persistent connection
         createUnifiedSchema()
 
-        // Embedding system version check (2026-05-17 architectural upgrade
-        // to NLContextualEmbedding). The old NLEmbedding vectors are in a
-        // different vector space and dimension — incomparable to the new
-        // model's output. Per Mark's directive ("data is disposable; wipe
-        // and start fresh"), on first launch after the upgrade we NULL
-        // every embedding BLOB. Rows stay (so conversation history isn't
-        // lost from the UI thread view), but the embedding column is
-        // cleared so the next access re-embeds with the new model.
-        wipeStaleEmbeddingsIfNeeded()
+        // v2.1 step 2 — per-backend "keep-both" embedding columns. Adds
+        // embedding_nl / embedding_nomic / embedding_mxbai to unified_content and
+        // does a one-time non-destructive copy of the legacy `embedding` column
+        // into the ACTIVE backend's column. Replaces the old destructive
+        // wipe-and-re-embed-on-switch: switching backends now just reads a
+        // different column (instant), and each backend's vectors coexist so an
+        // A/B comparison is possible. Idempotent + clobber-safe; safe every launch.
+        migrateEmbeddingsToPerBackendColumns()
 
         loadUnifiedStats()
 
         print("HALDEBUG-DATABASE: Persistent database setup complete")
     }
 
-    /// One-time wipe of embedding columns when the embedding system
-    /// version changes. Idempotent — the persisted flag prevents repeated
-    /// wipes on subsequent launches.
-    ///
-    /// Versions:
-    ///   1 = NLEmbedding.sentenceEmbedding (deprecated)
-    ///   2 = NLContextualEmbedding (Apple transformer, 512-dim)
-    ///   3 = EmbeddingGemma (MLX, 768-dim, Proposal A)
-    ///
-    /// The version is sourced from the currently active EmbeddingBackend,
-    /// so switching backends triggers a fresh wipe on the next startup
-    /// after the change (since UserDefaults version won't match).
-    nonisolated func wipeStaleEmbeddingsIfNeeded() {
-        let currentEmbeddingVersion = EmbeddingBackend.current().systemVersion
-        let activeBackendName = EmbeddingBackend.current().rawValue
-        let key = "embeddingSystemVersion"
-        let stored = UserDefaults.standard.integer(forKey: key)  // returns 0 if missing
-        if stored == currentEmbeddingVersion {
-            return  // already on current system
-        }
-        halLog("HALDEBUG-EMBEDDING: Embedding system version change detected (stored=\(stored), current=\(currentEmbeddingVersion), backend=\(activeBackendName)) — NULLing existing embedding columns so rows re-embed with the new backend")
-        let wipeUnified = "UPDATE unified_content SET embedding = NULL;"
-        let wipeSelf = "UPDATE self_knowledge SET embedding = NULL WHERE 1=1;"  // self_knowledge may not have an embedding column on all schemas; the WHERE clause is harmless and avoids accidental table-scan-with-side-effects
-        var unifiedChanges = 0
-        var selfChanges = 0
-        if sqlite3_exec(db, wipeUnified, nil, nil, nil) == SQLITE_OK {
-            unifiedChanges = Int(sqlite3_changes(db))
-        }
-        // self_knowledge may not have an embedding column; guard via PRAGMA
-        var hasSelfEmbeddingColumn = false
-        var infoStmt: OpaquePointer?
-        if sqlite3_prepare_v2(db, "PRAGMA table_info(self_knowledge);", -1, &infoStmt, nil) == SQLITE_OK {
-            while sqlite3_step(infoStmt) == SQLITE_ROW {
-                if let colName = sqlite3_column_text(infoStmt, 1) {
-                    if String(cString: colName) == "embedding" {
-                        hasSelfEmbeddingColumn = true
-                        break
-                    }
-                }
+    /// Column names of a table (PRAGMA table_info). Used to add per-backend
+    /// embedding columns idempotently.
+    nonisolated func tableColumns(_ table: String) -> Set<String> {
+        var cols = Set<String>()
+        var stmt: OpaquePointer?
+        if sqlite3_prepare_v2(db, "PRAGMA table_info(\(table));", -1, &stmt, nil) == SQLITE_OK {
+            while sqlite3_step(stmt) == SQLITE_ROW {
+                if let c = sqlite3_column_text(stmt, 1) { cols.insert(String(cString: c)) }
             }
         }
-        sqlite3_finalize(infoStmt)
-        if hasSelfEmbeddingColumn {
-            if sqlite3_exec(db, wipeSelf, nil, nil, nil) == SQLITE_OK {
-                selfChanges = Int(sqlite3_changes(db))
-            }
-        }
-        halLog("HALDEBUG-EMBEDDING: Wiped embeddings — unified_content: \(unifiedChanges) rows, self_knowledge: \(selfChanges) rows. Embeddings regenerate on next access.")
-        UserDefaults.standard.set(currentEmbeddingVersion, forKey: key)
+        sqlite3_finalize(stmt)
+        return cols
     }
 
-    // MARK: - Embedding Migration (Proposal A user upgrade path, 2026-05-17)
-    //
-    // When the user switches embedding backend, existing rows have their
-    // embedding column NULLed via `wipeStaleEmbeddingsIfNeeded`. New rows
-    // re-embed lazily through the new backend, but already-stored content
-    // (the bulk of a real user's database after weeks of conversation)
-    // stays semantically dark until each row is explicitly re-embedded.
-    //
-    // `reEmbedAllNullRows` walks every row with NULL embedding, calls
-    // `generateEmbedding` (which dispatches to the current backend), and
-    // UPDATEs the row. Progress is logged at decile boundaries. Returns
-    // (updated, skipped, failed) counts.
-    //
-    // Intentionally synchronous and chunked-by-row rather than batched.
-    // EmbeddingGemma on iPhone 16+ produces ~1 embedding per ~50ms; for
-    // a thousand-row corpus that's under a minute. For larger corpora a
-    // future variant could batch via MLX padded inputs — landing this in
-    // single-row mode first keeps the code simple and the failure surface
-    // small.
-    nonisolated func reEmbedAllNullRows() -> (updated: Int, skipped: Int, failed: Int) {
+    /// v2.1 step 2 — migrate to per-backend "keep-both" embedding columns.
+    ///
+    /// Replaces the old destructive `wipeStaleEmbeddingsIfNeeded`, which NULLed
+    /// every embedding on a backend switch (forcing a full-corpus re-embed and
+    /// making an A/B impossible). Now each backend owns a permanent column and
+    /// all vector sets coexist; switching backends just reads a different column.
+    ///
+    /// This does two idempotent, NON-destructive things:
+    ///   1. Adds `embedding_nl` / `embedding_nomic` / `embedding_mxbai` if missing.
+    ///   2. One-time copies the legacy single `embedding` column into the ACTIVE
+    ///      backend's column (only where legacy is non-NULL and the target is
+    ///      still NULL — clobber-safe, so a re-run matches nothing and never
+    ///      overwrites a freshly-written per-backend vector). The legacy column
+    ///      held whatever backend was active when the row was written, which
+    ///      after any prior destructive swap IS the current active backend — so
+    ///      this lands the existing vectors in the right column with no re-embed.
+    ///
+    /// The legacy `embedding` column is left in place (not dropped) as a safety
+    /// net; new writes go to the per-backend columns from here on.
+    nonisolated func migrateEmbeddingsToPerBackendColumns() {
         guard ensureHealthyConnection() else {
-            halLog("HALDEBUG-EMBEDDING: reEmbedAllNullRows aborted — no DB connection")
+            halLog("HALDEBUG-EMBEDDING: per-backend migration aborted — no DB connection")
+            return
+        }
+        let existing = tableColumns("unified_content")
+        var added: [String] = []
+        for col in EmbeddingBackend.allVectorColumns where !existing.contains(col) {
+            if sqlite3_exec(db, "ALTER TABLE unified_content ADD COLUMN \(col) BLOB;", nil, nil, nil) == SQLITE_OK {
+                added.append(col)
+            }
+        }
+        if !added.isEmpty {
+            halLog("HALDEBUG-EMBEDDING: added per-backend vector columns: \(added.joined(separator: ", "))")
+        }
+
+        // One-time non-destructive copy legacy → active backend's column.
+        // MUST run exactly ONCE, gated by a flag: the legacy `embedding` column
+        // holds vectors from whatever backend was active WHEN THEY WERE WRITTEN.
+        // At this first migration that IS the current active backend (a prior
+        // destructive swap would have re-embedded them), so copying legacy →
+        // active column lands them in the right column with correct dimensions.
+        // Running it again after a backend switch would copy, e.g., 512-dim NL
+        // vectors into the 768-dim nomic column — a dimension mismatch. Hence
+        // the one-shot flag.
+        let copyFlag = "didCopyLegacyEmbeddingColumn.v1"
+        if !UserDefaults.standard.bool(forKey: copyFlag) {
+            let activeCol = EmbeddingBackend.current().vectorColumn
+            let copySQL = "UPDATE unified_content SET \(activeCol) = embedding WHERE embedding IS NOT NULL AND \(activeCol) IS NULL;"
+            if sqlite3_exec(db, copySQL, nil, nil, nil) == SQLITE_OK {
+                let copied = Int(sqlite3_changes(db))
+                halLog("HALDEBUG-EMBEDDING: one-time copy of \(copied) legacy embeddings into \(activeCol) (active backend \(EmbeddingBackend.current().rawValue))")
+            }
+            UserDefaults.standard.set(true, forKey: copyFlag)
+        }
+    }
+
+    // MARK: - Embedding backfill (v2.1 step 2 — per-backend "keep-both" columns)
+    //
+    // `backfillEmbeddings(for:)` walks every row whose column for the GIVEN
+    // backend is NULL, embeds its content with THAT backend (via the explicit-
+    // backend primitive, not the active one), and fills the backend's column.
+    // This is how an inactive backend's column gets populated without changing
+    // which backend the retriever reads — the prerequisite for instant
+    // switch-without-re-embed and for an A/B comparison (both columns filled).
+    //
+    // Intentionally synchronous and chunked-by-row rather than batched. mxbai
+    // (BERT-large) runs ~0.66 s/encode; for a few-hundred-row corpus that's a
+    // few minutes, so callers run it off the main actor (the API verb kicks it
+    // off in a background Task and reports progress via EMBEDDING_COVERAGE).
+    nonisolated func backfillEmbeddings(for backend: EmbeddingBackend) -> (updated: Int, skipped: Int, failed: Int) {
+        guard ensureHealthyConnection() else {
+            halLog("HALDEBUG-EMBEDDING: backfillEmbeddings aborted — no DB connection")
             return (0, 0, 0)
         }
+        let col = backend.vectorColumn
         // Count total candidates first so we can log decile progress.
         var totalCandidates = 0
         var countStmt: OpaquePointer?
-        if sqlite3_prepare_v2(db, "SELECT count(*) FROM unified_content WHERE embedding IS NULL;", -1, &countStmt, nil) == SQLITE_OK {
+        if sqlite3_prepare_v2(db, "SELECT count(*) FROM unified_content WHERE \(col) IS NULL;", -1, &countStmt, nil) == SQLITE_OK {
             if sqlite3_step(countStmt) == SQLITE_ROW {
                 totalCandidates = Int(sqlite3_column_int(countStmt, 0))
             }
         }
         sqlite3_finalize(countStmt)
-        halLog("HALDEBUG-EMBEDDING: reEmbedAllNullRows starting — \(totalCandidates) candidate rows with NULL embedding")
+        halLog("HALDEBUG-EMBEDDING: backfillEmbeddings(\(backend.rawValue)) starting — \(totalCandidates) rows with NULL \(col)")
         guard totalCandidates > 0 else { return (0, 0, 0) }
 
-        // Pull ids + content in one pass; UPDATE in a second pass via
-        // prepared statement. Reading + writing in the same step would
-        // require recursive SQL or a held-cursor write, both of which
-        // surprise SQLite locking. Two passes is cleaner.
-        let selectSQL = "SELECT id, content FROM unified_content WHERE embedding IS NULL ORDER BY rowid ASC;"
+        // Pull ids + content in one pass; UPDATE in a second pass via a prepared
+        // statement. Reading + writing in the same step would surprise SQLite
+        // locking. Two passes is cleaner.
+        let selectSQL = "SELECT id, content FROM unified_content WHERE \(col) IS NULL ORDER BY rowid ASC;"
         var selStmt: OpaquePointer?
         guard sqlite3_prepare_v2(db, selectSQL, -1, &selStmt, nil) == SQLITE_OK else {
-            halLog("HALDEBUG-EMBEDDING: reEmbedAllNullRows — failed to prepare SELECT")
+            halLog("HALDEBUG-EMBEDDING: backfillEmbeddings — failed to prepare SELECT")
             return (0, 0, 0)
         }
         var pairs: [(id: String, content: String)] = []
@@ -745,10 +757,10 @@ class MemoryStore: ObservableObject {
         }
         sqlite3_finalize(selStmt)
 
-        let updateSQL = "UPDATE unified_content SET embedding = ? WHERE id = ?;"
+        let updateSQL = "UPDATE unified_content SET \(col) = ? WHERE id = ?;"
         var updStmt: OpaquePointer?
         guard sqlite3_prepare_v2(db, updateSQL, -1, &updStmt, nil) == SQLITE_OK else {
-            halLog("HALDEBUG-EMBEDDING: reEmbedAllNullRows — failed to prepare UPDATE")
+            halLog("HALDEBUG-EMBEDDING: backfillEmbeddings — failed to prepare UPDATE")
             return (0, 0, 0)
         }
         defer { sqlite3_finalize(updStmt) }
@@ -764,11 +776,11 @@ class MemoryStore: ObservableObject {
                 skipped += 1
                 continue
             }
-            let vector = generateEmbedding(for: trimmed, as: .document)
+            // Embed with the TARGET backend explicitly (not the active one).
+            let vector = EmbeddingProvider.shared.embed(trimmed, as: .document, in: backend) ?? []
             if vector.isEmpty {
-                // Backend not ready or embed returned nil. Leave embedding
-                // NULL and try again later. Don't count as failure if the
-                // backend just isn't loaded yet.
+                // Backend not ready / model not present. Leave NULL and retry
+                // later; don't count as a hard failure.
                 failed += 1
                 continue
             }
@@ -784,16 +796,47 @@ class MemoryStore: ObservableObject {
                 updated += 1
             } else {
                 failed += 1
-                halLog("HALDEBUG-EMBEDDING: reEmbedAllNullRows — UPDATE failed for id=\(pair.id.prefix(8)) result=\(stepResult)")
+                halLog("HALDEBUG-EMBEDDING: backfillEmbeddings — UPDATE failed for id=\(pair.id.prefix(8)) result=\(stepResult)")
             }
 
             if (index + 1) % progressStep == 0 || index == pairs.count - 1 {
                 let pct = Int(Double(index + 1) / Double(pairs.count) * 100)
-                halLog("HALDEBUG-EMBEDDING: reEmbedAllNullRows progress \(pct)% (\(index + 1)/\(pairs.count)) updated=\(updated) skipped=\(skipped) failed=\(failed)")
+                halLog("HALDEBUG-EMBEDDING: backfillEmbeddings(\(backend.rawValue)) progress \(pct)% (\(index + 1)/\(pairs.count)) updated=\(updated) skipped=\(skipped) failed=\(failed)")
             }
         }
-        halLog("HALDEBUG-EMBEDDING: reEmbedAllNullRows complete — updated=\(updated) skipped=\(skipped) failed=\(failed)")
+        halLog("HALDEBUG-EMBEDDING: backfillEmbeddings(\(backend.rawValue)) complete — updated=\(updated) skipped=\(skipped) failed=\(failed)")
         return (updated, skipped, failed)
+    }
+
+    /// Back-compat shim: fill the ACTIVE backend's column for rows missing it.
+    /// Existing callers (the embedder migration coordinator, the
+    /// MIGRATE_EMBEDDINGS_REEMBED API verb) keep working; they now target the
+    /// active backend's per-backend column instead of the retired single column.
+    nonisolated func reEmbedAllNullRows() -> (updated: Int, skipped: Int, failed: Int) {
+        return backfillEmbeddings(for: EmbeddingBackend.current())
+    }
+
+    /// Per-backend embedding coverage across `unified_content`: total rows and,
+    /// for each backend, how many have that backend's column filled. Powers the
+    /// EMBEDDING_COVERAGE diagnostic and the backfill/A-B workflow (you can't
+    /// compare backends whose columns are empty).
+    nonisolated func embeddingCoverage() -> (total: Int, filled: [String: Int]) {
+        guard ensureHealthyConnection() else { return (0, [:]) }
+        func scalar(_ sql: String) -> Int {
+            var stmt: OpaquePointer?
+            var v = 0
+            if sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK, sqlite3_step(stmt) == SQLITE_ROW {
+                v = Int(sqlite3_column_int(stmt, 0))
+            }
+            sqlite3_finalize(stmt)
+            return v
+        }
+        let total = scalar("SELECT count(*) FROM unified_content;")
+        var filled: [String: Int] = [:]
+        for backend in EmbeddingBackend.allCases {
+            filled[backend.rawValue] = scalar("SELECT count(*) FROM unified_content WHERE \(backend.vectorColumn) IS NOT NULL;")
+        }
+        return (total, filled)
     }
 
 
@@ -1872,6 +1915,11 @@ class MemoryStore: ObservableObject {
                             let embeddingBlob = embedding.withUnsafeBufferPointer { buffer in
                                 Data(buffer: buffer)
                             }
+                            // v2.1 step 2: write into the ACTIVE backend's per-backend
+                            // column (the vector was produced by the active backend via
+                            // generateEmbedding). Inactive backends' columns are filled
+                            // separately by the backfill worker.
+                            let activeVectorColumn = EmbeddingBackend.current().vectorColumn
 
                             // SURGICAL DEBUG: Log exact values being stored
                             print("HALDEBUG-MEMORY: SURGERY - Store prep contentId='\(contentId.prefix(8))....' type='\(sourceType.rawValue)' sourceId='\(sourceId.prefix(8))....' pos=\(position)")
@@ -1882,10 +1930,13 @@ class MemoryStore: ObservableObject {
                             }
 
 
-                            // ENHANCED SQL with entity_keywords, device_type, turn_number, deliberation_round, and seat_number columns
+                            // ENHANCED SQL with entity_keywords, device_type, turn_number, deliberation_round, and seat_number columns.
+                            // v2.1 step 2: the embedding blob (param 3) lands in the
+                            // active backend's per-backend column (interpolated — a
+                            // fixed enum-derived identifier, never user input).
                             let sql = """
                             INSERT OR REPLACE INTO unified_content
-                            (id, content, embedding, timestamp, source_type, source_id, position, is_from_user, entity_keywords, recorded_by_model, metadata_json, device_type, turn_number, deliberation_round, seat_number, created_at)
+                            (id, content, \(activeVectorColumn), timestamp, source_type, source_id, position, is_from_user, entity_keywords, recorded_by_model, metadata_json, device_type, turn_number, deliberation_round, seat_number, created_at)
                             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
                             """
 
@@ -2526,10 +2577,15 @@ extension MemoryStore {
 
         // --- 1. Semantic retrieval — pure cosine similarity, no threshold ---
         print("HALDEBUG-SEARCH: Performing semantic retrieval (RRF-style, no threshold)...")
+        // v2.1 step 2: read the ACTIVE backend's per-backend column (the query was
+        // embedded with the active backend just above). Rows whose active column
+        // is still NULL (not yet backfilled) simply don't contribute a semantic
+        // candidate — BM25 carries them until the backfill fills the column.
+        let activeVectorColumn = EmbeddingBackend.current().vectorColumn
         let semanticSQL = """
-        SELECT id, content, embedding, source_type, source_id, position, metadata_json, timestamp, recorded_by_model
+        SELECT id, content, \(activeVectorColumn), source_type, source_id, position, metadata_json, timestamp, recorded_by_model
         FROM unified_content
-        WHERE embedding IS NOT NULL\(exclusionClause);
+        WHERE \(activeVectorColumn) IS NOT NULL\(exclusionClause);
         """
 
         var semanticScored: [(id: String, score: Double)] = []
@@ -2905,10 +2961,13 @@ extension MemoryStore {
         // Create a map of content -> timestamp by re-scanning results
         var contentTimestampMap: [String: Date] = [:]
         
+        // v2.1 step 2: cover ALL rows (this is just a content→timestamp lookup
+        // for attaching timestamps to already-retrieved snippets). The old
+        // `embedding IS NOT NULL` filter would miss rows retrieved via BM25 whose
+        // active-backend column isn't filled yet, dropping their timestamp label.
         let timestampSQL = """
         SELECT content, timestamp
-        FROM unified_content
-        WHERE embedding IS NOT NULL OR entity_keywords IS NOT NULL;
+        FROM unified_content;
         """
         var tsStmt: OpaquePointer?
         if sqlite3_prepare_v2(db, timestampSQL, -1, &tsStmt, nil) == SQLITE_OK {
@@ -3751,10 +3810,12 @@ extension MemoryStore {
             return "{\"status\":\"error\",\"message\":\"empty query embedding\"}"
         }
 
+        // v2.1 step 2: read the ACTIVE backend's per-backend column.
+        let activeVectorColumn = EmbeddingBackend.current().vectorColumn
         let sql = """
-        SELECT id, content, source_type, source_id, position, length(embedding) AS bytes, embedding
+        SELECT id, content, source_type, source_id, position, length(\(activeVectorColumn)) AS bytes, \(activeVectorColumn)
         FROM unified_content
-        WHERE embedding IS NOT NULL
+        WHERE \(activeVectorColumn) IS NOT NULL
         ORDER BY created_at DESC, timestamp DESC
         LIMIT 500
         """

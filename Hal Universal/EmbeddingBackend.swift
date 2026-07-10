@@ -13,9 +13,11 @@
 //     via Apple's MLTensor (no MLX). Asymmetric retrieval, 522 MB on disk.
 //
 // The backend is selected via UserDefaults key "embeddingBackend"; default
-// is "nlcontextual". When the backend changes, wipeStaleEmbeddingsIfNeeded
-// detects the version mismatch (via systemVersion) and NULLs all stored
-// embeddings — the re-embed happens via reEmbedAllNullRows.
+// is "nlcontextual". As of v2.1 step 2, each backend owns a permanent
+// per-backend vector column (`vectorColumn`) in unified_content and all
+// vector sets coexist — switching backends just reads a different column
+// (no destructive wipe). An inactive backend's column is filled in the
+// background by `MemoryStore.backfillEmbeddings(for:)`.
 //
 // =====================================================================
 // HISTORY — EmbeddingGemma (removed 2026-05-20 as part of v2.0.1 hotfix)
@@ -184,8 +186,9 @@ nonisolated enum EmbeddingBackend: String, Sendable, CaseIterable {
     //       UserDefaults.standard.removeObject(forKey: crashGuardKey)
     //   }
 
-    /// Integer used by `wipeStaleEmbeddingsIfNeeded` so a backend change
-    /// triggers wipe-and-re-embed. Bump this when adding a new backend.
+    /// Legacy per-backend version integer. Was used by the retired destructive
+    /// wipe-on-switch; kept for the one-time legacy→per-backend-column migration
+    /// bookkeeping and as a stable per-backend id. Bump when adding a backend.
     nonisolated var systemVersion: Int {
         switch self {
         case .nlContextual: return 2  // matches original (post-NLEmbedding migration)
@@ -213,6 +216,26 @@ nonisolated enum EmbeddingBackend: String, Sendable, CaseIterable {
         case .nomicSwift: return "nomic-ai/nomic-embed-text-v1.5"
         case .mxbai: return "mixedbread-ai/mxbai-embed-large-v1"
         }
+    }
+
+    /// The `unified_content` BLOB column this backend's vectors live in (v2.1
+    /// step 2 — "keep-both" per-backend columns). Each backend owns a permanent
+    /// column so all backends' vectors coexist; switching backends just changes
+    /// which column the retriever reads/writes — no destructive wipe-and-re-embed.
+    /// A backfill worker fills an inactive backend's column in the background.
+    /// Column names are fixed enum-derived identifiers (never user input), so it
+    /// is safe to interpolate them into SQL.
+    nonisolated var vectorColumn: String {
+        switch self {
+        case .nlContextual: return "embedding_nl"
+        case .nomicSwift:   return "embedding_nomic"
+        case .mxbai:        return "embedding_mxbai"
+        }
+    }
+
+    /// All per-backend vector columns, for schema creation + coverage queries.
+    nonisolated static var allVectorColumns: [String] {
+        allCases.map { $0.vectorColumn }
     }
 
     // MARK: - UI surface (display strings)

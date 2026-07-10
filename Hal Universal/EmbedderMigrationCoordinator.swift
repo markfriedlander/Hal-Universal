@@ -142,10 +142,12 @@ final class EmbedderMigrationCoordinator: ObservableObject {
         let coordinator = self
         let storeRef = memoryStore
         pollTask = Task.detached(priority: .userInitiated) {
-            // Persist the new backend, wipe existing embeddings.
+            // v2.1 step 2: persist the new backend. NON-destructive — no wipe.
+            // Each backend owns a permanent per-backend column; the retriever
+            // just reads the new one. The backfill below fills the target
+            // backend's column for existing rows (rows already filled are
+            // skipped, so a re-switch back is instant with nothing to redo).
             UserDefaults.standard.set(target.rawValue, forKey: EmbeddingBackend.defaultsKey)
-            UserDefaults.standard.removeObject(forKey: "embeddingSystemVersion")
-            storeRef.wipeStaleEmbeddingsIfNeeded()
             // Kick off async warm-up; wait until loaded (cap at ~60s so
             // a busted load doesn't hang the UI forever).
             EmbeddingProvider.shared.warmUp()
