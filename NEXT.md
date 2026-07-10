@@ -132,19 +132,26 @@ retrieval quality improves regardless of how Bonsai turns out.
    updated embedder cards are compile-verified but not visually confirmed on the
    Model Library embedder screen (harness can't navigate there).
 
-6. **Ternary Bonsai 8B — evaluate + calibrate (CUT LINE).**
+6. **Ternary Bonsai 8B — evaluate + calibrate (CUT LINE).** IN PROGRESS.
    `prism-ml/Ternary-Bonsai-8B-mlx-2bit`. 1.58-bit ternary weights
    *trained* ternary (not post-hoc crushed → no usual 2-bit quality
    penalty), packed as standard MLX 2-bit, **Qwen3-8B architecture**,
-   Apache 2.0, ~2.3 GB, 65k context, ~27 tok/s on iPhone 17 Pro Max.
+   Apache 2.0, ~2.3 GB (actual: 2.32 GB, single `model.safetensors`),
+   65k context, ~27 tok/s on iPhone 17 Pro Max.
    Integration is a new `ModelConfiguration` seed in
    `ModelCatalogService.swift` on Hal's existing Qwen3 load path.
-   **Two real unknowns:** (a) Hal has only ever loaded 4-BIT MLX —
-   prove the 2-bit load on device first (~30 min gate before anything
-   else); (b) full calibration: temp / KV-cost estimate / layer-1
-   framing / Maxim suite vs the 2026-05-13 baselines (this is what got
-   Phi dropped — Bonsai must earn its slot the same way). Lighter alt
-   exists if ever wanted: `Ternary-Bonsai-1.7B-mlx-2bit` (Qwen3-1.7B,
+   **Unknown (a) — the 2-bit load — is RESOLVED GREEN 2026-07-11:** on
+   iPhone 16 Plus it loads via the existing non-catalog MLX path (~12s,
+   no jetsam) and generates coherent, accurate text (tides explainer +
+   solved the "17 sheep / all but 9" trap). See HISTORY 2026-07-11.
+   **Real caveat for (b): speed** — only ~4-5 tok/s generation on the
+   16 Plus (the 27 tok/s figure is 17 Pro MAX). **Remaining — unknown (b),
+   IN PROGRESS:** build the real curated seed + full calibration: temp /
+   KV-cost estimate / layer-1 framing / Maxim suite vs the 2026-05-13
+   baselines (this is what got Phi dropped — Bonsai must earn its slot the
+   same way). Gate ran via a new test-only `DOWNLOAD_MODEL:<id>:<sizeGB>`
+   size hint (repo ids have no ':'); no curated seed committed yet. Lighter
+   alt exists if ever wanted: `Ternary-Bonsai-1.7B-mlx-2bit` (Qwen3-1.7B,
    ~0.48 GB, 32k ctx).
 7. **EmbeddingGemma — PARKED watch-item (not dropped).** Mark wants it:
    EmbeddingGemma 300M is MTEB SOTA for open <500M and "supposed to be

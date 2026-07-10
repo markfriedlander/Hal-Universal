@@ -4278,3 +4278,45 @@ screen (harness can't navigate there) — flagged for a Mark eyeball.
 New instruments kept: `tests/rrf_global_sweep.py`, `tests/rrf_deep_sweep.py`.
 Per-embedder tuning stays deferred (Mark: "maybe will tune per model another
 time"). This closes v2.1 item 5.5.
+
+---
+
+## 2026-07-11 (Ternary Bonsai — the 2-bit load gate)
+
+v2.1 item 6 (Ternary Bonsai 8B) opened with its designated first move: prove the
+2-bit MLX load on device BEFORE any integration or calibration. Hal has only ever
+loaded 4-BIT MLX (the whole curated tier is 4-bit); Bonsai
+(`prism-ml/Ternary-Bonsai-8B-mlx-2bit`) is 1.58-bit ternary weights packed as
+standard MLX 2-bit on the Qwen3-8B architecture. Two real risks going in: (a) does
+mlx-swift's 2-bit quant path load at all, and (b) does an 8B fit in memory on the
+iPhone 16 Plus (a non-Pro A18) without jetsam.
+
+We ran the gate with ZERO curated-seed commitment, entirely through the test API —
+the honest "prove before you integrate" path. One snag surfaced first: a bare
+`DOWNLOAD_MODEL:<arbitrary-repo>` was refused with "this model's size couldn't be
+determined from its repository." That message is misleading — it's not a network or
+repo problem (the repo is public, 2.32 GB, a single `model.safetensors`). It's the
+disk-space PRE-FLIGHT guard: the downloader never probes HF for size, it relies on
+`sizeGB` coming from the catalog, and a non-curated id carries none, so the guard
+refuses outright. Fix was a tiny test-only affordance: `DOWNLOAD_MODEL:<id>:<sizeGB>`
+accepts an optional size hint (repo ids never contain ':'), used only when the id
+isn't in the catalog. That let the harness size-check and download Bonsai without
+seeding it first. (Noted as a latent limitation: community-model downloads of truly
+arbitrary ids can't self-size — a real fix would probe HF when sizeGB is nil.)
+
+Result: **gate GREEN on both unknowns.** SET_MODEL to the downloaded 2-bit repo
+went through Hal's existing non-catalog load path (switchToModel builds a minimal
+config and calls setupLLM); MLX_STATE reported `isModelLoaded=true`, "MLX model
+loaded successfully", no mlxError, load in ~12s, and — critically — no memory crash
+(the 8B@2-bit fit on the 16 Plus). Generation is coherent and accurate: a clean
+two-sentence explanation of the tides, and it correctly solved the "17 sheep, all
+but 9 run away → 9" language trap with sound reasoning. The "trained-ternary, no
+2-bit quality penalty" claim holds up in first contact.
+
+One real caveat for calibration: **speed.** ~4-5 tok/s generation on the 16 Plus
+(~17-20s for those short answers) — the ~27 tok/s in our notes is the 17 Pro MAX;
+an 8B on a non-Pro A18 is much slower. Usable but deliberate; this is exactly the
+kind of thing the calibration pass (unknown b) has to weigh, alongside the Maxim
+suite vs the 2026-05-13 baselines. Next: build the real curated `ModelConfiguration`
+seed in ModelCatalogService.swift and run the full calibration — Bonsai must earn
+its curated slot the same way Phi failed to.

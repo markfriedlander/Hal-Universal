@@ -491,8 +491,18 @@ class HalTestConsole: ObservableObject {
             return buildModelListJSON(vm: vm)
 
         } else if trimmed.hasPrefix("DOWNLOAD_MODEL:") {
-            let modelID = String(trimmed.dropFirst("DOWNLOAD_MODEL:".count)).trimmingCharacters(in: .whitespaces)
-            return await startModelDownload(modelID, vm: vm)
+            // Optional trailing :<sizeGB> hint. The disk-space pre-flight refuses
+            // a download whose size it can't determine, and a raw (non-curated)
+            // repo id carries no sizeGB — so a bare DOWNLOAD_MODEL of an arbitrary
+            // repo is refused. Repo ids never contain ':', so a second
+            // colon-separated field is unambiguously the size hint. Test-only:
+            // lets the harness run a load gate on a model before a curated seed
+            // (with its own sizeGB) exists — e.g. the Ternary Bonsai 2-bit gate.
+            let arg = String(trimmed.dropFirst("DOWNLOAD_MODEL:".count)).trimmingCharacters(in: .whitespaces)
+            let parts = arg.split(separator: ":", maxSplits: 1, omittingEmptySubsequences: false).map(String.init)
+            let modelID = parts[0].trimmingCharacters(in: .whitespaces)
+            let sizeHint = parts.count > 1 ? Double(parts[1].trimmingCharacters(in: .whitespaces)) : nil
+            return await startModelDownload(modelID, sizeHintGB: sizeHint, vm: vm)
 
         } else if trimmed.hasPrefix("MODEL_STATUS:") {
             let modelID = String(trimmed.dropFirst("MODEL_STATUS:".count)).trimmingCharacters(in: .whitespaces)
@@ -1600,7 +1610,7 @@ class HalTestConsole: ObservableObject {
         return "{\"status\":\"ok\",\"models\":[\(entries.joined(separator: ","))]}"
     }
 
-    private func startModelDownload(_ modelID: String, vm: ChatViewModel) async -> String {
+    private func startModelDownload(_ modelID: String, sizeHintGB: Double? = nil, vm: ChatViewModel) async -> String {
         if MLXModelDownloader.shared.isModelDownloaded(modelID) {
             return "{\"status\":\"ok\",\"modelID\":\"\(jsonStringEscape(modelID))\",\"note\":\"already downloaded\"}"
         }
@@ -1612,7 +1622,7 @@ class HalTestConsole: ObservableObject {
             let shortName = modelID.split(separator: "/").last.map(String.init) ?? modelID
             model = ModelConfiguration(
                 id: modelID, displayName: shortName, source: .mlx,
-                sizeGB: nil, contextWindow: 4096, license: nil, description: nil,
+                sizeGB: sizeHintGB, contextWindow: 4096, license: nil, description: nil,
                 isDownloaded: false, localPath: nil
             )
         }
