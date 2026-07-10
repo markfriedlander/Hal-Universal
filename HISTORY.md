@@ -4146,3 +4146,50 @@ explicit-backend embed primitive from step 1.
 
 Step 3 (A/B + model cards + choice UI) is next; the backfill + coverage tools
 built here are exactly what the A/B needs.
+
+### 2026-07-09 (continued) — v2.1 item 5, STEP 3: A/B, model cards, choice UI
+
+With all three embedders coexisting in the DB (step 2), ran the head-to-head Mark
+asked for and turned it into a user-facing choice.
+
+**The A/B (`tests/embedder_ab_eval.py`, device).** Same curated SAME/RELATED/UNREL
+pair set through each backend via SET_EMBEDDING_BACKEND (now instant) +
+EMBED_SIM_BATCH. Headline metric SEPARATION = mean(SAME) − mean(UNREL) (how well a
+backend pulls related content apart from noise — the retrieval-quality signal):
+
+  mxbai 0.480  ≫  Nomic 0.303  ≫  NLContextual 0.101
+
+The story is the UNREL column: NLContextual rates *unrelated* text at 0.82 (barely
+separates signal from noise — lots of generic English-structure similarity); Nomic
+0.55; mxbai 0.36 (cleanest gap by far). Full tables in
+`Docs/Embedder_AB_Findings_2026-07-09.md`.
+
+**Calibration.** mxbai's synthesis threshold was a 0.85 placeholder; measured
+RELATED tops out at 0.79, so the calibrated value is **0.82** (just above the
+RELATED tail, capturing clearer duplicates without merging same-topic pairs —
+same logic as Nomic's 0.85). Contradiction threshold set to **0.5**
+(distribution-informed; still soft pending real evolution events).
+
+**Product decision — keep all three, let the user choose.** Not one-size-fits-all:
+NLContextual stays the default/always-available (built-in, no download — Hal must
+work on first launch with nothing downloaded); Nomic is the balanced middle; mxbai
+is `isRecommended = true` (sharpest retrieval, heaviest ~670 MB, opt-in). Encoded
+as model cards: the `blurb` for each now states its retrieval strength + tradeoffs
+in plain language, and the Model Library embedder row shows a "Recommended" badge
+for mxbai.
+
+**UI honesty fix.** The embedder-switch confirmation dialog still said "existing
+embeddings will be wiped and regenerated" — false since step 2. Rewrote it: nothing
+is deleted, each embedder keeps its own vectors, switch back is instant, and Hal
+backfills the new one in the background (keyword search covers older memories until
+ready).
+
+**Verification.** A/B + calibration are device-measured; thresholds + cards +
+badge + isRecommended build clean (no warnings) and the app launches + renders
+Settings fine. The "Recommended" badge and new card copy are compile-verified and
+functionally sound but NOT yet visually confirmed on the exact Model Library
+embedder screen — the test harness can't navigate there directly; flagged for a
+Mark eyeball. All embedder *behavior* (switch/backfill/coverage/retrieval) is
+device-verified via the step-2 tests. Device restored to NLContextual.
+
+**v2.1 item 5 (mxbai + multi-embedder) is complete across all three steps.**

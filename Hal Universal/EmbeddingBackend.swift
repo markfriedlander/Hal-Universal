@@ -250,18 +250,33 @@ nonisolated enum EmbeddingBackend: String, Sendable, CaseIterable {
         }
     }
 
-    /// Short description used in the embedder card body.
+    /// Short "model card" description shown in the embedder card body. The
+    /// retrieval-strength language reflects the measured separation between
+    /// related and unrelated memories (tests/embedder_ab_eval.py, 2026-07-09):
+    /// mxbai (0.48) > Nomic (0.30) > NLContextual (0.10).
     var blurb: String {
         switch self {
         case .nlContextual:
-            return "Built into iOS 26+. Runs on the Neural Engine. 512-dim sentence vectors. No download, always available."
+            return "Apple's built-in on-device embedder. 512-dim, runs on the Neural Engine, no download — always available and the default. Fastest and lightest, but the coarsest at telling related memories from unrelated ones. Best when you want zero setup and minimal storage."
         // REMOVED 2026-05-20:
         // case .embeddingGemma:
         //     return "Google's open embedding model, 308M params, MLX 4-bit quantized. 768-dim, state-of-the-art on MTEB Multilingual v2 among models under 500M. Adds ~210 MB on disk."
         case .nomicSwift:
-            return "Nomic AI's open embedding model, 137M params, 768-dim, purpose-built for asymmetric retrieval (query vs document). Runs via Apple's MLTensor framework (no MLX). Adds ~522 MB on disk."
+            return "Nomic Embed Text v1.5. 137M params, 768-dim, purpose-built for asymmetric retrieval. On-device via Apple's MLTensor (no MLX). A solid middle ground — noticeably sharper at distinguishing related from unrelated memories than the built-in embedder, at ~522 MB and moderate speed."
         case .mxbai:
-            return "Mixedbread's mxbai-embed-large-v1, 335M params, 1024-dim. BERT-large via the same swift-embeddings path as Nomic (no MLX). CLS pooling, asymmetric retrieval (query prefix). The strongest retrieval of the three and the heaviest. Adds ~670 MB on disk."
+            return "Mixedbread mxbai-embed-large-v1. BERT-large, 335M params, 1024-dim, CLS pooling, asymmetric retrieval. On-device via the same path as Nomic (no MLX). The sharpest memory retrieval of the three — recommended when recall quality matters most. The heaviest and slowest to embed; ~670 MB on disk."
+        }
+    }
+
+    /// Whether to badge this backend as "Recommended" in the picker. mxbai wins
+    /// on retrieval quality (see `blurb`); it's opt-in (a download) rather than
+    /// the default because Hal must work on first launch with no download —
+    /// that's NLContextual's job. So: NLContextual = default/always-available,
+    /// mxbai = recommended-for-quality, Nomic = balanced middle.
+    var isRecommended: Bool {
+        switch self {
+        case .mxbai: return true
+        case .nlContextual, .nomicSwift: return false
         }
     }
 
@@ -332,13 +347,18 @@ nonisolated enum EmbeddingBackend: String, Sendable, CaseIterable {
             // zone.
             return 0.85
         case .mxbai:
-            // PLACEHOLDER (v2.1 item 5, step 1) — mxbai's CLS/L2-normalized
-            // cosine distribution differs from Nomic's and must be calibrated on
-            // reflection-shaped SAME/RELATED pairs in step 3 (the A/B pass)
-            // before this is trusted. 0.85 is a conservative starting point, not
-            // a measured value. See tests/nomic_calibration_probe.py for the
-            // probe shape to reuse.
-            return 0.85
+            // Calibrated 2026-07-09 via tests/embedder_ab_eval.py on
+            // reflection-shaped pairs (device, iPhone 16 Plus). mxbai's
+            // CLS/L2-normalized cosine distribution is much wider than Nomic's:
+            //   SAME    0.79 – 0.92  (mean 0.84)
+            //   RELATED 0.58 – 0.79  (mean 0.67)
+            //   UNREL   0.26 – 0.49  (mean 0.36)
+            // As with Nomic, SAME and RELATED overlap at the bottom, so the
+            // threshold sits just ABOVE the RELATED tail (max 0.79 + headroom).
+            // 0.82 captures the clearer SAME duplicates while never merging an
+            // observed RELATED pair. Conservative bias is correct — synthesis is
+            // destructive. See Docs/Embedder_AB_Findings_2026-07-09.md.
+            return 0.82
         // REMOVED 2026-05-20:
         // case .embeddingGemma:
         //     // PLACEHOLDER — calibrate from real corpus data when re-enabled.
@@ -378,9 +398,11 @@ nonisolated enum EmbeddingBackend: String, Sendable, CaseIterable {
             // 0.4-0.5), but we'll know after observing real evolutions.
             return 0.6
         case .mxbai:
-            // PLACEHOLDER (v2.1 item 5) — calibrate in step 3 alongside the
-            // synthesis threshold.
-            return 0.6
+            // Distribution-informed (2026-07-09 A/B): mxbai's RELATED band
+            // centers ~0.67 and UNREL ~0.36, so ~0.5 is a sensible "aligned vs
+            // in-tension" boundary (below RELATED, above UNREL). Still soft —
+            // like the others, refine from real trait-evolution events.
+            return 0.5
         // REMOVED 2026-05-20:
         // case .embeddingGemma:
         //     // PLACEHOLDER — calibrate when re-enabled.

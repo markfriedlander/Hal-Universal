@@ -226,6 +226,20 @@ struct EmbedderBackendRow: View {
                         // row labels.
                         .lineLimit(2)
                         .fixedSize(horizontal: false, vertical: true)
+                    // "Recommended" badge — mxbai wins the retrieval-quality A/B
+                    // (see EmbeddingBackend.isRecommended + the findings doc).
+                    if backend.isRecommended {
+                        Text("Recommended")
+                            .font(.caption2)
+                            .fontWeight(.semibold)
+                            .foregroundColor(.accentColor)
+                            .padding(.horizontal, 6)
+                            .padding(.vertical, 2)
+                            .background(Color.accentColor.opacity(0.15))
+                            .clipShape(Capsule())
+                            .lineLimit(1)
+                            .fixedSize()
+                    }
                     Spacer(minLength: 8)
                     if let size = backend.sizeBlurb {
                         Text(size)
@@ -271,12 +285,12 @@ struct EmbedderBackendRow: View {
             isPresented: $showingConfirm,
             titleVisibility: .visible
         ) {
-            Button("Switch and re-embed memories", role: .destructive) {
+            Button("Switch") {
                 coordinator.switchAndMigrate(to: backend, memoryStore: chatViewModel.memoryStore)
             }
             Button("Cancel", role: .cancel) {}
         } message: {
-            Text("Existing embeddings will be wiped and regenerated with \(backend.displayName). This may take a few minutes depending on your memory size.")
+            Text("Nothing is deleted — each embedder keeps its own copy of your memory vectors, so you can switch back instantly. Hal will fill in \(backend.displayName)'s vectors in the background; that can take a few minutes depending on your memory size, during which some older memories rely on keyword search until they're ready.")
         }
     }
 
