@@ -1773,7 +1773,16 @@ class MLXModelDownloader: ObservableObject {
     }
     
     func getModelPath(_ modelID: String) -> URL? {
-        guard downloadedModelIDs.contains(modelID) else { return nil }
+        // Gate on the SAME shared-store disk-truth that `isModelDownloaded` uses,
+        // NOT Hal's private `downloadedModelIDs` record. A model a sibling app
+        // (Posey) downloaded is present in the App-Group store and selectable in
+        // the Model Library (the row uses isModelDownloaded), but it's not in
+        // Hal's own downloadedModelIDs — so the old guard returned nil here, the
+        // MLX load failed with "not downloaded," and switchToModel reverted to the
+        // previous model. That's the "tried to switch to Dolphin, got Bonsai" bug
+        // (2026-07-11): the two presence checks disagreed. Keeping them identical
+        // fixes it and lets Hal load any model present in the shared store.
+        guard isModelDownloaded(modelID) else { return nil }
         let path = modelPath(for: modelID)
         return FileManager.default.fileExists(atPath: path.path) ? path : nil
     }
