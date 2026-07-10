@@ -4,15 +4,20 @@
 // Extracted from Hal.swift 2026-05-17 afternoon as part of the standing
 // refactor-as-you-go directive.
 //
-// Drives the user-facing flow for upgrading the embedding backend:
+// Drives the user-facing flow for switching the embedding backend:
 //   1. Download a non-built-in backend's model files (e.g. Nomic Embed
-//      Text v1.5, 522 MB) via the existing MLXModelDownloader /
-//      BackgroundDownloadCoordinator pipeline.
-//   2. Switch the active backend (UserDefaults + wipe existing embeddings).
-//   3. Re-embed all stored rows in the background (the migration).
+//      Text v1.5 ~522 MB, or mxbai ~670 MB) via the existing
+//      MLXModelDownloader / BackgroundDownloadCoordinator pipeline.
+//   2. Switch the active backend (UserDefaults). As of v2.1 step 2 this is
+//      NON-destructive: each backend has its own vector column
+//      (embedding_nl / embedding_nomic / embedding_mxbai), so switching
+//      never wipes anything.
+//   3. Backfill the newly active backend's column in the background for any
+//      rows it hasn't embedded yet (a no-op when switching back to one that
+//      was already filled — so a re-switch is instant with nothing to redo).
 //
-// Two-way: every step is reversible. Switching back to Apple NLContextual
-// goes through the same wipe + re-embed flow.
+// Two-way: every step is reversible, and switching back is instant because
+// the other backends' vectors were never discarded.
 //
 // State is a single @Published `phase`. The UI observes it to render
 // the appropriate label + progress (download progress bar, then migration

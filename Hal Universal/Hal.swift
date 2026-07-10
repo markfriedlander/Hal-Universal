@@ -6621,8 +6621,10 @@ struct ModelLibraryView: View {
 
                 // ── EMBEDDING (MEMORY) ──────────────────────────────────
                 // Switchable embedder backends. Apple NLContextual is the
-                // built-in default; EmbeddingGemma is an optional upgrade
-                // that downloads and migrates the user's stored memories.
+                // built-in default; Nomic and mxbai are optional stronger
+                // downloads. As of v2.1 step 2, switching is instant and
+                // non-destructive — each backend keeps its own vector column,
+                // so no re-embed is needed to switch back.
                 Section {
                     // Render one row per available backend. Backends with
                     // isAvailableInThisBuild == false (e.g. Gemma in App
@@ -6635,7 +6637,7 @@ struct ModelLibraryView: View {
                 } header: {
                     Label("Embedding (Memory)", systemImage: "brain")
                 } footer: {
-                    Text("The embedding model powers memory recall during chat. Apple NLContextual is built in. Nomic Embed Text v1.5 is a stronger model — better discrimination on semantic similarity, especially asymmetric query/document retrieval. Adds ~522 MB. Switching backends re-embeds your stored memories.")
+                    Text("The embedding model powers how Hal recalls your memories during chat. Apple NLContextual is built in and always available; Nomic Embed Text v1.5 (~522 MB) and Mixedbread mxbai (~670 MB) are optional stronger downloads. Switching between them is instant and non-destructive — each keeps its own copy of your memory vectors, and Hal fills in a newly chosen one in the background.")
                         .font(.caption2)
                 }
 

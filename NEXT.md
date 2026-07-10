@@ -1092,6 +1092,31 @@ Still not covered:
 
 ## Side work (not blocking)
 
+### 0a. Per-embedder RRF tuning — SAVED FOR A FUTURE RELEASE (Mark, 2026-07-10)
+
+Item 5.5 landed a single GLOBAL fusion default (`rrfKSemantic=15`). Per-embedder
+deltas were investigated (the global sweep showed the safe family holds `kBM25d=10`
+and lowers only `kSem`; nomic/mxbai benefit from going lower, nlcontextual is flat)
+but deliberately deferred — Mark: "let's save per-embedder tuning for another
+release." Everything needed is already in place: the tunable knobs
+(`SET_RRF_SEMANTIC_K` etc.), the sweep harnesses (`tests/rrf_global_sweep.py`,
+`rrf_deep_sweep.py`), and the storage pattern to copy (the existing per-embedder
+synthesis/contradiction thresholds in `EmbeddingBackend.swift`). Plan when picked
+up: sweep each backend separately, keep a per-embedder `kSem` ONLY where it beats
+the global by a real margin, and guard overfitting (expand the eval corpus + hold
+out queries before locking). Candidate for v2.2.
+
+### 0b. Fix the test antenna so CC can navigate ALL screens (Mark, 2026-07-10)
+
+The local-API test harness can drive most of Hal, but it CANNOT navigate to some
+screens — notably the Model Library embedder cards — so UI/copy changes there land
+compile-verified but not visually confirmed, forcing a "Mark eyeball." (This is how
+the stale embedder-section footer — "Switching backends re-embeds your stored
+memories," fixed 2026-07-10 — went unseen by CC.) Extend the `SET_UI_STATE` /
+navigation verbs (or add new ones) so the harness can open the Model Library, expand
+an embedder card, and screenshot it. Would let CC self-verify embedder + model-card
+UI without waiting on Mark. Tooling, not user-facing.
+
 ### A. Re-enable EmbeddingGemma when upstream MLX ships fix
 
 Re-enable recipe at top of `EmbeddingBackend.swift`. Track mlx-swift
