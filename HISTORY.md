@@ -3941,3 +3941,47 @@ antenna (same way increment #1's delete cycle was checked). Device left clean:
 in, the actor-isolation caution, how to verify) + a pointer at the top of
 Posey's `next.md`. The lock is only fully effective once BOTH apps carry it;
 Hal-first is a safe pure-addition. Mark will make sure Posey follows the note.
+
+### 2026-07-09 (continued) — download lock verified END-TO-END across both real apps
+
+Closed the honesty gap from the entry above (which shipped "decision logic
+device-verified, full orchestration code-review-verified, not a real two-app
+concurrent download"). Mark gave the go-ahead and Posey's antenna token, so I
+drove the real two-app test myself (Qwen 3.5 2B as the guinea-pig model;
+foreground-switching via `devicectl` since only the foreground app's antenna
+answers). All three paths passed:
+
+- **Wait (Test A).** Deleted Qwen via Posey → absent. Planted a fresh Posey lock,
+  fired `DOWNLOAD_MODEL` on Hal: Hal entered the wait state (UI "downloading" but
+  progress 0), the lock stayed held by Posey (Hal did **not** acquire), and **zero
+  bytes** were written — Hal did not start a duplicate.
+- **Take-over (Test B).** Re-planted the lock near-stale (age 599, window 600):
+  within 3s Hal acquired the now-stale lock (holder flipped Posey→Hal) and began a
+  **real** download (42% in ~3s). Cancelled immediately — the lock was released on
+  cancel (lockCount→0), confirming release-on-cancel. Deleted the partial → absent.
+- **Adopt (Test C) — the headline.** Planted a fresh Posey lock, fired Hal's
+  download → Hal waited. Switched to Posey, which **really downloaded** Qwen
+  (~1.5 GB, 135s, progress 0→1.0) into the shared store and claimed it. Back on
+  Hal: while the (still-planted) Posey lock was held, Hal kept waiting even though
+  the files were now fully present — it read the shared dir and showed ~90%
+  "downloading in Posey", but did **not** adopt while the lock was held (correct).
+  The moment I cleared the lock (simulating updated-Posey's `releaseDownloadLock`),
+  Hal **adopted within 2s**: claim added (`[Posey, Hal]`), `downloaded=true`,
+  `progress=1.0`, **zero bytes downloaded** (a real download is 135s; 2s is
+  impossible — it claimed Posey's existing files). The lock holder never became
+  "Hal" in this phase, proving no take-over/re-download.
+
+Two synthetic pieces stood in for the not-yet-updated Posey: the lock was
+*planted* (real Posey doesn't write one yet) and the release was a manual *clear*
+(real Posey doesn't release yet). Those are exactly the two lines Posey gains
+when it adopts the block — everything else (Hal entering wait on a real download
+attempt, Posey's real download landing in the shared store, Hal detecting
+completion and adopting with zero re-download, release-on-cancel, take-over on
+stale) was real. So the interim behavior is also now known: until Posey ships the
+block, a Hal download that races a Posey download will *wait* on Posey's lock
+only if one exists — since Posey writes none today, both would still download; the
+full mutual protection needs Posey's half, as the note says.
+
+**Device restored to baseline:** all four models present, all `[Posey]`, no
+stray locks, Hal on AFM. Qwen was re-downloaded by Posey (the one real cost) and
+Hal's adopt-claim released back to `[Posey]`.

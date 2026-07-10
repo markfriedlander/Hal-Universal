@@ -84,12 +84,13 @@ download; see HISTORY). `MLXModelDownloader` gains `performLockedDownload` (the
 split-out download body), `awaitSharedDownloadThenAdopt` (the wait/adopt/take-
 over loop), `adoptSharedModel`, a lock heartbeat in the progress loop, and lock
 release on success/cancel/error. `DOWNLOAD_LOCK` API verb + new
-`tests/download_lock_regression.py`. **Device-verified: DECISION LOGIC only**
-(fresh→wait, stale→take-over, release); the full wait→adopt→take-over
-orchestration is code-review + primitive-verified, NOT a real two-app concurrent
-download (all 4 models present → the already-present guard blocks the download
-path; real race needs an absent model + coordinated timing → later Posey-antenna
-spot-check). **Posey must adopt the matching block** for full two-app protection
+`tests/download_lock_regression.py`. **Verified END-TO-END across both real apps**
+(2026-07-09, Qwen 3.5 2B, Posey antenna): wait (Hal doesn't duplicate),
+take-over-on-stale (Hal starts a real download + release-on-cancel), and the
+headline adopt (Posey really downloads ~1.5 GB → Hal adopts the finished copy in
+2s with ZERO bytes). The lock-plant + lock-release were simulated (the two lines
+Posey doesn't have yet); everything else was real. Device restored to baseline.
+**Posey must adopt the matching block** for full two-app protection
 (Hal-first is a safe pure addition) — adoption note at
 `Posey/docs-internal/CROSS_APP_DOWNLOAD_LOCK.md` + pointer in Posey `next.md`.
 

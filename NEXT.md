@@ -62,15 +62,15 @@ retrieval quality improves regardless of how Bonsai turns out.
    download — see HISTORY 2026-07-09). New `SharedModelStore` BLOCK SMS.4 +
    `MLXModelDownloader` `performLockedDownload`/`awaitSharedDownloadThenAdopt`/
    `adoptSharedModel` + release sites; `DOWNLOAD_LOCK` API verb;
-   `tests/download_lock_regression.py`. **Device-verified: decision logic
-   only** (fresh→wait, stale→take-over, release) — the full
-   wait→adopt→take-over orchestration is code-review + primitive-verified,
-   NOT a real two-app concurrent download (all 4 models present on device →
-   already-present guard blocks the path; needs an absent model + coordinated
-   timing). Two-app spot-check available later via Posey antenna. **Posey must
-   adopt the matching block** for full protection — Hal-first is a safe pure
-   addition; adoption note left at `Posey/docs-internal/CROSS_APP_DOWNLOAD_LOCK.md`
-   + pointer in Posey `next.md`. **UX polish candidate (open):**
+   `tests/download_lock_regression.py`. **Verified END-TO-END across both real
+   apps 2026-07-09** (Qwen 3.5 2B, Posey antenna, foreground-switch via
+   devicectl): wait (Hal doesn't duplicate), take-over-on-stale (real download
+   starts + release-on-cancel), and the headline adopt (Posey really downloads
+   ~1.5 GB → Hal adopts the finished copy in 2s, ZERO bytes). Lock-plant +
+   lock-release were simulated (the two lines Posey lacks); all else real.
+   Device restored to `[Posey]` baseline. **Posey must adopt the matching block**
+   for full protection — Hal-first is a safe pure addition; adoption note at
+   `Posey/docs-internal/CROSS_APP_DOWNLOAD_LOCK.md` + pointer in Posey `next.md`. **UX polish candidate (open):**
    present-but-unclaimed models show "Download" (tap is instant/adopt) —
    consider "Add"/"Available (instant)" labeling; touches Posey too, decide
    together. Posey antenna for two-app testing: `169.254.214.164:8765`.
