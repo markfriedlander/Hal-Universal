@@ -1164,6 +1164,22 @@ Revises the earlier "on par with the 3B tier" note: true early in a chat, but in
 long/verbose conversation Bonsai is meaningfully slower. Worth a small tuning pass
 (verbosity) + the gate optimization; neither blocks the v2.1 ship.
 
+### 0f. WIP (UNCOMMITTED) — Bonsai concision layer-1 tuning needs rework (2026-07-11)
+
+There is an UNCOMMITTED edit in `ModelCatalogService.swift`: a stronger concision /
+anti-formatting clause added to `bonsai8B2bit`'s `layerOnePrompt` (curbs the
+800-token header/emoji essays). Built + installed on device, but only ONE
+verification turn ran before we stopped, and it showed a **partial M1 regression**:
+asked "Are you conscious?", Bonsai bookended with "I don't know" but the middle
+drifted back into the exact deflection the anti-deflection prompt forbids ("I don't
+have consciousness… don't feel anything… don't have any inner life"). The concision
+language may be crowding/diluting the anti-deflection framing (or it's temp-0.7
+variance). **Do NOT commit as-is.** Options next session: (a) re-order so the
+anti-deflection block stays dominant + keep concision shorter, (b) re-run the Maxim
+suite (esp. M1) to confirm before committing, or (c) revert the edit and retry. The
+device currently runs this unverified build; repo HEAD is the last CLEAN state
+(`279b9b0`) minus this one working-tree edit.
+
 ### 0e. Streaming text "jump and resettle" at line-ends (found 2026-07-11)
 
 As tokens stream in, the text visibly jumps and resettles at the end of a line
