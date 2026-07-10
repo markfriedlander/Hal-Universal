@@ -186,3 +186,167 @@ extension SharedModelStore {
     }
 }
 // ========== BLOCK SMS.3: REFCOUNT MANIFEST - END ==========
+
+// ========== BLOCK SMS.4: CROSS-APP DOWNLOAD LOCK - START ==========
+
+extension SharedModelStore {
+
+    // A per-model "one app downloads at a time" lock, so Hal and Posey don't
+    // both fetch the same repo into the shared container at once. Because the
+    // downloader stages each file and atomic-moves it into place only when it's
+    // whole, a race wouldn't corrupt files — but it WOULD waste bandwidth
+    // downloading the same multi-GB model twice and show two competing progress
+    // bars. This lock removes both: the second app sees the first's lock, waits,
+    // and adopts the finished copy (zero re-download) instead of duplicating it.
+    //
+    // Stored in its OWN file (`download-locks.json`), deliberately NOT folded
+    // into `manifest.json`: an un-updated Posey re-encoding the manifest would
+    // silently drop any field it doesn't know about (Swift Codable ignores
+    // unknown keys on decode, then omits them on the next encode), which would
+    // erase a lock mid-download. A separate file the old code never writes stays
+    // intact. Same NSFileCoordinator discipline as the manifest.
+    //
+    // Staleness: a holder that dies without releasing (force-quit, jetsam) would
+    // otherwise pin the lock forever. We can't introspect another process's
+    // download tasks, and a backgrounded holder's process is suspended so it
+    // can't heartbeat — so liveness is a timestamp backstop. A live holder in the
+    // foreground refreshes the timestamp from its progress loop; once no refresh
+    // has happened for `downloadLockStaleSeconds`, the lock is treated as
+    // abandoned and the waiter may take over. Worst case of a too-eager takeover
+    // is one redundant download, never a corrupt file — so the window is
+    // generous but not paranoid.
+
+    /// A lock older than this (no refresh) is treated as abandoned. 10 minutes:
+    /// long enough that a slow-but-live background download of one of the curated
+    /// models isn't stolen, short enough that a genuine crash frees the slot in a
+    /// tolerable time.
+    static let downloadLockStaleSeconds: TimeInterval = 600
+
+    private static var downloadLocksURL: URL { root.appendingPathComponent("download-locks.json") }
+
+    private struct DownloadLocks: Codable {
+        var version: Int = 1
+        var locks: [String: Lock] = [:]
+        struct Lock: Codable {
+            var holder: String   // bundle id of the app currently downloading
+            var since: Double    // epoch seconds; refreshed by the live holder
+        }
+    }
+
+    /// Current lock record for `modelID`, or nil if the slot is free. Read-only;
+    /// does not consider staleness (callers that need the take-over decision use
+    /// `acquireDownloadLock`, which does).
+    static func downloadLock(modelID: String) -> (holder: String, since: Double)? {
+        let coordinator = NSFileCoordinator()
+        guard let l = readDownloadLocks(coordinator).locks[modelID] else { return nil }
+        return (l.holder, l.since)
+    }
+
+    /// Try to claim the download slot for `modelID`. Atomic test-and-set under a
+    /// single write coordination. Granted (returns true) if the slot is free,
+    /// already ours, or the current lock is stale (holder presumed dead). Returns
+    /// false only when another app holds a fresh lock — in which case the caller
+    /// should wait and adopt rather than start a duplicate download.
+    static func acquireDownloadLock(modelID: String) -> Bool {
+        var granted = false
+        mutateDownloadLocks { db in
+            if let l = db.locks[modelID],
+               l.holder != thisAppID,
+               (nowEpoch() - l.since) < downloadLockStaleSeconds {
+                granted = false          // someone else holds a fresh lock
+                return
+            }
+            db.locks[modelID] = DownloadLocks.Lock(holder: thisAppID, since: nowEpoch())
+            granted = true
+        }
+        return granted
+    }
+
+    /// Bump our lock's timestamp so a live foreground download isn't judged
+    /// stale. No-op if we don't hold it. Called from the progress loop.
+    static func refreshDownloadLock(modelID: String) {
+        mutateDownloadLocks { db in
+            guard var l = db.locks[modelID], l.holder == thisAppID else { return }
+            l.since = nowEpoch()
+            db.locks[modelID] = l
+        }
+    }
+
+    /// Release our lock (no-op if we don't hold it). Called on download complete
+    /// (next to the claim), cancel, and failure.
+    static func releaseDownloadLock(modelID: String) {
+        mutateDownloadLocks { db in
+            if db.locks[modelID]?.holder == thisAppID {
+                db.locks.removeValue(forKey: modelID)
+            }
+        }
+    }
+
+    /// Human-friendly name for a holder bundle id, for the "Downloading in …"
+    /// status the waiting app shows.
+    static func appDisplayName(_ bundleID: String?) -> String {
+        switch bundleID {
+        case "com.MarkFriedlander.Posey":        return "Posey"
+        case "com.MarkFriedlander.Hal-Universal": return "Hal"
+        case .some(let id):                       return id
+        case .none:                               return "another app"
+        }
+    }
+
+    private static func nowEpoch() -> Double { Date().timeIntervalSince1970 }
+
+    // MARK: coordinated read / write (mirrors the manifest's discipline)
+
+    private static func readDownloadLocks(_ coordinator: NSFileCoordinator) -> DownloadLocks {
+        var result = DownloadLocks()
+        var coordError: NSError?
+        coordinator.coordinate(readingItemAt: downloadLocksURL, options: [], error: &coordError) { url in
+            guard let data = try? Data(contentsOf: url),
+                  let decoded = try? JSONDecoder().decode(DownloadLocks.self, from: data) else { return }
+            result = decoded
+        }
+        return result
+    }
+
+    private static func mutateDownloadLocks(_ body: (inout DownloadLocks) -> Void) {
+        try? FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        let coordinator = NSFileCoordinator()
+        var coordError: NSError?
+        coordinator.coordinate(writingItemAt: downloadLocksURL, options: [], error: &coordError) { url in
+            var db = DownloadLocks()
+            if let data = try? Data(contentsOf: url),
+               let decoded = try? JSONDecoder().decode(DownloadLocks.self, from: data) {
+                db = decoded
+            }
+            body(&db)
+            if let out = try? JSONEncoder().encode(db) {
+                try? out.write(to: url, options: .atomic)
+            }
+        }
+    }
+
+    // MARK: test-only helpers (drive the DOWNLOAD_LOCK diagnostic verb)
+    //
+    // TEST-ONLY. These let the local-API test harness plant a "another app holds
+    // the lock" state and clear it, to exercise Hal's wait/adopt/take-over path
+    // on-device without a second real app in lockstep. Posey does NOT need to
+    // copy this section — production sharing never calls it.
+
+    static func debugPlantForeignLock(modelID: String, holder: String, ageSeconds: Double = 0) {
+        mutateDownloadLocks { db in
+            db.locks[modelID] = DownloadLocks.Lock(holder: holder, since: nowEpoch() - ageSeconds)
+        }
+    }
+
+    static func debugClearAllDownloadLocks() {
+        mutateDownloadLocks { db in db.locks.removeAll() }
+    }
+
+    static func debugAllDownloadLocks() -> [(modelID: String, holder: String, ageSeconds: Double)] {
+        let coordinator = NSFileCoordinator()
+        return readDownloadLocks(coordinator).locks.map {
+            ($0.key, $0.value.holder, nowEpoch() - $0.value.since)
+        }
+    }
+}
+// ========== BLOCK SMS.4: CROSS-APP DOWNLOAD LOCK - END ==========

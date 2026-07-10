@@ -390,6 +390,55 @@ class HalTestConsole: ObservableObject {
             }
             return "{\"status\":\"ok\",\"command\":\"SHARED_MODELS\",\"appGroupResolved\":\(containerResolved),\"root\":\"\(jsonStringEscape(root.path))\",\"presentCount\":\(entries.count),\"present\":[\(entries.joined(separator: ","))]}"
 
+        } else if trimmed.hasPrefix("DOWNLOAD_LOCK") {
+            // v2.1 diagnostic + TEST harness for the cross-app download lock
+            // (SharedModelStore BLOCK SMS.4). Lets the device test suite exercise
+            // Hal's wait/adopt/take-over path without a second real app running in
+            // lockstep. Sub-commands (modelID / holder never contain ':'):
+            //   DOWNLOAD_LOCK QUERY                        — current locks + window
+            //   DOWNLOAD_LOCK PLANT:<modelID>:<holder>[:<ageSec>]
+            //                                              — plant a foreign lock
+            //   DOWNLOAD_LOCK CLEAR                        — remove all locks
+            //   DOWNLOAD_LOCK ACQUIRE:<modelID>            — Hal claims the slot
+            //   DOWNLOAD_LOCK RELEASE:<modelID>            — Hal releases the slot
+            let arg = String(trimmed.dropFirst("DOWNLOAD_LOCK".count)).trimmingCharacters(in: .whitespaces)
+            let parts = arg.split(separator: ":", omittingEmptySubsequences: false).map(String.init)
+            let sub = (parts.first?.isEmpty == false ? parts[0] : "QUERY").uppercased()
+
+            func locksJSON() -> String {
+                let items = SharedModelStore.debugAllDownloadLocks().map {
+                    "{\"modelID\":\"\(jsonStringEscape($0.modelID))\",\"holder\":\"\(jsonStringEscape($0.holder))\",\"holderName\":\"\(jsonStringEscape(SharedModelStore.appDisplayName($0.holder)))\",\"ageSeconds\":\(Int($0.ageSeconds))}"
+                }
+                return "[" + items.joined(separator: ",") + "]"
+            }
+
+            switch sub {
+            case "PLANT":
+                guard parts.count >= 3, !parts[1].isEmpty, !parts[2].isEmpty else {
+                    return "{\"status\":\"error\",\"command\":\"DOWNLOAD_LOCK\",\"detail\":\"usage PLANT:<modelID>:<holder>[:<ageSec>]\"}"
+                }
+                let age = parts.count >= 4 ? (Double(parts[3]) ?? 0) : 0
+                SharedModelStore.debugPlantForeignLock(modelID: parts[1], holder: parts[2], ageSeconds: age)
+                return "{\"status\":\"ok\",\"command\":\"DOWNLOAD_LOCK\",\"action\":\"PLANT\",\"modelID\":\"\(jsonStringEscape(parts[1]))\",\"holder\":\"\(jsonStringEscape(parts[2]))\",\"ageSeconds\":\(Int(age)),\"locks\":\(locksJSON())}"
+            case "CLEAR":
+                SharedModelStore.debugClearAllDownloadLocks()
+                return "{\"status\":\"ok\",\"command\":\"DOWNLOAD_LOCK\",\"action\":\"CLEAR\",\"locks\":\(locksJSON())}"
+            case "ACQUIRE":
+                guard parts.count >= 2, !parts[1].isEmpty else {
+                    return "{\"status\":\"error\",\"command\":\"DOWNLOAD_LOCK\",\"detail\":\"usage ACQUIRE:<modelID>\"}"
+                }
+                let granted = SharedModelStore.acquireDownloadLock(modelID: parts[1])
+                return "{\"status\":\"ok\",\"command\":\"DOWNLOAD_LOCK\",\"action\":\"ACQUIRE\",\"modelID\":\"\(jsonStringEscape(parts[1]))\",\"granted\":\(granted),\"locks\":\(locksJSON())}"
+            case "RELEASE":
+                guard parts.count >= 2, !parts[1].isEmpty else {
+                    return "{\"status\":\"error\",\"command\":\"DOWNLOAD_LOCK\",\"detail\":\"usage RELEASE:<modelID>\"}"
+                }
+                SharedModelStore.releaseDownloadLock(modelID: parts[1])
+                return "{\"status\":\"ok\",\"command\":\"DOWNLOAD_LOCK\",\"action\":\"RELEASE\",\"modelID\":\"\(jsonStringEscape(parts[1]))\",\"locks\":\(locksJSON())}"
+            default: // QUERY
+                return "{\"status\":\"ok\",\"command\":\"DOWNLOAD_LOCK\",\"action\":\"QUERY\",\"staleSeconds\":\(Int(SharedModelStore.downloadLockStaleSeconds)),\"lockCount\":\(SharedModelStore.debugAllDownloadLocks().count),\"locks\":\(locksJSON())}"
+            }
+
         } else if trimmed == "LIST_MODELS" {
             return buildModelListJSON(vm: vm)
 

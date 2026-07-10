@@ -425,6 +425,12 @@ class BackgroundDownloadCoordinator: NSObject, URLSessionDownloadDelegate, Obser
         // Library/Caches is (App Review 2.5.1).
         SharedModelStore.claim(modelID: modelID, repo: modelID)
         SharedModelStore.excludeFromBackup(modelID)
+        // Release the cross-app download lock now the model is whole. This is the
+        // success release site (claim first, then release) — placing it here
+        // rather than in performLockedDownload means a completion delivered after
+        // a background relaunch, when that Task is gone, still clears the lock. A
+        // waiting sibling sees "no lock + a claim" and adopts.
+        SharedModelStore.releaseDownloadLock(modelID: modelID)
         NotificationCenter.default.post(name: .mlxModelDidDownload, object: nil, userInfo: ["modelID": modelID])
     }
 
@@ -1264,10 +1270,49 @@ class MLXModelDownloader: ObservableObject {
             return
         }
 
+        // CROSS-APP DOWNLOAD LOCK (v2.1). Before fetching, try to claim the
+        // shared "one app downloads this model at a time" slot. If the sibling
+        // app (Posey) is already downloading this same repo into the shared
+        // container, don't start a second copy — wait for theirs to land and
+        // adopt it (zero re-download), taking over only if their download dies.
+        // See SharedModelStore BLOCK SMS.4 and awaitSharedDownloadThenAdopt.
+        let gotLock = SharedModelStore.acquireDownloadLock(modelID: modelID)
+        if !gotLock {
+            let holder = SharedModelStore.downloadLock(modelID: modelID)?.holder
+            halLog("HALDEBUG-DOWNLOAD: \(modelID) already being downloaded by \(SharedModelStore.appDisplayName(holder)); waiting to adopt instead of duplicating")
+            await MainActor.run {
+                self.currentDownloadModelID = modelID
+                var state = self.downloadStates[modelID] ?? DownloadState(
+                    isDownloading: true, progress: 0.0, message: "", error: nil, localPath: nil
+                )
+                state.isDownloading = true
+                state.error = nil
+                state.message = "Downloading in \(SharedModelStore.appDisplayName(holder))…"
+                self.downloadStates[modelID] = state
+                self.currentDownloadTask = Task {
+                    await self.awaitSharedDownloadThenAdopt(modelID: modelID, repoID: repoID, sizeGB: sizeGB)
+                }
+            }
+            return
+        }
+
+        // We hold the cross-app lock — run the actual download.
+        await performLockedDownload(modelID: modelID, repoID: repoID, sizeGB: sizeGB)
+    }
+
+    /// Runs the real download once the cross-app download lock is held. Split out
+    /// from `startDownload` so the take-over path (a prior holder died mid-
+    /// download) can reach it without re-tripping `startDownload`'s
+    /// already-present / queue guards. Releases the lock on cancel and failure;
+    /// the success path releases it in
+    /// `BackgroundDownloadCoordinator.notifyModelDownloadComplete` (next to the
+    /// claim) so a completion delivered after a background relaunch still clears
+    /// the lock.
+    private func performLockedDownload(modelID: String, repoID: String, sizeGB: Double?) async {
         // Start download
         await MainActor.run {
             currentDownloadModelID = modelID
-            
+
             var state = downloadStates[modelID] ?? DownloadState(
                 isDownloading: true,
                 progress: 0.0,
@@ -1281,7 +1326,7 @@ class MLXModelDownloader: ObservableObject {
             state.error = nil
             downloadStates[modelID] = state
         }
-        
+
         // Snapshot the huggingface cache directory size before download starts,
         // so we can subtract pre-existing content and compute byte-accurate progress.
         let huggingfaceDir = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask)[0]
@@ -1304,6 +1349,11 @@ class MLXModelDownloader: ObservableObject {
             while !Task.isCancelled {
                 try? await Task.sleep(nanoseconds: 500_000_000)
                 guard !Task.isCancelled else { break }
+                // Heartbeat: keep our cross-app lock fresh so a sibling app
+                // waiting on this model doesn't judge our live download stale
+                // and start a redundant copy. (Only fires while we're in the
+                // foreground; the staleness window covers backgrounded holders.)
+                SharedModelStore.refreshDownloadLock(modelID: modelID)
                 await MainActor.run {
                     let bgdlFraction = BackgroundDownloadCoordinator.shared.progress(for: modelID)
                     // Fallback to legacy directorySize if BGDL hasn't yet
@@ -1383,8 +1433,9 @@ class MLXModelDownloader: ObservableObject {
                 // posts it AND calls markModelAsDownloadedFromBackground,
                 // which handles ALL the success bookkeeping (DownloadState,
                 // downloadedModelIDs, in-flight marker, currentDownloadTask
-                // clear, queue advance, cache size). So all we do here on
-                // success is cancel the polling task and log.
+                // clear, queue advance, cache size) AND releases the cross-app
+                // download lock. So all we do here on success is cancel the
+                // polling task and log.
                 try await self.waitForModelCompletion(modelID: modelID)
                 progressPollingTask?.cancel()
                 halLog("HALDEBUG-DOWNLOAD: ✅ Download notification received for \(modelID); coordinator handled bookkeeping")
@@ -1394,6 +1445,8 @@ class MLXModelDownloader: ObservableObject {
                 // they don't continue burning bandwidth after the cancel.
                 await BackgroundDownloadCoordinator.shared.cancelDownload(modelID: modelID)
                 progressPollingTask?.cancel()
+                // Release the cross-app lock so a sibling app can proceed.
+                SharedModelStore.releaseDownloadLock(modelID: modelID)
                 await MainActor.run {
                     if var state = self.downloadStates[modelID] {
                         state.isDownloading = false
@@ -1414,6 +1467,9 @@ class MLXModelDownloader: ObservableObject {
                 }
             } catch {
                 progressPollingTask?.cancel()
+                // Release the cross-app lock so a sibling app (or our own
+                // next-launch resume) can retry this model.
+                SharedModelStore.releaseDownloadLock(modelID: modelID)
                 await MainActor.run {
                     if var state = self.downloadStates[modelID] {
                         state.isDownloading = false
@@ -1440,7 +1496,81 @@ class MLXModelDownloader: ObservableObject {
             }
         }
     }
-    
+
+    /// The wait-and-adopt path taken when a sibling app already holds the
+    /// download lock for `modelID`. Polls the shared store: if the sibling's
+    /// download completes, we adopt the finished copy with zero re-download; if
+    /// the sibling releases without finishing, or its lock goes stale (crash /
+    /// force-quit), we take over and download it ourselves. Runs inside
+    /// `currentDownloadTask`, so a user cancel (which cancels that task) ends it.
+    private func awaitSharedDownloadThenAdopt(modelID: String, repoID: String, sizeGB: Double?) async {
+        let modelDir = SharedModelStore.mlxModelDir(modelID)
+        let expectedBytes = sizeGB.map { Int64($0 * 1_073_741_824) } ?? 0
+        halLog("HALDEBUG-DOWNLOAD: awaiting sibling download of \(modelID) to adopt")
+
+        while !Task.isCancelled {
+            try? await Task.sleep(nanoseconds: 2_000_000_000)
+            if Task.isCancelled { break }
+
+            // Did it finish elsewhere? Completion = lock released AND a claim
+            // recorded AND files on disk (the sibling's notifyModelDownloadComplete
+            // does claim-then-release, so seeing no lock + a claim means whole).
+            if SharedModelStore.downloadLock(modelID: modelID) == nil,
+               !SharedModelStore.claimants(modelID: modelID).isEmpty,
+               SharedModelStore.isRepoDownloaded(modelID) {
+                halLog("HALDEBUG-DOWNLOAD: sibling finished \(modelID); adopting with zero re-download")
+                adoptSharedModel(modelID: modelID)
+                return
+            }
+
+            // Try to (re)acquire. Succeeds once the holder releases (gave up
+            // without finishing) or its lock ages past the staleness backstop
+            // (presumed dead). Either way, we now own the slot and download.
+            if SharedModelStore.acquireDownloadLock(modelID: modelID) {
+                // Race guard: it may have completed in the same tick we grabbed.
+                if !SharedModelStore.claimants(modelID: modelID).isEmpty,
+                   SharedModelStore.isRepoDownloaded(modelID) {
+                    SharedModelStore.releaseDownloadLock(modelID: modelID)
+                    adoptSharedModel(modelID: modelID)
+                    return
+                }
+                halLog("HALDEBUG-DOWNLOAD: took over \(modelID) download (prior holder released or went stale)")
+                await performLockedDownload(modelID: modelID, repoID: repoID, sizeGB: sizeGB)
+                return
+            }
+
+            // Still held by the sibling — reflect their progress from the shared
+            // dir's completed bytes so the user sees movement, not a dead bar.
+            let size = directorySize(modelDir)
+            let holder = SharedModelStore.downloadLock(modelID: modelID)?.holder
+            await MainActor.run {
+                guard var state = self.downloadStates[modelID], state.isDownloading else { return }
+                if expectedBytes > 0 {
+                    let frac = min(0.99, Double(size) / Double(expectedBytes))
+                    state.progress = frac
+                    state.message = "Downloading in \(SharedModelStore.appDisplayName(holder)) — \(Int(frac * 100))%…"
+                } else {
+                    state.message = "Downloading in \(SharedModelStore.appDisplayName(holder))…"
+                }
+                self.downloadStates[modelID] = state
+            }
+        }
+    }
+
+    /// Adopt a model that a sibling app downloaded into the shared container:
+    /// record Hal's claim (so the sibling's delete can't pull it out from under
+    /// us), exclude it from iCloud backup, and run the same success bookkeeping a
+    /// real download would. No bytes are fetched. (The whole downloader is
+    /// MainActor-isolated by the project default, so no explicit annotation is
+    /// needed here.)
+    private func adoptSharedModel(modelID: String) {
+        SharedModelStore.claim(modelID: modelID, repo: modelID)
+        SharedModelStore.excludeFromBackup(modelID)
+        halLog("HALDEBUG-DOWNLOAD: ✅ Adopted shared model \(modelID) (fetched by another app; zero re-download)")
+        markModelAsDownloadedFromBackground(modelID: modelID)
+        NotificationCenter.default.post(name: .mlxModelDidDownload, object: nil, userInfo: ["modelID": modelID])
+    }
+
     /// Returns the total bytes of all files under a directory tree (non-recursive symlinks excluded).
     private func directorySize(_ url: URL) -> Int64 {
         guard let enumerator = FileManager.default.enumerator(
@@ -1478,6 +1608,10 @@ class MLXModelDownloader: ObservableObject {
             // Remove from queue if queued
             downloadQueue.removeAll { $0.modelID == modelID }
         }
+
+        // Release the cross-app download lock if we held it (harmless no-op if we
+        // didn't, or if we were only waiting to adopt a sibling's download).
+        SharedModelStore.releaseDownloadLock(modelID: modelID)
         
         // Update state
         if var state = downloadStates[modelID] {

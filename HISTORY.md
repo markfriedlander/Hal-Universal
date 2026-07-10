@@ -3852,3 +3852,92 @@ Library offers "Download" for a model already on disk (the tap would be
 instant/adopt). Tolerable, but a cleaner UX would label a present-but-unclaimed
 model as "Add"/"Available (instant)" rather than "Download." Touches Posey too
 → log as a coordinated polish decision, non-blocking.
+
+### 2026-07-09 (continued) — cross-app download lock (item 4 increment #3)
+
+Built the last piece of concurrency safety flagged above: the cross-app
+download lock, so Hal and Posey never fetch the same model into the shared
+container at once. Worth stating plainly what the risk actually was — because
+reading the code changed my framing. Because `BackgroundDownloadCoordinator`
+stages each file and atomic-moves it into place only when whole, a concurrent
+download wouldn't *corrupt* files; it would waste a multi-GB download and show
+two competing progress bars for one shared copy. So the lock is a
+waste/UX-correctness feature, not a corruption fix — implemented as if it were
+one anyway, because the shared-store philosophy is "one copy, fetched once."
+
+**Design decisions, and where I departed from the NEXT.md sketch.** The sketch
+said drop a marker at `<modelID>/.downloading-by-<bundleID>` *inside the model
+dir*. That's a bug: `SharedModelStore.isRepoDownloaded()` returns true for any
+non-empty model dir, so a lock marker sitting in an otherwise-empty dir would
+make both apps think the model is fully present and try to LOAD a model that
+isn't downloaded. So the lock lives in its own `download-locks.json` at the
+store root instead — deliberately NOT folded into `manifest.json`, because an
+un-updated Posey re-encoding the manifest would silently strip an unknown field
+(Codable drops unknown keys on the round-trip) and erase a live lock. A separate
+file the old code never writes stays intact. Same `NSFileCoordinator` discipline
+as the manifest; format `{version, locks:{modelID:{holder, since}}}`.
+
+**Staleness = timestamp backstop, not heartbeat and not disk-growth.** I went
+down a rabbit hole here and want the reasoning recorded so nobody re-derives it.
+A holder that force-quits mid-download would pin the lock forever without a
+staleness rule. Heartbeat doesn't work: a backgrounded holder's process is
+suspended (can't heartbeat) yet its background URLSession download keeps running.
+Disk-growth-of-the-shared-dir doesn't work either: BGDL only atomic-moves a file
+into the shared dir when it's *whole*, so for a single big `model.safetensors`
+(which our curated 4-bit models are) the dir stays flat for the entire multi-
+minute tail — a live download would read as "stalled." So neither liveness
+signal is reliable for exactly our case. The robust choice is a plain
+timestamp backstop (`downloadLockStaleSeconds = 600`): a live foreground holder
+refreshes `since` from its progress loop; once no refresh for 10 min the lock is
+abandoned and takeable. Worst case of a too-eager takeover is one redundant
+download, never a corrupt file — so the window is generous but not paranoid.
+
+**Second-app behavior: wait-and-adopt, not refuse.** When Hal taps a model
+Posey is already downloading, Hal doesn't start a duplicate — it polls the
+shared store and, when Posey's copy completes, *adopts* it (claim +
+excludeFromBackup + the normal success bookkeeping, zero bytes fetched). If
+Posey releases without finishing, or its lock goes stale, Hal takes over and
+downloads it itself. Even a "refuse" MVP would have needed a poll loop anyway —
+NotificationCenter is in-process only, so Hal can't hear Posey's completion any
+other way.
+
+**Code.** `SharedModelStore` gains BLOCK SMS.4 (the lock primitives:
+`acquireDownloadLock` / `refreshDownloadLock` / `releaseDownloadLock` /
+`downloadLock`, `appDisplayName`, coordinated read/write, plus TEST-ONLY debug
+helpers). `MLXModelDownloader.startDownload` acquires the lock before fetching
+and, on failure to acquire, spawns `awaitSharedDownloadThenAdopt`; the download
+body was split into `performLockedDownload` so the take-over path can reach it
+without re-tripping the already-present/queue guards; `adoptSharedModel` does
+the zero-download adopt; the progress loop heartbeats the lock; release lands on
+success (in BGDL's `notifyModelDownloadComplete`, next to the claim — so a
+completion delivered after a background relaunch still clears it), on cancel, and
+on error. A `DOWNLOAD_LOCK` API verb (QUERY/PLANT/ACQUIRE/RELEASE/CLEAR) drives
+testing.
+
+**Isolation gotcha caught by warnings-are-errors (Rule #7).** The build flagged
+two "no async operations occur within 'await'" warnings — the project builds
+with `SWIFT_DEFAULT_ACTOR_ISOLATION = MainActor`, so the whole downloader is
+MainActor-isolated and the `await adoptSharedModel(...)` calls (a sync same-actor
+func) were redundant. Dropped the `await` and the now-redundant `@MainActor`.
+Also means the wait loop's file I/O runs on the main actor every 2s — small, and
+consistent with the existing manifest calls, acceptable.
+
+**Verification (honest scope).** Device-verified on iPhone 16 Plus the lock's
+decision logic — the risky, branchy part — via the `DOWNLOAD_LOCK` verb and new
+`tests/download_lock_regression.py`: a FRESH foreign lock blocks acquire
+(granted:false → the app waits, no duplicate), a STALE foreign lock (age > 600s)
+is takeable (granted:true, ownership transfers), release clears cleanly, a free
+slot is acquirable. The full wait→adopt→take-over *orchestration*
+(`awaitSharedDownloadThenAdopt`) is verified by code review + the primitive
+tests, NOT by a real two-app concurrent download — all four curated models are
+present on the dev device, so `startDownload`'s already-present guard blocks the
+download path, and forcing the real race needs an absent model + coordinated
+timing across both apps. That two-app spot-check is available later via Posey's
+antenna (same way increment #1's delete cycle was checked). Device left clean:
+4 models present, all `[Posey]`, no stray locks.
+
+**Posey side.** Left a full adoption note for Posey's CC at
+`Posey/docs-internal/CROSS_APP_DOWNLOAD_LOCK.md` (what to copy, where it wires
+in, the actor-isolation caution, how to verify) + a pointer at the top of
+Posey's `next.md`. The lock is only fully effective once BOTH apps carry it;
+Hal-first is a safe pure-addition. Mark will make sure Posey follows the note.

@@ -1,6 +1,6 @@
 # Hal Universal — Handoff Brief
-**Updated:** July 9, 2026 (v2.1 roadmap agreed; Bug 4 recency fix landed + device-verified)
-**Branch:** `main` (Bug 4 fix + docs staged; see below)
+**Updated:** July 9, 2026 (v2.1 items 2/3/4-inc-#1 + 4-inc-#3 cross-app download lock landed + device-verified)
+**Branch:** `main`
 **Production:** Hal Universal **v2.0 is live on the App Store** since 2026-05-19. Non-EU markets only (DSA non-trader; see HISTORY).
 
 > **Toolchain (changed during the 2026-06 gap):** the whole stack is on
@@ -68,12 +68,37 @@ paths (HubApi load path, MLXModelDownloader, `isModelDownloaded` → disk-truth)
 to the shared container. Hal now sees/loads Posey's four MLX models with zero
 re-download; claims on use, deletes refcount-safely (can't nuke Posey's
 files); `isExcludedFromBackup` on downloads. Read-only `SHARED_MODELS`
-diagnostic added. **Increment #2 (launch-time migration of a v2.0 user's old
-`Caches` models into the shared container) is STILL TODO** — no risk on dev
-device, do it deliberately. Embedder sharing (Nomic/mxbai) rides with item #5.
+diagnostic added.
+
+**Cross-app DOWNLOAD lock — INCREMENT #3 DONE + device-verified**
+(2026-07-09, roadmap item 4). Stops Hal + Posey both fetching the same model
+into the shared container at once (wasteful/duplicate, not corrupting — files
+are atomic-moved when whole). New `SharedModelStore` BLOCK SMS.4: a per-model
+lock in its OWN `download-locks.json` at the store root (NOT a marker in the
+model dir — trips `isRepoDownloaded`; NOT in `manifest.json` — an un-updated
+Posey would strip the field). Second app that sees a fresh foreign lock WAITS
+and adopts the finished copy (zero re-download); takes over only if the holder's
+lock goes stale (`downloadLockStaleSeconds = 600`, a timestamp backstop —
+heartbeat + disk-growth are both unreliable for a backgrounded single-big-file
+download; see HISTORY). `MLXModelDownloader` gains `performLockedDownload` (the
+split-out download body), `awaitSharedDownloadThenAdopt` (the wait/adopt/take-
+over loop), `adoptSharedModel`, a lock heartbeat in the progress loop, and lock
+release on success/cancel/error. `DOWNLOAD_LOCK` API verb + new
+`tests/download_lock_regression.py`. **Device-verified: DECISION LOGIC only**
+(fresh→wait, stale→take-over, release); the full wait→adopt→take-over
+orchestration is code-review + primitive-verified, NOT a real two-app concurrent
+download (all 4 models present → the already-present guard blocks the download
+path; real race needs an absent model + coordinated timing → later Posey-antenna
+spot-check). **Posey must adopt the matching block** for full two-app protection
+(Hal-first is a safe pure addition) — adoption note at
+`Posey/docs-internal/CROSS_APP_DOWNLOAD_LOCK.md` + pointer in Posey `next.md`.
+
+**Increment #2 (launch-time migration of a v2.0 user's old `Caches` models into
+the shared container) is STILL TODO** — no risk on dev device, do it
+deliberately. Embedder sharing (Nomic/mxbai) rides with item #5.
 
 Roadmap now: items 1 (v2.0.1 ship — Mark's ASC action), 4-increment-#2
-(migration), 5 (mxbai + embedder sharing), 6 (Bonsai, cut line) remain.
+(migration, next), 5 (mxbai + embedder sharing), 6 (Bonsai, cut line) remain.
 
 **v2.0.1 hotfix** (EmbeddingGemma mis-download) remains **fully verified
 — sim + device — deferred to ride with v2.1** per Mark 2026-05-26 (the

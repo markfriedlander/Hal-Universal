@@ -50,17 +50,27 @@ retrieval quality improves regardless of how Bonsai turns out.
    STILL TODO:** the launch-time migration that moves a v2.0 user's OLD
    `Caches/huggingface/models/*` into the shared container (so existing
    App Store upgraders don't lose downloads) — no risk on dev device
-   (nothing to migrate), do it deliberately. **Increment #3 (NEXT BUILD
-   TASK, Mark approved 2026-07-09): cross-app download lock.** Verified
-   2026-07-09 across both real apps: delete refcount is bulletproof both
-   directions (Hal↔Posey), BUT concurrent DOWNLOAD of the same model is
-   UNPROTECTED — each app only guards against itself
-   (`inFlightDownloadIDs`), no cross-app lock. Build the per-model lock
-   marker (`<modelID>/.downloading-by-<bundleID>` in the shared store):
-   before starting a download, claim the marker; if another app's marker
-   exists, wait/skip; clear on completion or on stale-PID/timeout. Add to
-   both Hal's `MLXModelDownloader` and (coordinate) Posey's. Full spec
-   under "Cross-app infrastructure" below. **UX polish candidate (open):**
+   (nothing to migrate), do it deliberately. **Increment #3 (cross-app
+   download lock) DONE + device-verified 2026-07-09.** Per-model lock in
+   its OWN `download-locks.json` at the store root (NOT a marker inside the
+   model dir — that would trip `isRepoDownloaded`; and NOT folded into
+   `manifest.json` — an un-updated Posey would strip the field). Second app
+   that sees a fresh foreign lock WAITS and adopts the finished copy (zero
+   re-download); takes over only if the holder's lock goes stale
+   (`downloadLockStaleSeconds = 600`; timestamp backstop, since heartbeat +
+   disk-growth are both unreliable for a backgrounded single-big-file
+   download — see HISTORY 2026-07-09). New `SharedModelStore` BLOCK SMS.4 +
+   `MLXModelDownloader` `performLockedDownload`/`awaitSharedDownloadThenAdopt`/
+   `adoptSharedModel` + release sites; `DOWNLOAD_LOCK` API verb;
+   `tests/download_lock_regression.py`. **Device-verified: decision logic
+   only** (fresh→wait, stale→take-over, release) — the full
+   wait→adopt→take-over orchestration is code-review + primitive-verified,
+   NOT a real two-app concurrent download (all 4 models present on device →
+   already-present guard blocks the path; needs an absent model + coordinated
+   timing). Two-app spot-check available later via Posey antenna. **Posey must
+   adopt the matching block** for full protection — Hal-first is a safe pure
+   addition; adoption note left at `Posey/docs-internal/CROSS_APP_DOWNLOAD_LOCK.md`
+   + pointer in Posey `next.md`. **UX polish candidate (open):**
    present-but-unclaimed models show "Download" (tap is instant/adopt) —
    consider "Add"/"Available (instant)" labeling; touches Posey too, decide
    together. Posey antenna for two-app testing: `169.254.214.164:8765`.
