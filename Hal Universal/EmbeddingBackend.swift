@@ -260,14 +260,14 @@ nonisolated enum EmbeddingBackend: String, Sendable, CaseIterable {
     var blurb: String {
         switch self {
         case .nlContextual:
-            return "Apple's built-in on-device embedder. 512-dim, runs on the Neural Engine — no download, instant, always available, private by construction. The lightest option; a bit less precise than the downloadable models at separating closely-related memories, but plenty for everyday recall."
+            return "Apple's built-in embedder (512-dim), running on the Neural Engine.\n• Good at: nothing to download, instant, fully private, tiny storage, fastest to embed — works out of the box.\n• Weaker at: precision. It's the least sharp of the three at telling closely-related memories apart, so it can occasionally surface a loosely-related memory instead of the exact one.\nBest when you want zero setup and the smallest footprint."
         // REMOVED 2026-05-20:
         // case .embeddingGemma:
         //     return "Google's open embedding model, 308M params, MLX 4-bit quantized. 768-dim, state-of-the-art on MTEB Multilingual v2 among models under 500M. Adds ~210 MB on disk."
         case .nomicSwift:
-            return "Nomic Embed Text v1.5. 137M params, 768-dim, purpose-built for asymmetric retrieval. On-device via Apple's MLTensor (no MLX). A step up in retrieval precision over the built-in embedder, at ~522 MB and moderate embedding speed."
+            return "Nomic Embed Text v1.5 (768-dim), purpose-built for search. On-device via Apple's MLTensor (no MLX).\n• Good at: a clear step up in precision over the built-in embedder — better at pulling the right memory rather than a merely on-topic one — while staying moderate in size and speed.\n• Costs: a ~522 MB download and a bit more compute than the built-in option.\nA balanced middle ground."
         case .mxbai:
-            return "Mixedbread mxbai-embed-large-v1. BERT-large, 335M params, 1024-dim, CLS pooling. On-device via the same path as Nomic (no MLX). The most precise of the three at telling closely-related memories apart — at the cost of being the largest (~670 MB) and slowest to embed."
+            return "Mixedbread mxbai-embed-large (1024-dim, BERT-large). On-device via the same path as Nomic (no MLX).\n• Good at: the sharpest of the three at distinguishing closely-related memories, so it most reliably surfaces exactly the right one — best for large or nuanced memories.\n• Costs: the largest download (~670 MB) and the slowest to embed, so building or rebuilding your memory index takes the longest.\nBest when recall precision matters most and you can spare the storage."
         }
     }
 

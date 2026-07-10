@@ -194,6 +194,13 @@ struct EmbedderBackendRow: View {
 
     @State private var isExpanded: Bool = false
     @State private var showingConfirm: Bool = false
+    // Pre-download disclosure, aligned with the LLM Download flow (which shows a
+    // hardware-disclosure sheet before a multi-GB fetch). Embedder models are
+    // smaller but still a 0.5–0.7 GB one-time download, so the same "warn before
+    // you download" courtesy applies. The onDismiss-resume pattern avoids the
+    // present-two-sheets-at-once race (same fix as the LLM row).
+    @State private var showingDownloadDisclosure: Bool = false
+    @State private var disclosureAcknowledged: Bool = false
 
     private var isActive: Bool { coordinator.activeBackend == backend }
 
@@ -278,6 +285,24 @@ struct EmbedderBackendRow: View {
         } message: {
             Text("Nothing is deleted — each embedder keeps its own copy of your memory vectors, so you can switch back instantly. Hal will fill in \(backend.displayName)'s vectors in the background; that can take a few minutes depending on your memory size, during which some older memories rely on keyword search until they're ready.")
         }
+        // Pre-download disclosure (aligned with the LLM Download flow). Records
+        // intent on continue + dismisses; the download starts in onDismiss once
+        // the sheet is gone (avoids the drop-second-presentation race).
+        .sheet(isPresented: $showingDownloadDisclosure, onDismiss: {
+            if disclosureAcknowledged {
+                disclosureAcknowledged = false
+                coordinator.startDownload(for: backend)
+            }
+        }) {
+            EmbedderDownloadDisclosureSheet(
+                backend: backend,
+                onContinue: {
+                    disclosureAcknowledged = true
+                    showingDownloadDisclosure = false
+                },
+                onCancel: { showingDownloadDisclosure = false }
+            )
+        }
     }
 
     // Action row layout matches ModelLibraryRow (Hal.swift:10177) so the
@@ -340,7 +365,7 @@ struct EmbedderBackendRow: View {
                     }
                     .buttonStyle(.plain)
                 } else {
-                    Button(action: { coordinator.startDownload(for: backend) }) {
+                    Button(action: { showingDownloadDisclosure = true }) {
                         HStack(spacing: 4) {
                             Image(systemName: "arrow.down.circle.fill")
                             Text("Download")
@@ -385,6 +410,63 @@ struct EmbedderBackendRow: View {
                 }
             }
         }
+    }
+}
+
+/// Pre-download disclosure for an embedding model — the embedder analog of the
+/// LLM `HardwareDisclosureSheet`. Content is accurate for embedders (a smaller,
+/// on-device memory-search model), not the LLM inference framing.
+struct EmbedderDownloadDisclosureSheet: View {
+    let backend: EmbeddingBackend
+    let onContinue: () -> Void
+    let onCancel: () -> Void
+
+    var body: some View {
+        NavigationView {
+            ScrollView {
+                VStack(alignment: .leading, spacing: 20) {
+                    VStack(alignment: .leading, spacing: 6) {
+                        Text("Download \(backend.displayName)")
+                            .font(.title2).fontWeight(.semibold)
+                        Text("Optional memory-search model")
+                            .font(.subheadline).foregroundColor(.secondary)
+                    }
+                    Text("This embedder improves how Hal searches your memory. It runs entirely on your iPhone — nothing you store or ask leaves the device — and works offline once downloaded.")
+                        .font(.body)
+                    VStack(alignment: .leading, spacing: 10) {
+                        Label("Storage & download", systemImage: "internaldrive")
+                            .font(.headline)
+                        bullet("\(backend.sizeBlurb ?? "A few hundred MB") — a one-time download")
+                        bullet("Wi-Fi recommended for the initial download")
+                        bullet("Runs on-device afterward; no ongoing network use")
+                        bullet("You can delete it anytime to reclaim the space")
+                    }
+                    Text("Switching to it later is instant and non-destructive — your other embedders keep their own copies, and Hal fills this one in the background.")
+                        .font(.footnote).foregroundColor(.secondary)
+                }
+                .padding()
+                .frame(maxWidth: .infinity, alignment: .leading)
+            }
+            .navigationTitle("Before You Download")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .cancellationAction) {
+                    Button("Cancel", action: onCancel)
+                }
+                ToolbarItem(placement: .confirmationAction) {
+                    Button("Download", action: onContinue)
+                }
+            }
+        }
+    }
+
+    @ViewBuilder private func bullet(_ text: String) -> some View {
+        HStack(alignment: .top, spacing: 8) {
+            Text("•")
+            Text(text)
+            Spacer(minLength: 0)
+        }
+        .font(.subheadline)
     }
 }
 
