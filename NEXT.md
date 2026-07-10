@@ -207,9 +207,20 @@ refactor "cosmetic cleanup candidates" list.
 verbosity — revisit after 0c/0f).
 
 **In flight / decisions (2026-07-11):**
-- **Core AI availability** — background research agent running (is the framework real +
-  are our curated models converted?). Report pending; decision (POC vs stay-parked)
-  follows the findings.
+- **Core AI — investigated 2026-07-11 (agent); PARK as an early-adopter bet.**
+  Per the research pass (confidence HIGH on the framework, MEDIUM on model-availability
+  specifics — VERIFY before acting; it's past CC's knowledge cutoff): Core AI is real,
+  shipped WWDC26, `.aimodel` format, positioned as the successor to Core ML, requires
+  iOS/Xcode **27+**. Conversion is **PyTorch → `.aimodel` via `coreai-torch`** — NOT a
+  reuse of our MLX weights; every model is a fresh re-quantize + re-validate from the
+  original checkpoint. **None of our five exact builds** ship as official `.aimodel`s;
+  community re-conversions of Gemma 4 E2B and Qwen3.5-2B reportedly exist, Llama/Dolphin
+  absent, and **Ternary Bonsai 8B is the blocker — no documented 2-bit/ternary route**
+  (the only ternary example in the wild needed a hand-written 2-bit Metal kernel). If
+  ever pursued: time-boxed spike on ONE easy model (Qwen/Gemma via Apple's official
+  recipe) to benchmark Core AI decode vs our MLX, before anything broader. Min-iOS stays
+  26, so it's a conditional-enhancement bet regardless. Sources to re-verify: WWDC26
+  sessions 324/326, `apple/coreai-models`.
 - **Multimodal / images — PARKED, not worth wiring now.** Hal loads all MLX models via
   the text-only `LLMModelFactory` (string prompts); no image path. Qwen 3.5 + Gemma are
   multimodal at the model level but unused; AFM images need a newer OS than 26. Wiring a
