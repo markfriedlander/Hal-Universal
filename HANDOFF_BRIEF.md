@@ -1,5 +1,5 @@
 # Hal Universal — Handoff Brief
-**Updated:** July 10, 2026 (v2.1 item 5.5 — retrieval-fusion rebalance — landed + device-verified; item 5 mxbai/multi-embedder complete)
+**Updated:** July 11, 2026 (v2.1 item 6 — Ternary Bonsai 8B — SHIPS as curated after a clean Maxim sweep; item 5.5 fusion rebalance + item 5 multi-embedder complete)
 **Branch:** `main`
 **Production:** Hal Universal **v2.0 is live on the App Store** since 2026-05-19. Non-EU markets only (DSA non-trader; see HISTORY).
 
@@ -19,7 +19,22 @@ roadmap (one release, priority order, Ternary Bonsai as cut line) — full
 list in NEXT.md → "v2.1 roadmap — AGREED 2026-07-09". Proposals system +
 Soul Document are explicitly OUT of scope for now.
 
-**Latest (2026-07-10): item 5.5 — the retrieval-fusion rebalance — is DONE and
+**Latest (2026-07-11): item 6 — Ternary Bonsai 8B — is DONE and SHIPS as
+curated.** Hal's first 8B and first 2-bit model
+(`prism-ml/Ternary-Bonsai-8B-mlx-2bit`, Qwen3-8B arch, 2.32 GB, 65k ctx). The
+2-bit load gate passed on the 16 Plus (~12s, no jetsam), and after swapping the
+Qwen-derived layer-1 for an anti-deflection one it **clean-swept all five Maxims**
+(M1 pass, M2 pass, M3 pass, **M4 standout**, M5 pass) — the only curated model that
+passes all five. Real cost: **~4-5 tok/s** (slowest in the tier; the 27 tok/s figure
+is 17 Pro MAX). Mark's call: SHIP as an opt-in "deep reasoner, most capable,
+slowest." Seed = `ModelCatalogService.bonsai8B2bit` (in curatedSeeds +
+availableModels); findings `Docs/Maxim_Suite_Bonsai_2026-07-11.md`; new test verb
+`DOWNLOAD_MODEL:<id>:<sizeGB>`. Full story: HISTORY 2026-07-11. **This closes the
+v2.1 cut line — items 1-6 are all done except the item-1 ship action (Mark's ASC
+step).** Non-blocking follow-ups: re-measure speed on Pro hardware; measure prefill
+tok/s (seed carries a conservative 8,000 placeholder).
+
+**Prior (2026-07-10): item 5.5 — the retrieval-fusion rebalance — is DONE and
 device-verified.** The RRF k weights in `searchUnifiedContent` are now tunable
 global `@AppStorage` knobs (`SET_RRF_SEMANTIC_K` / `SET_RRF_BM25_DISTINCTIVE_K` /
 `SET_RRF_BM25_DEFAULT_K` / `RRF_STATUS`), and the global default moved
@@ -35,8 +50,9 @@ opposite of the pure-cosine A/B). recency_regression still PASS. New instruments
 Per-embedder tuning deferred (Mark: "maybe another time"). **Item 5 (mxbai +
 multi-embedder) is complete across all three steps** (see below / HISTORY 2026-07-09).
 
-**Roadmap remaining (order in NEXT.md):** item 1 (v2.0.1 hotfix ship — needs the
-SHIP_BLOCKER flip + Mark's ASC action), then item 6 (Ternary Bonsai, the cut line).
+**Roadmap remaining (order in NEXT.md):** just item 1 (v2.0.1 → v2.1 ship — needs
+the SHIP_BLOCKER flip + CFBundleVersion bump + Mark's ASC action). Items 2-6 are all
+landed; the whole v2.1 feature set is done and the cut line (item 6) shipped.
 **Open eyeball for Mark:** the updated embedder model cards + download disclosure
 are compile-verified but not visually confirmed on the Model Library embedder screen
 (harness can't navigate there).
