@@ -230,6 +230,9 @@ struct Hal10000App: App {
         // is wired up before iOS dispatches any pending completion events on
         // app launch (e.g. when iOS wakes us to deliver a finished download).
         _ = BackgroundDownloadCoordinator.shared
+        // Start watching network reachability for the privacy lock indicator.
+        // Idempotent; the first path update flips the lock off "locked" default.
+        PrivacyMonitor.shared.start()
     }
 
     var body: some Scene {
@@ -264,6 +267,16 @@ import SwiftUI
 
 struct iOSChatView: View {
     @EnvironmentObject var chatViewModel: ChatViewModel
+    // Privacy lock indicator: the shared network monitor (started at launch)
+    // plus the tap-popover flag. The lock glyph is computed live in
+    // `isPrivacyLocked` from the active model + this monitor + the salon config.
+    @StateObject private var privacyMonitor = PrivacyMonitor.shared
+    @State private var showingPrivacyPopover = false
+    // Set when the user taps "Model Library" in the privacy popover; consumed
+    // in the popover's onDisappear so the sheet presents only AFTER the popover
+    // is fully gone (a popover + sheet can't present at once — same race as the
+    // download disclosure sheet; .popover has no onDismiss, hence onDisappear).
+    @State private var pendingModelLibraryNav = false
     @State private var scrollToBottomTrigger = UUID()
     // Sheet flags moved to ChatViewModel.showingSettings / showingThreadPanel /
     // showingDocumentPicker so the LocalAPIServer can read them via GET_UI_STATE.
@@ -382,6 +395,36 @@ struct iOSChatView: View {
                         Image(systemName: "line.3.horizontal")
                     }
                 }
+                // Privacy lock — sits just left of the gear (declared first in
+                // the trailing group). Monochrome outline glyph to match the
+                // gearshape. Tap opens a plain-language explanation of the
+                // current state. See PrivacyMonitor.swift.
+                ToolbarItem(placement: .navigationBarTrailing) {
+                    Button {
+                        showingPrivacyPopover = true
+                    } label: {
+                        Image(systemName: isPrivacyLocked ? "lock" : "lock.open")
+                    }
+                    .popover(isPresented: $showingPrivacyPopover) {
+                        PrivacyLockPopover(
+                            isLocked: isPrivacyLocked,
+                            modelName: chatViewModel.selectedModel.displayName
+                        ) {
+                            // Record intent + dismiss the popover; the actual
+                            // Model Library sheet is presented from onDisappear
+                            // below, once the popover is fully gone.
+                            pendingModelLibraryNav = true
+                            showingPrivacyPopover = false
+                        }
+                        .presentationCompactAdaptation(.popover)
+                        .onDisappear {
+                            if pendingModelLibraryNav {
+                                pendingModelLibraryNav = false
+                                chatViewModel.apiNavModelLibrary = true
+                            }
+                        }
+                    }
+                }
                 ToolbarItem(placement: .navigationBarTrailing) {
                     Button {
                         chatViewModel.showingSettings = true
@@ -448,6 +491,26 @@ struct iOSChatView: View {
     // Falls back to "Hal" for empty threads (e.g., brand new conversation before first message).
     private var conversationTitle: String {
         chatViewModel.threads.first(where: { $0.id == chatViewModel.conversationId })?.title ?? "Hal"
+    }
+
+    /// Whether the privacy lock reads "locked" (no data can leave the device)
+    /// right now. Recomputed on every render — because it reads @Published
+    /// state (the active model, the network monitor, and the salon config),
+    /// SwiftUI re-renders the toolbar the instant any of them changes, so the
+    /// glyph flips live on a model switch or an Airplane-Mode toggle. The pure
+    /// decision lives in PrivacyMonitor.isLocked; here we just resolve each
+    /// active salon seat's source (unknown → .appleFoundation, the
+    /// conservative cloud-capable assumption) and hand it the inputs.
+    private var isPrivacyLocked: Bool {
+        let seatSources = chatViewModel.salonConfig.activeSeats.map { seat in
+            ModelCatalogService.shared.getModel(byID: seat.modelID)?.source ?? .appleFoundation
+        }
+        return PrivacyMonitor.isLocked(
+            activeModelSource: chatViewModel.selectedModel.source,
+            networkAvailable: privacyMonitor.isNetworkAvailable,
+            salonEnabled: chatViewModel.salonConfig.isEnabled,
+            salonSeatSources: seatSources
+        )
     }
 
     // MARK: - Composer (Text Input Area)

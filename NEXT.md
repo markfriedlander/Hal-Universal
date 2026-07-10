@@ -31,10 +31,14 @@ retrieval quality improves regardless of how Bonsai turns out.
    path. Device-verified on iPhone 16 Plus: old row decayed to 19.25% at
    weight 0.95, fresh row unchanged, fresh ranks above old. See HISTORY
    2026-07-09. Two test-only API verbs added (MEMORY_PLANT_AGED[_CLEANUP]).
-3. **Privacy Lock toolbar indicator** — lock/unlock glyph reflecting
-   on-device (MLX / AFM-no-network) vs possible-egress (AFM+network).
-   New `PrivacyMonitor` (NWPathMonitor). Full spec under "v2.1 design
-   work" below.
+3. ~~**Privacy Lock toolbar indicator**~~ — **DONE 2026-07-09.** `lock` /
+   `lock.open` glyph left of the gear (monochrome, matches gearshape), tap
+   → popover explaining state + "Model Library →" link. New
+   `PrivacyMonitor.swift` (NWPathMonitor + pure `isLocked` truth table +
+   popover view). Device-verified on iPhone 16 Plus: AFM+network→open,
+   AFM+airplane/Wi-Fi-off→closed (live within ~1s), Qwen (real loaded
+   MLX)→closed. Two follow-on sheet-race bugs fixed during the work (see
+   HISTORY). See "v2.1 design work" below for the original spec.
 4. **Cross-app model sharing with Posey** — App Group
    `group.com.MarkFriedlander.aifamily`, shared model store, migration
    helper, `isExcludedFromBackup`, per-model lock. Full spec under
@@ -271,6 +275,17 @@ cosmetic (smaller blocks that aren't pulling their weight).
      in ChatViews.swift for now.
    - LEGO numbering inconsistencies (07.5 vs 8.5, 10.3.5, 27.1) —
      keep as-is per Mark; renumber later if it makes sense.
+   - **Model Library Delete button hidden on the active model**
+     (`ModelLibraryRow`, `.mlx && !isActive`) reads as "missing." A
+     disabled Delete with a "switch models to delete" hint would be
+     clearer than silently hiding it. (Surfaced 2026-07-09.)
+   - **Model Library dismiss timing on selection.** `selectModel`
+     awaits the full model load before `dismiss()`, so AFM (nothing to
+     load) bounces to chat instantly while an MLX model appears to
+     "hold" in the Library for its multi-second load, then dismisses.
+     Consistent + correct (the await is deliberate), just not snappy —
+     could dismiss immediately and show the load state in chat. Polish,
+     not a bug. (Surfaced 2026-07-09; Mark: "fine, maybe one day.")
 
 ### v2.0.1 What's New text (drafted, ready to use)
 

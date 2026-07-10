@@ -51,6 +51,17 @@ pattern. **Open UX candidate (not actioned):** `ModelLibraryRow`'s Delete
 button is hidden for the *active* model (`.mlx && !isActive`), which reads as
 "missing" — consider a disabled Delete + "switch models to delete" hint.
 
+**Privacy Lock indicator (v2.1 roadmap item 3) is DONE and device-verified**
+(2026-07-09). `lock` / `lock.open` glyph left of the gear (monochrome, matches
+gearshape); tap → popover with plain-language state + "Model Library →" link.
+New `PrivacyMonitor.swift` (NWPathMonitor + pure `isLocked` truth table +
+popover). Live-reactive to model switch and Airplane Mode. A second
+sheet-race (the popover → Model Library link) was fixed via
+`onDisappear`-resume. Two more polish candidates logged in NEXT (the Delete
+hint above; snappier Library dismiss on MLX selection). Roadmap now: items 1
+(v2.0.1 ship — Mark's ASC action), 4 (Posey sharing), 5 (mxbai), 6 (Bonsai,
+cut line) remain.
+
 **v2.0.1 hotfix** (EmbeddingGemma mis-download) remains **fully verified
 — sim + device — deferred to ride with v2.1** per Mark 2026-05-26 (the
 orphan-weights bug is bandwidth-leaky but crash-safe).

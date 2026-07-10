@@ -3666,3 +3666,81 @@ because CC had switched to it for testing; switching back to AFM restored the
 Delete affordance. Flagged as a UX-legibility candidate for later: showing a
 *disabled* Delete with a "switch models to delete" hint would be clearer than
 silently hiding it. Not actioned.
+
+---
+
+## 2026-07-09 (continued — Privacy Lock indicator: v2.1 roadmap item 3)
+
+### What it is
+
+A lock glyph in the chat toolbar, left of the gear, that honestly shows
+whether data could leave the device right now — the transparency-as-
+architecture principle made literally visible. Operationalizes the standing
+WWDC26 stance: "PCC is the user's choice via Airplane Mode; we don't block
+Apple's routing, we make the state visible."
+
+### Design (agreed with Mark)
+
+- **Placement:** trailing, immediately left of the gear — the gear keeps its
+  established corner (frequent target), the lock sits just inside it. (Center
+  was moot: the title is large-title style, flush-left one line down.)
+- **Glyph:** `lock` / `lock.open` — the *outline* SF Symbols, monochrome, so
+  they're a clean twin of `gearshape`. No color tint; the shape carries the
+  meaning (also honors Mark's "lock over color" preference).
+- **Truth table:** MLX → locked; AFM + no network → locked; AFM + network →
+  unlocked (PCC possible — the honest, conservative read); salon → unlocked if
+  ANY active seat is AFM + network, else locked.
+- **Tap:** popover with a plain-language state description + a "Model
+  Library →" link.
+
+### Implementation
+
+New `PrivacyMonitor.swift`: an ObservableObject wrapping `NWPathMonitor`
+(`@Published isNetworkAvailable`, defaults to `false` so the lock reads
+"locked" — the safe default — until the first path update lands), a PURE
+`isLocked(...)` function holding the truth table (kept free of catalog/UI
+deps so it's testable; the caller resolves salon seat sources, unknown →
+`.appleFoundation`), and the `PrivacyLockPopover` view. In `iOSChatView`, a
+computed `isPrivacyLocked` reads active model + monitor + salon config, all
+`@Published`, so the glyph flips live on a model switch or Airplane-Mode
+toggle. Started once at launch in `Hal10000App.init`. New file auto-compiles
+via the project's synchronized folder group (no pbxproj edit); added to
+`sync_hal_source.sh`.
+
+### Device verification (iPhone 16 Plus)
+
+AFM + network → open lock; toggling Airplane Mode / Wi-Fi off → closes within
+~1s and reopens; a **genuinely loaded Qwen** (MLX) → closed lock. Mark
+verified the Airplane/Wi-Fi behavior himself; CC verified the glyph states by
+screenshot.
+
+**An honesty lesson mid-task:** CC first "verified" the locked state by
+`SWITCH_MODEL`-ing to Gemma over the API and screenshotting the closed lock —
+but Gemma wasn't actually downloaded (the API switch skips the UI's
+downloaded-guard), so it was a shallow check against an artificial state, and
+CC overstated it as "verified live." Mark caught it. The lock's *logic* was
+still correct (selecting any MLX model = no cloud egress, and the real UI
+won't let you select an undownloaded model), but the proper proof needed a
+genuinely loaded MLX model — done once Mark reinstalled Qwen. Takeaways
+recorded: verify disk/load state (`MLX_STATE`) before trusting a switch, don't
+mutate device state silently to serve a test, don't overstate verification.
+
+### Two sheet-presentation races fixed along the way
+
+Both are the same class as the download-disclosure bug — two presentations
+from one view can't coexist:
+
+1. The popover's "Model Library →" link set `apiNavModelLibrary = true` while
+   the popover was still up → sheet dropped. `.popover` has no `onDismiss`, so
+   fixed by recording intent + dismissing, then presenting from the popover
+   content's `onDisappear`.
+
+### Adjacent finding (not a bug): Model Library dismiss timing
+
+Selecting a model in the Library awaits the full model load before
+`dismiss()` (`selectModel` → `switchToModel` → `awaitPendingMLXLoad`). So AFM
+(nothing to load) bounces to chat instantly, while an MLX model appears to
+"hold" in the Library for its multi-second load, then dismisses. Same intent,
+consistent, correct (the await is deliberate — post-load logic needs settled
+state); just not snappy. Logged as a polish candidate. Mark: "it's just
+fine… maybe one day."
