@@ -107,9 +107,20 @@ is a same-volume rename (no byte copy). Display is disk-truth so a final
 via planted fakes (real migration is a no-op on the dev device). Embedder sharing
 (Nomic/mxbai) rides with item #5.
 
-Roadmap now: items 1 (v2.0.1 ship — Mark's ASC action), 5 (mxbai + embedder
-sharing, next), 6 (Bonsai, cut line) remain. Item 4 (cross-app sharing) is now
-fully done bar Posey adopting the download-lock block.
+**Item 5 (mxbai + multi-embedder) DONE + device-verified 2026-07-09** — all
+three steps: mxbai backend + embedder load-path fix (`2accebf`); per-embedder
+"keep-both" columns replacing the destructive wipe, so switching embedders is
+instant + non-destructive + A/B-able (`95b2f05`); A/B + calibration + model
+cards + Recommended badge (`a448540`). Retrieval separation mxbai 0.48 > Nomic
+0.30 > NLContextual 0.10; kept all three for user choice (NLContextual default,
+mxbai recommended-for-quality). Findings: `Docs/Embedder_AB_Findings_2026-07-09.md`.
+New tests: `embedding_columns_regression.py`, `embedder_ab_eval.py`. **Open
+eyeball for Mark:** the "Recommended" badge + new embedder card copy are
+compile-verified but not visually confirmed on the Model Library screen.
+
+Roadmap now: items 1 (v2.0.1 ship — Mark's ASC action), 6 (Bonsai, cut line)
+remain. Item 4 (cross-app sharing) is fully done bar Posey adopting the
+download-lock block.
 
 **v2.0.1 hotfix** (EmbeddingGemma mis-download) remains **fully verified
 — sim + device — deferred to ride with v2.1** per Mark 2026-05-26 (the

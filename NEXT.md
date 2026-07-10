@@ -80,19 +80,33 @@ retrieval quality improves regardless of how Bonsai turns out.
    present-but-unclaimed models show "Download" (tap is instant/adopt) —
    consider "Add"/"Available (instant)" labeling; touches Posey too, decide
    together. Posey antenna for two-app testing: `169.254.214.164:8765`.
-5. **mxbai third embedding backend** — add `mxbai-embed-large-v1`
-   (Mixedbread, BERT-large, 1024-dim, ~670 MB) as a third embedder.
-   Runs via `swift-embeddings`' Bert path — the SAME library + code
-   path Hal already uses for Nomic, so **no MLX, no Metal-init crash
-   risk**. Device-proven in Posey 2026-06-19 (dim=1024, finite,
-   ~0.66s/encode). Rides in with #4's shared model space (a user who
-   downloaded it in Posey gets it in Hal free). **Then A/B it against
-   Nomic** using `rag_pipeline_eval.py` / `nomic_calibration_probe.py`
-   before deciding whether it becomes the recommended embedder or just
-   an available one — it's stronger but heavier + slower to embed than
-   Nomic, so the tradeoff must be measured, not assumed. Hal already
-   handles variable embedding dims (512 NLContextual / 768 Nomic), so
-   1024 is just another value on the existing switch-and-re-embed path.
+5. ~~**mxbai third embedding backend + multi-embedder architecture**~~ —
+   **DONE + device-verified 2026-07-09 (all 3 steps).** Shipped as three
+   commits:
+   - **Step 1** (`2accebf`): mxbai (`mxbai-embed-large-v1`, BERT-large,
+     1024-dim) via swift-embeddings' Bert path (no MLX/Metal risk) +
+     fixed a latent bug — the embedder LOAD path still read pre-v2.1
+     Caches while models moved to the shared store (broke Nomic).
+     `EMBED_PROBE` verb. Both device-proven (768/1024-dim, finite,
+     L2-normalized).
+   - **Step 2** (`95b2f05`): **per-embedder columns (keep-both)** —
+     replaced the destructive wipe-and-re-embed-on-switch with permanent
+     `embedding_nl`/`embedding_nomic`/`embedding_mxbai` columns; switching
+     is now instant + non-destructive; `backfillEmbeddings(for:)` fills
+     inactive columns; `EMBEDDING_COVERAGE` / `BACKFILL_EMBEDDINGS` verbs;
+     one-time flag-gated legacy→active-column copy.
+     `tests/embedding_columns_regression.py`.
+   - **Step 3** (`a448540`): **A/B** (`tests/embedder_ab_eval.py`) —
+     retrieval separation mxbai 0.48 > Nomic 0.30 > NLContextual 0.10;
+     calibrated mxbai synth threshold → 0.82; model cards (enriched
+     blurbs + `isRecommended` badge for mxbai); non-destructive-switch
+     confirmation copy. Findings in
+     `Docs/Embedder_AB_Findings_2026-07-09.md`.
+     **Product call:** keep all three (NLContextual default/always-avail,
+     Nomic balanced, mxbai recommended-for-quality). **Open eyeball for
+     Mark:** the "Recommended" badge + new card copy are compile-verified
+     but not visually confirmed on the Model Library embedder screen
+     (harness can't navigate there).
 6. **Ternary Bonsai 8B — evaluate + calibrate (CUT LINE).**
    `prism-ml/Ternary-Bonsai-8B-mlx-2bit`. 1.58-bit ternary weights
    *trained* ternary (not post-hoc crushed → no usual 2-bit quality
