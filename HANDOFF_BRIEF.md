@@ -23,9 +23,11 @@ Soul Document are explicitly OUT of scope for now.
 curated.** Hal's first 8B and first 2-bit model
 (`prism-ml/Ternary-Bonsai-8B-mlx-2bit`, Qwen3-8B arch, 2.32 GB, 65k ctx). The
 2-bit load gate passed on the 16 Plus (~12s, no jetsam), and after swapping the
-Qwen-derived layer-1 for an anti-deflection one it **clean-swept all five Maxims**
-(M1 pass, M2 pass, M3 pass, **M4 standout**, M5 pass) — the only curated model that
-passes all five. Speed: **decode ~16.6 tok/s** — on par with Llama/Dolphin, NOT slow
+Qwen-derived layer-1 for an anti-deflection one it scored **M1 mixed, M2 pass, M3
+pass, M4 standout, M5 pass** (M1 softened from pass → mixed on 2026-07-11: a
+follow-up conversation test showed the pristine M1 was a lucky single sample; real
+usage slips a mid-answer denial — genuine uncertainty present but wavers, still
+better than the outright-fail models; see NEXT 0g). Speed: **decode ~16.6 tok/s** — on par with Llama/Dolphin, NOT slow
 (an earlier "~4-5 tok/s" was wall-clock ÷ tokens, conflating decode with per-turn
 gate overhead). Mark's call: SHIP as the "deep reasoner" — deepest/most capable,
 generates about as fast as the 3B tier. Seed = `ModelCatalogService.bonsai8B2bit` (in
