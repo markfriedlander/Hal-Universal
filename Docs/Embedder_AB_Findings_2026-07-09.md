@@ -54,16 +54,17 @@ refine from real trait-evolution events.
 
 ## Product decision
 
-**Keep all three; let the user choose (model cards in the picker).** Not
-one-size-fits-all:
+**Keep all three as equal, legitimate choices; let the user pick via model
+cards.** Mark (2026-07-09): "all three are the recommended ones" — so NO single
+"Recommended" badge; the picker presents each one's strengths and costs
+neutrally. The separation numbers inform the *wording* (how precise each is),
+not a ranking that steers the user.
 
-- **NLContextual** — the **default / always-available** (built-in, no download,
-  fastest, lightest). Hal must work on first launch with no download, so this
-  stays the out-of-box embedder. Weakest discrimination.
-- **Nomic** — balanced middle (~522 MB, moderate speed, clearly better than
-  built-in).
-- **mxbai** — **recommended for quality** (`isRecommended = true`). Sharpest
-  retrieval; heaviest (~670 MB) and slowest to embed. Opt-in download.
+- **NLContextual** — built-in, no download, instant, always available, private.
+  Lightest; least precise. (Also the out-of-box default because Hal must work on
+  first launch with nothing downloaded — a default, not a recommendation.)
+- **Nomic** — ~522 MB, moderate speed, a step up in precision.
+- **mxbai** — most precise; largest (~670 MB) and slowest to embed.
 
 ## Caveats
 

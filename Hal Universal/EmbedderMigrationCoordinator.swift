@@ -226,20 +226,6 @@ struct EmbedderBackendRow: View {
                         // row labels.
                         .lineLimit(2)
                         .fixedSize(horizontal: false, vertical: true)
-                    // "Recommended" badge — mxbai wins the retrieval-quality A/B
-                    // (see EmbeddingBackend.isRecommended + the findings doc).
-                    if backend.isRecommended {
-                        Text("Recommended")
-                            .font(.caption2)
-                            .fontWeight(.semibold)
-                            .foregroundColor(.accentColor)
-                            .padding(.horizontal, 6)
-                            .padding(.vertical, 2)
-                            .background(Color.accentColor.opacity(0.15))
-                            .clipShape(Capsule())
-                            .lineLimit(1)
-                            .fixedSize()
-                    }
                     Spacer(minLength: 8)
                     if let size = backend.sizeBlurb {
                         Text(size)
@@ -302,10 +288,11 @@ struct EmbedderBackendRow: View {
     //   - Trash + "Delete" text in red (not just an icon)
     //
     // The embedding side adds one wrinkle the LLM side doesn't have: a
-    // "Switch" action that triggers a destructive re-embed migration.
-    // We surface that semantics through the existing confirmation dialog
-    // (set up on the parent VStack), so the button itself can stay quiet
-    // and just say "Select" like the LLM row.
+    // "Switch" action. As of v2.1 step 2 the switch is NON-destructive
+    // (each embedder keeps its own vector column; a background backfill
+    // fills the new one) — the confirmation dialog on the parent VStack
+    // explains that, so the button itself stays quiet and says "Select"
+    // like the LLM row.
     @ViewBuilder
     private var actionRow: some View {
         HStack(spacing: 12) {
@@ -366,8 +353,8 @@ struct EmbedderBackendRow: View {
                 }
             } else {
                 // Downloaded but not active — "Select" triggers the
-                // destructive confirmation dialog (parent VStack handles
-                // it). Same affordance as ModelLibraryRow's Select state.
+                // (now non-destructive) switch confirmation dialog (parent
+                // VStack handles it). Same affordance as ModelLibraryRow's Select.
                 Button(action: { showingConfirm = true }) {
                     HStack(spacing: 4) {
                         Image(systemName: "circle")

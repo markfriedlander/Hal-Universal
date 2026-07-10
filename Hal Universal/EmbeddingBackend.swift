@@ -250,33 +250,24 @@ nonisolated enum EmbeddingBackend: String, Sendable, CaseIterable {
         }
     }
 
-    /// Short "model card" description shown in the embedder card body. The
-    /// retrieval-strength language reflects the measured separation between
-    /// related and unrelated memories (tests/embedder_ab_eval.py, 2026-07-09):
+    /// Short "model card" description shown in the embedder card body. All three
+    /// are legitimate choices with different tradeoffs (Mark, 2026-07-09 — "all
+    /// three are the recommended ones"); the wording states each one's strengths
+    /// and costs neutrally rather than ranking a single winner. The
+    /// retrieval-precision language is grounded in the measured separation
+    /// between related and unrelated memories (tests/embedder_ab_eval.py):
     /// mxbai (0.48) > Nomic (0.30) > NLContextual (0.10).
     var blurb: String {
         switch self {
         case .nlContextual:
-            return "Apple's built-in on-device embedder. 512-dim, runs on the Neural Engine, no download — always available and the default. Fastest and lightest, but the coarsest at telling related memories from unrelated ones. Best when you want zero setup and minimal storage."
+            return "Apple's built-in on-device embedder. 512-dim, runs on the Neural Engine — no download, instant, always available, private by construction. The lightest option; a bit less precise than the downloadable models at separating closely-related memories, but plenty for everyday recall."
         // REMOVED 2026-05-20:
         // case .embeddingGemma:
         //     return "Google's open embedding model, 308M params, MLX 4-bit quantized. 768-dim, state-of-the-art on MTEB Multilingual v2 among models under 500M. Adds ~210 MB on disk."
         case .nomicSwift:
-            return "Nomic Embed Text v1.5. 137M params, 768-dim, purpose-built for asymmetric retrieval. On-device via Apple's MLTensor (no MLX). A solid middle ground — noticeably sharper at distinguishing related from unrelated memories than the built-in embedder, at ~522 MB and moderate speed."
+            return "Nomic Embed Text v1.5. 137M params, 768-dim, purpose-built for asymmetric retrieval. On-device via Apple's MLTensor (no MLX). A step up in retrieval precision over the built-in embedder, at ~522 MB and moderate embedding speed."
         case .mxbai:
-            return "Mixedbread mxbai-embed-large-v1. BERT-large, 335M params, 1024-dim, CLS pooling, asymmetric retrieval. On-device via the same path as Nomic (no MLX). The sharpest memory retrieval of the three — recommended when recall quality matters most. The heaviest and slowest to embed; ~670 MB on disk."
-        }
-    }
-
-    /// Whether to badge this backend as "Recommended" in the picker. mxbai wins
-    /// on retrieval quality (see `blurb`); it's opt-in (a download) rather than
-    /// the default because Hal must work on first launch with no download —
-    /// that's NLContextual's job. So: NLContextual = default/always-available,
-    /// mxbai = recommended-for-quality, Nomic = balanced middle.
-    var isRecommended: Bool {
-        switch self {
-        case .mxbai: return true
-        case .nlContextual, .nomicSwift: return false
+            return "Mixedbread mxbai-embed-large-v1. BERT-large, 335M params, 1024-dim, CLS pooling. On-device via the same path as Nomic (no MLX). The most precise of the three at telling closely-related memories apart — at the cost of being the largest (~670 MB) and slowest to embed."
         }
     }
 
