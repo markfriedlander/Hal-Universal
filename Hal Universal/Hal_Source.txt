@@ -22415,13 +22415,54 @@ class LLMService: ObservableObject {
             }
 
         case .mlx:
-            guard mlxWrapper.isModelLoaded else {
-                halLog("HALDEBUG-MLX-CHAT: Cannot generate - MLX model not loaded")
-                return AsyncThrowingStream { continuation in
-                    continuation.finish(throwing: LLMError.modelNotLoaded)
+            // Fast path: model resident → generate directly.
+            if mlxWrapper.isModelLoaded {
+                return mlxWrapper.generateChatStream(messages: messages, temperature: temperature)
+            }
+            // RELOAD-ON-DEMAND. The MLX model may not be resident for two reasons,
+            // and neither should dead-end a chat with "model could not be loaded":
+            //   1. Background-unload — Hal unloads MLX on didEnterBackground (see
+            //      ~4950) to drop its ~2.5 GB footprint so iOS doesn't jetsam a
+            //      backgrounded Hal. A message typed after returning finds it gone.
+            //   2. First-turn-after-switch race (Bug 3) — a just-issued SWITCH_MODEL
+            //      for a large model may still be loading when the next turn arrives.
+            // So: wait for any in-flight load, else trigger a fresh reload of the
+            // current model, then generate. The reload reuses the same
+            // setupLLM / pendingMLXLoadTask machinery a switch uses (~5-15s for a
+            // big model — the user sees the normal thinking state a beat longer,
+            // then the answer, instead of an error).
+            return AsyncThrowingStream { continuation in
+                Task { [weak self] in
+                    guard let self else {
+                        continuation.finish(throwing: LLMError.modelNotLoaded)
+                        return
+                    }
+                    // 1. Await any load already in flight (e.g. mid-switch → Bug 3).
+                    await self.awaitPendingMLXLoad()
+                    // 2. Still not resident (e.g. a background-unload left nothing
+                    //    pending) → reload the current model and wait for it.
+                    if !self.mlxWrapper.isModelLoaded {
+                        halLog("HALDEBUG-MLX-CHAT: model not resident (likely background-unload) — reloading \(self.currentModel.displayName) on demand before generating")
+                        self.setupLLM(for: self.currentModel)
+                        await self.awaitPendingMLXLoad()
+                    }
+                    // 3. If it still didn't load, surface the real error.
+                    guard self.mlxWrapper.isModelLoaded else {
+                        halLog("HALDEBUG-MLX-CHAT: reload-on-demand failed — model still not loaded")
+                        continuation.finish(throwing: LLMError.modelNotLoaded)
+                        return
+                    }
+                    // 4. Bridge the inner generation stream through to the caller.
+                    do {
+                        for try await chunk in self.mlxWrapper.generateChatStream(messages: messages, temperature: temperature) {
+                            continuation.yield(chunk)
+                        }
+                        continuation.finish()
+                    } catch {
+                        continuation.finish(throwing: error)
+                    }
                 }
             }
-            return mlxWrapper.generateChatStream(messages: messages, temperature: temperature)
         }
     }
 

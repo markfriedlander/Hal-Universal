@@ -181,9 +181,12 @@ refactor "cosmetic cleanup candidates" list.
 1. ~~**Finish the Bonsai concision layer-1 tuning (0f)**~~ **DONE 2026-07-11.**
    Format-scoped instruction added; explanations now return clean prose, M5 depth
    kept, M1 unchanged (the "regression" was a false alarm — see 0f/0g below).
-2. **Reload-on-demand for MLX chat (0c)** — fixes the background-unload "model could
-   not be loaded" error AND closes Bug 3. Highest-value bug; also stabilizes long
-   test/chat sessions. ~20–40 lines at Hal.swift:5955.
+2. ~~**Reload-on-demand for MLX chat (0c)**~~ **DONE + device-verified 2026-07-11.**
+   The `.mlx` chat path (Hal.swift:5955) now, when the model isn't resident, awaits any
+   in-flight load or triggers a reload of the current model, then generates — instead
+   of erroring. Verified: forced a background-unload, sent a raw chat (no reload-guard)
+   → log showed "model not resident … reloading … on demand," it reloaded and answered
+   (no error). Closes Bug 3 (same `awaitPendingMLXLoad` path). See 0c detail below.
 3. **RAG-miss confabulation gate (Bug 2b)** — when retrieval finds no strong match,
    tell the model to say "I don't have that" instead of inventing. Squarely
    on-mission (Maxim 1 in the retrieval path). Small–medium.
@@ -1185,7 +1188,21 @@ navigation verbs (or add new ones) so the harness can open the Model Library, ex
 an embedder card, and screenshot it. Would let CC self-verify embedder + model-card
 UI without waiting on Mark. Tooling, not user-facing.
 
-### 0c. Reload-on-demand for MLX chat — fixes background-unload error + Bug 3 (found 2026-07-11)
+### 0c. Reload-on-demand for MLX chat — DONE + device-verified 2026-07-11 (WL2)
+
+**Shipped.** The `.mlx` case of `generateChatResponseStream` (Hal.swift ~5955) now, on
+a non-resident model, wraps generation in a Task that (1) awaits any in-flight load,
+(2) if still not resident, calls `setupLLM(for: currentModel)` and awaits it, (3) then
+bridges the inner `mlxWrapper.generateChatStream` through — instead of erroring.
+`generateChatResponse` drains the same stream, so the gate + all callers inherit it.
+Device-verified: forced a background-unload (launch another app → didEnterBackground →
+unload), re-foregrounded, sent a RAW chat (no reload-guard) → log
+"model not resident (likely background-unload) — reloading Ternary Bonsai 8B on
+demand," it reloaded (~12s wrapped into the turn) and answered, no error. Closes Bug 3
+(same `awaitPendingMLXLoad` branch; the background-unload test exercised the harder
+trigger-a-fresh-load branch). No "reloading…" status message was added — the user just
+sees the normal thinking state a beat longer, then the answer (clean; a status yield
+would pollute the response/copy/export). Original analysis kept below for the record.
 
 Two symptoms, ONE root cause and ONE fix site. Hal deliberately unloads the MLX
 model on `didEnterBackgroundNotification` (Hal.swift:4947 — drops a ~2.5 GB
