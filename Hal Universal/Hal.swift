@@ -441,7 +441,33 @@ class MemoryStore: ObservableObject {
             print("HALDEBUG-RECENCY: Recency floor updated to \(recencyFloor)")
         }
     }
-    
+
+    // RRF fusion weights for time-aware RAG. These are the k constants in the
+    // Reciprocal Rank Fusion that blends semantic + BM25 retrieval in
+    // searchUnifiedContent: a retriever's rank-r hit contributes 1/(k + r), so
+    // a SMALLER k means that retriever's top hits dominate the fused order.
+    // They live here (global, not per-model) because they describe retrieval
+    // behavior, not a model's personality. Defaults reproduce the historical
+    // hardcoded constants exactly (60 / 10 / 60), so the app is byte-identical
+    // until they're deliberately swept. The 2026-07-09 retrieval eval found
+    // semantic under-weighted next to distinctive BM25 (60 vs 10 ≈ 5.5× weaker),
+    // so the embedder only broke ties; these knobs exist to rebalance that.
+    @AppStorage("rrfKSemantic") var rrfKSemantic: Double = 60.0 {
+        didSet {
+            print("HALDEBUG-RRF: Semantic k updated to \(rrfKSemantic)")
+        }
+    }
+    @AppStorage("rrfKBM25Distinctive") var rrfKBM25Distinctive: Double = 10.0 {
+        didSet {
+            print("HALDEBUG-RRF: BM25 distinctive k updated to \(rrfKBM25Distinctive)")
+        }
+    }
+    @AppStorage("rrfKBM25Default") var rrfKBM25Default: Double = 60.0 {
+        didSet {
+            print("HALDEBUG-RRF: BM25 default k updated to \(rrfKBM25Default)")
+        }
+    }
+
     // Self-knowledge decay settings (parallel to RAG decay but with different defaults)
     @AppStorage("selfKnowledgeHalfLifeDays") var selfKnowledgeHalfLifeDays: Double = 365.0 {
         didSet {
@@ -2903,8 +2929,11 @@ extension MemoryStore {
         // gets RRF'd to rank-2 behind a semantically-adjacent conversation
         // snippet — exactly the Bug 2a failure mode where imported docs
         // show up below conversation echoes of their own content.
-        let rrfKSemantic: Double = 60.0
-        let rrfKBM25: Double = bm25Distinctive ? 10.0 : 60.0
+        // Fusion weights are the live tunable knobs (defaults 60/10/60
+        // reproduce the historical constants exactly). See the @AppStorage
+        // declarations in this class for the rationale.
+        let rrfKSemantic: Double = self.rrfKSemantic
+        let rrfKBM25: Double = bm25Distinctive ? rrfKBM25Distinctive : rrfKBM25Default
         var rrfScored: [(id: String, score: Double, inSemantic: Bool, inBM25: Bool)] = []
         let unionIds = Set(semanticRanks.keys).union(Set(bm25Ranks.keys))
         for rowId in unionIds {

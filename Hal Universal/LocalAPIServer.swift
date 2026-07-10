@@ -636,6 +636,39 @@ class HalTestConsole: ObservableObject {
             }
             return "{\"status\":\"error\",\"message\":\"SET_RECENCY_HALFLIFE: must be >= 1.0 (days)\"}"
 
+        } else if trimmed.hasPrefix("SET_RRF_SEMANTIC_K:") {
+            // RRF fusion knob. Smaller k → semantic hits dominate the fused
+            // order. Global (not per-model). See MemoryStore's rrfKSemantic.
+            // Exists so tests/embedder_retrieval_eval.py can sweep the fusion.
+            let valStr = String(trimmed.dropFirst("SET_RRF_SEMANTIC_K:".count)).trimmingCharacters(in: .whitespaces)
+            if let val = Double(valStr), val >= 1.0, val <= 1000.0 {
+                vm.memoryStore.rrfKSemantic = val
+                return "{\"status\":\"ok\",\"rrfKSemantic\":\(val)}"
+            }
+            return "{\"status\":\"error\",\"message\":\"SET_RRF_SEMANTIC_K: must be 1.0–1000.0\"}"
+
+        } else if trimmed.hasPrefix("SET_RRF_BM25_DISTINCTIVE_K:") {
+            // k applied to BM25 when its top-1 is a distinctive lexical match.
+            let valStr = String(trimmed.dropFirst("SET_RRF_BM25_DISTINCTIVE_K:".count)).trimmingCharacters(in: .whitespaces)
+            if let val = Double(valStr), val >= 1.0, val <= 1000.0 {
+                vm.memoryStore.rrfKBM25Distinctive = val
+                return "{\"status\":\"ok\",\"rrfKBM25Distinctive\":\(val)}"
+            }
+            return "{\"status\":\"error\",\"message\":\"SET_RRF_BM25_DISTINCTIVE_K: must be 1.0–1000.0\"}"
+
+        } else if trimmed.hasPrefix("SET_RRF_BM25_DEFAULT_K:") {
+            // k applied to BM25 when its top-1 is NOT distinctive.
+            let valStr = String(trimmed.dropFirst("SET_RRF_BM25_DEFAULT_K:".count)).trimmingCharacters(in: .whitespaces)
+            if let val = Double(valStr), val >= 1.0, val <= 1000.0 {
+                vm.memoryStore.rrfKBM25Default = val
+                return "{\"status\":\"ok\",\"rrfKBM25Default\":\(val)}"
+            }
+            return "{\"status\":\"error\",\"message\":\"SET_RRF_BM25_DEFAULT_K: must be 1.0–1000.0\"}"
+
+        } else if trimmed == "RRF_STATUS" {
+            let ms = vm.memoryStore
+            return "{\"status\":\"ok\",\"command\":\"RRF_STATUS\",\"rrfKSemantic\":\(ms.rrfKSemantic),\"rrfKBM25Distinctive\":\(ms.rrfKBM25Distinctive),\"rrfKBM25Default\":\(ms.rrfKBM25Default)}"
+
         } else if trimmed.hasPrefix("MEMORY_PLANT_AGED:") {
             // MEMORY_PLANT_AGED:<days_old>:<content>
             //
