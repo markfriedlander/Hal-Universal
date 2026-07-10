@@ -108,6 +108,11 @@ nonisolated enum EmbeddingBackend: String, Sendable, CaseIterable {
     case nlContextual = "nlcontextual"
     // REMOVED 2026-05-20: case embeddingGemma = "embeddinggemma"
     case nomicSwift = "nomicswift"
+    /// Mixedbread mxbai-embed-large-v1 — BERT-large (335M, 1024-dim), via the
+    /// SAME swift-embeddings `Bert` path Nomic uses (no MLX, no Metal-init crash
+    /// risk). CLS pooling; asymmetric retrieval (query-only prefix). Added
+    /// 2026-07-09 (v2.1 item 5); device-proven in Posey 2026-06-19.
+    case mxbai = "mxbai"
 
     nonisolated static let defaultsKey = "embeddingBackend"
     // REMOVED 2026-05-20: nonisolated static let crashGuardKey = "embeddingGemmaCrashAttempts"
@@ -124,6 +129,7 @@ nonisolated enum EmbeddingBackend: String, Sendable, CaseIterable {
         switch self {
         case .nlContextual: return true
         case .nomicSwift: return true
+        case .mxbai: return true
         // REMOVED 2026-05-20: case .embeddingGemma:
         //     #if HAL_ENABLE_EMBEDDING_GEMMA
         //     return true
@@ -185,6 +191,7 @@ nonisolated enum EmbeddingBackend: String, Sendable, CaseIterable {
         case .nlContextual: return 2  // matches original (post-NLEmbedding migration)
         // REMOVED 2026-05-20: case .embeddingGemma: return 3
         case .nomicSwift: return 4
+        case .mxbai: return 5
         }
     }
 
@@ -194,6 +201,7 @@ nonisolated enum EmbeddingBackend: String, Sendable, CaseIterable {
         case .nlContextual: return 512
         // REMOVED 2026-05-20: case .embeddingGemma: return 768
         case .nomicSwift: return 768
+        case .mxbai: return 1024
         }
     }
 
@@ -203,6 +211,7 @@ nonisolated enum EmbeddingBackend: String, Sendable, CaseIterable {
         case .nlContextual: return nil
         // REMOVED 2026-05-20: case .embeddingGemma: return "mlx-community/embeddinggemma-300m-4bit"
         case .nomicSwift: return "nomic-ai/nomic-embed-text-v1.5"
+        case .mxbai: return "mixedbread-ai/mxbai-embed-large-v1"
         }
     }
 
@@ -214,6 +223,7 @@ nonisolated enum EmbeddingBackend: String, Sendable, CaseIterable {
         case .nlContextual: return "Apple NLContextual"
         // REMOVED 2026-05-20: case .embeddingGemma: return "EmbeddingGemma 300M"
         case .nomicSwift: return "Nomic Embed Text v1.5"
+        case .mxbai: return "Mixedbread mxbai-embed-large"
         }
     }
 
@@ -227,6 +237,8 @@ nonisolated enum EmbeddingBackend: String, Sendable, CaseIterable {
         //     return "Google's open embedding model, 308M params, MLX 4-bit quantized. 768-dim, state-of-the-art on MTEB Multilingual v2 among models under 500M. Adds ~210 MB on disk."
         case .nomicSwift:
             return "Nomic AI's open embedding model, 137M params, 768-dim, purpose-built for asymmetric retrieval (query vs document). Runs via Apple's MLTensor framework (no MLX). Adds ~522 MB on disk."
+        case .mxbai:
+            return "Mixedbread's mxbai-embed-large-v1, 335M params, 1024-dim. BERT-large via the same swift-embeddings path as Nomic (no MLX). CLS pooling, asymmetric retrieval (query prefix). The strongest retrieval of the three and the heaviest. Adds ~670 MB on disk."
         }
     }
 
@@ -236,6 +248,7 @@ nonisolated enum EmbeddingBackend: String, Sendable, CaseIterable {
         case .nlContextual: return nil
         // REMOVED 2026-05-20: case .embeddingGemma: return "~210 MB"
         case .nomicSwift: return "~522 MB"
+        case .mxbai: return "~670 MB"
         }
     }
 
@@ -295,6 +308,14 @@ nonisolated enum EmbeddingBackend: String, Sendable, CaseIterable {
             // range; Nomic's 0.85 sits at the floor of its safe-merge
             // zone.
             return 0.85
+        case .mxbai:
+            // PLACEHOLDER (v2.1 item 5, step 1) — mxbai's CLS/L2-normalized
+            // cosine distribution differs from Nomic's and must be calibrated on
+            // reflection-shaped SAME/RELATED pairs in step 3 (the A/B pass)
+            // before this is trusted. 0.85 is a conservative starting point, not
+            // a measured value. See tests/nomic_calibration_probe.py for the
+            // probe shape to reuse.
+            return 0.85
         // REMOVED 2026-05-20:
         // case .embeddingGemma:
         //     // PLACEHOLDER — calibrate from real corpus data when re-enabled.
@@ -332,6 +353,10 @@ nonisolated enum EmbeddingBackend: String, Sendable, CaseIterable {
             // PLACEHOLDER — needs calibration. Nomic's wider score
             // distribution likely wants a lower threshold here (maybe
             // 0.4-0.5), but we'll know after observing real evolutions.
+            return 0.6
+        case .mxbai:
+            // PLACEHOLDER (v2.1 item 5) — calibrate in step 3 alongside the
+            // synthesis threshold.
             return 0.6
         // REMOVED 2026-05-20:
         // case .embeddingGemma:

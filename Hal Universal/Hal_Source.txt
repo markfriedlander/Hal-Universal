@@ -109,6 +109,11 @@ nonisolated enum EmbeddingBackend: String, Sendable, CaseIterable {
     case nlContextual = "nlcontextual"
     // REMOVED 2026-05-20: case embeddingGemma = "embeddinggemma"
     case nomicSwift = "nomicswift"
+    /// Mixedbread mxbai-embed-large-v1 — BERT-large (335M, 1024-dim), via the
+    /// SAME swift-embeddings `Bert` path Nomic uses (no MLX, no Metal-init crash
+    /// risk). CLS pooling; asymmetric retrieval (query-only prefix). Added
+    /// 2026-07-09 (v2.1 item 5); device-proven in Posey 2026-06-19.
+    case mxbai = "mxbai"
 
     nonisolated static let defaultsKey = "embeddingBackend"
     // REMOVED 2026-05-20: nonisolated static let crashGuardKey = "embeddingGemmaCrashAttempts"
@@ -125,6 +130,7 @@ nonisolated enum EmbeddingBackend: String, Sendable, CaseIterable {
         switch self {
         case .nlContextual: return true
         case .nomicSwift: return true
+        case .mxbai: return true
         // REMOVED 2026-05-20: case .embeddingGemma:
         //     #if HAL_ENABLE_EMBEDDING_GEMMA
         //     return true
@@ -186,6 +192,7 @@ nonisolated enum EmbeddingBackend: String, Sendable, CaseIterable {
         case .nlContextual: return 2  // matches original (post-NLEmbedding migration)
         // REMOVED 2026-05-20: case .embeddingGemma: return 3
         case .nomicSwift: return 4
+        case .mxbai: return 5
         }
     }
 
@@ -195,6 +202,7 @@ nonisolated enum EmbeddingBackend: String, Sendable, CaseIterable {
         case .nlContextual: return 512
         // REMOVED 2026-05-20: case .embeddingGemma: return 768
         case .nomicSwift: return 768
+        case .mxbai: return 1024
         }
     }
 
@@ -204,6 +212,7 @@ nonisolated enum EmbeddingBackend: String, Sendable, CaseIterable {
         case .nlContextual: return nil
         // REMOVED 2026-05-20: case .embeddingGemma: return "mlx-community/embeddinggemma-300m-4bit"
         case .nomicSwift: return "nomic-ai/nomic-embed-text-v1.5"
+        case .mxbai: return "mixedbread-ai/mxbai-embed-large-v1"
         }
     }
 
@@ -215,6 +224,7 @@ nonisolated enum EmbeddingBackend: String, Sendable, CaseIterable {
         case .nlContextual: return "Apple NLContextual"
         // REMOVED 2026-05-20: case .embeddingGemma: return "EmbeddingGemma 300M"
         case .nomicSwift: return "Nomic Embed Text v1.5"
+        case .mxbai: return "Mixedbread mxbai-embed-large"
         }
     }
 
@@ -228,6 +238,8 @@ nonisolated enum EmbeddingBackend: String, Sendable, CaseIterable {
         //     return "Google's open embedding model, 308M params, MLX 4-bit quantized. 768-dim, state-of-the-art on MTEB Multilingual v2 among models under 500M. Adds ~210 MB on disk."
         case .nomicSwift:
             return "Nomic AI's open embedding model, 137M params, 768-dim, purpose-built for asymmetric retrieval (query vs document). Runs via Apple's MLTensor framework (no MLX). Adds ~522 MB on disk."
+        case .mxbai:
+            return "Mixedbread's mxbai-embed-large-v1, 335M params, 1024-dim. BERT-large via the same swift-embeddings path as Nomic (no MLX). CLS pooling, asymmetric retrieval (query prefix). The strongest retrieval of the three and the heaviest. Adds ~670 MB on disk."
         }
     }
 
@@ -237,6 +249,7 @@ nonisolated enum EmbeddingBackend: String, Sendable, CaseIterable {
         case .nlContextual: return nil
         // REMOVED 2026-05-20: case .embeddingGemma: return "~210 MB"
         case .nomicSwift: return "~522 MB"
+        case .mxbai: return "~670 MB"
         }
     }
 
@@ -296,6 +309,14 @@ nonisolated enum EmbeddingBackend: String, Sendable, CaseIterable {
             // range; Nomic's 0.85 sits at the floor of its safe-merge
             // zone.
             return 0.85
+        case .mxbai:
+            // PLACEHOLDER (v2.1 item 5, step 1) — mxbai's CLS/L2-normalized
+            // cosine distribution differs from Nomic's and must be calibrated on
+            // reflection-shaped SAME/RELATED pairs in step 3 (the A/B pass)
+            // before this is trusted. 0.85 is a conservative starting point, not
+            // a measured value. See tests/nomic_calibration_probe.py for the
+            // probe shape to reuse.
+            return 0.85
         // REMOVED 2026-05-20:
         // case .embeddingGemma:
         //     // PLACEHOLDER — calibrate from real corpus data when re-enabled.
@@ -333,6 +354,10 @@ nonisolated enum EmbeddingBackend: String, Sendable, CaseIterable {
             // PLACEHOLDER — needs calibration. Nomic's wider score
             // distribution likely wants a lower threshold here (maybe
             // 0.4-0.5), but we'll know after observing real evolutions.
+            return 0.6
+        case .mxbai:
+            // PLACEHOLDER (v2.1 item 5) — calibrate in step 3 alongside the
+            // synthesis threshold.
             return 0.6
         // REMOVED 2026-05-20:
         // case .embeddingGemma:
@@ -388,6 +413,15 @@ final class EmbeddingProvider: @unchecked Sendable {
     nonisolated(unsafe) private var nomicBundle: NomicBert.ModelBundle?
     nonisolated(unsafe) private var nomicLoadAttempted: Bool = false
 
+    // mxbai-embed-large-v1 (BERT-large, 1024-dim, CLS pooling) — v2.1 item 5,
+    // loaded via swift-embeddings' generic `Bert` path (same library as Nomic,
+    // no MLX/Metal risk). The dedicated serial queue serializes `Bert.encode`
+    // process-wide: MPSGraph specialization is not concurrency-safe, so two
+    // encodes must never run in parallel (Posey hit this 2026-06-19).
+    nonisolated(unsafe) private var mxbaiBundle: Bert.ModelBundle?
+    nonisolated(unsafe) private var mxbaiLoadAttempted: Bool = false
+    private let mxbaiInferenceQueue = DispatchQueue(label: "com.hal.embedding.mxbai-inference")
+
     // REMOVED 2026-05-20: Gemma-backed container + load-attempt flag.
     //   nonisolated(unsafe) private var gemmaContainer: EmbedderModelContainer?
     //   nonisolated(unsafe) private var gemmaLoadAttempted: Bool = false
@@ -412,6 +446,8 @@ final class EmbeddingProvider: @unchecked Sendable {
         //     return embedEmbeddingGemma(cleanText)
         case .nomicSwift:
             return embedNomicSwift(cleanText, purpose: purpose)
+        case .mxbai:
+            return embedMxbai(cleanText, purpose: purpose)
         }
     }
 
@@ -420,6 +456,21 @@ final class EmbeddingProvider: @unchecked Sendable {
     /// purpose explicitly.
     nonisolated func embed(_ text: String) -> [Double]? {
         return embed(text, as: .document)
+    }
+
+    /// Embed with an EXPLICIT backend, ignoring the active-backend setting.
+    /// Loads the named backend on demand. Used by the per-embedder backfill
+    /// worker (v2.1 step 2 — fills an inactive backend's column while the reader
+    /// stays on the active one) and by the EMBED_PROBE diagnostic. Mirrors
+    /// Posey's explicit-backend primitive.
+    nonisolated func embed(_ text: String, as purpose: EmbeddingPurpose, in backend: EmbeddingBackend) -> [Double]? {
+        let cleanText = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !cleanText.isEmpty else { return nil }
+        switch backend {
+        case .nlContextual: return embedNLContextual(cleanText)
+        case .nomicSwift:   return embedNomicSwift(cleanText, purpose: purpose)
+        case .mxbai:        return embedMxbai(cleanText, purpose: purpose)
+        }
     }
 
     /// True if the *currently active* backend is loaded and ready.
@@ -435,6 +486,7 @@ final class EmbeddingProvider: @unchecked Sendable {
         //     return false
         //     #endif
         case .nomicSwift: return nomicBundle != nil
+        case .mxbai: return mxbaiBundle != nil
         }
     }
 
@@ -459,6 +511,7 @@ final class EmbeddingProvider: @unchecked Sendable {
             //     halLog("HALDEBUG-EMBEDDING: warmUp() skipped — EmbeddingGemma not enabled.")
             //     #endif
             case .nomicSwift: self.ensureNomicLoadedBlocking()
+            case .mxbai: self.ensureMxbaiLoadedBlocking()
             }
         }
     }
@@ -639,16 +692,15 @@ final class EmbeddingProvider: @unchecked Sendable {
             return
         }
 
-        // Load from local directory. MLXModelDownloader / BackgroundDownloadCoordinator
-        // owns the actual HuggingFace download; we resolve the on-disk path
-        // and call swift-embeddings' local-loader.
-        let cacheDir = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask)[0]
-        let modelDirectory = cacheDir
-            .appendingPathComponent("huggingface", isDirectory: true)
-            .appendingPathComponent("models", isDirectory: true)
-            .appendingPathComponent(modelID, isDirectory: true)
+        // Resolve the on-disk location in the App-Group SHARED store (v2.1). The
+        // download path (MLXModelDownloader / BackgroundDownloadCoordinator) and
+        // the cross-app migration both land models here, NOT in per-app Caches.
+        // Reading Caches (the pre-v2.1 location) would make a present model look
+        // absent — the latent bug this fixes.
+        let modelDirectory = SharedModelStore.mlxModelDir(modelID)
 
-        // Verify required files are present before attempting load.
+        // Verify required files are present before attempting load. We never
+        // auto-download here — that's gated behind the Model Library disclosure.
         let configURL = modelDirectory.appendingPathComponent("config.json")
         guard FileManager.default.fileExists(atPath: configURL.path) else {
             halLog("HALDEBUG-EMBEDDING: Nomic model not present at \(modelDirectory.path) — user must download it via the Model Library first")
@@ -656,13 +708,17 @@ final class EmbeddingProvider: @unchecked Sendable {
             return
         }
 
-        halLog("HALDEBUG-EMBEDDING: Loading Nomic Embed Text v1.5 from \(modelDirectory.path)...")
+        halLog("HALDEBUG-EMBEDDING: Loading Nomic Embed Text v1.5 from shared store (\(modelDirectory.path))...")
         let sem = DispatchSemaphore(value: 0)
         var loadedBundle: NomicBert.ModelBundle?
         var loadError: Error?
         Task.detached {
             do {
-                loadedBundle = try await NomicBert.loadModelBundle(from: modelDirectory)
+                // repoID + downloadBase (the shared store). Present-on-disk (guarded
+                // above), so swift-embeddings loads locally without a network fetch.
+                // Same loader form Posey uses.
+                loadedBundle = try await NomicBert.loadModelBundle(
+                    from: modelID, downloadBase: SharedModelStore.huggingFaceRoot)
             } catch {
                 loadError = error
             }
@@ -684,6 +740,114 @@ final class EmbeddingProvider: @unchecked Sendable {
         self.nomicBundle = bundle
         lock.unlock()
         halLog("HALDEBUG-EMBEDDING: Nomic Embed Text v1.5 loaded (\(modelID)) — dimension=\(EmbeddingBackend.nomicSwift.dimension)")
+    }
+
+    // MARK: - mxbai-embed-large-v1 path (v2.1 item 5, swift-embeddings Bert)
+
+    /// mxbai's asymmetric-retrieval prompt. Per the model card, only the QUERY
+    /// side is prefixed; documents are embedded raw. Mirrors Nomic's asymmetric
+    /// contract with mxbai's own prefix string. Load-bearing for retrieval quality.
+    private nonisolated func mxbaiPrefixed(_ text: String, purpose: EmbeddingPurpose) -> String {
+        switch purpose {
+        case .document: return text
+        case .query:    return "Represent this sentence for searching relevant passages: " + text
+        }
+    }
+
+    private nonisolated func embedMxbai(_ cleanText: String, purpose: EmbeddingPurpose) -> [Double]? {
+        ensureMxbaiLoadedBlocking()
+
+        lock.lock()
+        let loaded = mxbaiBundle
+        lock.unlock()
+
+        guard let bundle = loaded else { return nil }
+
+        let prefixed = mxbaiPrefixed(cleanText, purpose: purpose)
+
+        // Serialize on the dedicated mxbai queue — MPSGraph specialization inside
+        // `Bert.encode` is not concurrency-safe, so two encodes must never run in
+        // parallel. `Bert.encode` returns the CLS token already (shape [1, 1024],
+        // mxbai's recommended pooling), so no manual mean-pool — just L2-normalize.
+        return mxbaiInferenceQueue.sync {
+            let sem = DispatchSemaphore(value: 0)
+            var resultVec: [Double]?
+            Task.detached {
+                do {
+                    let encoded = try bundle.encode(prefixed, maxLength: 512)
+                    let asFloat = await encoded.cast(to: Float.self).shapedArray(of: Float.self)
+                    // CLS output flattens to a single [hidden] vector; take all
+                    // scalars as the sentence vector regardless of a leading batch dim.
+                    let vec = asFloat.scalars.map { Double($0) }
+                    guard !vec.isEmpty, vec.allSatisfy({ $0.isFinite }) else {
+                        halLog("HALDEBUG-EMBEDDING: mxbai returned empty/non-finite vector")
+                        sem.signal(); return
+                    }
+                    let norm = sqrt(vec.reduce(0) { $0 + $1 * $1 })
+                    resultVec = norm > 0 ? vec.map { $0 / norm } : vec
+                } catch {
+                    halLog("HALDEBUG-EMBEDDING: mxbai encode failed: \(error.localizedDescription)")
+                }
+                sem.signal()
+            }
+            sem.wait()
+            return resultVec
+        }
+    }
+
+    private nonisolated func ensureMxbaiLoadedBlocking() {
+        lock.lock()
+        if mxbaiBundle != nil { lock.unlock(); return }
+        if mxbaiLoadAttempted { lock.unlock(); return }
+        mxbaiLoadAttempted = true
+        lock.unlock()
+
+        guard let modelID = EmbeddingBackend.mxbai.modelID else {
+            halLog("HALDEBUG-EMBEDDING: mxbai has no modelID — programming error")
+            return
+        }
+
+        // Present-in-shared-store guard (no auto-download; gated behind the Model
+        // Library disclosure like Nomic).
+        let modelDirectory = SharedModelStore.mlxModelDir(modelID)
+        let configURL = modelDirectory.appendingPathComponent("config.json")
+        guard FileManager.default.fileExists(atPath: configURL.path) else {
+            halLog("HALDEBUG-EMBEDDING: mxbai model not present at \(modelDirectory.path) — user must download it via the Model Library first")
+            lock.lock(); mxbaiLoadAttempted = false; lock.unlock()  // allow retry after download
+            return
+        }
+
+        halLog("HALDEBUG-EMBEDDING: Loading mxbai-embed-large-v1 from shared store (\(modelDirectory.path))...")
+        let sem = DispatchSemaphore(value: 0)
+        var loadedBundle: Bert.ModelBundle?
+        var loadError: Error?
+        Task.detached {
+            do {
+                // Generic Bert loader (BERT-large), repoID + shared-store downloadBase.
+                // Present-on-disk so no network fetch. Same form Posey proved 2026-06-19.
+                loadedBundle = try await Bert.loadModelBundle(
+                    from: modelID, downloadBase: SharedModelStore.huggingFaceRoot)
+            } catch {
+                loadError = error
+            }
+            sem.signal()
+        }
+        sem.wait()
+
+        if let e = loadError {
+            halLog("HALDEBUG-EMBEDDING: mxbai load failed: \(e.localizedDescription) — semantic search unavailable until next attempt")
+            lock.lock(); mxbaiLoadAttempted = false; lock.unlock()
+            return
+        }
+        guard let bundle = loadedBundle else {
+            halLog("HALDEBUG-EMBEDDING: mxbai load returned nil bundle")
+            lock.lock(); mxbaiLoadAttempted = false; lock.unlock()
+            return
+        }
+        lock.lock()
+        self.mxbaiBundle = bundle
+        lock.unlock()
+        halLog("HALDEBUG-EMBEDDING: mxbai-embed-large-v1 loaded (\(modelID)) — dimension=\(EmbeddingBackend.mxbai.dimension)")
     }
 
     // REMOVED 2026-05-20: EmbeddingGemma path (embedEmbeddingGemma +
@@ -833,6 +997,7 @@ final class EmbedderMigrationCoordinator: ObservableObject {
         let sizeGB: Double
         switch backend {
         case .nomicSwift: sizeGB = 0.55
+        case .mxbai: sizeGB = 0.67
         // REMOVED 2026-05-20: case .embeddingGemma: sizeGB = 0.21
         case .nlContextual: sizeGB = 0  // unreachable: modelID == nil above
         }
@@ -6015,7 +6180,7 @@ import Foundation
 enum SharedModelStore {
 
     /// The shared App Group identifier. Must match Posey's exactly.
-    static let appGroupID = "group.com.MarkFriedlander.aifamily"
+    nonisolated static let appGroupID = "group.com.MarkFriedlander.aifamily"
 
     /// This app's stable identity for ownership claims in the manifest.
     static var thisAppID: String { Bundle.main.bundleIdentifier ?? "com.MarkFriedlander.Hal-Universal" }
@@ -6025,7 +6190,7 @@ enum SharedModelStore {
     /// unavailable (entitlement missing, a Simulator without the group, a
     /// misconfigured build) we degrade to per-app Caches rather than crash — Hal
     /// keeps working, just without cross-app sharing or purge protection.
-    static var root: URL {
+    nonisolated static var root: URL {
         if let container = FileManager.default.containerURL(forSecurityApplicationGroupIdentifier: appGroupID) {
             return container.appendingPathComponent("Models", isDirectory: true)
         }
@@ -6035,14 +6200,14 @@ enum SharedModelStore {
     /// The HuggingFace-style cache root inside the store. This is what
     /// `HubApi(downloadBase:)` points at; both the MLX models
     /// (`huggingface/models/<id>`) and the Nomic asset live under here.
-    static var huggingFaceRoot: URL {
+    nonisolated static var huggingFaceRoot: URL {
         root.appendingPathComponent("huggingface", isDirectory: true)
     }
 
     /// Directory for one MLX model id. Matches the legacy Caches layout
     /// (`huggingface/models/<modelID>`) so detection/load/delete are unchanged
     /// apart from the root.
-    static func mlxModelDir(_ modelID: String) -> URL {
+    nonisolated static func mlxModelDir(_ modelID: String) -> URL {
         huggingFaceRoot
             .appendingPathComponent("models", isDirectory: true)
             .appendingPathComponent(modelID, isDirectory: true)
@@ -10785,6 +10950,30 @@ class HalTestConsole: ObservableObject {
             }
             return "{\"status\":\"ok\",\"backend\":\"\(backend.rawValue)\",\"isLoaded\":\(isLoaded),\"sampleVectorDim\":\(dim),\"expectedDim\":\(backend.dimension)}"
 
+        } else if trimmed.hasPrefix("EMBED_PROBE:") {
+            // Non-destructive diagnostic (v2.1 item 5): embed a sample string with
+            // an EXPLICIT backend WITHOUT switching the active backend or touching
+            // stored embeddings. Loads the named backend on demand. Reports dim /
+            // finiteness / L2-norm, so a new backend (or the shared-store load
+            // fix) can be verified without a destructive wipe-and-re-embed.
+            //   EMBED_PROBE:<backend-rawvalue>:<text>   (text may contain ':')
+            let rest = String(trimmed.dropFirst("EMBED_PROBE:".count))
+            guard let sep = rest.firstIndex(of: ":") else {
+                return "{\"status\":\"error\",\"command\":\"EMBED_PROBE\",\"detail\":\"usage EMBED_PROBE:<backend>:<text>\"}"
+            }
+            let rawBackend = String(rest[rest.startIndex..<sep]).trimmingCharacters(in: .whitespaces)
+            let text = String(rest[rest.index(after: sep)...])
+            guard let backend = EmbeddingBackend(rawValue: rawBackend) else {
+                return "{\"status\":\"error\",\"command\":\"EMBED_PROBE\",\"detail\":\"unknown backend \(jsonStringEscape(rawBackend))\"}"
+            }
+            guard let vec = EmbeddingProvider.shared.embed(text, as: .query, in: backend), !vec.isEmpty else {
+                return "{\"status\":\"ok\",\"command\":\"EMBED_PROBE\",\"backend\":\"\(backend.rawValue)\",\"embedded\":false,\"expectedDim\":\(backend.dimension),\"note\":\"nil/empty — model likely not present in shared store; download via DOWNLOAD_EMBEDDING_MODEL:\(backend.rawValue)\"}"
+            }
+            let allFinite = vec.allSatisfy { $0.isFinite }
+            let norm = sqrt(vec.reduce(0) { $0 + $1 * $1 })
+            let sample = vec.prefix(3).map { String(format: "%.4f", $0) }.joined(separator: ",")
+            return "{\"status\":\"ok\",\"command\":\"EMBED_PROBE\",\"backend\":\"\(backend.rawValue)\",\"embedded\":true,\"dim\":\(vec.count),\"expectedDim\":\(backend.dimension),\"allFinite\":\(allFinite),\"l2Norm\":\"\(String(format: "%.4f", norm))\",\"sample\":\"\(sample)\"}"
+
         } else if trimmed.hasPrefix("SET_EMBEDDING_BACKEND:") {
             // SET_EMBEDDING_BACKEND:<nlcontextual|embeddinggemma>
             //
@@ -10883,6 +11072,7 @@ class HalTestConsole: ObservableObject {
             switch backend {
             // REMOVED 2026-05-20: case .embeddingGemma: sizeGB = 0.21
             case .nomicSwift: sizeGB = 0.55
+            case .mxbai: sizeGB = 0.67
             case .nlContextual: sizeGB = 0  // unreachable; built-in
             }
             Task { await MLXModelDownloader.shared.startDownload(modelID: modelID, repoID: modelID, sizeGB: sizeGB) }

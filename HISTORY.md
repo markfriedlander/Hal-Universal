@@ -4041,3 +4041,52 @@ Confirmed the migration code is innocent (it only touches the empty legacy
 Caches) and that a relaunch does NOT auto-claim (Qwen stayed `[Posey]` across a
 restart). Device left at baseline: 4 models present, all `[Posey]`, no locks,
 Hal on AFM.
+
+### 2026-07-09 (continued) — v2.1 item 5, STEP 1: mxbai backend + embedder load-path fix
+
+Mark greenlit doing all three steps of the multi-embedder work in order (mxbai →
+per-embedder columns → A/B + model cards + choice), and stepped away trusting CC
+to execute. Step 1 landed + device-verified.
+
+**The load-path bug (found while planning, fixed here).** Increment #1 redirected
+the model *download* to the App-Group shared store but left the embedder *load*
+path (`EmbeddingProvider.ensureNomicLoadedBlocking`) reading the pre-v2.1
+`Caches/huggingface/models/`. Device state confirmed the break: Nomic was present
+in the shared store but absent from Caches, so switching Hal to Nomic would fail
+"not downloaded" even though it was right there. Fixed both embedder loaders to
+resolve `SharedModelStore.mlxModelDir(...)` for the presence gate and load via
+`loadModelBundle(from: repoID, downloadBase: SharedModelStore.huggingFaceRoot)`
+(present-on-disk → no network), matching Posey. EMBED_PROBE:nomicswift now returns
+a 768-dim finite L2-normalized vector on device — the fix works.
+
+**mxbai added** (`mixedbread-ai/mxbai-embed-large-v1`, BERT-large 335M, 1024-dim)
+as a third `EmbeddingBackend`, following Posey's proven 2026-06-19 wiring: the
+swift-embeddings generic `Bert` path (same library as Nomic — no MLX, no
+Metal-init crash risk), CLS pooling (`Bert.encode` returns the CLS token at
+[1,1024], no manual mean-pool), a dedicated serial inference queue (MPSGraph
+specialization isn't concurrency-safe), and query-only prompt prefixing. Enum arms
+filled (dimension 1024, modelID, systemVersion 5, displayName/blurb/~670 MB, +
+PLACEHOLDER synthesis/contradiction thresholds flagged for step-3 calibration);
+provider load/embed/dispatch; download sizing (~0.67 GB) in both the coordinator
+and the API. The Model Library embedder row auto-adds via
+`allCases.filter(isAvailableInThisBuild)`. mxbai rides the shared store — it was
+already present (Posey downloaded it), so Hal adopted it zero-download.
+EMBED_PROBE:mxbai returns a 1024-dim finite L2-normalized vector on device.
+
+**New primitives, both non-destructive:** `EmbeddingProvider.embed(_:as:in:)` (an
+explicit-backend embed that ignores the active-backend setting — needed by step
+2's backfill worker, and used here so testing didn't require a destructive
+active-backend switch + full re-embed of Mark's real corpus), and an
+`EMBED_PROBE:<backend>:<text>` API verb reporting dim/finite/L2-norm.
+
+**Isolation note (contained this time).** The embedder loaders are `nonisolated`
+(they run off the main actor) but needed `SharedModelStore.mlxModelDir` for the
+presence gate, which was MainActor-isolated → a warning. Unlike the increment-#2
+attempt (which pulled the manifest's Codable conformances into the cascade),
+marking ONLY the pure path cluster nonisolated — `appGroupID` → `root` →
+`huggingFaceRoot` → `mlxModelDir` (no manifest/Codable state) — is a clean,
+contained opt-out. Zero warnings, no cascade.
+
+Active backend untouched throughout (still NLContextual on device). Step 1 does
+NOT change switching behavior yet — that's step 2 (per-embedder columns replace
+the destructive wipe-and-re-embed). Build clean, no warnings.

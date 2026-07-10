@@ -43,6 +43,15 @@ final class EmbeddingProvider: @unchecked Sendable {
     nonisolated(unsafe) private var nomicBundle: NomicBert.ModelBundle?
     nonisolated(unsafe) private var nomicLoadAttempted: Bool = false
 
+    // mxbai-embed-large-v1 (BERT-large, 1024-dim, CLS pooling) — v2.1 item 5,
+    // loaded via swift-embeddings' generic `Bert` path (same library as Nomic,
+    // no MLX/Metal risk). The dedicated serial queue serializes `Bert.encode`
+    // process-wide: MPSGraph specialization is not concurrency-safe, so two
+    // encodes must never run in parallel (Posey hit this 2026-06-19).
+    nonisolated(unsafe) private var mxbaiBundle: Bert.ModelBundle?
+    nonisolated(unsafe) private var mxbaiLoadAttempted: Bool = false
+    private let mxbaiInferenceQueue = DispatchQueue(label: "com.hal.embedding.mxbai-inference")
+
     // REMOVED 2026-05-20: Gemma-backed container + load-attempt flag.
     //   nonisolated(unsafe) private var gemmaContainer: EmbedderModelContainer?
     //   nonisolated(unsafe) private var gemmaLoadAttempted: Bool = false
@@ -67,6 +76,8 @@ final class EmbeddingProvider: @unchecked Sendable {
         //     return embedEmbeddingGemma(cleanText)
         case .nomicSwift:
             return embedNomicSwift(cleanText, purpose: purpose)
+        case .mxbai:
+            return embedMxbai(cleanText, purpose: purpose)
         }
     }
 
@@ -75,6 +86,21 @@ final class EmbeddingProvider: @unchecked Sendable {
     /// purpose explicitly.
     nonisolated func embed(_ text: String) -> [Double]? {
         return embed(text, as: .document)
+    }
+
+    /// Embed with an EXPLICIT backend, ignoring the active-backend setting.
+    /// Loads the named backend on demand. Used by the per-embedder backfill
+    /// worker (v2.1 step 2 — fills an inactive backend's column while the reader
+    /// stays on the active one) and by the EMBED_PROBE diagnostic. Mirrors
+    /// Posey's explicit-backend primitive.
+    nonisolated func embed(_ text: String, as purpose: EmbeddingPurpose, in backend: EmbeddingBackend) -> [Double]? {
+        let cleanText = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !cleanText.isEmpty else { return nil }
+        switch backend {
+        case .nlContextual: return embedNLContextual(cleanText)
+        case .nomicSwift:   return embedNomicSwift(cleanText, purpose: purpose)
+        case .mxbai:        return embedMxbai(cleanText, purpose: purpose)
+        }
     }
 
     /// True if the *currently active* backend is loaded and ready.
@@ -90,6 +116,7 @@ final class EmbeddingProvider: @unchecked Sendable {
         //     return false
         //     #endif
         case .nomicSwift: return nomicBundle != nil
+        case .mxbai: return mxbaiBundle != nil
         }
     }
 
@@ -114,6 +141,7 @@ final class EmbeddingProvider: @unchecked Sendable {
             //     halLog("HALDEBUG-EMBEDDING: warmUp() skipped — EmbeddingGemma not enabled.")
             //     #endif
             case .nomicSwift: self.ensureNomicLoadedBlocking()
+            case .mxbai: self.ensureMxbaiLoadedBlocking()
             }
         }
     }
@@ -294,16 +322,15 @@ final class EmbeddingProvider: @unchecked Sendable {
             return
         }
 
-        // Load from local directory. MLXModelDownloader / BackgroundDownloadCoordinator
-        // owns the actual HuggingFace download; we resolve the on-disk path
-        // and call swift-embeddings' local-loader.
-        let cacheDir = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask)[0]
-        let modelDirectory = cacheDir
-            .appendingPathComponent("huggingface", isDirectory: true)
-            .appendingPathComponent("models", isDirectory: true)
-            .appendingPathComponent(modelID, isDirectory: true)
+        // Resolve the on-disk location in the App-Group SHARED store (v2.1). The
+        // download path (MLXModelDownloader / BackgroundDownloadCoordinator) and
+        // the cross-app migration both land models here, NOT in per-app Caches.
+        // Reading Caches (the pre-v2.1 location) would make a present model look
+        // absent — the latent bug this fixes.
+        let modelDirectory = SharedModelStore.mlxModelDir(modelID)
 
-        // Verify required files are present before attempting load.
+        // Verify required files are present before attempting load. We never
+        // auto-download here — that's gated behind the Model Library disclosure.
         let configURL = modelDirectory.appendingPathComponent("config.json")
         guard FileManager.default.fileExists(atPath: configURL.path) else {
             halLog("HALDEBUG-EMBEDDING: Nomic model not present at \(modelDirectory.path) — user must download it via the Model Library first")
@@ -311,13 +338,17 @@ final class EmbeddingProvider: @unchecked Sendable {
             return
         }
 
-        halLog("HALDEBUG-EMBEDDING: Loading Nomic Embed Text v1.5 from \(modelDirectory.path)...")
+        halLog("HALDEBUG-EMBEDDING: Loading Nomic Embed Text v1.5 from shared store (\(modelDirectory.path))...")
         let sem = DispatchSemaphore(value: 0)
         var loadedBundle: NomicBert.ModelBundle?
         var loadError: Error?
         Task.detached {
             do {
-                loadedBundle = try await NomicBert.loadModelBundle(from: modelDirectory)
+                // repoID + downloadBase (the shared store). Present-on-disk (guarded
+                // above), so swift-embeddings loads locally without a network fetch.
+                // Same loader form Posey uses.
+                loadedBundle = try await NomicBert.loadModelBundle(
+                    from: modelID, downloadBase: SharedModelStore.huggingFaceRoot)
             } catch {
                 loadError = error
             }
@@ -339,6 +370,114 @@ final class EmbeddingProvider: @unchecked Sendable {
         self.nomicBundle = bundle
         lock.unlock()
         halLog("HALDEBUG-EMBEDDING: Nomic Embed Text v1.5 loaded (\(modelID)) — dimension=\(EmbeddingBackend.nomicSwift.dimension)")
+    }
+
+    // MARK: - mxbai-embed-large-v1 path (v2.1 item 5, swift-embeddings Bert)
+
+    /// mxbai's asymmetric-retrieval prompt. Per the model card, only the QUERY
+    /// side is prefixed; documents are embedded raw. Mirrors Nomic's asymmetric
+    /// contract with mxbai's own prefix string. Load-bearing for retrieval quality.
+    private nonisolated func mxbaiPrefixed(_ text: String, purpose: EmbeddingPurpose) -> String {
+        switch purpose {
+        case .document: return text
+        case .query:    return "Represent this sentence for searching relevant passages: " + text
+        }
+    }
+
+    private nonisolated func embedMxbai(_ cleanText: String, purpose: EmbeddingPurpose) -> [Double]? {
+        ensureMxbaiLoadedBlocking()
+
+        lock.lock()
+        let loaded = mxbaiBundle
+        lock.unlock()
+
+        guard let bundle = loaded else { return nil }
+
+        let prefixed = mxbaiPrefixed(cleanText, purpose: purpose)
+
+        // Serialize on the dedicated mxbai queue — MPSGraph specialization inside
+        // `Bert.encode` is not concurrency-safe, so two encodes must never run in
+        // parallel. `Bert.encode` returns the CLS token already (shape [1, 1024],
+        // mxbai's recommended pooling), so no manual mean-pool — just L2-normalize.
+        return mxbaiInferenceQueue.sync {
+            let sem = DispatchSemaphore(value: 0)
+            var resultVec: [Double]?
+            Task.detached {
+                do {
+                    let encoded = try bundle.encode(prefixed, maxLength: 512)
+                    let asFloat = await encoded.cast(to: Float.self).shapedArray(of: Float.self)
+                    // CLS output flattens to a single [hidden] vector; take all
+                    // scalars as the sentence vector regardless of a leading batch dim.
+                    let vec = asFloat.scalars.map { Double($0) }
+                    guard !vec.isEmpty, vec.allSatisfy({ $0.isFinite }) else {
+                        halLog("HALDEBUG-EMBEDDING: mxbai returned empty/non-finite vector")
+                        sem.signal(); return
+                    }
+                    let norm = sqrt(vec.reduce(0) { $0 + $1 * $1 })
+                    resultVec = norm > 0 ? vec.map { $0 / norm } : vec
+                } catch {
+                    halLog("HALDEBUG-EMBEDDING: mxbai encode failed: \(error.localizedDescription)")
+                }
+                sem.signal()
+            }
+            sem.wait()
+            return resultVec
+        }
+    }
+
+    private nonisolated func ensureMxbaiLoadedBlocking() {
+        lock.lock()
+        if mxbaiBundle != nil { lock.unlock(); return }
+        if mxbaiLoadAttempted { lock.unlock(); return }
+        mxbaiLoadAttempted = true
+        lock.unlock()
+
+        guard let modelID = EmbeddingBackend.mxbai.modelID else {
+            halLog("HALDEBUG-EMBEDDING: mxbai has no modelID — programming error")
+            return
+        }
+
+        // Present-in-shared-store guard (no auto-download; gated behind the Model
+        // Library disclosure like Nomic).
+        let modelDirectory = SharedModelStore.mlxModelDir(modelID)
+        let configURL = modelDirectory.appendingPathComponent("config.json")
+        guard FileManager.default.fileExists(atPath: configURL.path) else {
+            halLog("HALDEBUG-EMBEDDING: mxbai model not present at \(modelDirectory.path) — user must download it via the Model Library first")
+            lock.lock(); mxbaiLoadAttempted = false; lock.unlock()  // allow retry after download
+            return
+        }
+
+        halLog("HALDEBUG-EMBEDDING: Loading mxbai-embed-large-v1 from shared store (\(modelDirectory.path))...")
+        let sem = DispatchSemaphore(value: 0)
+        var loadedBundle: Bert.ModelBundle?
+        var loadError: Error?
+        Task.detached {
+            do {
+                // Generic Bert loader (BERT-large), repoID + shared-store downloadBase.
+                // Present-on-disk so no network fetch. Same form Posey proved 2026-06-19.
+                loadedBundle = try await Bert.loadModelBundle(
+                    from: modelID, downloadBase: SharedModelStore.huggingFaceRoot)
+            } catch {
+                loadError = error
+            }
+            sem.signal()
+        }
+        sem.wait()
+
+        if let e = loadError {
+            halLog("HALDEBUG-EMBEDDING: mxbai load failed: \(e.localizedDescription) — semantic search unavailable until next attempt")
+            lock.lock(); mxbaiLoadAttempted = false; lock.unlock()
+            return
+        }
+        guard let bundle = loadedBundle else {
+            halLog("HALDEBUG-EMBEDDING: mxbai load returned nil bundle")
+            lock.lock(); mxbaiLoadAttempted = false; lock.unlock()
+            return
+        }
+        lock.lock()
+        self.mxbaiBundle = bundle
+        lock.unlock()
+        halLog("HALDEBUG-EMBEDDING: mxbai-embed-large-v1 loaded (\(modelID)) — dimension=\(EmbeddingBackend.mxbai.dimension)")
     }
 
     // REMOVED 2026-05-20: EmbeddingGemma path (embedEmbeddingGemma +

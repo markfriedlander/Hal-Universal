@@ -93,6 +93,7 @@ final class EmbedderMigrationCoordinator: ObservableObject {
         let sizeGB: Double
         switch backend {
         case .nomicSwift: sizeGB = 0.55
+        case .mxbai: sizeGB = 0.67
         // REMOVED 2026-05-20: case .embeddingGemma: sizeGB = 0.21
         case .nlContextual: sizeGB = 0  // unreachable: modelID == nil above
         }

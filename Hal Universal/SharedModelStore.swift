@@ -32,7 +32,7 @@ import Foundation
 enum SharedModelStore {
 
     /// The shared App Group identifier. Must match Posey's exactly.
-    static let appGroupID = "group.com.MarkFriedlander.aifamily"
+    nonisolated static let appGroupID = "group.com.MarkFriedlander.aifamily"
 
     /// This app's stable identity for ownership claims in the manifest.
     static var thisAppID: String { Bundle.main.bundleIdentifier ?? "com.MarkFriedlander.Hal-Universal" }
@@ -42,7 +42,7 @@ enum SharedModelStore {
     /// unavailable (entitlement missing, a Simulator without the group, a
     /// misconfigured build) we degrade to per-app Caches rather than crash — Hal
     /// keeps working, just without cross-app sharing or purge protection.
-    static var root: URL {
+    nonisolated static var root: URL {
         if let container = FileManager.default.containerURL(forSecurityApplicationGroupIdentifier: appGroupID) {
             return container.appendingPathComponent("Models", isDirectory: true)
         }
@@ -52,14 +52,14 @@ enum SharedModelStore {
     /// The HuggingFace-style cache root inside the store. This is what
     /// `HubApi(downloadBase:)` points at; both the MLX models
     /// (`huggingface/models/<id>`) and the Nomic asset live under here.
-    static var huggingFaceRoot: URL {
+    nonisolated static var huggingFaceRoot: URL {
         root.appendingPathComponent("huggingface", isDirectory: true)
     }
 
     /// Directory for one MLX model id. Matches the legacy Caches layout
     /// (`huggingface/models/<modelID>`) so detection/load/delete are unchanged
     /// apart from the root.
-    static func mlxModelDir(_ modelID: String) -> URL {
+    nonisolated static func mlxModelDir(_ modelID: String) -> URL {
         huggingFaceRoot
             .appendingPathComponent("models", isDirectory: true)
             .appendingPathComponent(modelID, isDirectory: true)

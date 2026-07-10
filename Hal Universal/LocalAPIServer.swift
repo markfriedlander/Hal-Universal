@@ -1062,6 +1062,30 @@ class HalTestConsole: ObservableObject {
             }
             return "{\"status\":\"ok\",\"backend\":\"\(backend.rawValue)\",\"isLoaded\":\(isLoaded),\"sampleVectorDim\":\(dim),\"expectedDim\":\(backend.dimension)}"
 
+        } else if trimmed.hasPrefix("EMBED_PROBE:") {
+            // Non-destructive diagnostic (v2.1 item 5): embed a sample string with
+            // an EXPLICIT backend WITHOUT switching the active backend or touching
+            // stored embeddings. Loads the named backend on demand. Reports dim /
+            // finiteness / L2-norm, so a new backend (or the shared-store load
+            // fix) can be verified without a destructive wipe-and-re-embed.
+            //   EMBED_PROBE:<backend-rawvalue>:<text>   (text may contain ':')
+            let rest = String(trimmed.dropFirst("EMBED_PROBE:".count))
+            guard let sep = rest.firstIndex(of: ":") else {
+                return "{\"status\":\"error\",\"command\":\"EMBED_PROBE\",\"detail\":\"usage EMBED_PROBE:<backend>:<text>\"}"
+            }
+            let rawBackend = String(rest[rest.startIndex..<sep]).trimmingCharacters(in: .whitespaces)
+            let text = String(rest[rest.index(after: sep)...])
+            guard let backend = EmbeddingBackend(rawValue: rawBackend) else {
+                return "{\"status\":\"error\",\"command\":\"EMBED_PROBE\",\"detail\":\"unknown backend \(jsonStringEscape(rawBackend))\"}"
+            }
+            guard let vec = EmbeddingProvider.shared.embed(text, as: .query, in: backend), !vec.isEmpty else {
+                return "{\"status\":\"ok\",\"command\":\"EMBED_PROBE\",\"backend\":\"\(backend.rawValue)\",\"embedded\":false,\"expectedDim\":\(backend.dimension),\"note\":\"nil/empty — model likely not present in shared store; download via DOWNLOAD_EMBEDDING_MODEL:\(backend.rawValue)\"}"
+            }
+            let allFinite = vec.allSatisfy { $0.isFinite }
+            let norm = sqrt(vec.reduce(0) { $0 + $1 * $1 })
+            let sample = vec.prefix(3).map { String(format: "%.4f", $0) }.joined(separator: ",")
+            return "{\"status\":\"ok\",\"command\":\"EMBED_PROBE\",\"backend\":\"\(backend.rawValue)\",\"embedded\":true,\"dim\":\(vec.count),\"expectedDim\":\(backend.dimension),\"allFinite\":\(allFinite),\"l2Norm\":\"\(String(format: "%.4f", norm))\",\"sample\":\"\(sample)\"}"
+
         } else if trimmed.hasPrefix("SET_EMBEDDING_BACKEND:") {
             // SET_EMBEDDING_BACKEND:<nlcontextual|embeddinggemma>
             //
@@ -1160,6 +1184,7 @@ class HalTestConsole: ObservableObject {
             switch backend {
             // REMOVED 2026-05-20: case .embeddingGemma: sizeGB = 0.21
             case .nomicSwift: sizeGB = 0.55
+            case .mxbai: sizeGB = 0.67
             case .nlContextual: sizeGB = 0  // unreachable; built-in
             }
             Task { await MLXModelDownloader.shared.startDownload(modelID: modelID, repoID: modelID, sizeGB: sizeGB) }
