@@ -50,8 +50,20 @@ retrieval quality improves regardless of how Bonsai turns out.
    STILL TODO:** the launch-time migration that moves a v2.0 user's OLD
    `Caches/huggingface/models/*` into the shared container (so existing
    App Store upgraders don't lose downloads) — no risk on dev device
-   (nothing to migrate), do it deliberately. Full spec under "Cross-app
-   infrastructure" below.
+   (nothing to migrate), do it deliberately. **Increment #3 (NEXT BUILD
+   TASK, Mark approved 2026-07-09): cross-app download lock.** Verified
+   2026-07-09 across both real apps: delete refcount is bulletproof both
+   directions (Hal↔Posey), BUT concurrent DOWNLOAD of the same model is
+   UNPROTECTED — each app only guards against itself
+   (`inFlightDownloadIDs`), no cross-app lock. Build the per-model lock
+   marker (`<modelID>/.downloading-by-<bundleID>` in the shared store):
+   before starting a download, claim the marker; if another app's marker
+   exists, wait/skip; clear on completion or on stale-PID/timeout. Add to
+   both Hal's `MLXModelDownloader` and (coordinate) Posey's. Full spec
+   under "Cross-app infrastructure" below. **UX polish candidate (open):**
+   present-but-unclaimed models show "Download" (tap is instant/adopt) —
+   consider "Add"/"Available (instant)" labeling; touches Posey too, decide
+   together. Posey antenna for two-app testing: `169.254.214.164:8765`.
 5. **mxbai third embedding backend** — add `mxbai-embed-large-v1`
    (Mixedbread, BERT-large, 1024-dim, ~670 MB) as a third embedder.
    Runs via `swift-embeddings`' Bert path — the SAME library + code

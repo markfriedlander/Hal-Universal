@@ -3819,3 +3819,36 @@ The actual file *removal* at refcount-zero (last app deletes) — can't be
 triggered from Hal alone against a Posey-owned model (Posey must release
 first). It's the standard file delete gated on the now-verified `releaseClaim`.
 Embedder sharing (Nomic/mxbai) is NOT wired — that rides with item #5.
+
+### Two-app verification (Mark granted Posey antenna access, 169.254.214.164:8765)
+
+With both antennas driveable (only the FOREGROUND app's antenna responds —
+iOS suspends the background one; switch by `devicectl` launch), the full
+zero-refcount deletion cycle was verified across the two REAL apps:
+1. Hal uses Qwen → ledger `[Posey, Hal]`.
+2. **Posey** deletes Qwen → releases its claim → `[Hal]`, **files kept** (Posey's
+   delete is itself refcount-safe — it respected Hal's claim). Posey's own view
+   showed "not downloaded" though the files remained (Posey tracks its own
+   claim; nuance below).
+3. **Hal** deletes Qwen (last claim) → `[]` → **files actually removed**
+   (`present: False`). Then re-downloaded via Posey to restore `[Posey]` — all
+   four back to baseline.
+
+**Concurrency findings (code-inspected, not race-tested):** concurrent LOAD
+(read the same model files) is safe; concurrent manifest access is safe
+(`NSFileCoordinator`, watched both apps mutate `manifest.json` cleanly); but
+**concurrent DOWNLOAD of the same model is NOT protected** — each app only
+guards against ITSELF double-downloading (per-app `inFlightDownloadIDs`), no
+cross-app lock. This is the "per-model lock file" the NEXT.md plan flagged,
+never built. Realistic trigger: one app background-downloading (URLSession
+continues backgrounded) while the other foreground-downloads the same model →
+both write the same shared dir. **Next task: build the cross-app download
+lock** (see NEXT.md).
+
+**UX nuance (open):** Hal shows a model as downloaded by DISK-TRUTH (present if
+files exist, so Hal sees Posey's models); Posey shows "not downloaded" once it
+releases its claim even with files present. So after releasing, Posey's Model
+Library offers "Download" for a model already on disk (the tap would be
+instant/adopt). Tolerable, but a cleaner UX would label a present-but-unclaimed
+model as "Add"/"Available (instant)" rather than "Download." Touches Posey too
+→ log as a coordinated polish decision, non-blocking.
