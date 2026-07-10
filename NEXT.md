@@ -103,10 +103,47 @@ retrieval quality improves regardless of how Bonsai turns out.
      confirmation copy. Findings in
      `Docs/Embedder_AB_Findings_2026-07-09.md`.
      **Product call:** keep all three (NLContextual default/always-avail,
-     Nomic balanced, mxbai recommended-for-quality). **Open eyeball for
-     Mark:** the "Recommended" badge + new card copy are compile-verified
-     but not visually confirmed on the Model Library embedder screen
-     (harness can't navigate there).
+     Nomic balanced). **Post-ship follow-ups (2026-07-09):** (a) dropped the
+     "Recommended" badge — all three are equal choices per Mark; cards rewritten
+     with explicit good-at/costs bullets (`cf38d02`/`5053a9c`); (b) aligned the
+     embedder download UX with the LLMs — a pre-download disclosure sheet
+     (`EmbedderDownloadDisclosureSheet`, `cf38d02`). **Open eyeball for Mark:**
+     the rewritten cards + embedder download disclosure are compile-verified but
+     not visually confirmed on the Model Library embedder screen (harness can't
+     navigate there).
+
+5.5. **Rebalance the retrieval fusion — AGREED 2026-07-09 (high priority).**
+   The real-world retrieval eval (`tests/embedder_retrieval_eval.py`,
+   `Docs/Embedder_Retrieval_Eval_2026-07-09.md`) found that **the embedder
+   barely affects what Hal actually retrieves** today: full-pipeline recall is
+   ~identical across all three (MRR ~0.50), even though pure-semantic recall@3 is
+   mxbai 0.84 vs NLContextual 0.63. Root cause: `searchUnifiedContent`'s RRF
+   weights a distinctive BM25 keyword hit (`rrfKBM25=10`) ~5.5× more than the top
+   semantic hit (`rrfKSemantic=60`), so keyword matching dominates and the
+   embedder only breaks ties. **Agreed plan, IN THIS ORDER:**
+   1. Make the fusion weights TUNABLE (like `recencyWeight` already is) — settings
+      + API verbs (e.g. `SET_RRF_SEMANTIC_K`/`SET_RRF_BM25_K`) so the harness can
+      sweep them.
+   2. **Global sweep FIRST** — find the single mixture that maximizes recall/MRR
+      across all embedders (current k=60 is too keyword-heavy for ALL three; even
+      NLContextual loses 0.63→0.47). Lock the best global as the new default.
+   3. **THEN per-embedder deltas** — sweep each backend separately; keep
+      per-embedder values ONLY where they beat the global by a real margin. Store
+      per-embedder (same mechanism as the existing per-embedder synthesis/
+      contradiction thresholds). Rationale: RRF is RANK-based, so score
+      distributions wash out; what differs is ranking RELIABILITY (mxbai's top
+      hit right 84% vs NLContextual 63%) → trust a better embedder more (lower k).
+   4. Re-run the harness before/after each step. **Guard overfitting:** expand the
+      corpus/query set + hold out some queries BEFORE locking per-embedder values
+      (26 queries proves direction, too small to tune 3 param sets on).
+   Also: **revisit the mxbai model-card wording** — "most reliably surfaces
+   exactly the right one" overstates the END-TO-END benefit until this rebalance
+   lands (true at the vector level, not in today's pipeline). Nomic's
+   pure-semantic recall@3 was NOT measured in the confirmation run (only nl +
+   mxbai); the sweep will produce all three. Instruments in place:
+   MEMORY_SEARCH_DEBUG (full pipeline), MEMORY_SIMILARITY_DEBUG (pure semantic),
+   BACKFILL_EMBEDDINGS, EMBEDDING_COVERAGE, EMBED_PROBE.
+
 6. **Ternary Bonsai 8B — evaluate + calibrate (CUT LINE).**
    `prism-ml/Ternary-Bonsai-8B-mlx-2bit`. 1.58-bit ternary weights
    *trained* ternary (not post-hoc crushed → no usual 2-bit quality

@@ -118,9 +118,22 @@ New tests: `embedding_columns_regression.py`, `embedder_ab_eval.py`. **Open
 eyeball for Mark:** the "Recommended" badge + new embedder card copy are
 compile-verified but not visually confirmed on the Model Library screen.
 
-Roadmap now: items 1 (v2.0.1 ship — Mark's ASC action), 6 (Bonsai, cut line)
-remain. Item 4 (cross-app sharing) is fully done bar Posey adopting the
-download-lock block.
+**BIG FINDING from the item-5 follow-up work (2026-07-09):** built the real-world
+retrieval eval (`tests/embedder_retrieval_eval.py`,
+`Docs/Embedder_Retrieval_Eval_2026-07-09.md`) and it shows **the embedder barely
+affects what Hal actually retrieves** — full-pipeline recall is ~identical across
+all three (MRR ~0.50), even though pure-semantic recall@3 is mxbai 0.84 vs
+NLContextual 0.63. Root cause: the RRF fusion weights BM25 keyword hits ~5.5× more
+than semantic (`rrfKBM25=10` vs `rrfKSemantic=60`), so keyword matching dominates.
+**Mark AGREED (2026-07-09) to rebalance the fusion** — see NEXT.md item 5.5 for
+the ordered plan (tunable knobs → global sweep → per-embedder deltas, guard
+overfitting). Also dropped the "Recommended" badge (all three equal) + aligned the
+embedder download UX with the LLMs (pre-download disclosure).
+
+Roadmap now: **item 5.5 (rebalance retrieval fusion — AGREED, high priority, do
+next)**, item 1 (v2.0.1 ship — Mark's ASC action), item 6 (Bonsai, cut line).
+Item 4 (cross-app sharing) is fully done bar Posey adopting the download-lock
+block.
 
 **v2.0.1 hotfix** (EmbeddingGemma mis-download) remains **fully verified
 — sim + device — deferred to ride with v2.1** per Mark 2026-05-26 (the
