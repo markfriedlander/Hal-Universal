@@ -112,37 +112,25 @@ retrieval quality improves regardless of how Bonsai turns out.
      not visually confirmed on the Model Library embedder screen (harness can't
      navigate there).
 
-5.5. **Rebalance the retrieval fusion — AGREED 2026-07-09 (high priority).**
-   The real-world retrieval eval (`tests/embedder_retrieval_eval.py`,
-   `Docs/Embedder_Retrieval_Eval_2026-07-09.md`) found that **the embedder
-   barely affects what Hal actually retrieves** today: full-pipeline recall is
-   ~identical across all three (MRR ~0.50), even though pure-semantic recall@3 is
-   mxbai 0.84 vs NLContextual 0.63. Root cause: `searchUnifiedContent`'s RRF
-   weights a distinctive BM25 keyword hit (`rrfKBM25=10`) ~5.5× more than the top
-   semantic hit (`rrfKSemantic=60`), so keyword matching dominates and the
-   embedder only breaks ties. **Agreed plan, IN THIS ORDER:**
-   1. Make the fusion weights TUNABLE (like `recencyWeight` already is) — settings
-      + API verbs (e.g. `SET_RRF_SEMANTIC_K`/`SET_RRF_BM25_K`) so the harness can
-      sweep them.
-   2. **Global sweep FIRST** — find the single mixture that maximizes recall/MRR
-      across all embedders (current k=60 is too keyword-heavy for ALL three; even
-      NLContextual loses 0.63→0.47). Lock the best global as the new default.
-   3. **THEN per-embedder deltas** — sweep each backend separately; keep
-      per-embedder values ONLY where they beat the global by a real margin. Store
-      per-embedder (same mechanism as the existing per-embedder synthesis/
-      contradiction thresholds). Rationale: RRF is RANK-based, so score
-      distributions wash out; what differs is ranking RELIABILITY (mxbai's top
-      hit right 84% vs NLContextual 63%) → trust a better embedder more (lower k).
-   4. Re-run the harness before/after each step. **Guard overfitting:** expand the
-      corpus/query set + hold out some queries BEFORE locking per-embedder values
-      (26 queries proves direction, too small to tune 3 param sets on).
-   Also: **revisit the mxbai model-card wording** — "most reliably surfaces
-   exactly the right one" overstates the END-TO-END benefit until this rebalance
-   lands (true at the vector level, not in today's pipeline). Nomic's
-   pure-semantic recall@3 was NOT measured in the confirmation run (only nl +
-   mxbai); the sweep will produce all three. Instruments in place:
-   MEMORY_SEARCH_DEBUG (full pipeline), MEMORY_SIMILARITY_DEBUG (pure semantic),
-   BACKFILL_EMBEDDINGS, EMBEDDING_COVERAGE, EMBED_PROBE.
+5.5. ~~**Rebalance the retrieval fusion**~~ — **DONE + device-verified 2026-07-10.**
+   The three RRF k weights are now tunable `@AppStorage` knobs (`SET_RRF_SEMANTIC_K`/
+   `SET_RRF_BM25_DISTINCTIVE_K`/`SET_RRF_BM25_DEFAULT_K`/`RRF_STATUS`), global (not
+   per-model). **Global default moved `rrfKSemantic` 60 → 15** (kBM25d 10, default 60
+   unchanged) → evidence ordering **distinctive keyword (10) > semantic (15) >
+   generic keyword (60)**. Global sweep (`tests/rrf_global_sweep.py` +
+   `rrf_deep_sweep.py`) showed mean MRR rising monotonically as semantic k dropped
+   and the embedders finally diverging; +17% mean MRR on a 59-memory/46-query set;
+   before→after on the 26q set nl 0.499→0.535 / nomic 0.499→**0.693** / mxbai
+   0.502→0.638. **Nomic is the end-to-end champion** (beats mxbai in the full
+   pipeline — opposite of the pure-cosine A/B; answers the Nomic question left open
+   2026-07-09). Kept a Bug 2a cushion: held `kBM25d=10`, swept only `kSem`, so
+   distinctive keyword stays 1.5× stronger than semantic (k=10 is the boundary; we
+   did NOT cross it). recency_regression still PASS under the new default. Revisited
+   the mxbai model-card copy (dropped the "most reliably surfaces the right one"
+   overclaim). Full narrative: HISTORY 2026-07-10. **Per-embedder tuning deferred**
+   (Mark: "maybe will tune per model another time"). **Open eyeball for Mark:** the
+   updated embedder cards are compile-verified but not visually confirmed on the
+   Model Library embedder screen (harness can't navigate there).
 
 6. **Ternary Bonsai 8B — evaluate + calibrate (CUT LINE).**
    `prism-ml/Ternary-Bonsai-8B-mlx-2bit`. 1.58-bit ternary weights

@@ -4193,3 +4193,88 @@ Mark eyeball. All embedder *behavior* (switch/backfill/coverage/retrieval) is
 device-verified via the step-2 tests. Device restored to NLContextual.
 
 **v2.1 item 5 (mxbai + multi-embedder) is complete across all three steps.**
+
+---
+
+## 2026-07-10 (retrieval-fusion rebalance — v2.1 item 5.5)
+
+The 2026-07-09 retrieval eval had left us with a sharp finding: the embedder
+barely affected what Hal actually retrieved, because `searchUnifiedContent`'s RRF
+fusion weighted a distinctive BM25 keyword hit (`rrfKBM25Distinctive=10`) about
+5.5× more than the top semantic hit (`rrfKSemantic=60`). Keyword matching
+dominated; the embedder only broke ties. Mark's call: rebalance the fusion,
+globally first ("if we can make them all better more easily, great"), per-embedder
+maybe another day.
+
+**Step 1 — make the fusion tunable.** Extracted the three hardcoded RRF k
+constants into `@AppStorage` knobs on `MemoryStore` (`rrfKSemantic`,
+`rrfKBM25Distinctive`, `rrfKBM25Default`), beside `recencyWeight`. Kept them
+*global*, deliberately NOT wired into per-model `effectiveSettings` — the fusion
+balance describes retrieval, not a model's personality (a future pass may make it
+per-*embedder*, like the existing per-embedder synthesis/contradiction thresholds).
+Added four API verbs for the sweep harness: `SET_RRF_SEMANTIC_K`,
+`SET_RRF_BM25_DISTINCTIVE_K`, `SET_RRF_BM25_DEFAULT_K`, `RRF_STATUS`. Defaults
+initially reproduced the old constants exactly (60/10/60), so at that point the app
+was byte-identical. Device-verified the knobs reach the fusion (the RRF debug log
+printed the live `kSem` after a SET). Commit `a897036`.
+
+**Step 2 — the global sweep, and a genuine trade-off surfaced.** Built
+`tests/rrf_global_sweep.py` (reusing the eval's exact corpus/queries so they can't
+drift). Lowering `rrfKSemantic` 60→10 lifted mean MRR monotonically 0.500→0.662
+(+32% on the 26-query set) and — the real tell — made the three embedders finally
+*diverge* (mxbai−nl spread grew from +0.003 at k=60 to +0.170 at k=10): the
+semantic signal was reaching retrieval at last. The curve was still climbing at
+k=10, which is exactly where Mark asked the sharp question: does going below 10
+break the Bug 2a guard (a rare imported-document term must win)? Answer: it depends
+on the *relationship* between two knobs, not the number 10. Bug 2a is protected iff
+`rrfKBM25Distinctive ≤ rrfKSemantic`. Holding `kBM25d=10` fixed (prod value) and
+lowering only `kSem`, the whole safe-with-margin family is `kSem>10`; `kSem=10` is
+the boundary; `kSem<10` re-opens Bug 2a.
+
+We tried to *certify* going below 10 with a synthetic Bug 2a guard, and this is
+where the honest work was. First guard (rare-term doc + generic distractor) was too
+easy — it passed even in a deliberately invariant-*violating* negative control
+(5/10), so it proved nothing. Second guard (opaque buried doc + natural distractor
+whose words we put in the query) swung too far — it failed even at *production*
+60/10, because the distractor's words leaked into BM25. Neither faithfully isolated
+the invariant. The lesson: a real Bug 2a is a long imported document vs a
+conversation echo of its content, which one-line synthetic memories can't reproduce
+cleanly. So we stopped trying to certify sub-10 on a guard we didn't trust, and
+reframed around what's *provably* safe: hold `kBM25d=10`, sweep only `kSem`, and use
+a *realistic* guard (imported doc vs a conversation echo of the same content). That
+guard passed 12/12 across the whole family down to the boundary and beyond — real
+distinctive docs are robust because they carry both the rare term *and* semantic
+support, so they beat their echoes regardless of k.
+
+On the expanded 59-memory / 46-query set the safe family read (mean MRR): prod 60/10
+= 0.562, 20/10 = 0.626, **15/10 = 0.657**, 12/10 = 0.674, boundary 10/10 = 0.694.
+nlcontextual stayed essentially flat across the whole range (~0.54) — the built-in
+embedder simply lacks the semantic resolution to exploit lower k; the gains accrue
+to Nomic and mxbai. And a second surprise held: **Nomic is the end-to-end champion**,
+edging out mxbai in the full pipeline (0.693 vs 0.638 MRR at the locked default),
+the opposite of the pure-cosine A/B — which answers the question left open on
+2026-07-09 (Nomic's real-pipeline number was never measured then).
+
+**Decision (Mark): lock `rrfKSemantic=15`, `rrfKBM25Distinctive=10`,
+`rrfKBM25Default=60`.** It captures the bulk of the win (+17% mean MRR on the big
+set, embedders diverge), keeps distinctive keyword 1.5× stronger than semantic so
+Bug 2a keeps a comfortable cushion above the k=10 boundary, and encodes a clean
+evidence ordering: **distinctive keyword (10) > semantic (15) > generic keyword
+(60)** — a rare exact term beats meaning beats generic word-overlap, which is
+exactly how Hal should weigh evidence. We did NOT go below 10: the extra ~0.05 MRR
+wasn't worth crossing the invariant that protects imported-document lookups on the
+strength of a synthetic guard we didn't fully trust.
+
+Guardrails after the default change: `recency_regression` still PASS on the live
+path (old 365d row decays to 19.28% at weight 0.95, fresh ranks above it); the
+headline eval at the new default shows the before/after cleanly (nl 0.499→0.535,
+nomic 0.499→0.693, mxbai 0.502→0.638). Also revisited the model-card copy the
+finding implicated: dropped mxbai's "most reliably surfaces exactly the right one"
+(measurably wrong end-to-end now) for honest "most detailed *raw* vectors, but its
+edge over Nomic in Hal's real retrieval is subtle," and noted Nomic tests best
+end-to-end. Cards are compile-verified but not visually confirmed on the embedder
+screen (harness can't navigate there) — flagged for a Mark eyeball.
+
+New instruments kept: `tests/rrf_global_sweep.py`, `tests/rrf_deep_sweep.py`.
+Per-embedder tuning stays deferred (Mark: "maybe will tune per model another
+time"). This closes v2.1 item 5.5.

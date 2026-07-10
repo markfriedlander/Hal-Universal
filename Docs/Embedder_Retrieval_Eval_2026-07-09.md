@@ -85,3 +85,36 @@ BM25 fails AND the strong semantic signal is weighted too low to rescue the rank
   it's identical across backends anyway).
 - Content matching is by substring on the 200-char preview; memories are short
   and unique, so matches are unambiguous.
+
+---
+
+## RESOLVED 2026-07-10 — the fusion was rebalanced
+
+The rebalance this doc called for landed. Full narrative in HISTORY 2026-07-10.
+
+**What shipped:** the three RRF k weights are now tunable `@AppStorage` knobs on
+`MemoryStore` (`SET_RRF_SEMANTIC_K` / `SET_RRF_BM25_DISTINCTIVE_K` /
+`SET_RRF_BM25_DEFAULT_K` / `RRF_STATUS`), and the global default moved from
+`rrfKSemantic=60` to **`15`** (kBM25 distinctive 10, default 60 unchanged).
+
+**Why 15:** a global sweep (`tests/rrf_global_sweep.py`) showed mean MRR rising
+monotonically as semantic k dropped, and the three embedders finally *diverging*
+(the semantic signal reaching retrieval). Holding `kBM25d=10` fixed and lowering
+only `kSem` keeps the Bug 2a invariant (`kBM25d ≤ kSem`) with margin for any
+`kSem>10`; k=10 is the boundary. 15 captures ~+17% mean MRR on an expanded
+59-memory/46-query set while keeping distinctive keyword 1.5× stronger than
+semantic. Evidence ordering is now **distinctive keyword > semantic > generic
+keyword** (10 / 15 / 60).
+
+**Before → after** (original 26-query set, MRR): nl 0.499→0.535, nomic
+0.499→0.693, mxbai 0.502→0.638. The embedder now measurably matters, and **Nomic
+is the end-to-end champion** (beats mxbai in the full pipeline — the opposite of the
+pure-cosine A/B; answers the Nomic question this doc left open).
+
+**On the Bug 2a guard:** we could not build a synthetic one-line-memory guard that
+faithfully isolated the invariant (too easy → passed even when violated; too hard →
+failed even at production). A *realistic* guard (imported doc vs a conversation echo
+of its content) passed everywhere, because real distinctive docs carry both the rare
+term and semantic support. So we did NOT go below k=10 (worth ~0.05 more MRR) — not
+worth crossing the invariant on a guard we didn't fully trust. Per-embedder tuning
+remains deferred.

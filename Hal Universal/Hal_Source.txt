@@ -266,9 +266,9 @@ nonisolated enum EmbeddingBackend: String, Sendable, CaseIterable {
         // case .embeddingGemma:
         //     return "Google's open embedding model, 308M params, MLX 4-bit quantized. 768-dim, state-of-the-art on MTEB Multilingual v2 among models under 500M. Adds ~210 MB on disk."
         case .nomicSwift:
-            return "Nomic Embed Text v1.5 (768-dim), purpose-built for search. On-device via Apple's MLTensor (no MLX).\n• Good at: a clear step up in precision over the built-in embedder — better at pulling the right memory rather than a merely on-topic one — while staying moderate in size and speed.\n• Costs: a ~522 MB download and a bit more compute than the built-in option.\nA balanced middle ground."
+            return "Nomic Embed Text v1.5 (768-dim), purpose-built for search. On-device via Apple's MLTensor (no MLX).\n• Good at: a clear step up in precision over the built-in embedder — better at pulling the right memory rather than a merely on-topic one — while staying moderate in size and speed. It tests extremely well in Hal's own end-to-end retrieval, holding its own with the larger model.\n• Costs: a ~522 MB download and a bit more compute than the built-in option.\nA balanced middle ground."
         case .mxbai:
-            return "Mixedbread mxbai-embed-large (1024-dim, BERT-large). On-device via the same path as Nomic (no MLX).\n• Good at: the sharpest of the three at distinguishing closely-related memories, so it most reliably surfaces exactly the right one — best for large or nuanced memories.\n• Costs: the largest download (~670 MB) and the slowest to embed, so building or rebuilding your memory index takes the longest.\nBest when recall precision matters most and you can spare the storage."
+            return "Mixedbread mxbai-embed-large (1024-dim, BERT-large). On-device via the same path as Nomic (no MLX).\n• Good at: the most detailed representation of the three — its 1024-dim vectors are the sharpest at telling near-identical passages apart in isolation, which can help with large or nuanced memories.\n• Costs: the largest download (~670 MB) and the slowest to embed, so building or rebuilding your memory index takes the longest; and in Hal's own end-to-end retrieval its edge over Nomic is subtle.\nBest when you want the most detailed embeddings and can spare the storage."
         }
     }
 
@@ -16791,12 +16791,21 @@ class MemoryStore: ObservableObject {
     // searchUnifiedContent: a retriever's rank-r hit contributes 1/(k + r), so
     // a SMALLER k means that retriever's top hits dominate the fused order.
     // They live here (global, not per-model) because they describe retrieval
-    // behavior, not a model's personality. Defaults reproduce the historical
-    // hardcoded constants exactly (60 / 10 / 60), so the app is byte-identical
-    // until they're deliberately swept. The 2026-07-09 retrieval eval found
-    // semantic under-weighted next to distinctive BM25 (60 vs 10 ≈ 5.5× weaker),
-    // so the embedder only broke ties; these knobs exist to rebalance that.
-    @AppStorage("rrfKSemantic") var rrfKSemantic: Double = 60.0 {
+    // behavior, not a model's personality.
+    //
+    // Defaults 15 / 10 / 60 encode a deliberate evidence ordering:
+    //   distinctive keyword (10)  >  semantic (15)  >  generic keyword (60)
+    // i.e. a rare exact term beats meaning beats generic word-overlap. This was
+    // set by the 2026-07-10 global RRF sweep (tests/rrf_global_sweep.py +
+    // rrf_deep_sweep.py): the original semantic k=60 was ~5.5× weaker than a
+    // distinctive BM25 hit, so keyword matching dominated and the embedder only
+    // broke ties (full-pipeline recall was ~identical across all three backends).
+    // Lowering semantic to 15 lifted mean MRR ~+17% on a 59-memory/46-query eval
+    // and made the embedders actually diverge, while keeping distinctive keyword
+    // 1.5× stronger than semantic so imported-document lookups (Bug 2a) keep a
+    // safety margin. k=10 is the boundary where semantic would equal distinctive
+    // keyword; below it Bug 2a re-opens, so 15 keeps a cushion above it.
+    @AppStorage("rrfKSemantic") var rrfKSemantic: Double = 15.0 {
         didSet {
             print("HALDEBUG-RRF: Semantic k updated to \(rrfKSemantic)")
         }
@@ -19273,9 +19282,9 @@ extension MemoryStore {
         // gets RRF'd to rank-2 behind a semantically-adjacent conversation
         // snippet — exactly the Bug 2a failure mode where imported docs
         // show up below conversation echoes of their own content.
-        // Fusion weights are the live tunable knobs (defaults 60/10/60
-        // reproduce the historical constants exactly). See the @AppStorage
-        // declarations in this class for the rationale.
+        // Fusion weights are the live tunable knobs (defaults 15/10/60 —
+        // distinctive keyword > semantic > generic keyword). See the @AppStorage
+        // declarations in this class for how the defaults were chosen.
         let rrfKSemantic: Double = self.rrfKSemantic
         let rrfKBM25: Double = bm25Distinctive ? rrfKBM25Distinctive : rrfKBM25Default
         var rrfScored: [(id: String, score: Double, inSemantic: Bool, inBM25: Bool)] = []

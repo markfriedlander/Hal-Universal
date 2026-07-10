@@ -1,5 +1,5 @@
 # Hal Universal — Handoff Brief
-**Updated:** July 9, 2026 (v2.1 items 2/3/4-inc-#1 + 4-inc-#3 cross-app download lock landed + device-verified)
+**Updated:** July 10, 2026 (v2.1 item 5.5 — retrieval-fusion rebalance — landed + device-verified; item 5 mxbai/multi-embedder complete)
 **Branch:** `main`
 **Production:** Hal Universal **v2.0 is live on the App Store** since 2026-05-19. Non-EU markets only (DSA non-trader; see HISTORY).
 
@@ -18,6 +18,28 @@ CC's session was lost from the desktop app). Mark agreed a 7-item v2.1
 roadmap (one release, priority order, Ternary Bonsai as cut line) — full
 list in NEXT.md → "v2.1 roadmap — AGREED 2026-07-09". Proposals system +
 Soul Document are explicitly OUT of scope for now.
+
+**Latest (2026-07-10): item 5.5 — the retrieval-fusion rebalance — is DONE and
+device-verified.** The RRF k weights in `searchUnifiedContent` are now tunable
+global `@AppStorage` knobs (`SET_RRF_SEMANTIC_K` / `SET_RRF_BM25_DISTINCTIVE_K` /
+`SET_RRF_BM25_DEFAULT_K` / `RRF_STATUS`), and the global default moved
+**`rrfKSemantic` 60 → 15** (kBM25d 10, default 60). The old k=60 made keyword
+matching dominate so the embedder was nearly inert; 15 lifts mean MRR ~+17% on a
+59-memory/46-query eval and makes the embedders actually diverge. Evidence ordering
+is now **distinctive keyword (10) > semantic (15) > generic keyword (60)** — a rare
+exact term beats meaning beats generic overlap. We held `kBM25d=10` and swept only
+`kSem` so Bug 2a keeps a 1.5× cushion (k=10 is the boundary; we did NOT cross it).
+**Nomic is the end-to-end retrieval champion** (beats mxbai in the full pipeline —
+opposite of the pure-cosine A/B). recency_regression still PASS. New instruments:
+`tests/rrf_global_sweep.py`, `rrf_deep_sweep.py`. Full story: HISTORY 2026-07-10.
+Per-embedder tuning deferred (Mark: "maybe another time"). **Item 5 (mxbai +
+multi-embedder) is complete across all three steps** (see below / HISTORY 2026-07-09).
+
+**Roadmap remaining (order in NEXT.md):** item 1 (v2.0.1 hotfix ship — needs the
+SHIP_BLOCKER flip + Mark's ASC action), then item 6 (Ternary Bonsai, the cut line).
+**Open eyeball for Mark:** the updated embedder model cards + download disclosure
+are compile-verified but not visually confirmed on the Model Library embedder screen
+(harness can't navigate there).
 
 **Roadmap item 2 (Bug 4 — orphaned recency scoring) is DONE and
 device-verified** (2026-07-09). Recency was reconnected into the RRF

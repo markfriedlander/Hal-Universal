@@ -447,12 +447,21 @@ class MemoryStore: ObservableObject {
     // searchUnifiedContent: a retriever's rank-r hit contributes 1/(k + r), so
     // a SMALLER k means that retriever's top hits dominate the fused order.
     // They live here (global, not per-model) because they describe retrieval
-    // behavior, not a model's personality. Defaults reproduce the historical
-    // hardcoded constants exactly (60 / 10 / 60), so the app is byte-identical
-    // until they're deliberately swept. The 2026-07-09 retrieval eval found
-    // semantic under-weighted next to distinctive BM25 (60 vs 10 ≈ 5.5× weaker),
-    // so the embedder only broke ties; these knobs exist to rebalance that.
-    @AppStorage("rrfKSemantic") var rrfKSemantic: Double = 60.0 {
+    // behavior, not a model's personality.
+    //
+    // Defaults 15 / 10 / 60 encode a deliberate evidence ordering:
+    //   distinctive keyword (10)  >  semantic (15)  >  generic keyword (60)
+    // i.e. a rare exact term beats meaning beats generic word-overlap. This was
+    // set by the 2026-07-10 global RRF sweep (tests/rrf_global_sweep.py +
+    // rrf_deep_sweep.py): the original semantic k=60 was ~5.5× weaker than a
+    // distinctive BM25 hit, so keyword matching dominated and the embedder only
+    // broke ties (full-pipeline recall was ~identical across all three backends).
+    // Lowering semantic to 15 lifted mean MRR ~+17% on a 59-memory/46-query eval
+    // and made the embedders actually diverge, while keeping distinctive keyword
+    // 1.5× stronger than semantic so imported-document lookups (Bug 2a) keep a
+    // safety margin. k=10 is the boundary where semantic would equal distinctive
+    // keyword; below it Bug 2a re-opens, so 15 keeps a cushion above it.
+    @AppStorage("rrfKSemantic") var rrfKSemantic: Double = 15.0 {
         didSet {
             print("HALDEBUG-RRF: Semantic k updated to \(rrfKSemantic)")
         }
@@ -2929,9 +2938,9 @@ extension MemoryStore {
         // gets RRF'd to rank-2 behind a semantically-adjacent conversation
         // snippet — exactly the Bug 2a failure mode where imported docs
         // show up below conversation echoes of their own content.
-        // Fusion weights are the live tunable knobs (defaults 60/10/60
-        // reproduce the historical constants exactly). See the @AppStorage
-        // declarations in this class for the rationale.
+        // Fusion weights are the live tunable knobs (defaults 15/10/60 —
+        // distinctive keyword > semantic > generic keyword). See the @AppStorage
+        // declarations in this class for how the defaults were chosen.
         let rrfKSemantic: Double = self.rrfKSemantic
         let rrfKBM25: Double = bm25Distinctive ? rrfKBM25Distinctive : rrfKBM25Default
         var rrfScored: [(id: String, score: Double, inSemantic: Bool, inBM25: Bool)] = []
