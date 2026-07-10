@@ -1,5 +1,5 @@
 # Hal Universal — Handoff Brief
-**Updated:** July 11, 2026 (v2.1 item 6 — Ternary Bonsai 8B — SHIPS as curated after a clean Maxim sweep; item 5.5 fusion rebalance + item 5 multi-embedder complete)
+**Updated:** July 11, 2026 (later — working-list session: WL1-7 all landed [Bonsai concision, reload-on-demand/Bug 3, confabulation gate, expandrow test verb, 2 Model Library cosmetics], M1 softened to mixed, and a one-source-of-truth fix so Hal loads Posey's shared models. Earlier: item 6 Bonsai ships. See MEMORY current-state for the full list.)
 **Branch:** `main`
 **Production:** Hal Universal **v2.0 is live on the App Store** since 2026-05-19. Non-EU markets only (DSA non-trader; see HISTORY).
 
