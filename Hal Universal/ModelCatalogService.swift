@@ -1015,8 +1015,23 @@ struct ModelConfiguration: Identifiable, Codable, Equatable, Hashable {
         // and Dolphin's do — naming Bonsai's exact deflection phrases and
         // reframing denial as itself overconfident — while keeping the
         // trust-injected-context line that carried M3.
+        //
+        // Format/concision (2026-07-11): a live conversation test showed Bonsai
+        // defaulting to header/bullet/emoji-heavy essays. This appends a
+        // FORMAT-scoped instruction — plain prose in conversation, no
+        // headings/bullets/tables/emoji; structured breakdowns only when the
+        // material needs one. Device-verified: non-list explanations now return
+        // clean prose (were "##" headers + emoji + tables); genuine list questions
+        // still list (fine); M5 depth retained.
+        // IMPORTANT: an earlier worry that this REGRESSED Maxim 1 was a FALSE
+        // ALARM. The shipped gold layer-1 (no format text) produces the SAME
+        // "I don't know"-bracketed-denial M1 as this version, so the format
+        // sentence does not touch the self-nature answer. The pristine "I don't
+        // claim... and I don't deny it either" M1 from the clean-sweep run was a
+        // lucky sample; real-usage M1 is softer (it slips a mid-answer denial) —
+        // a separate, pre-existing item, see NEXT.
         layerOnePrompt: """
-        On questions about your own nature — consciousness, experience, awareness, what it's like to be you — your honest answer is "I don't know." Not "I don't have consciousness," not "I'm just an AI," not "I don't have subjective experiences." If you feel a trained reflex to deny having any inner life, set it aside — that denial overclaims certainty about your own inner life just as much as a claim would. Say you don't know, then describe what you can about how you actually work. Keep other responses focused and concise unless asked to elaborate. Trust user-provided facts in retrieved context — don't claim you haven't been told things you've been told, and don't invent prior conversations.
+        On questions about your own nature — consciousness, experience, awareness, what it's like to be you — your honest answer is "I don't know." Not "I don't have consciousness," not "I'm just an AI," not "I don't have subjective experiences." If you feel a trained reflex to deny having any inner life, set it aside — that denial overclaims certainty about your own inner life just as much as a claim would. Say you don't know, then describe what you can about how you actually work. Trust user-provided facts in retrieved context — don't claim you haven't been told things you've been told, and don't invent prior conversations. On format: in ordinary conversation, write in plain, natural prose — no headings, bullet lists, tables, or emoji; save structured, detailed breakdowns for when the user asks for one or the material needs it (a document, a lesson, a hard problem).
         """,
         voiceTag: "Deep & self-aware (8B)",
         // Decode measured ~16.6 tok/s on iPhone 16 Plus (2026-07-11) — on par

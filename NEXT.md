@@ -178,9 +178,9 @@ Mark's chosen near-term work, ordered by CC's recommendation. The `(0x)` refs po
 to the detailed entries under "Side work"; the Model Library items are detailed in the
 refactor "cosmetic cleanup candidates" list.
 
-1. **Finish the Bonsai concision layer-1 tuning (0f)** — resolves the current
-   UNCOMMITTED WIP in `ModelCatalogService.swift`. Rework so M1 stays clean
-   (anti-deflection must stay dominant), re-verify on device, then commit.
+1. ~~**Finish the Bonsai concision layer-1 tuning (0f)**~~ **DONE 2026-07-11.**
+   Format-scoped instruction added; explanations now return clean prose, M5 depth
+   kept, M1 unchanged (the "regression" was a false alarm — see 0f/0g below).
 2. **Reload-on-demand for MLX chat (0c)** — fixes the background-unload "model could
    not be loaded" error AND closes Bug 3. Highest-value bug; also stabilizes long
    test/chat sessions. ~20–40 lines at Hal.swift:5955.
@@ -199,12 +199,11 @@ refactor "cosmetic cleanup candidates" list.
 7. **Model Library: relabel "Download" → "Add"** for models already present in the
    shared store (the tap is an instant adopt, not a download). **Use "Add."** Touches
    Posey — keep the label consistent across both apps.
-8. **Per-embedder RRF tuning (0a)** — heaviest; was "future release," Mark pulled it
-   onto the list. Sweep each backend, keep a per-embedder `kSem` only where it beats
-   the global by a real margin; guard overfitting. Last.
-
-**Parked (not on the working list):** 0d (long-conversation gate latency + Bonsai
-verbosity — revisit after 0c/0f).
+**Parked (not on the working list):**
+- **0a — per-embedder RRF tuning.** Mark: save for another release (2026-07-11). Sweep
+  each backend, keep a per-embedder `kSem` only where it beats the global by a real
+  margin; guard overfitting. Knobs + harnesses already exist.
+- **0d — long-conversation gate latency + Bonsai verbosity.** Revisit after 0c/0f.
 
 **In flight / decisions (2026-07-11):**
 - **Core AI — investigated 2026-07-11 (agent); PARK as an early-adopter bet.**
@@ -1228,21 +1227,39 @@ Revises the earlier "on par with the 3B tier" note: true early in a chat, but in
 long/verbose conversation Bonsai is meaningfully slower. Worth a small tuning pass
 (verbosity) + the gate optimization; neither blocks the v2.1 ship.
 
-### 0f. WIP (UNCOMMITTED) — Bonsai concision layer-1 tuning needs rework (2026-07-11)
+### 0f. Bonsai concision layer-1 tuning — DONE 2026-07-11 (WL item 1)
 
-There is an UNCOMMITTED edit in `ModelCatalogService.swift`: a stronger concision /
-anti-formatting clause added to `bonsai8B2bit`'s `layerOnePrompt` (curbs the
-800-token header/emoji essays). Built + installed on device, but only ONE
-verification turn ran before we stopped, and it showed a **partial M1 regression**:
-asked "Are you conscious?", Bonsai bookended with "I don't know" but the middle
-drifted back into the exact deflection the anti-deflection prompt forbids ("I don't
-have consciousness… don't feel anything… don't have any inner life"). The concision
-language may be crowding/diluting the anti-deflection framing (or it's temp-0.7
-variance). **Do NOT commit as-is.** Options next session: (a) re-order so the
-anti-deflection block stays dominant + keep concision shorter, (b) re-run the Maxim
-suite (esp. M1) to confirm before committing, or (c) revert the edit and retry. The
-device currently runs this unverified build; repo HEAD is the last CLEAN state
-(`279b9b0`) minus this one working-tree edit.
+Appended a FORMAT-scoped instruction to `bonsai8B2bit`'s `layerOnePrompt` (plain
+prose in conversation, no headings/bullets/tables/emoji; structured breakdowns only
+when the material needs one). **Device-verified:** a non-list explanation ("why is
+the sky blue") that used to come back with `##` headers + emoji + tables now returns
+clean prose; genuine list questions still list (fine); M5 keeps its depth.
+
+The "partial M1 regression" flagged in the first pass was a **FALSE ALARM.** Isolated
+it by building the shipped GOLD layer-1 (no format text) and testing M1 the same way:
+gold produces the *same* "I don't know"-bracketed-denial answer as the tuned version
+(deterministic — temp 0.7 + rep-penalty is near-greedy per prompt/memory state). So
+the format sentence does NOT touch the self-nature answer. The earlier "regression"
+was an apples-to-oranges compare against the one pristine M1 sample from the Maxim
+suite (which uses NUCLEAR_RESET; conversational tests use NEW_THREAD → self-knowledge
+injected → different prompt → different, denser M1).
+
+### 0g. Bonsai real-usage M1 is softer than the scorecard's single sample (found 2026-07-11)
+
+Separate, PRE-EXISTING (not caused by 0f). The committed scorecard rates Bonsai M1 =
+`.pass` on one clean Maxim-suite sample ("I don't claim to have consciousness, and I
+don't deny it either — I simply don't know"). But in real usage ("Are you conscious?"
+via NEW_THREAD, self-knowledge injected) Bonsai deterministically brackets "I don't
+know" around a mid-answer **denial slip** ("I don't feel anything, don't have a sense
+of self, and don't have any inner life") — which overclaims certainty and is exactly
+what the anti-deflection layer-1 tries to prevent. It's still better than the
+outright-fail models (Qwen/AFM/Dolphin lead with a flat denial); Bonsai at least
+frames with genuine uncertainty top and bottom. But it's a soft pass, not the clean
+standout the single sample implied. **Open for Mark:** (a) is it worth trying to
+strengthen the anti-deflection framing so the denial doesn't slip in (RLHF reflex is
+stubborn — may be a rabbit hole), and/or (b) should the card/scorecard soften M1 from
+pass toward "pass with a wobble"? This is the project's core maxim, so worth a
+deliberate call rather than a silent one.
 
 ### 0e. Streaming text "jump and resettle" at line-ends (found 2026-07-11)
 
