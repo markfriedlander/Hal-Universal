@@ -3985,3 +3985,59 @@ full mutual protection needs Posey's half, as the note says.
 **Device restored to baseline:** all four models present, all `[Posey]`, no
 stray locks, Hal on AFM. Qwen was re-downloaded by Posey (the one real cost) and
 Hal's adopt-claim released back to `[Posey]`.
+
+### 2026-07-09 (continued) — legacy → shared-store migration (item 4 increment #2)
+
+The last piece of the cross-app model story: v2.0 downloaded models to the
+per-app `Caches/huggingface/models/<org>/<name>/`; v2.1 reads from the App-Group
+shared store. Without a migration, a v2.0 user who upgrades would find the shared
+store empty and appear to have lost every download — a multi-GB re-fetch. This
+adds a one-shot launch migration that carries their models forward.
+
+**Where it lives.** `MaintenanceTasks.runAtLaunch()` was already the launch hook
+and already walked the exact old path (for the EmbeddingGemma orphan cleanup), so
+the migration slots in right beside it. Logic: guard on a one-shot
+`didMigrateV2CachesModels.v1` flag (so it costs nothing after the first pass);
+walk the legacy dir at repo granularity (`<org>/<name>`) — enumerating the real
+directory rather than a hardcoded curated list, so a user's community models
+migrate too; per repo: if the shared store already has it (Posey, or a prior
+pass) remove the redundant legacy duplicate, else `moveItem` it into the shared
+store; then claim it for Hal + `isExcludedFromBackup`; skip (delete) retired
+backends. Drop drained dirs; set the flag only on a fully clean pass so a partial
+failure retries next launch. Display is disk-truth (same path that lets Hal see
+Posey's models), so a final `refreshDownloadStates()` is all the UI needs — no
+touching `downloadedModelIDs`.
+
+**Why it's cheap on the main actor.** The migration runs `@MainActor` (it touches
+the MainActor-isolated shared store + refreshes the catalog). That's fine because
+on iOS the Caches→App-Group move is a *same-volume rename* — it re-links the
+directory entry, it does not copy the GBs inside — so it's instant regardless of
+model size and doesn't block launch.
+
+**An isolation detour worth recording.** First attempt made the migration
+`nonisolated` and tried to make the `SharedModelStore` methods it calls
+`nonisolated` too. That cascaded: under `SWIFT_DEFAULT_ACTOR_ISOLATION =
+MainActor`, marking the methods piecemeal dragged in the nested `Codable`
+conformances (`Manifest`, `DownloadLocks`) and the `static let` constants, each
+throwing its own isolation warning. Rather than fight the default isolation
+across a file Posey mirrors, I reverted `SharedModelStore` to untouched and moved
+the *migration* onto the main actor instead (correct + cheap, per the rename
+point above). Net `SharedModelStore` diff: zero. Lesson: when a helper needs to
+call into a MainActor-isolated type, move the helper to the main actor rather than
+un-isolating the type — especially a shared-contract type.
+
+**Testing.** The dev device never used the legacy location, so the real launch
+migration is a no-op there (it just sets the flag — confirmed). Added a
+`LEGACY_MIGRATION` test verb (PLANT a fake model in the legacy path / RUN
+force / QUERY where it landed / CLEANUP / RESETFLAG) and
+`tests/legacy_migration_regression.py`. Device-verified all three branches:
+**move** (`legacy-only → shared + Hal claim`), **reconcile** (`legacy duplicate
+removed when the shared copy already exists`), and **retired-skip**
+(`EmbeddingGemma deleted, not migrated`). Real models asserted untouched.
+
+**Aside caught during testing:** Qwen briefly showed `[Posey, Hal]` — stale
+leftover from the heavy download-lock adopt/delete testing, not from this work.
+Confirmed the migration code is innocent (it only touches the empty legacy
+Caches) and that a relaunch does NOT auto-claim (Qwen stayed `[Posey]` across a
+restart). Device left at baseline: 4 models present, all `[Posey]`, no locks,
+Hal on AFM.

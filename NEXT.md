@@ -47,10 +47,16 @@ retrieval quality improves regardless of how Bonsai turns out.
    loads them, claims on use, and deletes refcount-safely (can't remove
    files another app still claims). `isExcludedFromBackup` on Hal
    downloads. Read-only `SHARED_MODELS` diagnostic added. **Increment #2
-   STILL TODO:** the launch-time migration that moves a v2.0 user's OLD
-   `Caches/huggingface/models/*` into the shared container (so existing
-   App Store upgraders don't lose downloads) — no risk on dev device
-   (nothing to migrate), do it deliberately. **Increment #3 (cross-app
+   DONE + device-verified 2026-07-09:** the launch-time migration that moves a
+   v2.0 user's OLD `Caches/huggingface/models/*` into the shared container (so
+   existing App Store upgraders don't lose downloads). Added to
+   `MaintenanceTasks.runAtLaunch()` (`@MainActor`, one-shot flag): walks the
+   legacy dir at repo granularity (community models too), moves each into the
+   shared store (or removes the legacy dup if the shared copy already exists),
+   claims for Hal + excludes from backup, skips/deletes retired backends.
+   Same-volume rename so it's instant. `LEGACY_MIGRATION` test verb +
+   `tests/legacy_migration_regression.py`; move/reconcile/retired-skip branches
+   all device-verified (no-op on dev device, so tested via planted fakes). **Increment #3 (cross-app
    download lock) DONE + device-verified 2026-07-09.** Per-model lock in
    its OWN `download-locks.json` at the store root (NOT a marker inside the
    model dir — that would trip `isRepoDownloaded`; and NOT folded into

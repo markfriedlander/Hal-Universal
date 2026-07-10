@@ -94,12 +94,22 @@ Posey doesn't have yet); everything else was real. Device restored to baseline.
 (Hal-first is a safe pure addition) — adoption note at
 `Posey/docs-internal/CROSS_APP_DOWNLOAD_LOCK.md` + pointer in Posey `next.md`.
 
-**Increment #2 (launch-time migration of a v2.0 user's old `Caches` models into
-the shared container) is STILL TODO** — no risk on dev device, do it
-deliberately. Embedder sharing (Nomic/mxbai) rides with item #5.
+**Cross-app model sharing — INCREMENT #2 (legacy migration) DONE +
+device-verified** (2026-07-09). `MaintenanceTasks.runAtLaunch()` now migrates a
+v2.0 user's old `Caches/huggingface/models/*` into the App-Group shared store so
+upgraders don't lose downloads: `@MainActor`, one-shot flag, walks the legacy dir
+at repo granularity (community models too), moves each into the shared store (or
+removes the legacy duplicate if a shared copy already exists), claims for Hal +
+`isExcludedFromBackup`, deletes retired backends. Cheap because Caches→App-Group
+is a same-volume rename (no byte copy). Display is disk-truth so a final
+`refreshDownloadStates()` is all the UI needs. `LEGACY_MIGRATION` test verb +
+`tests/legacy_migration_regression.py`; move/reconcile/retired-skip all verified
+via planted fakes (real migration is a no-op on the dev device). Embedder sharing
+(Nomic/mxbai) rides with item #5.
 
-Roadmap now: items 1 (v2.0.1 ship — Mark's ASC action), 4-increment-#2
-(migration, next), 5 (mxbai + embedder sharing), 6 (Bonsai, cut line) remain.
+Roadmap now: items 1 (v2.0.1 ship — Mark's ASC action), 5 (mxbai + embedder
+sharing, next), 6 (Bonsai, cut line) remain. Item 4 (cross-app sharing) is now
+fully done bar Posey adopting the download-lock block.
 
 **v2.0.1 hotfix** (EmbeddingGemma mis-download) remains **fully verified
 — sim + device — deferred to ride with v2.1** per Mark 2026-05-26 (the

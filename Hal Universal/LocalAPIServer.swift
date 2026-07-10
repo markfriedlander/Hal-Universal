@@ -439,6 +439,54 @@ class HalTestConsole: ObservableObject {
                 return "{\"status\":\"ok\",\"command\":\"DOWNLOAD_LOCK\",\"action\":\"QUERY\",\"staleSeconds\":\(Int(SharedModelStore.downloadLockStaleSeconds)),\"lockCount\":\(SharedModelStore.debugAllDownloadLocks().count),\"locks\":\(locksJSON())}"
             }
 
+        } else if trimmed.hasPrefix("LEGACY_MIGRATION") {
+            // v2.1 diagnostic + TEST harness for the launch-time legacy→shared
+            // model migration (MaintenanceTasks). The dev device never used the
+            // legacy Caches location, so this lets the test suite plant a fake
+            // model there, run the migration, inspect where it landed, and clean
+            // up. Sub-commands (repoID never contains ':'):
+            //   LEGACY_MIGRATION QUERY[:<repoID>]  — flag + (per-repo) presence
+            //   LEGACY_MIGRATION PLANT:<repoID>    — plant a fake model in Caches
+            //   LEGACY_MIGRATION RUN               — force-run the migration
+            //   LEGACY_MIGRATION CLEANUP:<repoID>  — remove test repo everywhere
+            //   LEGACY_MIGRATION RESETFLAG         — clear the one-shot flag
+            let arg = String(trimmed.dropFirst("LEGACY_MIGRATION".count)).trimmingCharacters(in: .whitespaces)
+            let parts = arg.split(separator: ":", omittingEmptySubsequences: false).map(String.init)
+            let sub = (parts.first?.isEmpty == false ? parts[0] : "QUERY").uppercased()
+
+            func repoState(_ repoID: String) -> String {
+                let claimants = SharedModelStore.claimants(modelID: repoID)
+                let cj = "[" + claimants.map { "\"\(jsonStringEscape($0))\"" }.joined(separator: ",") + "]"
+                return "{\"repoID\":\"\(jsonStringEscape(repoID))\",\"legacyPresent\":\(MaintenanceTasks.debugLegacyPresent(repoID: repoID)),\"sharedPresent\":\(SharedModelStore.isRepoDownloaded(repoID)),\"claimants\":\(cj)}"
+            }
+
+            switch sub {
+            case "PLANT":
+                guard parts.count >= 2, !parts[1].isEmpty else {
+                    return "{\"status\":\"error\",\"command\":\"LEGACY_MIGRATION\",\"detail\":\"usage PLANT:<repoID>\"}"
+                }
+                let ok = MaintenanceTasks.debugPlantLegacyModel(repoID: parts[1])
+                return "{\"status\":\"ok\",\"command\":\"LEGACY_MIGRATION\",\"action\":\"PLANT\",\"planted\":\(ok),\"state\":\(repoState(parts[1]))}"
+            case "RUN":
+                let actions = MaintenanceTasks.migrateLegacyCachesModelsToSharedStore(force: true)
+                let aj = "[" + actions.map { "\"\(jsonStringEscape($0))\"" }.joined(separator: ",") + "]"
+                return "{\"status\":\"ok\",\"command\":\"LEGACY_MIGRATION\",\"action\":\"RUN\",\"flagSet\":\(MaintenanceTasks.debugMigrationFlagSet()),\"actions\":\(aj)}"
+            case "CLEANUP":
+                guard parts.count >= 2, !parts[1].isEmpty else {
+                    return "{\"status\":\"error\",\"command\":\"LEGACY_MIGRATION\",\"detail\":\"usage CLEANUP:<repoID>\"}"
+                }
+                MaintenanceTasks.debugRemoveModelEverywhere(repoID: parts[1])
+                return "{\"status\":\"ok\",\"command\":\"LEGACY_MIGRATION\",\"action\":\"CLEANUP\",\"state\":\(repoState(parts[1]))}"
+            case "RESETFLAG":
+                MaintenanceTasks.debugResetMigrationFlag()
+                return "{\"status\":\"ok\",\"command\":\"LEGACY_MIGRATION\",\"action\":\"RESETFLAG\",\"flagSet\":\(MaintenanceTasks.debugMigrationFlagSet())}"
+            default: // QUERY
+                if parts.count >= 2, !parts[1].isEmpty {
+                    return "{\"status\":\"ok\",\"command\":\"LEGACY_MIGRATION\",\"action\":\"QUERY\",\"flagSet\":\(MaintenanceTasks.debugMigrationFlagSet()),\"state\":\(repoState(parts[1]))}"
+                }
+                return "{\"status\":\"ok\",\"command\":\"LEGACY_MIGRATION\",\"action\":\"QUERY\",\"flagSet\":\(MaintenanceTasks.debugMigrationFlagSet())}"
+            }
+
         } else if trimmed == "LIST_MODELS" {
             return buildModelListJSON(vm: vm)
 
