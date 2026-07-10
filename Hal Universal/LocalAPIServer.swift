@@ -61,7 +61,6 @@ import Combine
 import Network
 import Security
 import SQLite3
-import WatchConnectivity
 
 // MARK: - MemoryStore Document API helpers (used by LocalAPIServer)
 extension MemoryStore {
@@ -511,30 +510,6 @@ class HalTestConsole: ObservableObject {
         } else if trimmed.hasPrefix("DELETE_MODEL:") {
             let modelID = String(trimmed.dropFirst("DELETE_MODEL:".count)).trimmingCharacters(in: .whitespaces)
             return await deleteModel(modelID)
-
-        } else if trimmed.hasPrefix("SIMULATE_WATCH_MESSAGE:") {
-            // Drive the Watch round-trip locally without paired hardware.
-            // Routes through the exact same ChatViewModel entrypoint
-            // (`processWatchIncomingMessage`) that HalWatchBridge uses for
-            // real WCSession deliveries. The reply is pushed to the Watch
-            // (a no-op if no Watch is reachable, with a HALDEBUG-WATCH log
-            // line) AND returned to the API caller in the response body so
-            // tests can verify the round-trip without a real Watch.
-            //
-            // Strategic Claude's May-14 directive: "This should behave
-            // exactly as if the Watch sent that text via WCSession — the
-            // iPhone receives it, routes it through ChatViewModel, generates
-            // a response, and sends the reply back through the WCSession path."
-            let payload = String(trimmed.dropFirst("SIMULATE_WATCH_MESSAGE:".count))
-                .trimmingCharacters(in: .whitespacesAndNewlines)
-            guard !payload.isEmpty else {
-                return "{\"status\":\"error\",\"command\":\"SIMULATE_WATCH_MESSAGE\",\"error\":\"empty payload\"}"
-            }
-            let reply = await vm.processWatchIncomingMessage(payload)
-            let watchReachable = WCSession.default.isReachable
-            let replyEscaped = jsonStringEscape(reply ?? "")
-            let payloadEscaped = jsonStringEscape(payload)
-            return "{\"status\":\"ok\",\"command\":\"SIMULATE_WATCH_MESSAGE\",\"sent\":\"\(payloadEscaped)\",\"reply\":\"\(replyEscaped)\",\"watchReachable\":\(watchReachable)}"
 
         } else if trimmed == "NEW_THREAD" {
             vm.startNewConversation()

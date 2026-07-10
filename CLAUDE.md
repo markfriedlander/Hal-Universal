@@ -47,8 +47,8 @@ When evaluating any implementation decision, ask: does this advance or undermine
 
 ### Structure
 - **Hal.swift** — single Swift file, ~11,000 lines, organized into 30+ LEGO blocks
-- **Hal_Watch.swift** — Apple Watch companion
 - **Xcode project** — iOS 18+ minimum, Swift/SwiftUI
+- *(The Apple Watch companion was excised 2026-07-11 — see HISTORY. Its source dirs and Xcode targets are being removed in a staged cleanup; do not treat the watch as a live feature.)*
 
 ### The LEGO Block System
 All code is organized into clearly bounded, numbered sections:
@@ -67,7 +67,6 @@ This system exists for AI-assisted collaboration — it enables surgical edits a
 - Source code self-knowledge (Hal.swift ingested into RAG so Hal can read his own architecture)
 - Temporal awareness (date, session duration, uptime)
 - Self-knowledge database table (Phase 1 complete — but has a prompt injection bug)
-- Apple Watch companion app
 
 ### Known Issues / Incomplete Work
 - Self-knowledge table exists but is NOT being injected into prompts correctly

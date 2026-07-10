@@ -172,6 +172,39 @@ Both can coexist — they're just different backend cases.
 
 ---
 
+## Apple Watch excision — staged (started 2026-07-11)
+
+**Decision:** the Apple Watch companion is being removed. The watch→iPhone relay
+could never work — iOS forbids sustained GPU/Metal inference while backgrounded or
+locked (measured ~175× throttle, confirmed by outside developers), so a pocketed
+phone can't generate the reply. Apple's own answer (watchOS 27) routes wrist AI to
+Private Cloud Compute, not local compute. Full finding + research: HISTORY 2026-07-11.
+
+Three stages, each leaving a shippable app:
+
+- ~~**Stage 1 — excise iOS-side watch Swift (CC).**~~ **DONE 2026-07-11, device build
+  clean.** Removed the `HalWatchBridge` bootstrap + class (LEGO 31),
+  `processWatchIncomingMessage`/`pickWatchTurnModel`, `isWatchTurnInProgress` + its
+  `buildChatMessages` branch, the `SIMULATE_WATCH_MESSAGE` verb + `WatchConnectivity`
+  import (LocalAPIServer), the Settings Apple Watch section, the `.watchDelivery`
+  prompt-inspector case (PromptDetailView, `kindRank` renumbered), and the
+  `simulate_watch` test-harness subcommand. Kept `sendMessage(externalText:)` (core
+  send fn; de-watched its doc comment). LEGO numbering now 30 → 32.
+- **Stage 2 — remove the Xcode targets (MARK, in Xcode).** Delete both watch targets
+  (`Hal Universal Watch Watch App`, `HalWatchComplicationExtension`) and remove the
+  `WatchConnectivity.framework` link from the `Hal Universal` target's Frameworks. This
+  is the one genuinely risky pbxproj op — do it in the Xcode UI (atomic + undoable), not
+  by hand-editing the project file. Kills the archive-time dependency build + the empty
+  "Embed Watch Content" phase. CC will provide click-by-click steps.
+- **Stage 3 — delete orphaned source (CC).** After Stage 2, `rm -rf "Hal Universal
+  Watch/" "HalWatchComplication/"`, verify build/archive clean, commit. Then finish the
+  CLAUDE.md cleanup (drop the "being removed" annotations once truly gone).
+
+Until Stage 2 lands, the two watch targets still compile as a dependency (harmless; the
+watch source is untouched).
+
+---
+
 ## Working list — active backlog, in order (agreed 2026-07-11)
 
 Mark's chosen near-term work, ordered by CC's recommendation. The `(0x)` refs point

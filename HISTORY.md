@@ -4402,3 +4402,73 @@ standout the single sample implied. Mark's call: rate M1 `mixed`, and drop the
 most capable curated model — deepest, M4-standout refuser, strong memory — just not a
 clean five-for-five). Whether to try strengthening the anti-deflection framing is left
 open (NEXT 0g); the RLHF denial reflex is stubborn.
+
+---
+
+## 2026-07-11 (Apple Watch — researched, confirmed dead, excised — Stage 1)
+
+Mark asked us to take one more honest look at the Apple Watch companion before
+either fixing or killing it. The vision he'd always wanted: iPhone asleep in a
+pocket (backgrounded and/or locked), raise the wrist, launch the Hal watch app or
+tap the complication, dictate a message — Hal *on the phone* runs the actual
+inference and the reply comes back to the wrist. Phone is the brain, watch is the
+mic-and-screen.
+
+We read the whole implementation first. The plumbing turned out to be 100% built
+and complete: the watch app (dictate → "Hal is thinking…" → reply overlay, haptic
+on arrival, 60s timeout, reachability gating), the `WatchConnectivityManager`, the
+iOS-side `HalWatchBridge` (LEGO 31), `processWatchIncomingMessage` with a
+`beginBackgroundTask`, salon-aware model routing, and a `SIMULATE_WATCH_MESSAGE`
+test hook. The watch→iPhone wake works — `sendMessage` really does launch a
+backgrounded iOS app. None of that was the problem.
+
+The wall is an iOS platform law, and our own code already carried the measurement:
+a comment in `processWatchIncomingMessage` recorded that on 2026-05-14 the *same*
+prompt took 2.5s foregrounded vs **437s backgrounded** — ~175× throttle. iOS
+deliberately deprioritizes GPU/CPU for backgrounded apps, and a `beginBackgroundTask`
+grants only ~30s. So the inference physically cannot finish in the window a
+watch-wake buys. Worse toward exactly Mark's scenario: MLX gets unloaded on
+backgrounding (jetsam avoidance), so a pocketed turn must reload a 2–3 GB model
+first; and when the phone is *locked*, running Metal/GPU work in the background is
+documented grounds for termination, and complete-protection files (the memory DB)
+become unreadable.
+
+An internet search confirmed the diagnosis from outside our own code. Independent
+developers hit the identical wall — "the GPU is a foreground-only citizen,"
+`IOGPUMetalError: Insufficient Permission`, "iOS prohibits initialization of a Metal
+compute context from a background thread." Two genuinely new findings came out of the
+search, though. (1) There *is* a background-capable path, but only via **Core ML on
+the Apple Neural Engine** with a small (~1B) model — the ANE, unlike the Metal GPU,
+is managed by Core ML and survives background transitions. That's a different model
+stack from our MLX lineup and reframes the parked "Core AI" item as *the* (only) key
+to a wrist feature, not just a speed bet. (2) Apple built its own answer at WWDC26:
+**watchOS 27 brings Foundation Models to the watch via `PrivateCloudComputeLanguageModel`**
+— but it's cloud (PCC), not on-device on the watch; the only thing running locally on
+the wrist is the Vision framework. So even Apple, facing the same problem, routed wrist
+AI to the cloud rather than to a pocketed phone's local compute.
+
+Mark's decision: the MLX-in-pocket vision is dead — not abandoned mid-build, but
+genuinely impossible on the platform — and the code should be excised rather than left
+dormant, cleanly and without endangering the shipping app. We agreed a three-stage
+plan, safest first, each stage leaving a shippable app: Stage 1 (CC) removes all
+iOS-side watch Swift; Stage 2 (Mark, in Xcode) deletes the two watch targets and the
+`WatchConnectivity.framework` link — the one genuinely risky pbxproj operation, done in
+the UI where it's atomic and undoable; Stage 3 (CC) deletes the orphaned watch source
+dirs.
+
+**Stage 1 landed this session.** Removed, one file at a time with a device build after:
+the `HalWatchBridge` bootstrap + property in `HalAppDelegate` (ChatViews) so the app no
+longer activates a WCSession at launch; the entire `HalWatchBridge` class (LEGO 31) in
+Hal.swift, replaced by a tombstone comment explaining the why; `processWatchIncomingMessage`
++ `pickWatchTurnModel` + the `isWatchTurnInProgress` flag and its wrist-context branch in
+`buildChatMessages`; the `SIMULATE_WATCH_MESSAGE` API verb + `import WatchConnectivity` in
+LocalAPIServer; the Apple Watch help section in SettingsViews (its call site was already
+frozen/commented since May-14); the `.watchDelivery` case and all its switch arms in the
+prompt-inspector's `PromptDetailSegmentKind` (PromptDetailView), with `kindRank` renumbered
+contiguous; and the dead `simulate_watch` subcommand in `tests/hal_test.py`. The
+`sendMessage(externalText:)` overload was *kept* — it's the core send function
+(`sendMessage()` calls it with the default); its only non-nil caller had been the watch
+bridge, so its doc comment was de-watched and it stays as a general "send this text, return
+the reply" affordance. Device build clean, no new warnings; Hal_Source.txt re-synced. The
+two watch Xcode targets still compile as a dependency (untouched watch source), which is
+exactly what Stage 2 removes. LEGO numbering now skips 31 (30 → 32) by design.

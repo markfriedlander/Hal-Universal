@@ -125,17 +125,6 @@ struct ActionsView: View {
                     .id("importexport")
                 modelSection
                     .id("ai")
-                // watchSection — frozen May-14, 2026. Apple Watch feature is
-                // not user-visible in v1.x. The underlying code remains intact
-                // (AppDelegate bridge, processWatchIncomingMessage, the
-                // Hal Universal Watch + HalWatchComplicationExtension build
-                // targets) so it can be reactivated by un-commenting this
-                // line. Decision rationale: the iOS WatchConnectivity
-                // platform does not reliably support cold-launch of the
-                // iPhone companion app, which makes the Watch use case
-                // (talk to Hal when the iPhone isn't in hand) inconsistent
-                // in a way that violates Mark's "never silently fail"
-                // principle.
                 powerUserSection
                     .id("poweruser")
 
@@ -540,35 +529,6 @@ struct ActionsView: View {
             Label("AI Model", systemImage: "cpu")
         } footer: {
             Text("Select from Apple Foundation Models or download MLX models from Hugging Face")
-                .font(.caption2)
-        }
-    }
-
-    // MARK: - Apple Watch Section
-    //
-    // Dedicated home for the Watch-related disclosure (and a natural place
-    // for future Watch-specific toggles — default model for Watch turns,
-    // haptic intensity, etc.). For v1.x this is just the educational
-    // disclosure Mark requested on May-14: response time depends on which
-    // model is active.
-    private var watchSection: some View {
-        Section {
-            VStack(alignment: .leading, spacing: 6) {
-                Text("Response time on your Watch depends on which model Hal is using. Faster models respond in seconds; larger or backgrounded models may take up to a minute.")
-                    .font(.caption)
-                    .foregroundColor(.secondary)
-                Text("Hal will buzz your wrist when the reply is ready. You can lower your wrist after dictating — Hal keeps working.")
-                    .font(.caption)
-                    .foregroundColor(.secondary)
-                Text("If your Watch says Hal isn't reachable, open Hal on your iPhone to reconnect. The Watch needs the iPhone within Bluetooth/Wi-Fi range with Hal at least recently active.")
-                    .font(.caption)
-                    .foregroundColor(.secondary)
-            }
-            .padding(.vertical, 2)
-        } header: {
-            Label("Apple Watch", systemImage: "applewatch")
-        } footer: {
-            Text("Tap the eye on your Watch, dictate, send. The active model handles the reply with a wrist-sized formatting hint.")
                 .font(.caption2)
         }
     }

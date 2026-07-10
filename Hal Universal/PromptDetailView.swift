@@ -33,7 +33,6 @@ enum PromptDetailSegmentKind: Sendable {
     case selfAwareness         // Runtime stats (turn count, etc.)
     case selfKnowledge         // Persistent traits / reflections
     case ragRetrieval          // Long-term memory snippets
-    case watchDelivery         // Watch-specific brevity instruction
     case conversationHistory   // Recent turn pairs
     case userMessage           // The user input that triggered this turn
     case other                 // Unclassified context
@@ -47,7 +46,6 @@ enum PromptDetailSegmentKind: Sendable {
         case .selfAwareness:       return "Self-Awareness"
         case .selfKnowledge:       return "Self-Knowledge"
         case .ragRetrieval:        return "Memory Snippets (RAG)"
-        case .watchDelivery:       return "Watch Delivery Note"
         case .conversationHistory: return "Conversation History"
         case .userMessage:         return "User Message"
         case .other:               return "Context"
@@ -63,7 +61,6 @@ enum PromptDetailSegmentKind: Sendable {
         case .selfAwareness:       return "gauge"
         case .selfKnowledge:       return "brain"
         case .ragRetrieval:        return "magnifyingglass"
-        case .watchDelivery:       return "applewatch"
         case .conversationHistory: return "bubble.left.and.bubble.right"
         case .userMessage:         return "person.circle"
         case .other:               return "ellipsis.circle"
@@ -83,7 +80,6 @@ enum PromptDetailSegmentKind: Sendable {
         case .selfAwareness:       return .teal
         case .selfKnowledge:       return .pink
         case .ragRetrieval:        return .green
-        case .watchDelivery:       return .brown
         case .conversationHistory: return .blue
         case .userMessage:         return .gray
         case .other:               return .secondary
@@ -109,10 +105,9 @@ enum PromptDetailSegmentKind: Sendable {
         case .selfAwareness:       return 3
         case .selfKnowledge:       return 4
         case .ragRetrieval:        return 5
-        case .watchDelivery:       return 6
-        case .conversationHistory: return 7
-        case .userMessage:         return 8
-        case .other:               return 9
+        case .conversationHistory: return 6
+        case .userMessage:         return 7
+        case .other:               return 8
         }
     }
 
@@ -128,7 +123,6 @@ enum PromptDetailSegmentKind: Sendable {
         case .selfAwareness:       return "📊 SELF-AWARENESS"
         case .selfKnowledge:       return "🧠 SELF-KNOWLEDGE"
         case .ragRetrieval:        return "🔍 MEMORY SNIPPETS (RAG)"
-        case .watchDelivery:       return "⌚ WATCH DELIVERY NOTE"
         case .conversationHistory: return "💬 CONVERSATION HISTORY"
         case .userMessage:         return "👤 USER MESSAGE"
         case .other:               return "• CONTEXT"
@@ -169,7 +163,7 @@ struct PromptDetailSegment: Identifiable, Sendable {
 /// Classify a context-block section by its opening line. The
 /// patterns mirror the literal section starters used in
 /// buildChatMessages (e.g. "Summary of earlier conversation:",
-/// "Relevant past context:", "DELIVERY CONTEXT:"). Anything that
+/// "Relevant past context:"). Anything that
 /// doesn't match a known marker falls back to .other so the user
 /// still sees the content — better to display unclassified than to
 /// drop it.
@@ -181,7 +175,6 @@ nonisolated func classifyPromptContextSection(_ section: String) -> PromptDetail
     // — these are unambiguous matches).
     if lower.hasPrefix("summary of earlier conversation:") { return .summary }
     if lower.hasPrefix("relevant past context:") { return .ragRetrieval }
-    if lower.hasPrefix("delivery context:") { return .watchDelivery }
 
     // Self-Awareness body is produced by buildSelfAwarenessContext and
     // opens with the "You are Hal" framing followed by a structured
