@@ -139,13 +139,16 @@ retrieval quality improves regardless of how Bonsai turns out.
    via the existing MLX path (~12s, no jetsam); **(b) calibration** — after
    swapping the Qwen layer-1 for an anti-deflection one, Bonsai **clean-sweeps
    all five Maxims** (M1 pass, M2 pass, M3 pass, **M4 standout**, M5 pass) — the
-   only curated model that passes all five. Real cost: **~4-5 tok/s** on the 16
-   Plus (slowest in the tier; 27 tok/s is 17 Pro MAX). **Decision (Mark): SHIP**
-   as an opt-in "deep reasoner, most capable, slowest." Seed
+   only curated model that passes all five. Speed: **decode ~16.6 tok/s** on the 16
+   Plus — on par with Llama/Dolphin, NOT slow (the earlier "~4-5 tok/s" was
+   wall-clock ÷ tokens, conflating decode with per-turn gate overhead). **Decision
+   (Mark): SHIP** as the "deep reasoner" — deepest/most capable, generating about as
+   fast as the 3B tier. Seed
    `ModelCatalogService.bonsai8B2bit` in curatedSeeds + availableModels; findings
    `Docs/Maxim_Suite_Bonsai_2026-07-11.md`; see HISTORY 2026-07-11. Non-blocking
-   follow-ups: re-measure speed on Pro hardware; measure prefill tok/s (seed
-   carries a conservative 8,000 placeholder); the 1.7B variant
+   follow-ups: measure prefill tok/s (seed carries a conservative 8,000
+   placeholder); whole-tier gate optimization logged (per-turn memory-search gate
+   runs the active model, ~4-5s on the 8B); the 1.7B variant
    (`Ternary-Bonsai-1.7B-mlx-2bit`, ~0.48 GB, 32k ctx) stays the lighter fallback.
    Gate ran via a new test-only `DOWNLOAD_MODEL:<id>:<sizeGB>` size hint.
 7. **EmbeddingGemma — PARKED watch-item (not dropped).** Mark wants it:

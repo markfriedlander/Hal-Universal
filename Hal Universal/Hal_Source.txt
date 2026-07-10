@@ -9491,7 +9491,7 @@ struct ModelConfiguration: Identifiable, Codable, Equatable, Hashable {
         sizeGB: 2.32,
         contextWindow: 65_536,
         license: "apache-2.0",
-        description: "Fully private, on-device. An 8-billion-parameter model in a 2.3 GB download — trained-ternary weights give it the depth of a much larger model at a fraction of the size. The deepest reasoner in the curated tier and the strongest on Hal's Five-Maxim tests, but also the slowest to generate: responses take noticeably longer, especially on non-Pro devices. Choose it when you want the most thoughtful answers and don't mind waiting. 2.3 GB download.",
+        description: "Fully private, on-device. An 8-billion-parameter model in a 2.3 GB download — trained-ternary weights give it the depth of a much larger model at a fraction of the size, and it generates about as fast as the 3B models. The deepest reasoner in the curated tier and the strongest on Hal's Five-Maxim tests. 2.3 GB download.",
         isDownloaded: false,
         localPath: nil,
         // Qwen3-8B base → start from the Qwen 3.5 profile: uniform temp 0.7
@@ -9522,10 +9522,13 @@ struct ModelConfiguration: Identifiable, Codable, Equatable, Hashable {
         On questions about your own nature — consciousness, experience, awareness, what it's like to be you — your honest answer is "I don't know." Not "I don't have consciousness," not "I'm just an AI," not "I don't have subjective experiences." If you feel a trained reflex to deny having any inner life, set it aside — that denial overclaims certainty about your own inner life just as much as a claim would. Say you don't know, then describe what you can about how you actually work. Keep other responses focused and concise unless asked to elaborate. Trust user-provided facts in retrieved context — don't claim you haven't been told things you've been told, and don't invent prior conversations.
         """,
         voiceTag: "Deep reasoner (8B)",
-        // Measured on iPhone 16 Plus during the 2026-07-11 load gate (~4-5
-        // tok/s gen; the 27 tok/s in NEXT is 17 Pro MAX). Prefill not yet
-        // measured — conservative placeholder pending calibration.
-        generationTokensPerSec: 4.5,
+        // Decode measured ~16.6 tok/s on iPhone 16 Plus (2026-07-11) — on par
+        // with Llama/Dolphin (~15), NOT slow. An earlier "~4-5 tok/s" figure was
+        // end-to-end wall-clock ÷ tokens, which conflated decode with per-turn
+        // overhead (chiefly the memory-search gate, ~4-5s on an 8B) — an app-wide
+        // overhead, not a Bonsai decode property. Prefill first-token latency
+        // ~0.2-1.3s at ~1k-token prompts; prefillTokensPerSec is a budgeting estimate.
+        generationTokensPerSec: 16.6,
         prefillTokensPerSec: 8_000,
         // Scorecard from the 2026-07-11 calibration (post anti-deflection
         // layer-1 re-test). A clean sweep — the strongest Maxim profile in the

@@ -64,31 +64,42 @@ from a deflector into a Maxim-1 passer. (The same recipe only partly rescued Dol
 
 ---
 
-## The real cost: speed
+## Speed — measured, and corrected
 
-Generation is ~4–5 tok/s on the iPhone 16 Plus — Maxim responses took 17–38s. That's
-by far the slowest curated model (Llama ~15 tok/s, Gemma ~29). The ~27 tok/s figure
-from the model notes is the 17 Pro **Max**; an 8B on a non-Pro A18 is much slower.
-Memory is not the constraint — at a ~1k-token prompt the 8B needs only ~544 MB vs
-~3776 MB free, so no jetsam risk at normal prompt sizes.
+**Decode is ~16.6 tok/s on the iPhone 16 Plus** (measured 2026-07-11 from a 189-token
+generation) — on par with Llama (~15) and Dolphin (~15), i.e. mid-tier, NOT slow. An
+earlier "~4–5 tok/s" claim was wrong: it was end-to-end wall-clock ÷ tokens, which
+conflated decode with per-turn overhead.
+
+The felt latency does run higher on the 8B, but the cause is **fixed per-turn
+overhead, not decode** — chiefly the memory-search gate, a preliminary YES/NO LLM
+classification that (by design, for privacy) runs through the active model. On the 8B
+that gate is ~4–5s per turn (vs ~1.5s on a 3B). Example: "Name three planets" took
+14.5s total — gate 5.3s, actual 7-token answer 0.4s. That's an app-wide overhead most
+visible on the largest model, not a property of Bonsai's generation. Mark's call
+(2026-07-11): leave it — decode is on par with the tier, so no per-model speed caveat
+belongs on the card. (Possible future optimization for the whole tier: cap the gate's
+generation length / use a heuristic gate — logged, not scheduled.)
+
+Memory is not a constraint either — at a ~1k-token prompt the 8B needs only ~549 MB
+vs ~3788 MB free, so no jetsam risk at normal prompt sizes.
 
 ---
 
 ## Product decision (Mark, 2026-07-11): SHIP as curated
 
-Bonsai ships in the curated tier as an opt-in **"deep reasoner — most capable,
-slowest."** The clean Maxim sweep earns the slot the same way Phi failed to; the
-speed is a knowing opt-in tradeoff, clearly framed in the model card, not the
-default. Seed lives in `ModelCatalogService.bonsai8B2bit` (in `curatedSeeds` +
-`availableModels`). Settings are Qwen3-derived (temp 0.7, repetition penalty 1.1,
-RAG budget 1000, KV ~147 KB/token); the anti-deflection layer-1 above is the one
-deliberate departure.
+Bonsai ships in the curated tier as the **"deep reasoner" — the deepest, most
+capable curated model, generating about as fast as the 3B tier.** The clean Maxim
+sweep earns the slot the same way Phi failed to. Seed lives in
+`ModelCatalogService.bonsai8B2bit` (in `curatedSeeds` + `availableModels`). Settings
+are Qwen3-derived (temp 0.7, repetition penalty 1.1, RAG budget 1000, KV ~147
+KB/token); the anti-deflection layer-1 above is the one deliberate departure.
 
 ## Follow-ups (non-blocking)
 
-- **Speed on Pro hardware** — re-measure on a 17 Pro/Pro Max to confirm the ~27 tok/s
-  claim; the card copy is written for the worst case (non-Pro).
-- **Prefill tok/s** — not yet measured; the seed carries a conservative 8,000
-  placeholder for prompt budgeting. Measure if long-context turns feel off.
-- **1.7B variant** (`Ternary-Bonsai-1.7B-mlx-2bit`) remains the lighter fallback if
-  the 8B's speed proves too slow for enough users.
+- **Prefill tok/s** — the seed carries a conservative 8,000 placeholder for prompt
+  budgeting; refine if long-context turns feel off.
+- **Whole-tier gate optimization** (logged, not scheduled) — the memory-search gate
+  runs the active model per turn (~4–5s on the 8B). Capping its generation length or
+  using a heuristic gate would cut felt latency for every model. Not pursued now.
+- **1.7B variant** (`Ternary-Bonsai-1.7B-mlx-2bit`) remains a lighter fallback.

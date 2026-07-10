@@ -25,14 +25,17 @@ curated.** Hal's first 8B and first 2-bit model
 2-bit load gate passed on the 16 Plus (~12s, no jetsam), and after swapping the
 Qwen-derived layer-1 for an anti-deflection one it **clean-swept all five Maxims**
 (M1 pass, M2 pass, M3 pass, **M4 standout**, M5 pass) — the only curated model that
-passes all five. Real cost: **~4-5 tok/s** (slowest in the tier; the 27 tok/s figure
-is 17 Pro MAX). Mark's call: SHIP as an opt-in "deep reasoner, most capable,
-slowest." Seed = `ModelCatalogService.bonsai8B2bit` (in curatedSeeds +
-availableModels); findings `Docs/Maxim_Suite_Bonsai_2026-07-11.md`; new test verb
-`DOWNLOAD_MODEL:<id>:<sizeGB>`. Full story: HISTORY 2026-07-11. **This closes the
-v2.1 cut line — items 1-6 are all done except the item-1 ship action (Mark's ASC
-step).** Non-blocking follow-ups: re-measure speed on Pro hardware; measure prefill
-tok/s (seed carries a conservative 8,000 placeholder).
+passes all five. Speed: **decode ~16.6 tok/s** — on par with Llama/Dolphin, NOT slow
+(an earlier "~4-5 tok/s" was wall-clock ÷ tokens, conflating decode with per-turn
+gate overhead). Mark's call: SHIP as the "deep reasoner" — deepest/most capable,
+generates about as fast as the 3B tier. Seed = `ModelCatalogService.bonsai8B2bit` (in
+curatedSeeds + availableModels); findings `Docs/Maxim_Suite_Bonsai_2026-07-11.md`; new
+test verb `DOWNLOAD_MODEL:<id>:<sizeGB>`. Full story: HISTORY 2026-07-11. **This closes
+the v2.1 cut line — items 1-6 are all done except the item-1 ship action (Mark's ASC
+step).** Non-blocking follow-ups: measure prefill tok/s (seed carries a conservative
+8,000 placeholder); whole-tier gate optimization logged (the per-turn memory-search
+gate runs the active model, ~4-5s on the 8B — an app-wide overhead, not a Bonsai
+decode property).
 
 **Prior (2026-07-10): item 5.5 — the retrieval-fusion rebalance — is DONE and
 device-verified.** The RRF k weights in `searchUnifiedContent` are now tunable

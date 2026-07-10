@@ -4358,3 +4358,29 @@ tradeoff, not the default. This closes v2.1 item 6 (the cut line) — v2.1 now h
 of items 1-6 except the item-1 ship action, which is Mark's ASC step. Non-blocking
 follow-ups: re-measure speed on Pro hardware; measure prefill tok/s (seed carries a
 conservative 8,000 placeholder); the 1.7B variant stays the lighter fallback.
+
+## 2026-07-11 (Bonsai speed — correction to the same-day entry)
+
+Mark asked why Bonsai felt slower than the tier and whether we could speed it up.
+Measuring the device logs corrected the record: the "~4-5 tok/s" in the entry above
+was WRONG — it was end-to-end wall-clock ÷ tokens, which conflated decode with
+per-turn overhead. **Bonsai's actual decode is ~16.6 tok/s** (measured from a
+189-token generation on the 16 Plus), on par with Llama (~15) and Dolphin (~15) — mid
+tier, not slow. Bonsai is not slow at generating.
+
+The felt latency that prompted the question is fixed per-turn OVERHEAD, dominated by
+the memory-search gate: a preliminary YES/NO LLM classification that, by design (a
+privacy choice — Hal.swift:9972, "everything in Bonsai mode stays on Bonsai"), runs
+through the ACTIVE model. On the 8B that gate is ~4-5s every turn (vs ~1.5s on a 3B).
+"Name three planets" measured 14.5s total: gate 5.3s, the actual 7-token answer 0.4s.
+That's an app-wide overhead most visible on the largest model, not a property of
+Bonsai's generation.
+
+Mark's call: since decode is on par, drop the "slowest / responses take longer"
+framing from the model card entirely — it was based on the wrong number. Card now
+reads "generates about as fast as the 3B models"; generationTokensPerSec corrected
+4.5 → 16.6. A whole-tier gate optimization (cap the gate's generation length or use a
+heuristic gate) is logged as a possible future win for every model, but NOT pursued —
+Mark: "no need to do any of those if it's on par with the others." The propagated
+"~4-5 tok/s slowest" figure was corrected across the card, findings doc, NEXT, and
+HANDOFF; this entry is the append-only correction for the record.
