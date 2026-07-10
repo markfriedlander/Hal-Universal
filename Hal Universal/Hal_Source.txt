@@ -5791,6 +5791,196 @@ struct PrivacyLockPopover: View {
 
 // ========== BLOCK PM.3: PrivacyLockPopover (tap explanation) - END ==========
 
+// ==== FILE: SharedModelStore.swift ====
+// SharedModelStore.swift
+// Hal Universal
+//
+// Hal's half of the cross-app model-sharing contract (v2.1). This is a
+// deliberate near-verbatim port of Posey's `SharedModelStore.swift` — the two
+// apps MUST agree on the App Group id, the on-disk layout, AND the
+// `manifest.json` format, or sharing silently breaks. Posey shipped this
+// contract first (2026-06); Hal adopts it here so a model downloaded by either
+// app is a single shared copy both can load, and neither app's delete can pull
+// the files out from under the other.
+//
+// The shared container lives at:
+//   <AppGroup>/Models/huggingface/models/<repoID>/     ← MLX models + Nomic asset
+//   <AppGroup>/Models/manifest.json                    ← co-ownership refcount
+//
+// The `Models/` subfolder is Posey's namespacing (so other shared state can
+// coexist in the container later) and is part of the contract — Hal must match
+// it exactly or it looks one folder too high and sees nothing.
+//
+// Ownership: each app records a claim (its bundle id) on every model it uses.
+// Deleting in one app releases only that app's claim; the files are removed
+// only when NO app still claims the model (see releaseClaim). All manifest
+// access is wrapped in NSFileCoordinator so Hal and Posey can read/write it
+// concurrently without corruption.
+
+import Foundation
+
+// ========== BLOCK SMS.1: SHARED MODEL STORE - PATHS - START ==========
+
+/// The on-device store for Hal's downloadable AI models (the MLX chat LLMs and
+/// the Nomic embedder asset), in the App Group container shared with Posey.
+enum SharedModelStore {
+
+    /// The shared App Group identifier. Must match Posey's exactly.
+    static let appGroupID = "group.com.MarkFriedlander.aifamily"
+
+    /// This app's stable identity for ownership claims in the manifest.
+    static var thisAppID: String { Bundle.main.bundleIdentifier ?? "com.MarkFriedlander.Hal-Universal" }
+
+    /// Container root for shared models, under a `Models/` subfolder (Posey's
+    /// namespacing — part of the contract). **Fallback:** if the container is
+    /// unavailable (entitlement missing, a Simulator without the group, a
+    /// misconfigured build) we degrade to per-app Caches rather than crash — Hal
+    /// keeps working, just without cross-app sharing or purge protection.
+    static var root: URL {
+        if let container = FileManager.default.containerURL(forSecurityApplicationGroupIdentifier: appGroupID) {
+            return container.appendingPathComponent("Models", isDirectory: true)
+        }
+        return FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask)[0]
+    }
+
+    /// The HuggingFace-style cache root inside the store. This is what
+    /// `HubApi(downloadBase:)` points at; both the MLX models
+    /// (`huggingface/models/<id>`) and the Nomic asset live under here.
+    static var huggingFaceRoot: URL {
+        root.appendingPathComponent("huggingface", isDirectory: true)
+    }
+
+    /// Directory for one MLX model id. Matches the legacy Caches layout
+    /// (`huggingface/models/<modelID>`) so detection/load/delete are unchanged
+    /// apart from the root.
+    static func mlxModelDir(_ modelID: String) -> URL {
+        huggingFaceRoot
+            .appendingPathComponent("models", isDirectory: true)
+            .appendingPathComponent(modelID, isDirectory: true)
+    }
+
+    /// "Is this HuggingFace repo present on disk?" — a non-empty repo directory.
+    /// Truth-on-disk, independent of HOW it was fetched (Hal's downloader,
+    /// swift-embeddings' snapshot, or a copy Posey already placed in the shared
+    /// container). Mid-download a partial dir reads present, so callers that
+    /// care also check the downloader's in-flight state.
+    static func isRepoDownloaded(_ repo: String) -> Bool {
+        let dir = mlxModelDir(repo)
+        let contents = (try? FileManager.default.contentsOfDirectory(atPath: dir.path)) ?? []
+        return !contents.isEmpty
+    }
+
+    /// Exclude a model directory from iCloud backup. MANDATORY for App Group
+    /// containers: unlike `Library/Caches` (auto-excluded), the shared container
+    /// IS backed up by default, so without this every user would burn multiple
+    /// GB of iCloud quota on re-downloadable model weights (App Review 2.5.1).
+    /// Idempotent; safe to call on every download-complete and migration.
+    static func excludeFromBackup(_ modelID: String) {
+        var dir = mlxModelDir(modelID)
+        guard FileManager.default.fileExists(atPath: dir.path) else { return }
+        var values = URLResourceValues()
+        values.isExcludedFromBackup = true
+        try? dir.setResourceValues(values)
+    }
+}
+// ========== BLOCK SMS.1: SHARED MODEL STORE - PATHS - END ==========
+
+// ========== BLOCK SMS.3: REFCOUNT MANIFEST (app-family co-ownership) - START ==========
+
+extension SharedModelStore {
+
+    /// `manifest.json` at the store root tracks which apps in the family claim
+    /// each model, so deleting from one app only removes the files when **no**
+    /// app still claims them. Format is identical to Posey's — the two apps
+    /// read/write the same file.
+    private static var manifestURL: URL { root.appendingPathComponent("manifest.json") }
+
+    private struct Manifest: Codable {
+        var version: Int = 1
+        var models: [String: Entry] = [:]
+        struct Entry: Codable {
+            var claimedBy: [String] = []   // bundle ids
+            var repo: String?              // hf repo id (recorded for cross-app match)
+            var sizeBytes: Int64?
+        }
+    }
+
+    /// Record that THIS app uses `modelID`. Called on a completed download and
+    /// when Hal first loads/adopts a model that's already present in the shared
+    /// container (so an adopted model gains Hal's claim and Posey's delete can't
+    /// then pull it out from under Hal). Idempotent.
+    static func claim(modelID: String, repo: String? = nil, sizeBytes: Int64? = nil) {
+        mutateManifest { m in
+            var e = m.models[modelID] ?? Manifest.Entry()
+            if !e.claimedBy.contains(thisAppID) { e.claimedBy.append(thisAppID) }
+            if let repo { e.repo = repo }
+            if let sizeBytes { e.sizeBytes = sizeBytes }
+            m.models[modelID] = e
+        }
+    }
+
+    /// Release THIS app's claim on `modelID`. Returns `true` iff NO app claims it
+    /// anymore — i.e. it is now safe to delete the files from disk. The caller
+    /// (Hal's delete path) removes files ONLY on `true`, so deleting a model
+    /// Posey still uses leaves Posey's copy intact.
+    @discardableResult
+    static func releaseClaim(modelID: String) -> Bool {
+        var safeToDelete = false
+        mutateManifest { m in
+            guard var e = m.models[modelID] else { safeToDelete = true; return }
+            e.claimedBy.removeAll { $0 == thisAppID }
+            if e.claimedBy.isEmpty {
+                m.models.removeValue(forKey: modelID)
+                safeToDelete = true
+            } else {
+                m.models[modelID] = e
+            }
+        }
+        return safeToDelete
+    }
+
+    /// Read-only: which apps currently claim `modelID`. Used for diagnostics
+    /// (e.g. the SHARED_MODELS API verb) so we can see the ledger without a
+    /// mutating call.
+    static func claimants(modelID: String) -> [String] {
+        let coordinator = NSFileCoordinator()
+        return readManifest(coordinator).models[modelID]?.claimedBy ?? []
+    }
+
+    // MARK: coordinated read / write
+
+    private static func readManifest(_ coordinator: NSFileCoordinator) -> Manifest {
+        var result = Manifest()
+        var coordError: NSError?
+        coordinator.coordinate(readingItemAt: manifestURL, options: [], error: &coordError) { url in
+            guard let data = try? Data(contentsOf: url),
+                  let decoded = try? JSONDecoder().decode(Manifest.self, from: data) else { return }
+            result = decoded
+        }
+        return result
+    }
+
+    private static func mutateManifest(_ body: (inout Manifest) -> Void) {
+        try? FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        let coordinator = NSFileCoordinator()
+        // Read-then-write under a single write coordination so two apps can't
+        // interleave a lost update.
+        var coordError: NSError?
+        coordinator.coordinate(writingItemAt: manifestURL, options: [], error: &coordError) { url in
+            var manifest = Manifest()
+            if let data = try? Data(contentsOf: url),
+               let decoded = try? JSONDecoder().decode(Manifest.self, from: data) {
+                manifest = decoded
+            }
+            body(&manifest)
+            if let out = try? JSONEncoder().encode(manifest) {
+                try? out.write(to: url, options: .atomic)
+            }
+        }
+    }
+}
+// ========== BLOCK SMS.3: REFCOUNT MANIFEST - END ==========
+
 // ==== FILE: MLXModelDownloader.swift ====
 // MLXModelDownloader.swift
 // Hal Universal
@@ -6200,11 +6390,9 @@ class BackgroundDownloadCoordinator: NSObject, URLSessionDownloadDelegate, Obser
     }
 
     private func modelDirectory(for modelID: String) -> URL {
-        let cacheDir = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask)[0]
-        return cacheDir
-            .appendingPathComponent("huggingface", isDirectory: true)
-            .appendingPathComponent("models", isDirectory: true)
-            .appendingPathComponent(modelID, isDirectory: true)
+        // v2.1: models live in the App-Group shared store, not per-app Caches,
+        // so Hal and Posey share one copy. See SharedModelStore.swift.
+        SharedModelStore.mlxModelDir(modelID)
     }
 
     // MARK: - Completion Notification
@@ -6215,6 +6403,12 @@ class BackgroundDownloadCoordinator: NSObject, URLSessionDownloadDelegate, Obser
         // Mark in MLXModelDownloader's downloaded set so future model-status
         // queries report it as downloaded.
         MLXModelDownloader.shared.markModelAsDownloadedFromBackground(modelID: modelID)
+        // v2.1 shared store: record Hal's claim on the freshly-downloaded model
+        // (so Posey's delete can't pull it out from under Hal) and exclude it
+        // from iCloud backup — App Group containers aren't auto-excluded the way
+        // Library/Caches is (App Review 2.5.1).
+        SharedModelStore.claim(modelID: modelID, repo: modelID)
+        SharedModelStore.excludeFromBackup(modelID)
         NotificationCenter.default.post(name: .mlxModelDidDownload, object: nil, userInfo: ["modelID": modelID])
     }
 
@@ -6578,13 +6772,9 @@ class MLXModelDownloader: ObservableObject {
         }
     }
     
-    // Helper: Construct runtime path for a model ID
+    // Helper: Construct runtime path for a model ID (App-Group shared store).
     private func modelPath(for modelID: String) -> URL {
-        let cacheDir = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask)[0]
-        return cacheDir
-            .appendingPathComponent("huggingface", isDirectory: true)
-            .appendingPathComponent("models", isDirectory: true)
-            .appendingPathComponent(modelID, isDirectory: true)
+        SharedModelStore.mlxModelDir(modelID)
     }
     
     // MARK: - Download Queue Management
@@ -6755,7 +6945,7 @@ class MLXModelDownloader: ObservableObject {
     // MARK: - Directory Management
     
     private var hubCacheDirectory: URL {
-        URL.cachesDirectory.appending(path: "huggingface")
+        SharedModelStore.huggingFaceRoot
     }
     
     private var legacyModelsDir: URL {
@@ -7286,19 +7476,25 @@ class MLXModelDownloader: ObservableObject {
     
     func deleteModel(modelID: String) async {
         let expectedPath = modelPath(for: modelID)
-        
-        if FileManager.default.fileExists(atPath: expectedPath.path) {
+
+        // v2.1 shared store: release Hal's claim FIRST. The files are removed
+        // only when NO other app (Posey) still claims the model. So deleting a
+        // shared model in Hal drops Hal's claim and leaves Posey's copy on disk;
+        // deleting a Hal-only model (no remaining claimant) removes the files as
+        // before. This is what makes "delete in one app can't break the other."
+        let safeToDelete = SharedModelStore.releaseClaim(modelID: modelID)
+        let fileExists = FileManager.default.fileExists(atPath: expectedPath.path)
+
+        if safeToDelete && fileExists {
             do {
                 try FileManager.default.removeItem(at: expectedPath)
                 print("HALDEBUG-DOWNLOAD: Model deleted from: \(expectedPath.path)")
-                
+
                 await MainActor.run {
-                    // Remove from persistent storage
                     var modelIDs = self.downloadedModelIDs
                     modelIDs.remove(modelID)
                     self.downloadedModelIDs = modelIDs
-                    
-                    // Update state
+
                     var state = self.downloadStates[modelID] ?? DownloadState(
                         isDownloading: false,
                         progress: 0.0,
@@ -7310,11 +7506,8 @@ class MLXModelDownloader: ObservableObject {
                     state.progress = 0.0
                     state.message = "Model deleted."
                     self.downloadStates[modelID] = state
-                    
-                    // Update cache size
-                    Task {
-                        await self.updateCacheSize()
-                    }
+
+                    Task { await self.updateCacheSize() }
                 }
             } catch {
                 await MainActor.run {
@@ -7331,12 +7524,19 @@ class MLXModelDownloader: ObservableObject {
                 }
             }
         } else {
-            // File doesn't exist, clean up storage anyway
+            // Not removed from disk — either another app still claims the model
+            // (files kept, shared) or it wasn't present. Drop Hal's local
+            // tracking either way. NOTE: for a still-shared model the files
+            // remain, so isModelDownloaded (disk-truth) will still report it
+            // present — that's correct (it IS on the device, via the other app).
+            if !safeToDelete {
+                print("HALDEBUG-DOWNLOAD: Released Hal's claim on \(modelID); another app still uses it — files kept.")
+            }
             await MainActor.run {
                 var modelIDs = self.downloadedModelIDs
                 modelIDs.remove(modelID)
                 self.downloadedModelIDs = modelIDs
-                
+
                 var state = self.downloadStates[modelID] ?? DownloadState(
                     isDownloading: false,
                     progress: 0.0,
@@ -7344,15 +7544,23 @@ class MLXModelDownloader: ObservableObject {
                     error: nil,
                     localPath: nil
                 )
-                state.message = "Model was already deleted."
+                state.message = safeToDelete
+                    ? "Model was already deleted."
+                    : "Removed from Hal. Still downloaded in another app (Posey)."
                 self.downloadStates[modelID] = state
+                Task { await self.updateCacheSize() }
             }
         }
     }
     
     func isModelDownloaded(_ modelID: String) -> Bool {
-        return downloadedModelIDs.contains(modelID) &&
-               FileManager.default.fileExists(atPath: modelPath(for: modelID).path)
+        // Disk-truth against the App-Group shared store: a model is "present"
+        // if its files exist there, regardless of WHICH app fetched them. This
+        // is what lets Hal see (and load) models Posey downloaded, without Hal
+        // having its own record of the download. Matches Posey's
+        // `SharedModelStore.isRepoDownloaded`. Mid-download a partial dir reads
+        // present, so callers that care also check `isDownloading`.
+        return SharedModelStore.isRepoDownloaded(modelID)
     }
 
     /// Waits asynchronously for the `.mlxModelDidDownload` notification that
@@ -9397,6 +9605,26 @@ class HalTestConsole: ObservableObject {
             return """
             {"status":"ok","selectedModelID":"\(jsonStringEscape(selectedID))","wrapper":{"isModelLoaded":\(wrapperLoaded),"currentModelConfigID":"\(jsonStringEscape(wrapperConfigID))","currentModelConfigLocalPath":"\(jsonStringEscape(wrapperConfigPath))","mlxError":"\(jsonStringEscape(wrapperError))","loadingMessage":"\(jsonStringEscape(wrapperLoadingMessage))","loadingProgress":\(wrapperLoadingProgress)},"catalog":{"hasEntry":\(catalogModel != nil),"isDownloaded":\(catalogIsDownloaded),"localPath":"\(jsonStringEscape(catalogLocalPath))"},"disk":{"resolvedPath":"\(jsonStringEscape(diskPathStr))","fileExists":\(diskHasModel)}}
             """
+
+        } else if trimmed == "SHARED_MODELS" {
+            // v2.1 diagnostic (READ-ONLY): the App-Group shared model store — its
+            // resolved root, whether the container entitlement resolved, and for
+            // each MLX catalog model whether its files are present on disk and
+            // which apps claim it in manifest.json. Verifies cross-app sharing
+            // (Hal seeing Posey's models) + the refcount ledger without mutating.
+            let root = SharedModelStore.root
+            let containerResolved = FileManager.default.containerURL(forSecurityApplicationGroupIdentifier: SharedModelStore.appGroupID) != nil
+            // Present-only: iterating the whole (post-HF-refresh) catalog would
+            // be huge + slow (an NSFileCoordinator read per model), so report
+            // just the models whose files are actually in the shared store.
+            var entries: [String] = []
+            for model in ModelCatalogService.shared.availableModels where model.source == .mlx {
+                guard SharedModelStore.isRepoDownloaded(model.id) else { continue }
+                let claimants = SharedModelStore.claimants(modelID: model.id)
+                let claimantsJSON = "[" + claimants.map { "\"\(jsonStringEscape($0))\"" }.joined(separator: ",") + "]"
+                entries.append("{\"id\":\"\(jsonStringEscape(model.id))\",\"claimants\":\(claimantsJSON)}")
+            }
+            return "{\"status\":\"ok\",\"command\":\"SHARED_MODELS\",\"appGroupResolved\":\(containerResolved),\"root\":\"\(jsonStringEscape(root.path))\",\"presentCount\":\(entries.count),\"present\":[\(entries.joined(separator: ","))]}"
 
         } else if trimmed == "LIST_MODELS" {
             return buildModelListJSON(vm: vm)
@@ -15218,9 +15446,12 @@ import Security // LocalAPIServer (Keychain token storage)
 
 // MARK: - Hub Extension for MLX Model Downloads
 extension HubApi {
-    /// Default HubApi instance configured for iOS cache directory
+    /// Default HubApi instance pointed at the App-Group shared model store
+    /// (`<AppGroup>/Models/huggingface`), so MLX loads models from the same
+    /// shared copy Posey downloads to. Was `Caches/huggingface` before the v2.1
+    /// cross-app sharing change — see SharedModelStore.swift.
     static let `default` = HubApi(
-        downloadBase: URL.cachesDirectory.appending(path: "huggingface")
+        downloadBase: SharedModelStore.huggingFaceRoot
     )
 }
 
@@ -20684,6 +20915,16 @@ class LLMService: ObservableObject {
     // the loaded MLX wrapper stays warm so seat 2 generation is instant.
     func setupLLM(for model: ModelConfiguration, keepMlxResident: Bool = false) {
         halLog("HALDEBUG-LLM: setupLLM called for model: \(model.displayName) (source: \(model.source), keepMlxResident: \(keepMlxResident))")
+        // v2.1 shared store: claim any on-device MLX model Hal loads, via ANY
+        // path — UI switch, API switch, launch, or a revert. setupLLM is the
+        // single chokepoint every switch path funnels through, so claiming here
+        // (rather than in one switch function) registers Hal in the shared
+        // ledger no matter how the model was selected, so another app's (Posey's)
+        // delete can't remove the shared files while Hal is using them.
+        // Idempotent; only for models actually present in the shared store.
+        if model.source == .mlx && SharedModelStore.isRepoDownloaded(model.id) {
+            SharedModelStore.claim(modelID: model.id, repo: model.id)
+        }
         // If the LLM is actually changing identity (not a same-model
         // re-setup), invalidate the query expansion cache — different
         // models extract different concept sets, so stale entries from a
@@ -23760,6 +24001,10 @@ class ChatViewModel: ObservableObject {
             print("HALDEBUG-SETTINGS: Model switch ABORTED — \(newModel.displayName) failed to load; reverted to \(previousModel.displayName)")
             return
         }
+
+        // (Hal's claim on this model is recorded in LLMService.setupLLM, the
+        // shared load chokepoint both the UI and API switch paths funnel
+        // through — see the v2.1 shared-store note there.)
 
         // Add context window detection transparency message (success path only)
         await MainActor.run {

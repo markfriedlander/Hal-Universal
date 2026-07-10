@@ -58,9 +58,22 @@ New `PrivacyMonitor.swift` (NWPathMonitor + pure `isLocked` truth table +
 popover). Live-reactive to model switch and Airplane Mode. A second
 sheet-race (the popover → Model Library link) was fixed via
 `onDisappear`-resume. Two more polish candidates logged in NEXT (the Delete
-hint above; snappier Library dismiss on MLX selection). Roadmap now: items 1
-(v2.0.1 ship — Mark's ASC action), 4 (Posey sharing), 5 (mxbai), 6 (Bonsai,
-cut line) remain.
+hint above; snappier Library dismiss on MLX selection).
+
+**Cross-app model sharing with Posey — INCREMENT #1 DONE + device-verified**
+(2026-07-09, roadmap item 4). Mark added the App Group
+`group.com.MarkFriedlander.aifamily` capability in Xcode; new
+`SharedModelStore.swift` (ported from Posey) + redirected all of Hal's model
+paths (HubApi load path, MLXModelDownloader, `isModelDownloaded` → disk-truth)
+to the shared container. Hal now sees/loads Posey's four MLX models with zero
+re-download; claims on use, deletes refcount-safely (can't nuke Posey's
+files); `isExcludedFromBackup` on downloads. Read-only `SHARED_MODELS`
+diagnostic added. **Increment #2 (launch-time migration of a v2.0 user's old
+`Caches` models into the shared container) is STILL TODO** — no risk on dev
+device, do it deliberately. Embedder sharing (Nomic/mxbai) rides with item #5.
+
+Roadmap now: items 1 (v2.0.1 ship — Mark's ASC action), 4-increment-#2
+(migration), 5 (mxbai + embedder sharing), 6 (Bonsai, cut line) remain.
 
 **v2.0.1 hotfix** (EmbeddingGemma mis-download) remains **fully verified
 — sim + device — deferred to ride with v2.1** per Mark 2026-05-26 (the

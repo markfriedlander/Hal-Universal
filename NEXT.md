@@ -40,9 +40,18 @@ retrieval quality improves regardless of how Bonsai turns out.
    MLX)→closed. Two follow-on sheet-race bugs fixed during the work (see
    HISTORY). See "v2.1 design work" below for the original spec.
 4. **Cross-app model sharing with Posey** — App Group
-   `group.com.MarkFriedlander.aifamily`, shared model store, migration
-   helper, `isExcludedFromBackup`, per-model lock. Full spec under
-   "Cross-app infrastructure" below.
+   `group.com.MarkFriedlander.aifamily`. **Increment #1 DONE +
+   device-verified 2026-07-09:** Hal adopts Posey's shared model store
+   (new `SharedModelStore.swift` ported from Posey — paths + refcount
+   manifest), sees all four of Posey's MLX models with zero re-download,
+   loads them, claims on use, and deletes refcount-safely (can't remove
+   files another app still claims). `isExcludedFromBackup` on Hal
+   downloads. Read-only `SHARED_MODELS` diagnostic added. **Increment #2
+   STILL TODO:** the launch-time migration that moves a v2.0 user's OLD
+   `Caches/huggingface/models/*` into the shared container (so existing
+   App Store upgraders don't lose downloads) — no risk on dev device
+   (nothing to migrate), do it deliberately. Full spec under "Cross-app
+   infrastructure" below.
 5. **mxbai third embedding backend** — add `mxbai-embed-large-v1`
    (Mixedbread, BERT-large, 1024-dim, ~670 MB) as a third embedder.
    Runs via `swift-embeddings`' Bert path — the SAME library + code

@@ -370,6 +370,26 @@ class HalTestConsole: ObservableObject {
             {"status":"ok","selectedModelID":"\(jsonStringEscape(selectedID))","wrapper":{"isModelLoaded":\(wrapperLoaded),"currentModelConfigID":"\(jsonStringEscape(wrapperConfigID))","currentModelConfigLocalPath":"\(jsonStringEscape(wrapperConfigPath))","mlxError":"\(jsonStringEscape(wrapperError))","loadingMessage":"\(jsonStringEscape(wrapperLoadingMessage))","loadingProgress":\(wrapperLoadingProgress)},"catalog":{"hasEntry":\(catalogModel != nil),"isDownloaded":\(catalogIsDownloaded),"localPath":"\(jsonStringEscape(catalogLocalPath))"},"disk":{"resolvedPath":"\(jsonStringEscape(diskPathStr))","fileExists":\(diskHasModel)}}
             """
 
+        } else if trimmed == "SHARED_MODELS" {
+            // v2.1 diagnostic (READ-ONLY): the App-Group shared model store — its
+            // resolved root, whether the container entitlement resolved, and for
+            // each MLX catalog model whether its files are present on disk and
+            // which apps claim it in manifest.json. Verifies cross-app sharing
+            // (Hal seeing Posey's models) + the refcount ledger without mutating.
+            let root = SharedModelStore.root
+            let containerResolved = FileManager.default.containerURL(forSecurityApplicationGroupIdentifier: SharedModelStore.appGroupID) != nil
+            // Present-only: iterating the whole (post-HF-refresh) catalog would
+            // be huge + slow (an NSFileCoordinator read per model), so report
+            // just the models whose files are actually in the shared store.
+            var entries: [String] = []
+            for model in ModelCatalogService.shared.availableModels where model.source == .mlx {
+                guard SharedModelStore.isRepoDownloaded(model.id) else { continue }
+                let claimants = SharedModelStore.claimants(modelID: model.id)
+                let claimantsJSON = "[" + claimants.map { "\"\(jsonStringEscape($0))\"" }.joined(separator: ",") + "]"
+                entries.append("{\"id\":\"\(jsonStringEscape(model.id))\",\"claimants\":\(claimantsJSON)}")
+            }
+            return "{\"status\":\"ok\",\"command\":\"SHARED_MODELS\",\"appGroupResolved\":\(containerResolved),\"root\":\"\(jsonStringEscape(root.path))\",\"presentCount\":\(entries.count),\"present\":[\(entries.joined(separator: ","))]}"
+
         } else if trimmed == "LIST_MODELS" {
             return buildModelListJSON(vm: vm)
 

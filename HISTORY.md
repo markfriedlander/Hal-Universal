@@ -3744,3 +3744,78 @@ Selecting a model in the Library awaits the full model load before
 consistent, correct (the await is deliberate — post-load logic needs settled
 state); just not snappy. Logged as a polish candidate. Mark: "it's just
 fine… maybe one day."
+
+---
+
+## 2026-07-09 (continued — cross-app model sharing with Posey, increment #1)
+
+### What landed
+
+Hal now shares the MLX model store with Posey via the App Group
+`group.com.MarkFriedlander.aifamily`. Increment #1 = **adopt the shared
+store** (see Posey's models, load them, safe delete). Increment #2 (the
+launch-time migration of a v2.0 user's OLD Caches models into the shared
+container) is deliberately separate and NOT in this commit — Mark's device
+has no old models to migrate, so we kept that risk out.
+
+### Setup + the layout catch
+
+Mark added the App Group capability to Hal's main target in Xcode (Automatic
+signing, team FBUNBDS7R7); the entitlements file now carries
+`com.apple.security.application-groups`. Reading Posey's actual
+`SharedModelStore.swift` (rather than our NEXT.md sketch) caught a layout
+detail the notes had wrong: models live at `<container>/**Models**/huggingface/
+models/<id>` — a `Models/` namespacing subfolder. Trusting the sketch would
+have made Hal look one folder too high and see nothing.
+
+### Implementation
+
+New `SharedModelStore.swift` — a near-verbatim port of Posey's, so both apps
+agree on the App Group id, the on-disk layout, AND the `manifest.json` refcount
+format. Redirected every Hal model path to it:
+- `HubApi.default.downloadBase` (Hal.swift) → shared `huggingface` root — the
+  LOAD path; without this Hal would download to the shared spot but still look
+  in Caches to load.
+- `MLXModelDownloader.modelDirectory` / `modelPath` / `hubCacheDirectory` →
+  shared store.
+- **`isModelDownloaded` → disk-truth** (`SharedModelStore.isRepoDownloaded`)
+  instead of requiring Hal's own `downloadedModelIDs` — this is what lets Hal
+  SEE models Posey downloaded (Hal has no record of them).
+
+Co-ownership (the "don't break the other app's stuff" guarantee):
+- On download-complete: `claim` + `excludeFromBackup` (App Group containers
+  aren't auto-excluded from iCloud like Caches — App Review 2.5.1).
+- On model load (`LLMService.setupLLM`, the chokepoint BOTH the UI switch and
+  the API switch funnel through): claim any on-device MLX model Hal loads, so
+  another app's delete can't remove it out from under Hal.
+- On delete: `releaseClaim` first, remove files ONLY if no app still claims it.
+
+New read-only `SHARED_MODELS` API verb (present-only) reports the resolved
+container, per-model presence, and claimants — for verification without mutation.
+
+### Device verification (iPhone 16 Plus, Posey holding all four models)
+
+`SHARED_MODELS`: `appGroupResolved: true`, root = the real
+`Shared/AppGroup/.../Models` container, **presentCount: 4** — Gemma, Qwen,
+Llama, Dolphin all present, each `claimants: [Posey]`. Model Library
+screenshot showed all four with the grey "downloaded" dot — **Hal adopted
+Posey's four models with zero re-download.** Mark's reaction: looked down,
+didn't realize it was Hal's library.
+
+Delete-safety put through its paces: Hal switch→Qwen registered
+`[Posey, Hal]`; Hal delete of Qwen dropped to `[Posey]` with **files intact**;
+Hal delete of a Posey-only model left it present and Posey-claimed. All four
+survived every test; ledger restored to baseline.
+
+**A real bug caught by testing:** claim-on-use first lived in
+`ChatViewModel.switchToModel` (the UI path), but the API `SWITCH_MODEL` uses a
+SEPARATE switch function in LocalAPIServer — so the API-driven test showed no
+Hal claim. Moved the claim to `LLMService.setupLLM`, the single load chokepoint
+every path funnels through; re-test showed the claim registering correctly.
+
+### Not live-fired
+
+The actual file *removal* at refcount-zero (last app deletes) — can't be
+triggered from Hal alone against a Posey-owned model (Posey must release
+first). It's the standard file delete gated on the now-verified `releaseClaim`.
+Embedder sharing (Nomic/mxbai) is NOT wired — that rides with item #5.

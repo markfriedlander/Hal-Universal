@@ -70,9 +70,12 @@ import Security // LocalAPIServer (Keychain token storage)
 
 // MARK: - Hub Extension for MLX Model Downloads
 extension HubApi {
-    /// Default HubApi instance configured for iOS cache directory
+    /// Default HubApi instance pointed at the App-Group shared model store
+    /// (`<AppGroup>/Models/huggingface`), so MLX loads models from the same
+    /// shared copy Posey downloads to. Was `Caches/huggingface` before the v2.1
+    /// cross-app sharing change — see SharedModelStore.swift.
     static let `default` = HubApi(
-        downloadBase: URL.cachesDirectory.appending(path: "huggingface")
+        downloadBase: SharedModelStore.huggingFaceRoot
     )
 }
 
@@ -5536,6 +5539,16 @@ class LLMService: ObservableObject {
     // the loaded MLX wrapper stays warm so seat 2 generation is instant.
     func setupLLM(for model: ModelConfiguration, keepMlxResident: Bool = false) {
         halLog("HALDEBUG-LLM: setupLLM called for model: \(model.displayName) (source: \(model.source), keepMlxResident: \(keepMlxResident))")
+        // v2.1 shared store: claim any on-device MLX model Hal loads, via ANY
+        // path — UI switch, API switch, launch, or a revert. setupLLM is the
+        // single chokepoint every switch path funnels through, so claiming here
+        // (rather than in one switch function) registers Hal in the shared
+        // ledger no matter how the model was selected, so another app's (Posey's)
+        // delete can't remove the shared files while Hal is using them.
+        // Idempotent; only for models actually present in the shared store.
+        if model.source == .mlx && SharedModelStore.isRepoDownloaded(model.id) {
+            SharedModelStore.claim(modelID: model.id, repo: model.id)
+        }
         // If the LLM is actually changing identity (not a same-model
         // re-setup), invalidate the query expansion cache — different
         // models extract different concept sets, so stale entries from a
@@ -8612,6 +8625,10 @@ class ChatViewModel: ObservableObject {
             print("HALDEBUG-SETTINGS: Model switch ABORTED — \(newModel.displayName) failed to load; reverted to \(previousModel.displayName)")
             return
         }
+
+        // (Hal's claim on this model is recorded in LLMService.setupLLM, the
+        // shared load chokepoint both the UI and API switch paths funnel
+        // through — see the v2.1 shared-store note there.)
 
         // Add context window detection transparency message (success path only)
         await MainActor.run {

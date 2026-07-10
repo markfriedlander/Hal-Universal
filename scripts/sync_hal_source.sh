@@ -29,6 +29,7 @@ FILES=(
   "Hal Universal/ProcessMemoryGuard.swift"
   "Hal Universal/MaintenanceTasks.swift"
   "Hal Universal/PrivacyMonitor.swift"
+  "Hal Universal/SharedModelStore.swift"
   "Hal Universal/MLXModelDownloader.swift"
   "Hal Universal/ModelCatalogService.swift"
   "Hal Universal/LocalAPIServer.swift"

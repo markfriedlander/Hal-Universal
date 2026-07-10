@@ -406,11 +406,9 @@ class BackgroundDownloadCoordinator: NSObject, URLSessionDownloadDelegate, Obser
     }
 
     private func modelDirectory(for modelID: String) -> URL {
-        let cacheDir = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask)[0]
-        return cacheDir
-            .appendingPathComponent("huggingface", isDirectory: true)
-            .appendingPathComponent("models", isDirectory: true)
-            .appendingPathComponent(modelID, isDirectory: true)
+        // v2.1: models live in the App-Group shared store, not per-app Caches,
+        // so Hal and Posey share one copy. See SharedModelStore.swift.
+        SharedModelStore.mlxModelDir(modelID)
     }
 
     // MARK: - Completion Notification
@@ -421,6 +419,12 @@ class BackgroundDownloadCoordinator: NSObject, URLSessionDownloadDelegate, Obser
         // Mark in MLXModelDownloader's downloaded set so future model-status
         // queries report it as downloaded.
         MLXModelDownloader.shared.markModelAsDownloadedFromBackground(modelID: modelID)
+        // v2.1 shared store: record Hal's claim on the freshly-downloaded model
+        // (so Posey's delete can't pull it out from under Hal) and exclude it
+        // from iCloud backup — App Group containers aren't auto-excluded the way
+        // Library/Caches is (App Review 2.5.1).
+        SharedModelStore.claim(modelID: modelID, repo: modelID)
+        SharedModelStore.excludeFromBackup(modelID)
         NotificationCenter.default.post(name: .mlxModelDidDownload, object: nil, userInfo: ["modelID": modelID])
     }
 
@@ -784,13 +788,9 @@ class MLXModelDownloader: ObservableObject {
         }
     }
     
-    // Helper: Construct runtime path for a model ID
+    // Helper: Construct runtime path for a model ID (App-Group shared store).
     private func modelPath(for modelID: String) -> URL {
-        let cacheDir = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask)[0]
-        return cacheDir
-            .appendingPathComponent("huggingface", isDirectory: true)
-            .appendingPathComponent("models", isDirectory: true)
-            .appendingPathComponent(modelID, isDirectory: true)
+        SharedModelStore.mlxModelDir(modelID)
     }
     
     // MARK: - Download Queue Management
@@ -961,7 +961,7 @@ class MLXModelDownloader: ObservableObject {
     // MARK: - Directory Management
     
     private var hubCacheDirectory: URL {
-        URL.cachesDirectory.appending(path: "huggingface")
+        SharedModelStore.huggingFaceRoot
     }
     
     private var legacyModelsDir: URL {
@@ -1492,19 +1492,25 @@ class MLXModelDownloader: ObservableObject {
     
     func deleteModel(modelID: String) async {
         let expectedPath = modelPath(for: modelID)
-        
-        if FileManager.default.fileExists(atPath: expectedPath.path) {
+
+        // v2.1 shared store: release Hal's claim FIRST. The files are removed
+        // only when NO other app (Posey) still claims the model. So deleting a
+        // shared model in Hal drops Hal's claim and leaves Posey's copy on disk;
+        // deleting a Hal-only model (no remaining claimant) removes the files as
+        // before. This is what makes "delete in one app can't break the other."
+        let safeToDelete = SharedModelStore.releaseClaim(modelID: modelID)
+        let fileExists = FileManager.default.fileExists(atPath: expectedPath.path)
+
+        if safeToDelete && fileExists {
             do {
                 try FileManager.default.removeItem(at: expectedPath)
                 print("HALDEBUG-DOWNLOAD: Model deleted from: \(expectedPath.path)")
-                
+
                 await MainActor.run {
-                    // Remove from persistent storage
                     var modelIDs = self.downloadedModelIDs
                     modelIDs.remove(modelID)
                     self.downloadedModelIDs = modelIDs
-                    
-                    // Update state
+
                     var state = self.downloadStates[modelID] ?? DownloadState(
                         isDownloading: false,
                         progress: 0.0,
@@ -1516,11 +1522,8 @@ class MLXModelDownloader: ObservableObject {
                     state.progress = 0.0
                     state.message = "Model deleted."
                     self.downloadStates[modelID] = state
-                    
-                    // Update cache size
-                    Task {
-                        await self.updateCacheSize()
-                    }
+
+                    Task { await self.updateCacheSize() }
                 }
             } catch {
                 await MainActor.run {
@@ -1537,12 +1540,19 @@ class MLXModelDownloader: ObservableObject {
                 }
             }
         } else {
-            // File doesn't exist, clean up storage anyway
+            // Not removed from disk — either another app still claims the model
+            // (files kept, shared) or it wasn't present. Drop Hal's local
+            // tracking either way. NOTE: for a still-shared model the files
+            // remain, so isModelDownloaded (disk-truth) will still report it
+            // present — that's correct (it IS on the device, via the other app).
+            if !safeToDelete {
+                print("HALDEBUG-DOWNLOAD: Released Hal's claim on \(modelID); another app still uses it — files kept.")
+            }
             await MainActor.run {
                 var modelIDs = self.downloadedModelIDs
                 modelIDs.remove(modelID)
                 self.downloadedModelIDs = modelIDs
-                
+
                 var state = self.downloadStates[modelID] ?? DownloadState(
                     isDownloading: false,
                     progress: 0.0,
@@ -1550,15 +1560,23 @@ class MLXModelDownloader: ObservableObject {
                     error: nil,
                     localPath: nil
                 )
-                state.message = "Model was already deleted."
+                state.message = safeToDelete
+                    ? "Model was already deleted."
+                    : "Removed from Hal. Still downloaded in another app (Posey)."
                 self.downloadStates[modelID] = state
+                Task { await self.updateCacheSize() }
             }
         }
     }
     
     func isModelDownloaded(_ modelID: String) -> Bool {
-        return downloadedModelIDs.contains(modelID) &&
-               FileManager.default.fileExists(atPath: modelPath(for: modelID).path)
+        // Disk-truth against the App-Group shared store: a model is "present"
+        // if its files exist there, regardless of WHICH app fetched them. This
+        // is what lets Hal see (and load) models Posey downloaded, without Hal
+        // having its own record of the download. Matches Posey's
+        // `SharedModelStore.isRepoDownloaded`. Mid-download a partial dir reads
+        // present, so callers that care also check `isDownloading`.
+        return SharedModelStore.isRepoDownloaded(modelID)
     }
 
     /// Waits asynchronously for the `.mlxModelDidDownload` notification that
