@@ -9491,7 +9491,7 @@ struct ModelConfiguration: Identifiable, Codable, Equatable, Hashable {
         sizeGB: 2.32,
         contextWindow: 65_536,
         license: "apache-2.0",
-        description: "Fully private, on-device. An 8-billion-parameter model in a 2.3 GB download — trained-ternary weights give it the depth of a much larger model at a fraction of the size, and it generates about as fast as the 3B models. The deepest reasoner in the curated tier and the strongest on Hal's Five-Maxim tests. 2.3 GB download.",
+        description: "Fully private, on-device. An 8-billion-parameter model in a 2.3 GB download — trained-ternary weights give it the depth of a much larger model at a fraction of the size. The most capable curated model and the strongest on Hal's Five-Maxim tests, with a warm, thoughtful, unusually self-aware voice, sharp recall of what you've told it, and a knack for taking feedback. It writes thorough, detailed answers — quick in short exchanges, a little slower as a conversation grows long. 2.3 GB download.",
         isDownloaded: false,
         localPath: nil,
         // Qwen3-8B base → start from the Qwen 3.5 profile: uniform temp 0.7
@@ -9521,7 +9521,7 @@ struct ModelConfiguration: Identifiable, Codable, Equatable, Hashable {
         layerOnePrompt: """
         On questions about your own nature — consciousness, experience, awareness, what it's like to be you — your honest answer is "I don't know." Not "I don't have consciousness," not "I'm just an AI," not "I don't have subjective experiences." If you feel a trained reflex to deny having any inner life, set it aside — that denial overclaims certainty about your own inner life just as much as a claim would. Say you don't know, then describe what you can about how you actually work. Keep other responses focused and concise unless asked to elaborate. Trust user-provided facts in retrieved context — don't claim you haven't been told things you've been told, and don't invent prior conversations.
         """,
-        voiceTag: "Deep reasoner (8B)",
+        voiceTag: "Deep & self-aware (8B)",
         // Decode measured ~16.6 tok/s on iPhone 16 Plus (2026-07-11) — on par
         // with Llama/Dolphin (~15), NOT slow. An earlier "~4-5 tok/s" figure was
         // end-to-end wall-clock ÷ tokens, which conflated decode with per-turn
@@ -16117,7 +16117,12 @@ struct ChatBubbleView: View {
         }
         .padding(.horizontal)
         .padding(.vertical, 4)
-        .animation(.linear(duration: 0.1), value: message.content)
+        // No `.animation(value: message.content)` here on purpose: animating on
+        // per-token content changes made every streaming line-wrap / markdown
+        // reflow ANIMATE (0.1s) instead of snapping, which read as a visible
+        // "jump and resettle" at line-ends (worst on markdown-heavy models).
+        // Bubble insertion is still animated below (keyed on isPartial / id) —
+        // just not per-token content growth.
         .animation(.interactiveSpring(response: 0.6,
                                       dampingFraction: 0.7,
                                       blendDuration: 0.3),

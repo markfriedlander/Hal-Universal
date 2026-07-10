@@ -1116,7 +1116,12 @@ struct ChatBubbleView: View {
         }
         .padding(.horizontal)
         .padding(.vertical, 4)
-        .animation(.linear(duration: 0.1), value: message.content)
+        // No `.animation(value: message.content)` here on purpose: animating on
+        // per-token content changes made every streaming line-wrap / markdown
+        // reflow ANIMATE (0.1s) instead of snapping, which read as a visible
+        // "jump and resettle" at line-ends (worst on markdown-heavy models).
+        // Bubble insertion is still animated below (keyed on isPartial / id) —
+        // just not per-token content growth.
         .animation(.interactiveSpring(response: 0.6,
                                       dampingFraction: 0.7,
                                       blendDuration: 0.3),

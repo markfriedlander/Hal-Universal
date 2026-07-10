@@ -1122,6 +1122,68 @@ navigation verbs (or add new ones) so the harness can open the Model Library, ex
 an embedder card, and screenshot it. Would let CC self-verify embedder + model-card
 UI without waiting on Mark. Tooling, not user-facing.
 
+### 0c. Reload-on-demand for MLX chat — fixes background-unload error + Bug 3 (found 2026-07-11)
+
+Two symptoms, ONE root cause and ONE fix site. Hal deliberately unloads the MLX
+model on `didEnterBackgroundNotification` (Hal.swift:4947 — drops a ~2.5 GB
+foreground footprint to ~100-200 MB so iOS doesn't jetsam-kill a backgrounded Hal;
+correct design). But the MLX chat guard at **Hal.swift:5955** does a hard
+`guard isModelLoaded else { finish(throwing: .modelNotLoaded) }` — so a message that
+arrives after a background-unload (screen lock → unload → return → type) errors with
+"The selected language model could not be loaded or is not available" instead of
+reloading. **Bug 3** (first-turn-after-swap race for ~3 GB models) is the SAME guard
+firing mid-load right after a switch. Fix: when a chat hits an unloaded/loading model,
+`await awaitPendingMLXLoad()` (or trigger `setupLLM(for: currentModel)` and await it)
+with a bounded timeout + a "reloading…" state, THEN generate — instead of erroring.
+Machinery already exists (`setupLLM` / `pendingMLXLoadTask` / `awaitPendingMLXLoad`,
+plus precedent `while !isModelLoaded && elapsed<30` loops at ~11182/11735). **Size:
+~20-40 lines, one function (Hal.swift ~5955), ~1-2 hrs incl. device testing both
+scenarios. Moderate risk (hot generation path, async coordination).** Caveat: doesn't
+make reload instant — the first message after a background-unload still eats the
+~5-15s remap of an 8B; it removes the ERROR (shows "reloading" then answers). This
+closes deferred **Bug 3** too.
+
+### 0d. Long-conversation MLX latency — findings (2026-07-11, from the Bonsai chat test)
+
+Not a bug; characterization for a future optimization pass. A live ~5-turn Bonsai
+conversation surfaced that a substantive mid-conversation turn hit **199s**. Decomposed
+from the log: memory-search **gate ~26s** (`Gate → YES in 25807ms`) + RAG + an
+**818-token / 6.3 tok/s generation ≈ 130s**. Three compounding costs, all amplified
+~3× on an 8B vs the 2-3B tier:
+1. **The gate scales with conversation length** — it runs the FULL active model over
+   the growing conversation prompt every turn (~5s early → ~26s at ~2300-token gate
+   prompt). This is the strongest lever: a cheaper/heuristic gate (see 0b/earlier gate
+   note) or a much shorter gate prompt would help every model and scale-proof it.
+2. **Decode degrades with context** — 16.6 tok/s at ~1k-token context → ~6 tok/s at
+   ~4k. Universal (KV cache growth), just 3× heavier on the 8B.
+3. **Bonsai is verbose** — 800+ token answers for a single conversational turn. A
+   tighter layer-1 concision directive and/or a lower per-turn max-tokens for Bonsai
+   would cut turn time a lot without hurting depth-on-demand. (The current "keep it
+   concise" line isn't holding on substantive prompts.)
+Revises the earlier "on par with the 3B tier" note: true early in a chat, but in a
+long/verbose conversation Bonsai is meaningfully slower. Worth a small tuning pass
+(verbosity) + the gate optimization; neither blocks the v2.1 ship.
+
+### 0e. Streaming text "jump and resettle" at line-ends (found 2026-07-11)
+
+As tokens stream in, the text visibly jumps and resettles at the end of a line
+(most noticeable on markdown-heavy models like Bonsai). **Cause identified:** the
+message bubble carries `.animation(.linear(duration: 0.1), value: message.content)`
+(ChatViews.swift:1119). `message.content` changes every streamed token, so every
+line-wrap/reflow during streaming is ANIMATED (0.1s) instead of snapping → the
+jump-and-settle. Compounded by the assistant bubble rendering via `MarkdownView`
+(ChatViews.swift:1041), which re-parses the full markdown each token, so incomplete
+markdown (`**bold`, `# header`) renders at one width then resolves to another — that
+reflow gets animated too.
+- **Minimal fix (~1 line, low risk):** remove the `.animation(value: message.content)`
+  so per-token growth snaps. KEEP the two sibling animations keyed on
+  `message.isPartial` (1120) and `message.id` (1124) — those are bubble
+  insertion, not content. Verify on device that streaming still looks smooth and the
+  insert animation is preserved.
+- **Deeper fix (optional):** render partial/streaming messages as plain `Text`, swap
+  to `MarkdownView` only when `message.isPartial` flips false — eliminates the
+  mid-word markdown-resolution reflow entirely (changes the live-streaming look).
+
 ### A. Re-enable EmbeddingGemma when upstream MLX ships fix
 
 Re-enable recipe at top of `EmbeddingBackend.swift`. Track mlx-swift
