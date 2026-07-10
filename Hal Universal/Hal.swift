@@ -6889,9 +6889,16 @@ struct ModelLibraryView: View {
             return
         }
 
+        // Dismiss immediately, then load in the background. Previously we awaited
+        // switchToModel (which blocks ~5-15s on the MLX load) BEFORE dismissing,
+        // so AFM (nothing to load) bounced to chat instantly while an MLX model
+        // appeared to "hold" in the Library for its load. Dismissing first makes
+        // both feel identical; the chat view shows the load state, and
+        // switchToModel's own failure/revert logic surfaces in chat rather than
+        // freezing the Library.
+        dismiss()
         Task {
             await chatViewModel.switchToModel(model)
-            dismiss()
         }
     }
 
@@ -7090,16 +7097,36 @@ struct ModelLibraryRow: View {
                 Spacer()
 
                 // Delete is only meaningful for MLX (AFM is system-managed).
-                if model.source == .mlx && !isActive {
-                    Button(action: onDelete) {
-                        HStack(spacing: 4) {
-                            Image(systemName: "trash")
-                            Text("Delete")
+                // For the model you're currently running, show a DISABLED Delete
+                // + a short reason rather than hiding it — a missing button reads
+                // as "this can't be deleted" with no explanation, which looks like
+                // a bug. Disabled-with-a-hint is clearer: you can't delete the
+                // model that's in use; switch away first.
+                if model.source == .mlx {
+                    if isActive {
+                        Button(action: {}) {
+                            HStack(spacing: 4) {
+                                Image(systemName: "trash")
+                                Text("Delete")
+                            }
+                            .font(.subheadline)
                         }
-                        .font(.subheadline)
-                        .foregroundColor(.red)
+                        .buttonStyle(.plain)
+                        .disabled(true)
+                        Text("switch models to delete")
+                            .font(.caption)
+                            .foregroundColor(.secondary)
+                    } else {
+                        Button(action: onDelete) {
+                            HStack(spacing: 4) {
+                                Image(systemName: "trash")
+                                Text("Delete")
+                            }
+                            .font(.subheadline)
+                            .foregroundColor(.red)
+                        }
+                        .buttonStyle(.plain)
                     }
-                    .buttonStyle(.plain)
                 }
             } else if let state = downloadState, state.error != nil {
                 VStack(alignment: .leading, spacing: 4) {

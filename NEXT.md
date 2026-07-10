@@ -210,15 +210,26 @@ refactor "cosmetic cleanup candidates" list.
    fully reveal it — deferred (the List's irregular indentation makes a safe wrap
    fiddly; not worth the risk for the cosmetic nits, which are verifiable by
    code + a partial screenshot + Mark's eyeball).
-5. **Model Library: Delete hidden on the ACTIVE model** → show a disabled Delete +
-   "switch models to delete this one" hint (today `.mlx && !isActive` hides it, reads
-   as missing).
-6. **Model Library: dismiss timing on selection** → dismiss immediately + show the
-   load state in chat (today `selectModel` awaits the full MLX load before dismissing,
-   so AFM bounces instantly while MLX appears to "hold").
-7. **Model Library: relabel "Download" → "Add"** for models already present in the
-   shared store (the tap is an instant adopt, not a download). **Use "Add."** Touches
-   Posey — keep the label consistent across both apps.
+5. ~~**Model Library: Delete hidden on the ACTIVE model**~~ **DONE 2026-07-11.** The
+   active MLX model's Delete was hidden (`.mlx && !isActive`), reading as missing. Now
+   shows a DISABLED Delete + "switch models to delete" hint (ModelLibraryRow.actionRow,
+   Hal.swift ~7092). Build clean; the disabled state renders at the card's action row
+   (off-screen without the deferred scroll verb — code-verified; a partial screenshot
+   confirmed the card renders; final visual is a quick Mark eyeball).
+6. ~~**Model Library: dismiss timing on selection**~~ **DONE 2026-07-11.** `selectModel`
+   (Hal.swift ~6892) awaited the full MLX load (~5-15s, `switchToModel` blocks on
+   `awaitPendingMLXLoad`) before `dismiss()`, so AFM bounced instantly while MLX
+   appeared to "hold." Now dismisses immediately, then loads in the background; the
+   chat view shows the load state and switchToModel's own failure/revert surfaces in
+   chat. Behavior/timing change — best confirmed by Mark tapping a model (harness can't
+   drive the Library select path).
+7. ~~**Model Library: relabel "Download" → "Add"**~~ **NO-OP — stale concern (2026-07-11).**
+   `MLXModelDownloader.isModelDownloaded` is now pure disk-truth
+   (`SharedModelStore.isRepoDownloaded`, line 1713): a model present in the shared store
+   — even one Posey fetched, even unclaimed — already shows **"Select"**, not "Download."
+   "Download" only appears for genuinely-absent models, where a real download DOES happen,
+   so "Download" is correct there and "Add" would be wrong. The disk-truth work already
+   resolved this; no relabel needed.
 **Parked (not on the working list):**
 - **0a — per-embedder RRF tuning.** Mark: save for another release (2026-07-11). Sweep
   each backend, keep a per-embedder `kSem` only where it beats the global by a real
