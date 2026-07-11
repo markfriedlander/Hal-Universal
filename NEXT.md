@@ -31,11 +31,15 @@ screenshots are PAUSED until this is done so the shots capture the corrected Hal
 
 **The work (one focused commit, separate from screenshots):**
 1. **Renumber every LEGO block sequentially 1…N**, no gaps/fractionals (kills 7.5, 10.1,
-   20.4, etc.), ordered the way Hal reads himself = `Hal_Source.txt` concatenation order
-   (foundational files first, `Hal.swift` last). Update every `LEGO START`/`END` marker
-   across all 18 files + every cross-reference/pointer/tombstone comment. (Verify no code
-   logic depends on block numbers — they should be comment-only; the self-model `blocks`
-   seed was already removed.)
+   20.4, etc.). **Order = the concatenation order, with `Hal.swift` FIRST** so the master
+   index (which lives at the top of Hal.swift) leads Hal_Source.txt like a table of
+   contents, then Hal.swift's own blocks, then each supporting file. So reading order =
+   numbering = index order. **Flip `scripts/sync_hal_source.sh` to put Hal.swift first**
+   (was foundational-first / Hal.swift-last; purely cosmetic for a linear read — RAG
+   retrieves regardless of order — so the flip is free). Update every `LEGO START`/`END`
+   marker across all 18 files + every cross-reference/pointer/tombstone comment. (Verify no
+   code logic depends on block numbers — they should be comment-only; the self-model
+   `blocks` seed was already removed.)
 2. **Audit each block's NAME** against what's actually in it; rename where drifted.
 3. **Write ONE master index** at the top of `Hal.swift` (the primary file), in comment
    form, covering **every file and every block in every file** (file → its blocks, number
