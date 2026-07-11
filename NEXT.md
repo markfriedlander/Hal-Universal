@@ -7,6 +7,62 @@ For how we got here: `HISTORY.md` (especially the 2026-05-19/20 entry).
 
 ---
 
+## ⭐ NEXT UP — LEGO / DNA cleanup (AGREED 2026-07-11, Mark + CC) — do FIRST after compaction
+
+**Why this is the priority:** Hal reads his own bundled source (`Hal_Source.txt`) as
+self-knowledge (Maxim #2). Right now that source misdescribes him — he narrates himself
+as "a 32-module LEGO-block system written in Swift" using "Phi-3," because the master
+index + comments at the top of `Hal.swift` are stale (single-file framing, caps at
+"01–29/32", names a removed model). This is his DNA — it must be accurate before release.
+Surfaced while shooting App Store screenshots (Bonsai said "32 blocks" three times); the
+screenshots are PAUSED until this is done so the shots capture the corrected Hal.
+
+**Mark's philosophy (the spec, in his words):**
+- Comments must be **true, relevant, and important** — they tell the next person what's
+  going on **now** so they don't break the code. Bullshit/stale comments poison trust in
+  ALL comments. This is NOT "delete comments" — it's "make every comment earn its place."
+- **History has no place in source code** (barring a rare, genuine present-tense hazard
+  warning). Anything explaining *how we got here* → `HISTORY.md`.
+- **No description essays in the code.** A minimal file header (1–2 lines: what this file
+  is) + the factual master index is enough. The index is a navigation aid for BOTH a
+  developer AND Hal ("where does my memory live?" → locate + reason).
+- Any mention of **features/models no longer present** (Phi, Apple Watch remnants,
+  EmbeddingGemma if still referenced, etc.) gets scrubbed — confusing to Hal and readers.
+
+**The work (one focused commit, separate from screenshots):**
+1. **Renumber every LEGO block sequentially 1…N**, no gaps/fractionals (kills 7.5, 10.1,
+   20.4, etc.), ordered the way Hal reads himself = `Hal_Source.txt` concatenation order
+   (foundational files first, `Hal.swift` last). Update every `LEGO START`/`END` marker
+   across all 18 files + every cross-reference/pointer/tombstone comment. (Verify no code
+   logic depends on block numbers — they should be comment-only; the self-model `blocks`
+   seed was already removed.)
+2. **Audit each block's NAME** against what's actually in it; rename where drifted.
+3. **Write ONE master index** at the top of `Hal.swift` (the primary file), in comment
+   form, covering **every file and every block in every file** (file → its blocks, number
+   + accurate name). This replaces the current stale single-file index (lines ~1–47).
+4. **Build a validator script** (`scripts/`) that reads the real `LEGO START/END` markers
+   across all files and checks: (a) every START has a matching END, (b) numbering is a
+   clean 1…N with no dups/gaps, (c) the master index matches the real markers exactly.
+   So the index can't silently rot. (Build any other helper scripts wanted, e.g. a
+   renumber assist.)
+5. **Scrub comments** for: stale/untrue statements, historical narrative (→ HISTORY.md),
+   and dead-feature/model references (Phi-3/Phi-4 in self-description contexts — NOT the
+   legit-but-restate-in-present-terms config rationale; Watch remnants; etc.). Known spots:
+   `Hal.swift` top overview + index (lines ~1–47), block names 11/19 (Phi), line ~10921
+   ("AFM, Phi-3, Llama"). Also sweep the other 17 files' headers.
+6. **Minimal file headers** (1–2 lines each: what the file is), no essays.
+7. **Re-sync** `Hal_Source.txt` (`./scripts/sync_hal_source.sh`) so Hal's copy matches.
+8. **Build-verify** on device (clean, no warnings) + confirm the validator passes.
+
+**Decisions locked (Mark):** sequential 1…N no gaps; validator yes; separate commit;
+compact BEFORE starting (big mechanical pass, don't want mid-renumber context loss).
+
+**After this:** recapture the 6 App Store screenshots with `devicectl device capture
+screenshot` (real status bar — the in-app API capture omitted it) now that Hal's answers
+are clean; then the ship sequence (item 1 below).
+
+---
+
 ## v2.1 roadmap — AGREED 2026-07-09 (Mark + CC)
 
 This is the authoritative plan for the next stretch of work. Scoped as
