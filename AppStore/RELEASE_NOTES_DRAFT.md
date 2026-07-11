@@ -127,6 +127,49 @@ Go field by field. The recurring risk is **stale references to things no longer 
 
 ---
 
+## 3b. LIVE ASC metadata — read 2026-07-11 (app ID 6754847753, iOS Version 2.0)
+
+**Good news: the live listing is already clean** of the things we worried about — NO "Phi",
+NO Apple Watch, NO "32 blocks" / architecture claims anywhere. No Watch screenshots (only
+iPhone 6.5"). So the review is mostly *additive* (bring it up to v2.5), not corrective.
+
+**Current field values (verbatim):**
+- **Promotional Text** (155/170): "On-device AI with persistent memory, multiple model
+  voices, and full transparency about how it works. Nothing leaves your device when running
+  local models." → **Clean. No change required** (optional: could tease Bonsai / privacy lock).
+- **Keywords** (80/100): `AI,assistant,private,on-device,memory,local,LLM,Gemma,MLX,chat,transparent,salon`
+  → Clean (no Phi/watch). ~20 chars free — optional add, e.g. `,reasoning` or `,reflection`.
+- **Support URL**: https://markfriedlander.github.io/Hal-Universal/support.html (present).
+  **Marketing URL**: EMPTY (optional to add; ties to the promo-webpage to-do).
+- **Copyright**: "© 2025-2026 Mark Friedlander" (fine).
+- **Screenshots** (iPhone 6.5"): the OLD 6 (1_chat_with_apple_intelligence … 2_self_model_viewer)
+  → replace with the new 6 in `AppStore/screenshots/6.5-inch/`.
+- **What's New**: currently the v2.0 notes → replace with the §1 v2.5 draft.
+
+**Description (2941/4000)** — clean of stale refs; two things to update for v2.5:
+1. **REQUIRED — add Ternary Bonsai 8B to the model list.** It currently reads:
+   > "...a curated library of tested local models: Gemma 4 E2B, Llama 3.2 3B, Qwen 3.5 2B,
+   > and Dolphin 3.0."
+   Change to:
+   > "...a curated library of tested local models: Gemma 4 E2B, Llama 3.2 3B, Qwen 3.5 2B,
+   > Dolphin 3.0, and Ternary Bonsai 8B — an 8-billion-parameter deep reasoner that still
+   > runs entirely on device."
+2. **OPTIONAL — surface the two other new features** (or just leave them to What's New):
+   - Memory section (after the Nomic line): "...or the higher-accuracy Mixedbread mxbai
+     embedder." 
+   - Genuinely Private / Transparency section: add "A privacy lock in the toolbar shows at a
+     glance whether Hal is in a state where data could leave your device."
+
+**One question for Mark (not stale — a judgment call):** the description opens with
+"on-device AI assistant for **iPhone, iPad, and Mac**." Hal Universal is listed as iOS-only,
+and our notes flag Mac UI as rough. Keep the "iPad, and Mac" claim, or narrow it? Your call.
+
+**All of the above rides with the v2.5 version** (create Version 2.5 in ASC + upload build 7),
+so per your "write it down, don't enter" rule nothing was typed into ASC. Ready to apply
+together whenever.
+
+---
+
 ## 4. Decisions (settled by Mark, 2026-07-11)
 1. **Version = v2.5.**
 2. **Keep Posey generic** ("our companion app") for now.
