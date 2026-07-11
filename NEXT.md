@@ -7,26 +7,23 @@ For how we got here: `HISTORY.md` (especially the 2026-05-19/20 entry).
 
 ---
 
-## ⭐ NEXT UP — recapture the 6 App Store screenshots
+## ⭐ NEXT UP — the ship sequence (screenshots DONE)
 
-The DNA cleanup landed 2026-07-11 (blocks renumbered 1…59, master index atop Hal.swift,
-`scripts/validate_lego.py` guard, headers scrubbed — full story in HISTORY). Hal now
-describes himself truthfully, so the paused screenshots can be reshot.
+Both the DNA cleanup and the App Store screenshots landed 2026-07-11 (full story in
+HISTORY). The 6 dark-mode 6.5"/1242×2688 shots in `AppStore/screenshots/6.5-inch/` were
+recaptured with a real status bar (`devicectl device capture screenshot`) off a clean
+install of the corrected build — so the self-model shot shows Hal's genuine first-person
+reflection + the fixed "all the source files that make me" self-knowledge, not "32 blocks."
 
-**The task:** recapture the 6 dark-mode 6.5"/1242×2688 shots in
-`AppStore/screenshots/6.5-inch/` (chat mid-consciousness-convo, prompt-detail viewer,
-power-user memory depth, model library, salon prefs, self model). The 6 already committed
-there have a **blank system status bar** because the in-app API `SCREENSHOT` verb can't
-capture that layer. **Fix (confirmed):** capture with
-`xcrun devicectl device capture screenshot --device D24FB384-9C55-5D33-9B0D-DAEBFA6528D6
---destination <path>` (grabs the real framebuffer *with* status bar), then resize
-1290×2796 → 1242×2688 (~0.15% aspect delta, negligible). Navigate via `SET_UI_STATE:<target>`
-verbs (incl. `promptdetail:latest`, `inlinedetails`, `expandrow`), FORCE_REFLECTION for
-genuine reflections, SALON_SET_SEAT ×4. Fresh install (Posey keeps shared models safe).
+**What's left before submit (Mark in the loop):**
+1. **SHIP_BLOCKER flip** — `kLocalAPIEnabledOnLaunch` → `false` (grep `SHIP_BLOCKER`).
+2. **Bump `CFBundleVersion` → 7.**
+3. **Decide the version name** — Mark is weighing **v2.5** vs v2.1 given how much shipped.
+4. **ASC** (Mark drives, CC can assist in Chrome): upload the new screenshots, audit all
+   text / "What's New" for stale **Phi** naming, review, submit. (Non-EU only; DSA
+   non-trader — unchanged.)
 
-**Then the ship sequence** — item 1 below (SHIP_BLOCKER flip `kLocalAPIEnabledOnLaunch`
-→ false, CFBundleVersion → 7, screenshot Phi-audit in ASC, Mark's ASC action). Mark is
-weighing calling this **v2.5** rather than v2.1 given how much has shipped — his call.
+See "v2.0.1 ship sequence" further below for the exact ASC steps.
 
 ---
 

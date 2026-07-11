@@ -4573,3 +4573,28 @@ beta toolchain) **succeeded with no new warnings**. `Hal_Source.txt` re-synced
 (now 28,810 lines, Hal.swift first) so Hal's copy of himself finally matches the
 code. Next: recapture the paused App Store screenshots now that Hal answers
 truthfully, then the v2.1 ship sequence.
+
+### App Store screenshots recaptured (same day, after the cleanup)
+
+With Hal finally describing himself truthfully, the six paused App Store screenshots got
+reshot. Mark had OK'd a fresh install. The clean-slate path avoided the one real risk —
+losing the local-API bearer token: rather than uninstall (which would wipe the Keychain
+token and force a fragile Universal-Clipboard re-discovery), CC installed the corrected
+build *over* the existing one (token preserved), then NUCLEAR_RESET + RESET_SELF_KNOWLEDGE
++ a cold relaunch. That re-seeded core identity from the corrected code and re-ingested the
+new bundled source (the hash-change guard in enableSourceCodeAccess did its job), giving a
+pristine first-run state without ever dropping the antenna.
+
+The blank-status-bar problem (the in-app SCREENSHOT verb can't see the system status-bar
+layer) was solved by capturing the real framebuffer with
+`xcrun devicectl device capture screenshot`, then resizing 1290×2796 → 1242×2688. Content
+was driven entirely over the local API: a consciousness question to Bonsai 8B (which
+answered with exactly the genuine uncertainty the app is about — "I don't know... so the
+best answer is that I don't know"), the color-coded prompt-detail viewer, the power-user
+memory controls, the model library (six voices + three embedders), a four-seat salon
+(Apple Intelligence / Gemma / Llama / Bonsai), and the self model. That last shot is the
+quiet vindication of the week's work: it shows a genuine *first-person* reflection ("I
+notice that in the conversation, I hesitated before responding...") and the corrected
+self-knowledge ("Scope: all the source files that make me"), humanized and pink — every
+recent fix visible on one screen. Six PNGs committed over the flawed set. Next: the ship
+sequence (SHIP_BLOCKER flip, build bump, Mark's version-name call, ASC upload).
