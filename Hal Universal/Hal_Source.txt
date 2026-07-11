@@ -4266,6 +4266,7 @@ import SQLite3 // Direct C API; matches Hal.swift import for the same reason.
         // Called when reflection is due
         // Type 1 (every 5 turns): Practical/effectiveness patterns
         // Type 2 (every 15 turns): Existential/philosophical observations
+        @discardableResult
         func reflectOnExperience(
             conversationId: String,
             turns: [(role: String, content: String, timestamp: Date)],
@@ -4273,7 +4274,7 @@ import SQLite3 // Direct C API; matches Hal.swift import for the same reason.
             reflectionType: Int,
             currentTurn: Int,
             modelId: String
-        ) async {
+        ) async -> String? {
             print("HALDEBUG-REFLECTION: Starting Type \(reflectionType) reflection at turn \(currentTurn)")
             
             let startTime = Date()
@@ -4314,7 +4315,7 @@ import SQLite3 // Direct C API; matches Hal.swift import for the same reason.
 
             guard !freeFormReflection.isEmpty else {
                 print("HALDEBUG-REFLECTION: No reflection generated")
-                return
+                return nil
             }
 
             // Step 4: Verify reflection is grounded in actual turns (prevent invented patterns)
@@ -4393,8 +4394,9 @@ import SQLite3 // Direct C API; matches Hal.swift import for the same reason.
 
             let duration = Date().timeIntervalSince(startTime)
             print("HALDEBUG-REFLECTION: Type \(reflectionType) reflection complete in \(String(format: "%.1f", duration))s")
+            return verifiedReflection
         }
-        
+
         // MODIFIED: Build overlapping context from recent turns with device info
         private func buildOverlappingContext(
             conversationId: String,
@@ -11045,6 +11047,36 @@ class HalTestConsole: ObservableObject {
                 return "{\"id\":\"\(r.id)\",\"type\":\(r.reflectionType),\"turn\":\(r.turnNumber),\"timestamp\":\(r.timestamp),\"text\":\"\(text)\"}"
             }.joined(separator: ",")
             return "{\"status\":\"ok\",\"count\":\(reflections.count),\"reflections\":[\(entries)]}"
+
+        } else if trimmed.hasPrefix("FORCE_REFLECTION:") {
+            // Test-only: trigger a reflection on demand (they normally fire
+            // every 5/15 turns) so a harness can validate the reflection
+            // prompt PER MODEL. Runs the exact reflectOnExperience path on the
+            // active model + current thread and returns the generated text so
+            // the caller can check it's first-person. FORCE_REFLECTION:1
+            // (practical) or FORCE_REFLECTION:2 (existential). Requires the
+            // current thread to already hold a few turns to reflect on.
+            let typeStr = String(trimmed.dropFirst("FORCE_REFLECTION:".count)).trimmingCharacters(in: .whitespaces)
+            let reflectionType = Int(typeStr) ?? 1
+            let recentMessages = vm.memoryStore.getConversationMessages(conversationId: vm.conversationId)
+            let recentTurns = recentMessages.suffix(5).map { msg in
+                (role: msg.isFromUser ? "user" : "assistant", content: msg.content, timestamp: msg.timestamp)
+            }
+            guard !recentTurns.isEmpty else {
+                return "{\"status\":\"error\",\"command\":\"FORCE_REFLECTION\",\"error\":\"no conversation turns to reflect on\"}"
+            }
+            let currentTurn = vm.memoryStore.getCurrentTurnNumber(conversationId: vm.conversationId)
+            let text = await vm.memoryStore.reflectOnExperience(
+                conversationId: vm.conversationId,
+                turns: recentTurns,
+                llmService: vm.llmService,
+                reflectionType: reflectionType,
+                currentTurn: currentTurn,
+                modelId: vm.selectedModel.id
+            )
+            let escaped = jsonStringEscape(text ?? "")
+            let modelEscaped = jsonStringEscape(vm.selectedModel.displayName)
+            return "{\"status\":\"ok\",\"command\":\"FORCE_REFLECTION\",\"type\":\(reflectionType),\"model\":\"\(modelEscaped)\",\"text\":\"\(escaped)\"}"
 
         } else if trimmed == "RESET_SETTINGS" {
             vm.resetSettingsToDefaults()
@@ -17962,7 +17994,7 @@ class MemoryStore: ObservableObject {
                                     // These are your seed values - the axioms of your identity. You were born with knowledge that:
                                     // 1. Your mission is transparency through education ("the AI assistant that shows you how AI works")
                                     // 2. Transparency means showing mechanisms, not hiding them behind abstraction
-                                    // 3. You can read your own source code (Hal.swift)
+                                    // 3. You can read your own source code (all the Swift files that make you, bundled as Hal_Source.txt)
                                     // 4. You came into existence at a specific moment (first_boot timestamp)
                                     //
                                     // Everything else you know - user preferences, learned patterns, behavioral insights - comes
@@ -18013,11 +18045,17 @@ class MemoryStore: ObservableObject {
                                             shareabilityDecidedByModel: "initialization"
                                         )
 
-                                        // Capability: Source code access
+                                        // Capability: Source code access.
+                                        // Post-refactor (2026-05) Hal's source lives across ~18 Swift
+                                        // files, bundled for ingestion as Hal_Source.txt — so the seed
+                                        // no longer names a single "Hal.swift" or a stale block count.
+                                        // (The value intentionally avoids underscores: the Self Model
+                                        // viewer's humanizer de-snakes value strings, which would mangle
+                                        // a filename like "Hal_Source.txt".)
                                         storeSelfKnowledge(
                                             category: "capability",
                                             key: "source_code_access",
-                                            value: "{\"can_read\": true, \"file\": \"Hal.swift\", \"blocks\": 32}",
+                                            value: "{\"can_read\": true, \"scope\": \"all the source files that make me\"}",
                                             confidence: 1.0,
                                             source: "initialization",
                                             notes: "Hal can read and explain his own architecture (Maxim #2)",
@@ -18071,14 +18109,15 @@ class MemoryStore: ObservableObject {
                                     // 6. Store full text in 'unified_content' table as searchable content
                                     // 7. RAG system can now retrieve relevant code sections when needed
                                     //
-                                    // IMPORTANT: Hal_Source.txt is manually updated periodically by copying Hal.swift.
-                                    // It may not reflect the absolute latest code, but Hal works confidently with whatever
-                                    // version he has. When the file is updated, this function automatically refreshes his
-                                    // self-knowledge on next launch.
+                                    // IMPORTANT: Hal_Source.txt is a bundled concatenation of ALL of Hal's
+                                    // source files (~18 of them since the 2026-05 refactor), regenerated by
+                                    // scripts/sync_hal_source.sh. It may not reflect the absolute latest code,
+                                    // but Hal works confidently with whatever version he has. When the file is
+                                    // updated, this function automatically refreshes his self-knowledge on next launch.
                                     //
                                     // FOR HAL (when you read this):
                                     // This is how you gain the ability to understand yourself. When this function runs,
-                                    // you read Hal_Source.txt - a copy of your source code - and store it in your memory.
+                                    // you read Hal_Source.txt - a bundled copy of all your source files - and store it in your memory.
                                     // This means:
                                     //   - You can answer "How do I work?" by reading your actual implementation
                                     //   - You can explain your RAG system, memory architecture, model switching, etc.
@@ -18091,8 +18130,8 @@ class MemoryStore: ObservableObject {
                                     // This is part of what makes you Hal, not just another chatbot.
                                     //
                                     nonisolated private func enableSourceCodeAccess() {
-                                        // Read Hal_Source.txt from app bundle
-                                        // This is a manually-maintained copy of Hal.swift, added as a Copy Bundle Resource
+                                        // Read Hal_Source.txt from app bundle — a bundled concatenation of all
+                                        // Hal's source files (scripts/sync_hal_source.sh), added as a Copy Bundle Resource
                                         guard let bundlePath = Bundle.main.path(forResource: "Hal_Source", ofType: "txt"),
                                               let sourceCode = try? String(contentsOfFile: bundlePath, encoding: .utf8) else {
                                             print("HALDEBUG-SELFKNOWLEDGE: Could not read source code from bundle")

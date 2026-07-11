@@ -914,6 +914,36 @@ class HalTestConsole: ObservableObject {
             }.joined(separator: ",")
             return "{\"status\":\"ok\",\"count\":\(reflections.count),\"reflections\":[\(entries)]}"
 
+        } else if trimmed.hasPrefix("FORCE_REFLECTION:") {
+            // Test-only: trigger a reflection on demand (they normally fire
+            // every 5/15 turns) so a harness can validate the reflection
+            // prompt PER MODEL. Runs the exact reflectOnExperience path on the
+            // active model + current thread and returns the generated text so
+            // the caller can check it's first-person. FORCE_REFLECTION:1
+            // (practical) or FORCE_REFLECTION:2 (existential). Requires the
+            // current thread to already hold a few turns to reflect on.
+            let typeStr = String(trimmed.dropFirst("FORCE_REFLECTION:".count)).trimmingCharacters(in: .whitespaces)
+            let reflectionType = Int(typeStr) ?? 1
+            let recentMessages = vm.memoryStore.getConversationMessages(conversationId: vm.conversationId)
+            let recentTurns = recentMessages.suffix(5).map { msg in
+                (role: msg.isFromUser ? "user" : "assistant", content: msg.content, timestamp: msg.timestamp)
+            }
+            guard !recentTurns.isEmpty else {
+                return "{\"status\":\"error\",\"command\":\"FORCE_REFLECTION\",\"error\":\"no conversation turns to reflect on\"}"
+            }
+            let currentTurn = vm.memoryStore.getCurrentTurnNumber(conversationId: vm.conversationId)
+            let text = await vm.memoryStore.reflectOnExperience(
+                conversationId: vm.conversationId,
+                turns: recentTurns,
+                llmService: vm.llmService,
+                reflectionType: reflectionType,
+                currentTurn: currentTurn,
+                modelId: vm.selectedModel.id
+            )
+            let escaped = jsonStringEscape(text ?? "")
+            let modelEscaped = jsonStringEscape(vm.selectedModel.displayName)
+            return "{\"status\":\"ok\",\"command\":\"FORCE_REFLECTION\",\"type\":\(reflectionType),\"model\":\"\(modelEscaped)\",\"text\":\"\(escaped)\"}"
+
         } else if trimmed == "RESET_SETTINGS" {
             vm.resetSettingsToDefaults()
             writeStateJSON(vm: vm)

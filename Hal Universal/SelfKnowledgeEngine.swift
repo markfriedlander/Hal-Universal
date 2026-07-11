@@ -1887,6 +1887,7 @@ import SQLite3 // Direct C API; matches Hal.swift import for the same reason.
         // Called when reflection is due
         // Type 1 (every 5 turns): Practical/effectiveness patterns
         // Type 2 (every 15 turns): Existential/philosophical observations
+        @discardableResult
         func reflectOnExperience(
             conversationId: String,
             turns: [(role: String, content: String, timestamp: Date)],
@@ -1894,7 +1895,7 @@ import SQLite3 // Direct C API; matches Hal.swift import for the same reason.
             reflectionType: Int,
             currentTurn: Int,
             modelId: String
-        ) async {
+        ) async -> String? {
             print("HALDEBUG-REFLECTION: Starting Type \(reflectionType) reflection at turn \(currentTurn)")
             
             let startTime = Date()
@@ -1935,7 +1936,7 @@ import SQLite3 // Direct C API; matches Hal.swift import for the same reason.
 
             guard !freeFormReflection.isEmpty else {
                 print("HALDEBUG-REFLECTION: No reflection generated")
-                return
+                return nil
             }
 
             // Step 4: Verify reflection is grounded in actual turns (prevent invented patterns)
@@ -2014,8 +2015,9 @@ import SQLite3 // Direct C API; matches Hal.swift import for the same reason.
 
             let duration = Date().timeIntervalSince(startTime)
             print("HALDEBUG-REFLECTION: Type \(reflectionType) reflection complete in \(String(format: "%.1f", duration))s")
+            return verifiedReflection
         }
-        
+
         // MODIFIED: Build overlapping context from recent turns with device info
         private func buildOverlappingContext(
             conversationId: String,
