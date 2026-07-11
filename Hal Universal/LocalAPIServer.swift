@@ -820,6 +820,12 @@ class HalTestConsole: ObservableObject {
                 // (SET_UI_STATE:modellibrary:true) for the row to exist.
                 // "" collapses all. See ChatViewModel.apiExpandRowID.
                 vm.apiExpandRowID = parts[1].trimmingCharacters(in: .whitespaces)
+            case "inlinedetails":
+                // Toggle the per-bubble inline prompt-details (normally set
+                // from a chat bubble's context menu, so not otherwise
+                // API-drivable). Lets the harness screenshot the color-coded
+                // inline breakdown. See ChatViewModel.showInlineDetails.
+                vm.showInlineDetails = value
             case "none":
                 vm.showingSettings = false
                 vm.showingThreadPanel = false

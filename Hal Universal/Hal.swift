@@ -8263,7 +8263,7 @@ struct WidgetTestView: View {
                                         VStack(alignment: .leading, spacing: 4) {
                                             // Key + private marker
                                             HStack(spacing: 6) {
-                                                Text(entry.key)
+                                                Text(humanizeKey(entry.key))
                                                     .font(.caption)
                                                     .fontWeight(.medium)
                                                     .foregroundColor(.primary)
@@ -8283,8 +8283,8 @@ struct WidgetTestView: View {
                                                 }
                                             }
 
-                                            // Value
-                                            Text(entry.value)
+                                            // Value (humanized for display only — see helpers below)
+                                            Text(humanizeTraitValue(entry.value))
                                                 .font(.footnote)
                                                 .textSelection(.enabled)
                                                 .padding(8)
@@ -8408,6 +8408,94 @@ struct WidgetTestView: View {
         // Helper: Format category for display
         private func formatCategory(_ category: String) -> String {
             return category.replacingOccurrences(of: "_", with: " ").capitalized
+        }
+
+        // MARK: - Human-readable trait rendering (DISPLAY ONLY)
+        //
+        // Trait keys are stored snake_case and trait values are stored
+        // either as a plain string or as a JSON object/array (the seeded
+        // self-knowledge — e.g. `{"can_read": true, "file": "Hal.swift"}` —
+        // and the multi-valued primary+tensions format). Dumping those
+        // verbatim reads like raw JSON. These helpers reshape them for a
+        // human READER only — nothing here touches the database, the stored
+        // value, or what gets injected into Hal's prompt.
+
+        // De-snake + Title Case a key for display (e.g. "source_code_access"
+        // → "Source Code Access", "principle" → "Principle").
+        private func humanizeKey(_ key: String) -> String {
+            return key.replacingOccurrences(of: "_", with: " ").capitalized
+        }
+
+        // Render a stored trait value for humans. JSON objects/arrays become
+        // labeled lines / bullets; a bare ISO-8601 timestamp becomes a
+        // friendly date; anything else passes through unchanged.
+        private func humanizeTraitValue(_ raw: String) -> String {
+            let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+            if let data = trimmed.data(using: .utf8),
+               let obj = try? JSONSerialization.jsonObject(with: data),
+               (obj is [String: Any] || obj is [Any]) {
+                return humanizeJSONValue(obj, indent: 0)
+            }
+            // Not a JSON object/array — prettify a bare ISO date, else keep as-is.
+            return prettyISODate(trimmed) ?? raw
+        }
+
+        private func humanizeJSONValue(_ obj: Any, indent: Int) -> String {
+            let pad = String(repeating: "  ", count: indent)
+            if let dict = obj as? [String: Any] {
+                return dict.keys.sorted().map { key -> String in
+                    let value = dict[key]!
+                    if value is [String: Any] || value is [Any] {
+                        return "\(pad)\(humanizeKey(key)):\n\(humanizeJSONValue(value, indent: indent + 1))"
+                    }
+                    return "\(pad)\(humanizeKey(key)): \(humanizeScalar(value))"
+                }.joined(separator: "\n")
+            }
+            if let arr = obj as? [Any] {
+                return arr.map { item -> String in
+                    if item is [String: Any] || item is [Any] {
+                        return "\(pad)•\n\(humanizeJSONValue(item, indent: indent + 1))"
+                    }
+                    return "\(pad)• \(humanizeScalar(item))"
+                }.joined(separator: "\n")
+            }
+            return humanizeScalar(obj)
+        }
+
+        private func humanizeScalar(_ value: Any) -> String {
+            // Bool must be detected via CFBoolean: JSONSerialization bridges
+            // true/false to NSNumber, and a plain `as? Bool` would also match
+            // integers like 0/1, turning "blocks: 32" into "Yes".
+            if let num = value as? NSNumber {
+                if CFGetTypeID(num) == CFBooleanGetTypeID() {
+                    return num.boolValue ? "Yes" : "No"
+                }
+                return num.stringValue
+            }
+            if let s = value as? String {
+                if let pretty = prettyISODate(s) { return pretty }
+                return s.replacingOccurrences(of: "_", with: " ")
+            }
+            return "\(value)"
+        }
+
+        // Return a friendly date string for a full ISO-8601 timestamp
+        // (e.g. "2026-07-10T16:44:11Z" → "Jul 10, 2026 at 4:44 PM"), or nil
+        // if the string isn't a full ISO datetime (date-only values like
+        // "2026-07-09" are already readable and pass through untouched).
+        private func prettyISODate(_ s: String) -> String? {
+            let iso = ISO8601DateFormatter()
+            iso.formatOptions = [.withInternetDateTime]
+            var date = iso.date(from: s)
+            if date == nil {
+                iso.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+                date = iso.date(from: s)
+            }
+            guard let d = date else { return nil }
+            let out = DateFormatter()
+            out.dateStyle = .medium
+            out.timeStyle = .short
+            return out.string(from: d)
         }
     }
 

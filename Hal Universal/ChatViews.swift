@@ -921,6 +921,30 @@ struct ChatBubbleView: View {
     }
     
 
+    // Inline-details segments — the SAME breakdown, in the SAME order, that
+    // the PromptDetailView sheet builds. Rendering these with each kind's
+    // color (below) makes the inline view speak the identical color language
+    // as the viewer: system prompt purple, temporal orange, memory/RAG green,
+    // and so on. Mirrors the sheet's `segments` so the two never drift.
+    // Display only — no data or prompt is changed.
+    private var inlinePromptSegments: [PromptDetailSegment] {
+        var result: [PromptDetailSegment] = []
+        if let prompt = message.fullPromptUsed, !prompt.isEmpty {
+            result.append(contentsOf: parsePromptSegments(fullPrompt: prompt))
+        }
+        if !recentHistory.isEmpty {
+            let body = recentHistory.map { m in
+                let speaker = m.isFromUser ? "User" : "Hal"
+                return "[\(speaker)] \(m.content)"
+            }.joined(separator: "\n\n")
+            result.append(PromptDetailSegment(kind: .conversationHistory, content: body))
+        }
+        if let userMsg = precedingUserContent, !userMsg.isEmpty {
+            result.append(PromptDetailSegment(kind: .userMessage, content: userMsg))
+        }
+        return result
+    }
+
     private func buildDetailsShareText() -> String {
         var lines: [String] = []
         // Header line: turn number + model + (salon) seat / host attribution.
@@ -1019,14 +1043,27 @@ struct ChatBubbleView: View {
                                 .frame(maxWidth: bubbleMaxWidth, alignment: .leading)
                         }
                         if chatViewModel.showInlineDetails {
+                            let segments = inlinePromptSegments
                             VStack(alignment: .leading, spacing: 4) {
-                                Text(buildDetailsShareText())
-                                    .font(.caption2)
-                                    .foregroundColor(.secondary)
-                                    .padding(6)
-                                    .background(Color.gray.opacity(0.15))
-                                    .cornerRadius(8)
+                                if segments.isEmpty {
+                                    // No captured prompt for this message — keep the
+                                    // original plain-text details so nothing is lost.
+                                    Text(buildDetailsShareText())
+                                        .font(.caption2)
+                                        .foregroundColor(.secondary)
+                                } else {
+                                    // Same sections as the viewer, each in its color.
+                                    ForEach(segments) { segment in
+                                        Text(segment.content)
+                                            .font(.caption2)
+                                            .foregroundColor(segment.kind.color)
+                                            .frame(maxWidth: .infinity, alignment: .leading)
+                                    }
+                                }
                             }
+                            .padding(6)
+                            .background(Color.gray.opacity(0.15))
+                            .cornerRadius(8)
                             .transition(.opacity)
                         }
                     }
