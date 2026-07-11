@@ -1560,11 +1560,11 @@ struct SalonModeView: View {
                 } header: {
                     Label("Behavior", systemImage: "brain")
                 } footer: {
-                    Text("**Host** frames each round and closes the conversation. " +
-                         "Without a Host, each voice forms its own independent " +
-                         "understanding of the conversation — slower, but " +
-                         "philosophically clean. With a Host, all voices share the " +
-                         "Host's framing — faster, but mediated.")
+                    // Single string literal (not a `+` concatenation) so SwiftUI
+                    // treats it as a LocalizedStringKey and renders the **bold**
+                    // markdown — concatenation produces a plain String, which
+                    // Text renders verbatim (showing literal asterisks).
+                    Text("**Host** frames each round and closes the conversation. Without a Host, each voice forms its own independent understanding of the conversation — slower, but philosophically clean. With a Host, all voices share the Host's framing — faster, but mediated.")
                         .font(.caption)
                 }
             }

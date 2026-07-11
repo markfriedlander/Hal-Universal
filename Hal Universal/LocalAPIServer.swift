@@ -826,6 +826,16 @@ class HalTestConsole: ObservableObject {
                 // API-drivable). Lets the harness screenshot the color-coded
                 // inline breakdown. See ChatViewModel.showInlineDetails.
                 vm.showInlineDetails = value
+            case "promptdetail":
+                // Open the color-coded prompt-detail SHEET for the most recent
+                // assistant message (normally a context-menu action). parts[1]
+                // = "latest" opens the newest assistant bubble's sheet; "" (or
+                // value=false) closes it. See ChatViewModel.apiPromptDetailMessageID.
+                if value || parts[1].lowercased() == "latest" {
+                    vm.apiPromptDetailMessageID = vm.messages.last(where: { !$0.isFromUser })?.id.uuidString ?? ""
+                } else {
+                    vm.apiPromptDetailMessageID = ""
+                }
             case "none":
                 vm.showingSettings = false
                 vm.showingThreadPanel = false
@@ -836,6 +846,7 @@ class HalTestConsole: ObservableObject {
                 vm.apiNavSalonSettings = false
                 vm.apiNavModelLibrary = false
                 vm.apiExpandRowID = ""
+                vm.apiPromptDetailMessageID = ""
             default:
                 return "{\"status\":\"error\",\"message\":\"Unknown target '\(target)' (use settings|threadPanel|systemPrompt|modelFraming|selfModel|none)\"}"
             }

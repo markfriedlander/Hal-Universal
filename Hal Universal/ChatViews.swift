@@ -1120,6 +1120,15 @@ struct ChatBubbleView: View {
                             recentHistory: recentHistory
                         )
                     }
+                    // Test hook: the harness can open this bubble's prompt-detail
+                    // sheet by setting apiPromptDetailMessageID to this message's id
+                    // (normally opened from the context menu, so not otherwise
+                    // API-drivable). See SET_UI_STATE:promptdetail.
+                    .onChange(of: chatViewModel.apiPromptDetailMessageID) { _, newID in
+                        if !newID.isEmpty && newID == message.id.uuidString {
+                            showingPromptDetail = true
+                        }
+                    }
                     footerView
                 }
                 Spacer()

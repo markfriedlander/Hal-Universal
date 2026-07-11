@@ -10979,6 +10979,16 @@ class HalTestConsole: ObservableObject {
                 // API-drivable). Lets the harness screenshot the color-coded
                 // inline breakdown. See ChatViewModel.showInlineDetails.
                 vm.showInlineDetails = value
+            case "promptdetail":
+                // Open the color-coded prompt-detail SHEET for the most recent
+                // assistant message (normally a context-menu action). parts[1]
+                // = "latest" opens the newest assistant bubble's sheet; "" (or
+                // value=false) closes it. See ChatViewModel.apiPromptDetailMessageID.
+                if value || parts[1].lowercased() == "latest" {
+                    vm.apiPromptDetailMessageID = vm.messages.last(where: { !$0.isFromUser })?.id.uuidString ?? ""
+                } else {
+                    vm.apiPromptDetailMessageID = ""
+                }
             case "none":
                 vm.showingSettings = false
                 vm.showingThreadPanel = false
@@ -10989,6 +10999,7 @@ class HalTestConsole: ObservableObject {
                 vm.apiNavSalonSettings = false
                 vm.apiNavModelLibrary = false
                 vm.apiExpandRowID = ""
+                vm.apiPromptDetailMessageID = ""
             default:
                 return "{\"status\":\"error\",\"message\":\"Unknown target '\(target)' (use settings|threadPanel|systemPrompt|modelFraming|selfModel|none)\"}"
             }
@@ -15016,11 +15027,11 @@ struct SalonModeView: View {
                 } header: {
                     Label("Behavior", systemImage: "brain")
                 } footer: {
-                    Text("**Host** frames each round and closes the conversation. " +
-                         "Without a Host, each voice forms its own independent " +
-                         "understanding of the conversation — slower, but " +
-                         "philosophically clean. With a Host, all voices share the " +
-                         "Host's framing — faster, but mediated.")
+                    // Single string literal (not a `+` concatenation) so SwiftUI
+                    // treats it as a LocalizedStringKey and renders the **bold**
+                    // markdown — concatenation produces a plain String, which
+                    // Text renders verbatim (showing literal asterisks).
+                    Text("**Host** frames each round and closes the conversation. Without a Host, each voice forms its own independent understanding of the conversation — slower, but philosophically clean. With a Host, all voices share the Host's framing — faster, but mediated.")
                         .font(.caption)
                 }
             }
@@ -16161,6 +16172,15 @@ struct ChatBubbleView: View {
                             precedingUserContent: precedingUserContent,
                             recentHistory: recentHistory
                         )
+                    }
+                    // Test hook: the harness can open this bubble's prompt-detail
+                    // sheet by setting apiPromptDetailMessageID to this message's id
+                    // (normally opened from the context menu, so not otherwise
+                    // API-drivable). See SET_UI_STATE:promptdetail.
+                    .onChange(of: chatViewModel.apiPromptDetailMessageID) { _, newID in
+                        if !newID.isEmpty && newID == message.id.uuidString {
+                            showingPromptDetail = true
+                        }
                     }
                     footerView
                 }
@@ -25273,6 +25293,9 @@ class ChatViewModel: ObservableObject {
     // collapse), so the harness can screenshot a card's internals (blurb, action
     // buttons, Delete/Add labels) without a physical tap. "" collapses all.
     @Published var apiExpandRowID: String = ""
+    // Test hook: set to an assistant message's id.uuidString to open that
+    // bubble's color-coded prompt-detail sheet (normally a context-menu action).
+    @Published var apiPromptDetailMessageID: String = ""
 
     // Lightweight mirrors of downloader state for binding
     var mlxIsDownloading: Bool { MLXModelDownloader.shared.isDownloading }

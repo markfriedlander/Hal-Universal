@@ -8777,6 +8777,9 @@ class ChatViewModel: ObservableObject {
     // collapse), so the harness can screenshot a card's internals (blurb, action
     // buttons, Delete/Add labels) without a physical tap. "" collapses all.
     @Published var apiExpandRowID: String = ""
+    // Test hook: set to an assistant message's id.uuidString to open that
+    // bubble's color-coded prompt-detail sheet (normally a context-menu action).
+    @Published var apiPromptDetailMessageID: String = ""
 
     // Lightweight mirrors of downloader state for binding
     var mlxIsDownloading: Bool { MLXModelDownloader.shared.isDownloading }
