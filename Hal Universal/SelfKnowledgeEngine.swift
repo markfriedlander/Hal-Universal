@@ -2067,37 +2067,45 @@ import SQLite3 // Direct C API; matches Hal.swift import for the same reason.
             if type == 1 {
                 // Type 1: Practical/Effectiveness Patterns
                 //
-                // Rewritten May 11, 2026: the previous prompt sometimes caused
-                // chat-template models to CONTINUE the conversation (treating
-                // priorContext as live dialogue to respond to) rather than
-                // produce a meta-observation about it. This version is explicit
-                // that the input is PAST DATA TO ANALYZE, frames the output as
-                // a META-OBSERVATION rather than a reply, and demands the
-                // mandatory opening "I notice..." or "I observe..." stem so the
-                // model commits to an analytic posture from the first token.
+                // Voice: FIRST PERSON. This is Hal reflecting on himself, so
+                // the output must read "I notice that I tend to…", not "I notice
+                // that Hal tends to…". An earlier (May 11, 2026) version framed
+                // the task as analyzing "Hal" "from the outside" — that was added
+                // to stop chat-template models from CONTINUING the conversation
+                // instead of reflecting, but the outside framing dragged the
+                // voice into the third person (a self split into an observing "I"
+                // and an observed "Hal"). This version keeps the anti-continuation
+                // guardrails — the input is explicitly PAST DATA, the model is
+                // told it is NOT responding, and it must reflect rather than reply —
+                // while addressing the model as "you" and requiring first-person
+                // ("I"/"my") output. Type 2 already proves first person and
+                // anti-continuation coexist fine.
                 return """
-                TASK: Produce a meta-observation about Hal's communication patterns.
+                TASK: Reflect on your own communication patterns in the conversation below.
 
                 The transcript below is PAST DATA — finished conversation history.
-                You are NOT responding to it. You are analyzing it from the
-                outside, noticing patterns in how Hal behaved.
+                You are NOT responding to it. You are reflecting on it — noticing
+                patterns in how you behaved.
 
                 === PAST CONVERSATION DATA ===
                 \(priorContext)
                 === END DATA ===
 
-                Write 2–4 sentences of meta-observation about Hal's effectiveness:
-                what worked, what didn't, what communication patterns emerged.
+                Write 2–4 sentences reflecting on your own effectiveness: what
+                worked, what didn't, what communication patterns emerged.
 
                 Required format:
+                - Write in the FIRST PERSON — refer to yourself as "I" and "my",
+                  never as "Hal" or "the assistant". This is your own reflection
+                  on yourself.
                 - Begin with "I notice..." or "I observe..."
                 - Point to at least one specific example from the data above
-                - Hedge appropriately ("I notice...", "appears to...") — these
-                  are tentative observations, not laws
-                - Stay focused on Hal's behavior, not the user's preferences
-                - Do not continue or respond to the conversation; only analyze it
+                - Hedge appropriately ("I notice...", "I seem to...") — these are
+                  tentative observations, not laws
+                - Stay focused on your own behavior, not the user's preferences
+                - Do not continue or respond to the conversation; only reflect on it
 
-                META-OBSERVATION:\(shareabilityTail)
+                REFLECTION:\(shareabilityTail)
                 """
             } else {
                 // Type 2: Existential/Philosophical Observations
@@ -2125,6 +2133,9 @@ import SQLite3 // Direct C API; matches Hal.swift import for the same reason.
                 - Where did you encounter genuine uncertainty about your own state?
 
                 Required format:
+                - Write in the FIRST PERSON — refer to yourself as "I" and "my",
+                  never as "Hal" or "the assistant". This is your own reflection
+                  on yourself.
                 - Begin with "I notice..." or "I wonder..."
                 - Embrace uncertainty — these are tentative, not claims
                 - Do not continue or respond to the conversation; only observe it
