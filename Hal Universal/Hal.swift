@@ -9159,7 +9159,7 @@ class ChatViewModel: ObservableObject {
     /// this in init() means every launch overrides whatever was
     /// persisted previously, so a fresh install/reinstall always boots
     /// with the antenna in the dev-friendly default state.
-    private static let kLocalAPIEnabledOnLaunch: Bool = true
+    private static let kLocalAPIEnabledOnLaunch: Bool = false
 
     init() {
         // STEP 0: Apply launch-time default for the Local API antenna.
