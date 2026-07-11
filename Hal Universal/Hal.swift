@@ -8251,11 +8251,15 @@ struct WidgetTestView: View {
                             // Group by category
                             ForEach(Array(Dictionary(grouping: visibleTraits, by: \.category).sorted(by: { $0.key < $1.key })), id: \.key) { category, entries in
                                 VStack(alignment: .leading, spacing: 8) {
-                                    // Category header
+                                    // Category header. Pink to match the color the
+                                    // prompt viewer / inline details give injected
+                                    // self-knowledge (PromptDetailSegmentKind.selfKnowledge),
+                                    // so "pink = Hal's persistent self-knowledge" reads
+                                    // the same across every interface.
                                     Text(formatCategory(category))
                                         .font(.subheadline)
                                         .fontWeight(.semibold)
-                                        .foregroundColor(.blue)
+                                        .foregroundColor(.pink)
                                         .padding(.top, 8)
 
                                     // Entries in this category
@@ -8283,13 +8287,15 @@ struct WidgetTestView: View {
                                                 }
                                             }
 
-                                            // Value (humanized for display only — see helpers below)
+                                            // Value (humanized for display only — see helpers below).
+                                            // Pink tint to match the self-knowledge color used in
+                                            // the prompt viewer / inline details.
                                             Text(humanizeTraitValue(entry.value))
                                                 .font(.footnote)
                                                 .textSelection(.enabled)
                                                 .padding(8)
                                                 .frame(maxWidth: .infinity, alignment: .leading)
-                                                .background(Color.green.opacity(0.08))
+                                                .background(Color.pink.opacity(0.08))
                                                 .cornerRadius(6)
 
                                             // Metadata
@@ -8484,6 +8490,8 @@ struct WidgetTestView: View {
         // if the string isn't a full ISO datetime (date-only values like
         // "2026-07-09" are already readable and pass through untouched).
         private func prettyISODate(_ s: String) -> String? {
+            // Full ISO-8601 datetime (e.g. "2026-07-10T16:44:11Z") → medium
+            // date + short time, e.g. "Jul 10, 2026 at 9:44 AM".
             let iso = ISO8601DateFormatter()
             iso.formatOptions = [.withInternetDateTime]
             var date = iso.date(from: s)
@@ -8491,11 +8499,32 @@ struct WidgetTestView: View {
                 iso.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
                 date = iso.date(from: s)
             }
-            guard let d = date else { return nil }
-            let out = DateFormatter()
-            out.dateStyle = .medium
-            out.timeStyle = .short
-            return out.string(from: d)
+            if let d = date {
+                let out = DateFormatter()
+                out.dateStyle = .medium
+                out.timeStyle = .short
+                return out.string(from: d)
+            }
+            // Date-only (e.g. "2026-07-09" from a `date` field) → medium date,
+            // no time of day, e.g. "Jul 9, 2026". Same style as the datetime
+            // case, minus the clock (there's no time in the data to show).
+            // A bare calendar date carries no timezone, so parse AND format in
+            // the same (UTC) zone — otherwise "2026-07-09" parsed as UTC
+            // midnight and formatted in a behind-UTC local zone slips to the
+            // 8th.
+            let utc = TimeZone(identifier: "UTC")
+            let dateOnly = DateFormatter()
+            dateOnly.locale = Locale(identifier: "en_US_POSIX")
+            dateOnly.timeZone = utc
+            dateOnly.dateFormat = "yyyy-MM-dd"
+            if let d = dateOnly.date(from: s) {
+                let out = DateFormatter()
+                out.timeZone = utc
+                out.dateStyle = .medium
+                out.timeStyle = .none
+                return out.string(from: d)
+            }
+            return nil
         }
     }
 
