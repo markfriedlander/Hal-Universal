@@ -6,7 +6,7 @@ the **live-text review still needs to happen together** — this doc is the prep
 
 **Release facts (current repo state):**
 - Live on the App Store: **v2.0, build 6** (since 2026-05-19). Non-EU markets only (DSA non-trader).
-- Upcoming: **build 7**, version name **UNDECIDED — Mark's call: v2.1 vs v2.5.**
+- Upcoming: **build 7**, version **v2.5** (decided by Mark 2026-07-11).
 - Min iOS: **26.0** (Apple-Intelligence-capable devices only).
 - Not yet done (the ship sequence): SHIP_BLOCKER flip (`kLocalAPIEnabledOnLaunch`→false),
   CFBundleVersion 6→7, ASC upload + submit.
@@ -38,11 +38,10 @@ Hal keeps getting more capable — and more honest about how he works.
 • Smoother and steadier: faster model switching and loading, and settings that stick.
 ```
 
-**Flags for Mark on the What's New:**
-- "our companion app" = **Posey**. Name it explicitly for cross-promo, or keep it generic? Mark's call.
-- Do we mention the **Apple Watch companion was removed**? It never shipped in a working
-  state, so probably NOT worth a line (users didn't have it). Just make sure NOTHING in the
-  live listing still advertises a Watch app (see §3).
+**Decisions applied to the What's New:**
+- "our companion app" stays **generic** (Mark, 2026-07-11 — don't name Posey for now).
+- Apple Watch removal: NOT mentioned (it never shipped working). Still verify the live
+  listing doesn't advertise a Watch app anywhere (see §3).
 
 ---
 
@@ -115,8 +114,8 @@ Go field by field. The recurring risk is **stale references to things no longer 
       to-do per NEXT.md.)
 - [ ] **Screenshots** — replace the 6.5" set with the six new ones in
       `AppStore/screenshots/6.5-inch/` (recaptured, real status bar, corrected Hal). Confirm
-      there are **no Apple Watch screenshots** in any slot. Note: ASC's primary slot is now
-      **6.9" (1290×2796)** — CC kept native 1290×2796 captures in scratch if that slot is needed.
+      there are **no Apple Watch screenshots** in any slot. **6.5" slot only** (Mark,
+      2026-07-11 — not doing the 6.9" slot this release).
 - [ ] **App Privacy / data-collection answers** — unchanged (fully on-device; no new data
       collection added this cycle). Verify nothing needs updating.
 
@@ -128,7 +127,7 @@ Go field by field. The recurring risk is **stale references to things no longer 
 
 ---
 
-## 4. Open decisions for Mark
-1. **Version name: v2.1 or v2.5?** (Everything else is ready to sequence behind this.)
-2. Name **Posey** in the What's New, or keep it generic?
-3. 6.5" slot only, or also provide the **6.9"** screenshots (native captures are ready)?
+## 4. Decisions (settled by Mark, 2026-07-11)
+1. **Version = v2.5.**
+2. **Keep Posey generic** ("our companion app") for now.
+3. **6.5" slot only** (no 6.9" this release).
