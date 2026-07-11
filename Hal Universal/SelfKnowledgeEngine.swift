@@ -1939,16 +1939,35 @@ import SQLite3 // Direct C API; matches Hal.swift import for the same reason.
                 return nil
             }
 
-            // Step 4: Verify reflection is grounded in actual turns (prevent invented patterns)
-            let turnText = turns.map { $0.content }.joined(separator: "\n")
-            let turnSentences = TextSummarizer.sentenceSplit(turnText)
-            let verifiedReflection = await TextSummarizer.verifyNarrative(
-                freeFormReflection,
-                against: turnSentences,
-                threshold: 0.72
-            )
+            // Step 4: reflections are intentionally NOT grounded (2026-07-11).
+            //
+            // Reflections used to run through TextSummarizer.verifyNarrative,
+            // which REPLACES any sentence that doesn't closely echo the
+            // transcript with the nearest source quote. That guard made sense
+            // in the ORIGINAL architecture, where a single reflection fed
+            // directly into structured self-knowledge (recordStructuredInsights,
+            // Step 5 below) — an invented pattern would instantly become a
+            // false trait. But that direct path was disabled 2026-05-18: traits
+            // now crystallize only through REINFORCEMENT (a pattern must recur
+            // across many reflections and clear a threshold in
+            // TraitCrystallizer). The reality-check moved downstream, so
+            // grounding here is a vestige — and a destructive one: it turned
+            // genuine self-observation into a collage of conversation quotes
+            // (five different models once returned near-identical "reflections"
+            // because all were overwritten with the same source sentences).
+            //
+            // A reflection is Hal's own internal narrative, and — per this
+            // project's premise — an entity exploring what it might be like to
+            // be itself may confabulate, daydream, retrofit. Human identity is
+            // a self-authored story; clamping it to the literal transcript
+            // makes it transcription, not reflection. Safety still lives at
+            // crystallization: a single confabulation stays a private momentary
+            // thought unless it recurs and is reinforced. Summaries KEEP
+            // verifyNarrative (a summary that invents content is just wrong);
+            // reflection reaching past the transcript is doing its job.
+            let reflectionText = freeFormReflection
 
-            print("HALDEBUG-REFLECTION: Reflection verified and grounded in experience (shareable=\(shareableDecision))")
+            print("HALDEBUG-REFLECTION: Reflection kept ungrounded (self-narrative, not a summary) (shareable=\(shareableDecision))")
 
             // NEW STEP 4.5: Store the verified free-form reflection.
             //
@@ -1973,7 +1992,7 @@ import SQLite3 // Direct C API; matches Hal.swift import for the same reason.
             // preserved (stickiness — first decision wins).
             await storeReflectionWithSynthesis(
                 conversationId: conversationId,
-                verifiedReflection: verifiedReflection,
+                verifiedReflection: reflectionText,
                 reflectionType: reflectionType,
                 turnNumber: currentTurn,
                 modelId: modelId,
@@ -2015,7 +2034,7 @@ import SQLite3 // Direct C API; matches Hal.swift import for the same reason.
 
             let duration = Date().timeIntervalSince(startTime)
             print("HALDEBUG-REFLECTION: Type \(reflectionType) reflection complete in \(String(format: "%.1f", duration))s")
-            return verifiedReflection
+            return reflectionText
         }
 
         // MODIFIED: Build overlapping context from recent turns with device info
