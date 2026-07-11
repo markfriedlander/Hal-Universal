@@ -1,23 +1,23 @@
 // PrivacyMonitor.swift
 // Hal Universal
 //
-// The privacy lock indicator's engine + UI, added in v2.1. Surfaces — in the
-// chat toolbar — whether Hal is currently operating in a state where data
-// *could* leave the device, so the user can see it at a glance and choose.
-// This operationalizes the standing WWDC26 principle: "PCC is the user's
-// choice via Airplane Mode; we don't block Apple's routing, we make the state
-// visible." See NEXT.md → "Privacy Lock indicator" for the full design.
+// The privacy lock indicator's engine and UI. Surfaces - in the chat
+// toolbar - whether Hal is currently operating in a state where data
+// could leave the device, so the user can see it at a glance and choose.
+// This operationalizes the standing principle: PCC is the user's choice
+// via Airplane Mode; we don't block Apple's routing, we make the state
+// visible.
 //
 // Three pieces live here:
-//   1. `PrivacyMonitor` — an ObservableObject wrapping `NWPathMonitor`. Its
+//   1. `PrivacyMonitor` - an ObservableObject wrapping `NWPathMonitor`. Its
 //      only published state is `isNetworkAvailable`. It defaults to `false`
 //      (locked-is-the-safe-default) until the first network path arrives,
 //      then flips within ~1s of any change.
-//   2. `PrivacyMonitor.isLocked(...)` — a PURE, testable function holding the
+//   2. `PrivacyMonitor.isLocked(...)` - a PURE, testable function holding the
 //      lock/unlock truth table. Kept free of catalog/UI dependencies so the
 //      logic can be reasoned about (and unit-tested) in isolation; the caller
 //      resolves salon seat sources and passes them in.
-//   3. `PrivacyLockPopover` — the small explain-yourself popover shown on tap.
+//   3. `PrivacyLockPopover` - the small explain-yourself popover shown on tap.
 //
 // The glyph itself (lock / lock.open) and the ToolbarItem live in
 // ChatViews.swift's iOSChatView, computed live from the active model + this
@@ -28,7 +28,7 @@ import SwiftUI
 import Network
 import Combine
 
-// ========== BLOCK PM.1: PrivacyMonitor (network path) - START ==========
+// ==== LEGO START: 41 Privacy Lock (Network Monitor, Lock Truth Table, Popover) ====
 
 /// Watches the device's network reachability for the privacy lock indicator.
 /// A single shared instance is started once at app launch.
@@ -70,7 +70,7 @@ final class PrivacyMonitor: ObservableObject {
         monitor.start(queue: queue)
     }
 
-    // ========== BLOCK PM.2: lock decision (pure truth table) - START ==========
+    // MARK: - Lock decision (pure truth table)
 
     /// The lock/unlock decision, as a pure function of the inputs. See the
     /// truth table in NEXT.md. `salonSeatSources` is the resolved `ModelSource`
@@ -105,12 +105,10 @@ final class PrivacyMonitor: ObservableObject {
         }
     }
 
-    // ========== BLOCK PM.2: lock decision (pure truth table) - END ==========
 }
 
-// ========== BLOCK PM.1: PrivacyMonitor (network path) - END ==========
 
-// ========== BLOCK PM.3: PrivacyLockPopover (tap explanation) - START ==========
+// MARK: - PrivacyLockPopover (tap explanation)
 
 /// The small popover shown when the user taps the lock. Explains the current
 /// state in plain language and offers a one-tap jump to the Model Library.
@@ -157,4 +155,4 @@ struct PrivacyLockPopover: View {
     }
 }
 
-// ========== BLOCK PM.3: PrivacyLockPopover (tap explanation) - END ==========
+// ==== LEGO END: 41 Privacy Lock (Network Monitor, Lock Truth Table, Popover) ====

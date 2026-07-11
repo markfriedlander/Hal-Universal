@@ -1,63 +1,36 @@
+// ==== LEGO START: 38 TraitCrystallizer (Reflection -> Trait Promotion) ====
 // TraitCrystallizer.swift
 // Hal Universal
 //
-// Phase 2 of v1 self-knowledge crystallization, landed 2026-05-18.
-// See Docs/v1_Build_Spec_Self_Knowledge_2026-05-18.md for the full
-// spec and the Evolutionary Salon notes that informed it.
+// The reflection-to-trait promotion engine. Reflections accumulate in
+// the database with a `reinforcement_count` that grows each time a
+// semantically-similar new reflection is merged into them via
+// storeReflectionWithSynthesis. When that count crosses a category-
+// specific threshold, the reflection becomes a candidate for promotion
+// to a structured trait. This module:
 //
-// What this file does:
-//
-//   The reflection-to-trait promotion engine. Reflections accumulate
-//   in the database with a `reinforcement_count` that grows each time
-//   a semantically-similar new reflection is merged into them via
-//   storeReflectionWithSynthesis. When that count crosses a category-
-//   specific threshold, the reflection is a "candidate" for promotion
-//   to a structured trait. This module:
-//
-//     1. Fetches candidate reflections from the MemoryStore.
-//     2. Builds a focused LLM prompt (Qwen-derived template — see the
-//        salon archive at Docs/Evolutionary_Salon_2026-05-17/ for
-//        where it came from) that distills a reflection into a
-//        (category, key, value) tuple representing the *durable shift*
-//        the reflection captures.
-//     3. Validates the LLM output, double-checks the category-specific
-//        threshold, and INSERTs the trait via MemoryStore's existing
-//        storeSelfKnowledge path (which handles category+key collision
-//        as an upsert + reinforcement — that's intentional for v2 of
-//        Phase 3, when trait evolution lands).
-//     4. Stamps the source reflection with the new trait's ID via
-//        markReflectionPromoted, so reverse-lineage queries
-//        (`WHERE promoted_to_trait_id = ?`) can find all reflections
-//        that fed any given trait.
-//
-// What this file does NOT do (yet — Phase 3+ work):
-//
-//   - Trait evolution / contradiction handling. If an existing trait
-//     already has the same (category, key) as the LLM's output, the
-//     storeSelfKnowledge upsert path just reinforces it with the new
-//     value as a straight write. Phase 3 will add proper cosine-based
-//     contradiction detection, the multi-valued JSON storage format,
-//     and the weighted-decay tension mechanism.
-//   - Per-backend cosine thresholds (those land in Phase 3 with
-//     `recommendedContradictionThreshold` on EmbeddingBackend).
-//   - The shareability decision at write time for reflections — that's
-//     Phase 4 work.
-//   - Pattern clustering or periodic LLM mining as alternatives to
-//     reinforcement-based promotion. We pre-decided v1 stays
-//     reinforcement-only.
+//   1. Fetches candidate reflections from the MemoryStore.
+//   2. Builds a focused LLM prompt that distills a reflection into a
+//      (category, key, value) tuple representing the durable shift the
+//      reflection captures.
+//   3. Validates the LLM output, double-checks the category-specific
+//      threshold, and INSERTs the trait via MemoryStore's
+//      storeSelfKnowledge path (which upserts on category+key collision
+//      as a reinforcement).
+//   4. Stamps the source reflection with the new trait's ID via
+//      markReflectionPromoted, so reverse-lineage queries
+//      (`WHERE promoted_to_trait_id = ?`) can find every reflection
+//      that fed a given trait.
 //
 // Dependencies (read-only consumer of):
 //   - MemoryStore (via SelfKnowledgeEngine.swift): getTraitCandidates,
-//     getSelfKnowledge (to look up the new trait's ID), storeSelfKnowledge,
-//     markReflectionPromoted
+//     getSelfKnowledge, storeSelfKnowledge, markReflectionPromoted
 //   - LLMService: generateChatResponse(messages:temperature:)
 //   - HalChatMessage: the message-array shape llmService uses
 //
-// AFM gate: NOT enforced inside this module. The chat-path caller
-// gates the invocation per the 2026-05-17 audit pattern — AFM never
-// invokes processTraitCandidates because AFM doesn't participate in
-// self-knowledge writes. That keeps this module clean of model-source
-// inspection.
+// AFM gate: not enforced inside this module. The chat-path caller gates
+// the invocation — AFM never invokes processTraitCandidates because AFM
+// doesn't participate in self-knowledge writes.
 
 import Foundation
 
@@ -946,3 +919,4 @@ enum TraitCrystallizer {
         return (category: normalizedCategory, key: normalizedKey, value: value)
     }
 }
+// ==== LEGO END: 38 TraitCrystallizer (Reflection -> Trait Promotion) ====

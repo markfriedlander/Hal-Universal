@@ -1,26 +1,23 @@
+// ==== LEGO START: 31 EmbeddingProvider (Active-Backend Wrapper) ====
 // EmbeddingProvider.swift
 // Hal Universal
 //
 // Single-instance wrapper around whichever embedding backend is active.
 // Lazy-loaded on first use; subsequent calls are synchronous and fast.
 //
-// Two switchable backends (v2.0.1+):
+// Switchable backends:
 //   - NLContextualEmbedding (default, built-in, 512-dim)
-//   - Nomic Embed Text v1.5 via swift-embeddings (768-dim, ~522 MB,
-//     uses Apple's MLTensor — no MLX, no Metal init crash). Asymmetric-
+//   - Nomic Embed Text v1.5 via swift-embeddings (768-dim). Asymmetric-
 //     retrieval tuned (requires "search_query:" / "search_document:"
 //     prefixes; handled here via EmbeddingPurpose).
-//
-// EmbeddingGemma was removed 2026-05-20. See EmbeddingBackend.swift's
-// header for full history and the recipe for re-enabling.
 //
 // Thread safety: locked around the one-time backend load; subsequent
 // embed() calls are reentrant and serialize through the backend's own
 // thread-safety guarantees.
 //
-// Sync API preserved across all backends via DispatchSemaphore bridges
-// when the underlying load/inference is async. Callers continue to
-// receive a `[Double]?` per call.
+// Sync API contract: every backend exposes a synchronous `[Double]?` per
+// call, bridged via DispatchSemaphore when the underlying load/inference
+// is async.
 
 import Foundation
 import CoreML
@@ -530,3 +527,4 @@ extension MemoryStore {
         return norm1 == 0 || norm2 == 0 ? 0 : dot / (norm1 * norm2)
     }
 }
+// ==== LEGO END: 31 EmbeddingProvider (Active-Backend Wrapper) ====

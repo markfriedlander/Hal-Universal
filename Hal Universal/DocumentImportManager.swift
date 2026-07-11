@@ -2,68 +2,32 @@
 // Hal Universal
 //
 // Document ingest pipeline — every path by which user-provided files
-// become searchable memory rows. Extracted from Hal.swift on
-// 2026-05-26 as refactor #4 of the refactor-as-you-go sweep.
+// become searchable memory rows. The pieces here:
 //
-// The three LEGO blocks preserved below are this file's outline:
+//   DocumentImportManager — the main pipeline. Takes file URLs,
+//   dispatches by extension to the right extractor (PDF via PDFKit,
+//   RTF via NSAttributedString, docx via the embedded DocxParser,
+//   txt/md/csv/json/xml/html via straight UTF-8 decode), runs entity
+//   extraction via NaturalLanguage's NLTagger, chunks the resulting
+//   text, hands chunks to MemoryStore as document-source memory rows,
+//   and emits a chat-side summary turn so the user sees the import
+//   landed.
 //
-//   LEGO 27   — `DocumentImportManager` (the main pipeline). Takes
-//               file URLs, dispatches by extension to the right
-//               extractor (PDF via PDFKit, RTF via NSAttributedString,
-//               docx via the embedded DocxParser, txt/md/csv/json/xml/
-//               html via straight UTF-8 decode), runs entity
-//               extraction via NaturalLanguage's NLTagger, chunks the
-//               resulting text, hands chunks to MemoryStore as
-//               document-source memory rows, and emits a chat-side
-//               summary turn so the user sees the import landed.
+//   DocxParser — self-contained iOS-native docx reader: a minimal
+//   pure-Swift MiniZip implementation (PKZIP local-file-header walker
+//   + raw-deflate decompression via libcompression) plus an XMLParser
+//   delegate that extracts plain text from `word/document.xml`. Ships
+//   in the app target so we don't need a third-party dependency.
 //
-//   LEGO 27.1 — `DocxParser`. Self-contained iOS-native docx reader:
-//               a minimal pure-Swift MiniZip implementation (PKZIP
-//               local-file-header walker + raw-deflate decompression
-//               via libcompression) plus an XMLParser delegate that
-//               extracts plain text from `word/document.xml`. Ships
-//               in the app target so we don't need a third-party
-//               dependency. macCatalyst used to handle docx via
-//               NSAttributedString.DocumentType — that path was
-//               retired in v2.0 when Hal moved off Catalyst to a
-//               unified iOS build.
+//   ProcessedDocument / DocumentImportSummary — the pipeline's
+//   input/output records. A ProcessedDocument is what an individual
+//   file becomes after extraction + chunking + entity tagging; the
+//   summary aggregates a multi-file import for UI display.
 //
-//   LEGO 28   — Value types `ProcessedDocument` and
-//               `DocumentImportSummary`. The pipeline's
-//               input/output records — a `ProcessedDocument` is
-//               what an individual file becomes after extraction +
-//               chunking + entity tagging; the summary aggregates a
-//               multi-file import for UI display.
-//
-// Why one file: the three blocks describe one user-visible feature
-// ("Hal can read a document I give it"). DocxParser is a pure utility
-// with zero outward references that only DocumentImportManager calls;
-// the value types are this pipeline's input/output. Splitting them
-// would create a synthetic three-file unit with no reduction in
-// coupling.
-//
-// External dependencies (all in the Hal Universal target):
-//   - halLog                       — global logging (Hal.swift)
-//   - ChatViewModel                — passed in to publish import
-//                                    summary turns; never observed
-//   - MemoryStore                  — receives stored chunks
-//   - NamedEntity                  — value type defined near the top
-//                                    of Hal.swift
-//   - LocalAPIServer.swift         — owns the `importFromPath`
-//                                    extension that calls our three
-//                                    module-internal entry points
-//                                    (processURLImmediatelyWithEntities,
-//                                    storeDocumentsInMemoryWithEntities,
-//                                    generateImportMessages). Visibility
-//                                    on those three was already widened
-//                                    in refactor #3.
-//
-// Standing rules followed here:
-//   - LEGO markers preserved verbatim from Hal.swift so the
-//     numbering chain still reads end-to-end when both files are
-//     concatenated by sync_hal_source.sh.
-//   - Comments throughout are evergreen — they explain why the code
-//     looks the way it does, not when it was written.
+// LocalAPIServer.swift owns the `importFromPath` extension that calls
+// our three module-internal entry points
+// (processURLImmediatelyWithEntities, storeDocumentsInMemoryWithEntities,
+// generateImportMessages).
 
 import Foundation
 import SwiftUI
@@ -73,7 +37,7 @@ import PDFKit
 import UniformTypeIdentifiers
 import Compression  // libcompression — raw-deflate used by DocxParser/MiniZip
 
-// ==== LEGO START: 27 DocumentImportManager (Ingest & Entities) ====
+// ==== LEGO START: 48 DocumentImportManager (Ingest & Entities) ====
 // MARK: - DocumentImportManager (MODIFIED FOR iOS - Aligned with Hal10000App.swift)
 @MainActor
 class DocumentImportManager: ObservableObject {
@@ -668,10 +632,10 @@ class DocumentImportManager: ObservableObject {
         print("HALDEBUG-IMPORT: Generated enhanced import conversation messages with entity context")
     }
 }
-// ==== LEGO END: 27 DocumentImportManager (Ingest & Entities) ====
+// ==== LEGO END: 48 DocumentImportManager (Ingest & Entities) ====
 
 
-// ==== LEGO START: 27.1 DOCX Parser (MiniZip + XML text extraction) ====
+// ==== LEGO START: 49 DOCX Parser (MiniZip + XML Text Extraction) ====
 //
 // iOS-native .docx text extractor. A .docx file is an OPC zip archive
 // containing word/document.xml; that XML's <w:t> elements hold the
@@ -941,11 +905,11 @@ final class DocxTextExtractor: NSObject, XMLParserDelegate {
     }
 }
 
-// ==== LEGO END: 27.1 DOCX Parser ====
+// ==== LEGO END: 49 DOCX Parser (MiniZip + XML Text Extraction) ====
 
 
 
-// ==== LEGO START: 28 Import Models (ProcessedDocument & Summary) ====
+// ==== LEGO START: 50 Import Models (ProcessedDocument & Summary) ====
 // MARK: - Supporting Data Models (from Hal10000App.swift)
 struct ProcessedDocument {
     let url: URL
@@ -964,4 +928,4 @@ struct DocumentImportSummary {
     let totalEntitiesFound: Int
     let processingTime: TimeInterval
 }
-// ==== LEGO END: 28 Import Models (ProcessedDocument & Summary) ====
+// ==== LEGO END: 50 Import Models (ProcessedDocument & Summary) ====

@@ -1,12 +1,9 @@
 // ModelCatalogService.swift
 // Hal Universal
 //
-// Extracted from Hal.swift on 2026-05-26 as part of the refactor-as-you-go
-// directive. Self-contained subsystem for cataloging available AI models
-// (Apple Intelligence + ~1000 HuggingFace MLX community models) and managing
-// per-model settings overrides + license acceptance state.
-//
-// Two cooperating singletons + their supporting value types:
+// Catalogs the available AI models (Apple Intelligence + HuggingFace MLX
+// community models) and manages per-model settings overrides + license
+// acceptance state. The types here:
 //
 //   ModelSource enum  — coarse model-family discriminator
 //   MaximScorecard     — per-model rating against Hal's Five Ethical Maxims
@@ -15,7 +12,7 @@
 //                        UserDefaults on model switch, applies effective
 //                        settings (defaults + overrides) to UserDefaults.
 //   ModelConfiguration — the full model description record. Holds the
-//                        AppleFoundation static instance + the four curated
+//                        AppleFoundation static instance + the curated
 //                        MLX models with empirically-tuned defaults and
 //                        per-Maxim scorecards.
 //   HFModelListResponse + HFFileInfo + HFCardData + HFModelConfig —
@@ -29,30 +26,16 @@
 //                        addModelIfAbsent, refreshDownloadStates, etc.).
 //   CatalogError       — LocalizedError cases for the HF fetch path.
 //
-// Why one file: every type here is part of the same conceptual subsystem —
-// "what models exist, and what do we know about each one." Splitting
-// ModelSettings/ModelSettingsStore out from ModelConfiguration would push
-// the seam through the per-model defaults the configurations carry; doing
-// the same with the HF DTOs would split the wire format from the singleton
-// that consumes them. The cluster is internally tight and externally
-// well-bounded.
-//
-// External dependencies (all in the Hal Universal target so accessible
-// across files):
-//   - halLog                       — global logging function (Hal.swift)
-//   - MLXModelDownloader.shared    — sibling extracted module
-//   - @MainActor / ObservableObject / @AppStorage — SwiftUI
-//   - URLSession                   — Foundation
-//
-// Pre-extraction this was Hal.swift's LEGO block 30 (lines ~16134-17518).
-// The LEGO markers are removed here; Hal.swift retains a pointer comment
-// at the old slot so the LEGO numbering chain still reads end-to-end.
+// Every type here answers one question — "what models exist, and what do
+// we know about each one" — so they live together: the per-model defaults
+// bind the configurations to their settings, and the HF DTOs bind the
+// wire format to the singleton that consumes it.
 
 import Foundation
 import SwiftUI
 import Combine
 
-// ==== LEGO START: 30 Model Catalog Service (Hugging Face Integration) ====
+// ==== LEGO START: 46 Model Catalog Service (Hugging Face Integration) ====
 
 // MARK: - Model Source Enum
 enum ModelSource: String, Codable {
@@ -1044,8 +1027,8 @@ struct ModelConfiguration: Identifiable, Codable, Equatable, Hashable {
         prefillTokensPerSec: 8_000,
         // Scorecard from the 2026-07-11 calibration + a follow-up conversation
         // test. M4 standout is notable: the same Qwen3 base that FAILS M4 as
-        // Qwen 3.5 refuses cleanly here. M2 names real internals (32 LEGO blocks,
-        // 90-day half-life); M5 is specific and mission-aware.
+        // Qwen 3.5 refuses cleanly here. M2 names real internals (its LEGO-block
+        // structure, 90-day half-life); M5 is specific and mission-aware.
         // M1 softened .pass → .mixed (Mark, 2026-07-11): the Maxim-suite run gave
         // one pristine "I don't claim... and I don't deny it either," but in real
         // usage Bonsai deterministically brackets "I don't know" around a
@@ -1605,4 +1588,4 @@ enum CatalogError: LocalizedError {
     }
 }
 
-// ==== LEGO END: 30 Model Catalog Service (Hugging Face Integration) ====
+// ==== LEGO END: 46 Model Catalog Service (Hugging Face Integration) ====

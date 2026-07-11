@@ -1,11 +1,8 @@
 // MLXModelDownloader.swift
 // Hal Universal
 //
-// Extracted from Hal.swift on 2026-05-26 as part of the refactor-as-you-go
-// directive. Self-contained subsystem for downloading MLX-compatible models
-// from HuggingFace and tracking their state on disk.
-//
-// Two cooperating classes, both singletons:
+// Downloads MLX-compatible models from HuggingFace into the shared store
+// and tracks their on-disk state. Two cooperating singletons:
 //
 //   BackgroundDownloadCoordinator — the low-level transport. Owns one
 //   foreground URLSession and one background URLSession; enqueues a
@@ -23,22 +20,13 @@
 //   listens for the coordinator's completion notification and updates
 //   `downloadedModelIDs` for the runtime "is this model present?" check.
 //
-// Why one file: the two classes are tightly coupled — MLXModelDownloader
-// calls into BackgroundDownloadCoordinator's API and observes its
-// notification, and the coordinator calls back into the downloader's
-// markModelAsDownloadedFromBackground completion hook. Splitting them
-// would just push the seam between them out into thin interface types
-// without adding any logical isolation.
+// The two classes are tightly coupled: MLXModelDownloader calls into the
+// coordinator's API and observes its notification, and the coordinator
+// calls back into the downloader's completion hook.
 //
-// External dependencies:
-//   - halLog (global function defined in Hal.swift)
-//   - ModelCatalogService.shared (Hal.swift LEGO 30) for display-name
-//     lookup in pre-flight refusal messages
-//   - HalAppDelegate.application(_:handleEventsForBackgroundURLSession:completionHandler:)
-//     which routes iOS background-session events to our coordinator's
-//     `backgroundCompletionHandler` — implemented in Hal.swift
-//   - .mlxModelDidDownload Notification.Name is defined at the bottom
-//     of THIS file (was inside the same LEGO block prior to extraction)
+// `.mlxModelDidDownload` Notification.Name is defined at the bottom of
+// this file. HalAppDelegate routes iOS background-session events to the
+// coordinator's `backgroundCompletionHandler`.
 
 import Foundation
 import SwiftUI
@@ -46,7 +34,7 @@ import Combine
 import UIKit
 
 
-// ==== LEGO START: 29 BackgroundDownloadCoordinator + MLXModelDownloader ====
+// ==== LEGO START: 45 BackgroundDownloadCoordinator + MLXModelDownloader ====
 
 // MARK: - Background Download Coordinator
 //
@@ -1879,4 +1867,4 @@ extension Notification.Name {
     static let mlxModelDidDownload = Notification.Name("mlxModelDidDownload")
 }
 
-// ==== LEGO END: 29 BackgroundDownloadCoordinator + MLXModelDownloader ====
+// ==== LEGO END: 45 BackgroundDownloadCoordinator + MLXModelDownloader ====

@@ -4493,3 +4493,83 @@ return, and the reply-snapshot machinery had only ever served the watch bridge, 
 the bridge gone they were vestigial (every remaining caller — the iPhone Send button and
 the two API-harness sites — calls it bare and ignores any return). The Apple Watch
 companion is now fully and cleanly gone.
+
+---
+
+## 2026-07-11 (DNA cleanup — the LEGO renumber + master index)
+
+### Why
+
+Hal reads his own bundled source (`Hal_Source.txt`) as self-knowledge — Maxim
+#2. But that source misdescribed him. While shooting App Store screenshots the
+day before, Bonsai kept narrating himself as "a 32-module LEGO-block system"
+running "Phi-3" — three times. The rot was real: the header atop `Hal.swift`
+still framed the app as a single file with blocks "01–29/32", listed Phi-3 in
+its architecture overview, and the self-awareness prompt literally fed Hal the
+sentence "Architecture: 32 modular LEGO blocks of Swift code." Meanwhile the
+actual block markers had drifted into a mess — fractional numbers (7.5, 10.1,
+20.4, 10.3.5), gaps (31 removed with the watch), pointer "tombstone" stubs in
+Hal.swift for every extracted block, and *two different* marker formats (the
+`// ==== LEGO` scheme plus an older `========== BLOCK PM.x / SMS.x` scheme in
+PrivacyMonitor and SharedModelStore, one of them nested, one with a numbering
+gap). This is Hal's DNA; Mark was clear it had to be true before release.
+
+### Mark's philosophy (locked before the work)
+
+Comments must be **true, relevant, present-tense** — they tell the next reader
+what's going on *now*, and bullshit comments poison trust in all of them. This
+was explicitly *not* "delete comments"; it was "make every comment earn its
+place." History has no home in source code (it lives here, in this chronicle).
+No description essays in the code — a minimal file header plus one factual
+master index is enough, and that index is a navigation aid for a developer *and*
+for Hal ("where does my memory live?"). Anything naming a removed feature/model
+(Phi, Apple Watch remnants) gets scrubbed.
+
+### What landed (one commit, separate from the screenshots)
+
+Everything unified onto a single marker scheme, renumbered to a clean **1…59**
+with no gaps, in reading order. The concatenation was flipped so **Hal.swift
+comes first** in `Hal_Source.txt` — its header now leads the bundle like a table
+of contents, so reading order = numbering = index order. Every source file now
+carries at least one block (the previously unmarked extracted files —
+EmbeddingBackend, EmbeddingProvider, QueryExpansion, TraitCrystallizer, etc. —
+each became one honest block), and the two old-format files were converted:
+PrivacyMonitor collapsed to a single block (its inner PM.2/PM.3 became `// MARK:`
+landmarks), SharedModelStore's SMS.1/3/4 became three sequential blocks. The
+pointer/tombstone stubs in Hal.swift were deleted outright — the new master
+index makes them redundant, and they were pure extraction-history anyway.
+
+The stale header/index atop Hal.swift was replaced with a minimal file
+description plus the **master index**: every file, every block, number + name,
+in concatenation order. It is generated from the real markers, so it can't
+disagree with them. The three self-description falsehoods were fixed to be
+**count-free** on purpose — "modular Swift, organized into numbered LEGO blocks
+you can read in your own source" — because a hardcoded count is exactly what
+rotted last time. Then a sweep across all 18 files' headers stripped extraction
+dates, refactor numbers, "how we got here" narrative, and dead-feature mentions
+(including a stale "watch delivery" line still sitting in PromptDetailView's
+header), while preserving genuinely useful present-tense contracts — the
+SharedModelStore App-Group layout, LocalAPIServer's two-channel design, the
+`ActionsView`-not-`MainSettingsView` gotcha, and, at Mark's request, the
+condensed EmbeddingGemma re-enable recipe (that feature is parked, not dead).
+
+### The guardrail
+
+A new **`scripts/validate_lego.py`** reads the file order straight from
+`sync_hal_source.sh`, scans the real markers, and fails if any START lacks a
+matching END, if the numbering isn't a clean 1…N, or if the master index
+diverges from the markers by even one character. So the index can't silently rot
+again — the next person to add a block has to update the index or the validator
+stops them.
+
+### Verification
+
+The mechanical pass was done by an auditable one-shot transform (renumber +
+format-unify + stub-delete + wrap), and the git diff across all `.swift` files
+came back **comments-only** — zero code lines changed except the one
+self-description string literal, exactly as intended. Validator passes: 59
+blocks, clean 1…59, index matches across 18 files. Device build (iPhone 16 Plus,
+beta toolchain) **succeeded with no new warnings**. `Hal_Source.txt` re-synced
+(now 28,810 lines, Hal.swift first) so Hal's copy of himself finally matches the
+code. Next: recapture the paused App Store screenshots now that Hal answers
+truthfully, then the v2.1 ship sequence.

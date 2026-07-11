@@ -1,64 +1,35 @@
 // SelfKnowledgeEngine.swift
 // Hal Universal
 //
-// Extracted from Hal.swift on 2026-05-17 (later evening) as part of the
-// standing refactor-as-you-go directive, in preparation for the reflection-
-// to-trait crystallization work and the Evolutionary Salon meta-conversation
-// about it.
+// The data layer and write-time orchestration for Hal's persistent
+// self-knowledge. Three `extension MemoryStore` declarations covering:
 //
-// This file is the data layer + write-time orchestration for Hal's
-// persistent self-knowledge. It groups what was previously LEGO blocks 4.1,
-// 4.2, and 4.3 of Hal.swift — three independent `extension MemoryStore`
-// declarations covering:
+//   - Self-Knowledge CRUD: storeSelfKnowledge (key-based upsert +
+//     reinforcement), getAllSelfKnowledge / getSelfKnowledgeValue,
+//     deleteSelfKnowledge (soft-delete via deleted_at), storeReflection,
+//     the shareability toggles, and backup/recovery helpers.
+//   - Self-Knowledge maintenance: confidence decay and similarity
+//     helpers (Levenshtein etc.).
+//   - Self-reflection orchestration: reflectOnExperience (the periodic
+//     reflection trigger), storeReflectionWithSynthesis (write-time
+//     cosine->=-threshold merge), and recordStructuredInsights
+//     (post-reflection structured-trait extraction).
 //
-//   4.1 Self-Knowledge CRUD (Phase 2):
-//       - storeSelfKnowledge (key-based upsert + reinforcement)
-//       - getAllSelfKnowledge / getSelfKnowledgeValue
-//       - deleteSelfKnowledge (soft-delete via deleted_at)
-//       - storeReflection (raw_reflection format)
-//       - getShareableReflections / getShareableSelfKnowledge
-//       - shareability toggles + backup/recovery helpers
+// The injection-side builders (buildSelfKnowledgeContext,
+// buildSelfAwarenessContext) live in the chat-message build path in
+// Hal.swift; they are consumers of this engine, not part of it.
 //
-//   4.2 Self-Knowledge Maintenance:
-//       - confidence decay
-//       - similarity helpers (Levenshtein etc.)
-//
-//   4.3 Self-Reflection Orchestration:
-//       - reflectOnExperience (the periodic reflection trigger)
-//       - storeReflectionWithSynthesis (write-time cosine-≥-threshold merge;
-//         threshold is per-backend via EmbeddingBackend.recommendedSynthesisThreshold)
-//       - recordStructuredInsights (post-reflection structured-trait extraction)
-//
-// What's NOT in this file:
-//   - The injection-side builders (buildSelfKnowledgeContext,
-//     buildSelfAwarenessContext) and the AFM gate that calls them.
-//     Those live in the chat-message build path in Hal.swift; they are
-//     CONSUMERS of this engine, not part of it. The AFM-gate audit
-//     (next step) examines all such consumers; it does not relocate them.
-//   - The catalog of category constants ("value", "preference", etc.).
-//     Categories are still referenced by string literals throughout the
-//     write and read paths. Worth tightening into an enum eventually,
-//     not in this extraction.
-//
-// Per-backend synthesis threshold (introduced 2026-05-17): the cosine
-// similarity threshold for reflection synthesis is no longer hardcoded.
-// `storeReflectionWithSynthesis` defaults to looking up the active
-// backend's `recommendedSynthesisThreshold` (see EmbeddingBackend.swift).
-// NLContextual = 0.85 (empirically calibrated). Nomic and EmbeddingGemma
-// are placeholders pending corpus calibration.
-//
-// Most access to MemoryStore internals (db pointer, embedding helpers,
-// cosineSimilarity) is via internal-level (default) members of MemoryStore.
-// One exception: `ensureHealthyConnection` was previously `private`. It's
-// referenced throughout this file, so it was promoted from `private` to
-// default-internal in the same change that created this file. That's a
-// privacy widening within the app, not exposure outside the module.
+// Per-backend synthesis threshold: the cosine similarity threshold for
+// reflection synthesis is not hardcoded. storeReflectionWithSynthesis
+// defaults to the active backend's recommendedSynthesisThreshold (see
+// EmbeddingBackend.swift). NLContextual = 0.85 (empirically calibrated);
+// other backends are placeholders pending corpus calibration.
 
 import Foundation
 import NaturalLanguage
 import SQLite3 // Direct C API; matches Hal.swift import for the same reason.
 
-// ==== LEGO START: 4.1 MemoryStore (Self-Knowledge CRUD - Phase 2) ====
+// ==== LEGO START: 35 Self-Knowledge Engine (CRUD) ====
 
     // MARK: - Phase 2 Self-Knowledge Methods
     
@@ -1251,8 +1222,8 @@ import SQLite3 // Direct C API; matches Hal.swift import for the same reason.
         }
     }
 
-// ==== LEGO END: 4.1 MemoryStore (Self-Knowledge CRUD - Phase 2) ====
-// ==== LEGO START: 4.2 MemoryStore (Self-Knowledge Maintenance) ====
+// ==== LEGO END: 35 Self-Knowledge Engine (CRUD) ====
+// ==== LEGO START: 36 Self-Knowledge Engine (Maintenance) ====
 
     // MARK: - Self-Knowledge Maintenance & Decay
     
@@ -1705,8 +1676,8 @@ import SQLite3 // Direct C API; matches Hal.swift import for the same reason.
         }
     }
 
-// ==== LEGO END: 4.2 MemoryStore (Self-Knowledge Maintenance) ====
-// ==== LEGO START: 4.3 MemoryStore (Self-Reflection Orchestration) ====
+// ==== LEGO END: 36 Self-Knowledge Engine (Maintenance) ====
+// ==== LEGO START: 37 Self-Knowledge Engine (Self-Reflection Orchestration) ====
 
     // MARK: - Self-Reflection System
 
@@ -2363,4 +2334,4 @@ import SQLite3 // Direct C API; matches Hal.swift import for the same reason.
         }
     }
 
-// ==== LEGO END: 4.3 MemoryStore (Self-Reflection Orchestration) ====
+// ==== LEGO END: 37 Self-Knowledge Engine (Self-Reflection Orchestration) ====

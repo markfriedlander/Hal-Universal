@@ -1,27 +1,24 @@
+// ==== LEGO START: 32 Embedder Migration Coordinator (Download + Switch + Backfill) ====
 // EmbedderMigrationCoordinator.swift
 // Hal Universal
 //
-// Extracted from Hal.swift 2026-05-17 afternoon as part of the standing
-// refactor-as-you-go directive.
-//
 // Drives the user-facing flow for switching the embedding backend:
 //   1. Download a non-built-in backend's model files (e.g. Nomic Embed
-//      Text v1.5 ~522 MB, or mxbai ~670 MB) via the existing
-//      MLXModelDownloader / BackgroundDownloadCoordinator pipeline.
-//   2. Switch the active backend (UserDefaults). As of v2.1 step 2 this is
-//      NON-destructive: each backend has its own vector column
-//      (embedding_nl / embedding_nomic / embedding_mxbai), so switching
-//      never wipes anything.
+//      Text v1.5, or mxbai) via the MLXModelDownloader /
+//      BackgroundDownloadCoordinator pipeline.
+//   2. Switch the active backend (UserDefaults). Non-destructive: each
+//      backend has its own vector column (embedding_nl / embedding_nomic /
+//      embedding_mxbai), so switching never wipes anything.
 //   3. Backfill the newly active backend's column in the background for any
 //      rows it hasn't embedded yet (a no-op when switching back to one that
 //      was already filled — so a re-switch is instant with nothing to redo).
 //
-// Two-way: every step is reversible, and switching back is instant because
-// the other backends' vectors were never discarded.
+// Every step is reversible, and switching back is instant because the
+// other backends' vectors were never discarded.
 //
-// State is a single @Published `phase`. The UI observes it to render
-// the appropriate label + progress (download progress bar, then migration
-// row counter, then idle). Errors land as an .error phase that the user
+// State is a single @Published `phase`. The UI observes it to render the
+// appropriate label + progress (download progress bar, then migration row
+// counter, then idle). Errors land as an .error phase that the user
 // dismisses to retry.
 
 import Foundation
@@ -547,3 +544,4 @@ struct EmbedderMigrationStatusRow: View {
         }
     }
 }
+// ==== LEGO END: 32 Embedder Migration Coordinator (Download + Switch + Backfill) ====

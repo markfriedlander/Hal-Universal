@@ -1,51 +1,114 @@
-// ==== LEGO START: 01 Imports & App Entry & Environment Wiring ====
+// ==== LEGO START: 1 Imports & App Entry & Environment Wiring ====
+//
+//  Hal.swift — Hal Universal's core: the memory store (SQLite + RAG),
+//  LLM routing (Apple Foundation Models + MLX), prompt assembly, and the
+//  SwiftUI chat surface. The largest source file; supporting subsystems
+//  live in their own files, all indexed below.
+//
+//  ============================================================
+//  MASTER LEGO INDEX
+//  Every source file and every LEGO block, in the order
+//  sync_hal_source.sh concatenates them into Hal_Source.txt (which is
+//  bundled and ingested so Hal can read his own architecture). Blocks
+//  form a single gapless sequence, numbered from 1. scripts/validate_lego.py
+//  keeps this index honest against the real markers.
+//  ============================================================
 //
 //  Hal.swift
-//  HalChatiOS
+//    1  Imports & App Entry & Environment Wiring
+//    2  ChatMessage, UnifiedSearchContext, MemoryStore (Part 1)
+//    3  MemoryStore (Part 2 - Schema, Encryption, Stats, Self-Knowledge)
+//    4  MemoryStore (Part 3 - Storing Turns & Entities)
+//    5  MemoryStore (Part 4 - Entities, Embeddings, Search)
+//    6  MemoryStore (Part 5 - Retrieval & Debug Functions)
+//    7  MemoryStore (Part 6 - Search Functions with Full Metadata)
+//    8  HalModelLimits Configuration
+//    9  Prompt Segment Budgeting & Compression
+//   10  MLXWrapper & LLMService (Foundation + MLX Routing)
+//   11  Text Summarization Utilities (LLM + Verification)
+//   12  Model Library UI
+//   13  UI Helper Components
+//   14  SelfReflectionView (Read-Only Viewer)
+//   15  ShareSheet (Export Utility)
+//   16  View Extensions (cornerRadius & conditional modifier)
+//   17  ChatViewModel (Core Properties & Init)
+//   18  ChatViewModel (Memory Stats & Summarization)
+//   19  ChatViewModel (MLX Model Management)
+//   20  ChatViewModel (Session Tracking & Main Prompt Builder)
+//   21  ChatViewModel (Temporal Context Builder)
+//   22  ChatViewModel (Self-Awareness Context Builder)
+//   23  ChatViewModel (Self-Knowledge Context Builder)
+//   24  ChatViewModel (Send Message Flow)
+//   25  ChatViewModel (Short-Term Memory Helpers)
+//   26  ChatViewModel (Repetition Removal Utility)
+//   27  ChatViewModel (Conversation & Database Reset)
+//   28  ChatViewModel (Export Chat History)
+//   29  DocumentPicker (UIKit Bridge)
 //
-//  Hal.swift â€” Core Application Source
-//  Architecture Overview:
-//  - Integrates Apple FoundationModels and MLX frameworks under LLMService.
-//  - Uses LEGO-block modular structure (01â€“29) for deterministic editing.
-//  - Includes on-device inference, streaming UI, and context-managed memory.
-//  - MLXWrapper supports Phi-3 and similar models via MLX Swift APIs.
-//  - MemoryStore uses SQLite with schema, embeddings, and semantic search.
+//  EmbeddingBackend.swift
+//   30  Embedding Backends (NLContextual + Nomic + mxbai)
 //
-//  - LEGO Index
-// 01  Imports & App Entry & Environment Wiring
-// 02  ChatMessage, UnifiedSearchContext, MemoryStore (Part 1)
-// 03  MemoryStore (Part 2 â€“ Schema, Encryption, Stats)
-// 04  MemoryStore (Part 3 â€“ Storing Turns & Entities)
-// 05  MemoryStore (Part 4 â€“ Entities, Embeddings, Search)
-// 06  MemoryStore (Part 5 â€“ Retrieval, Debug, Semantic Search)
-// 07  MemoryStore (Part 6 â€“ Full Search Flow) & LLMType Enum
-// 08  MLXWrapper & LLMService (Foundation + MLX Routing)
-// 09  App Entry & iOSChatView (UI Shell)
-// 10  ActionsView (Settings, Import/Export, Model Picker)
-// 11  ActionsView (Phi-3 Management & Power Tools)
-// 12  ActionsView (License & Status Helpers)
-// 12.5 SystemPromptEditorView (Power User Tool)
-// 13  ChatBubbleView & TimerView (Message UI Components)
-// 14  PromptDetailView (Full Prompt & Context Viewer)
-// 15  ShareSheet (Export Utility)
-// 16  View Extensions (cornerRadius & conditional modifier)
-// 17  ChatViewModel (Core Properties & Init)
-// 18  ChatViewModel (Memory Stats & Summarization)
-// 19  ChatViewModel (Phi-3 MLX Integration)
-// 20  ChatViewModel (Prompt History Builder)
-// 21  ChatViewModel (Send Message Flow)
-// 22  ChatViewModel (Short-Term Memory Helpers)
-// 23  ChatViewModel (Repetition Removal Utility)
-// 24  ChatViewModel (Conversation & Database Reset)
-// 25  ChatVM â€” Export Chat History
-// 26  DocumentPicker (UIKit Bridge)
-// 27  DocumentImportManager (Ingest & Entities)
-// 28  Import Models (ProcessedDocument & Summary)
-// 29  MLX Model Downloader (Singleton)
-// 30  Model Catalog Service (Hugging Face Integration)
-// 32  HalTestConsole (macOS only — file-based test harness for pipeline diagnostics)
+//  EmbeddingProvider.swift
+//   31  EmbeddingProvider (Active-Backend Wrapper)
 //
-
+//  EmbedderMigrationCoordinator.swift
+//   32  Embedder Migration Coordinator (Download + Switch + Backfill)
+//
+//  QueryExpansion.swift
+//   33  Query Expansion (LLM-Assisted Weak-Retrieval Recovery)
+//
+//  PromptDetailView.swift
+//   34  PromptDetailView (Color-Coded Prompt Inspector)
+//
+//  SelfKnowledgeEngine.swift
+//   35  Self-Knowledge Engine (CRUD)
+//   36  Self-Knowledge Engine (Maintenance)
+//   37  Self-Knowledge Engine (Self-Reflection Orchestration)
+//
+//  TraitCrystallizer.swift
+//   38  TraitCrystallizer (Reflection -> Trait Promotion)
+//
+//  ProcessMemoryGuard.swift
+//   39  ProcessMemoryGuard (Load-Time Memory Headroom)
+//
+//  MaintenanceTasks.swift
+//   40  MaintenanceTasks (Launch Housekeeping)
+//
+//  PrivacyMonitor.swift
+//   41  Privacy Lock (Network Monitor, Lock Truth Table, Popover)
+//
+//  SharedModelStore.swift
+//   42  Shared Model Store (App-Group Paths)
+//   43  Shared Model Store (Refcount Manifest)
+//   44  Shared Model Store (Cross-App Download Lock)
+//
+//  MLXModelDownloader.swift
+//   45  BackgroundDownloadCoordinator + MLXModelDownloader
+//
+//  ModelCatalogService.swift
+//   46  Model Catalog Service (Hugging Face Integration)
+//
+//  LocalAPIServer.swift
+//   47  Developer API (HTTP Server + File-Channel Test Console)
+//
+//  DocumentImportManager.swift
+//   48  DocumentImportManager (Ingest & Entities)
+//   49  DOCX Parser (MiniZip + XML Text Extraction)
+//   50  Import Models (ProcessedDocument & Summary)
+//
+//  SettingsViews.swift
+//   51  Main Settings (ActionsView)
+//   52  PowerUserView
+//   53  SystemPromptEditorView
+//   54  ModelFramingDetailView
+//   55  SalonModeView (Multi-LLM Configuration)
+//
+//  ChatViews.swift
+//   56  App Entry & iOSChatView (UI Shell)
+//   57  ThreadPanelView
+//   58  ChatBubbleView & TimerView (Message UI Components)
+//   59  MarkdownView (Block-Level Markdown Renderer)
+//
 import SwiftUI
 import Foundation
 import Combine
@@ -233,10 +296,10 @@ struct ThreadRecord: Identifiable, Equatable {
     var lastActiveAt: Int
 }
 
-// ==== LEGO END: 01 Imports & App Entry & Environment Wiring ====
+// ==== LEGO END: 1 Imports & App Entry & Environment Wiring ====
 
 
-// ==== LEGO START: 02 ChatMessage, UnifiedSearchContext, MemoryStore (Part 1) ====
+// ==== LEGO START: 2 ChatMessage, UnifiedSearchContext, MemoryStore (Part 1) ====
 
 // MARK: - Token Breakdown Structure
 struct TokenBreakdown: Equatable {
@@ -874,11 +937,11 @@ class MemoryStore: ObservableObject {
     }
 
 
-// ==== LEGO END: 02 ChatMessage, UnifiedSearchContext, MemoryStore (Part 1) ====
+// ==== LEGO END: 2 ChatMessage, UnifiedSearchContext, MemoryStore (Part 1) ====
     
     
     
-// ==== LEGO START: 03 MemoryStore (Part 2 - Schema, Encryption, Stats, Self-Knowledge) ====
+// ==== LEGO START: 3 MemoryStore (Part 2 - Schema, Encryption, Stats, Self-Knowledge) ====
 
                                     // Check if database connection is healthy, reconnect if needed.
                                     // nonisolated so it's callable from SegmentCompressor's actor
@@ -1778,11 +1841,11 @@ class MemoryStore: ObservableObject {
                                         return cleaned
                                     }
 
-// ==== LEGO END: 03 MemoryStore (Part 2 - Schema, Encryption, Stats, Self-Knowledge) ====
+// ==== LEGO END: 3 MemoryStore (Part 2 - Schema, Encryption, Stats, Self-Knowledge) ====
 
 
     
-// ==== LEGO START: 04 MemoryStore (Part 3 – Storing Turns & Entities) ====
+// ==== LEGO START: 4 MemoryStore (Part 3 - Storing Turns & Entities) ====
 
                         
                         // Close database connection properly
@@ -2087,7 +2150,7 @@ class MemoryStore: ObservableObject {
                         // Note: Entity extraction functions implemented below in this extension
                     }
 
-// ==== LEGO END: 04 MemoryStore (Part 3 – Storing Turns & Entities) ====
+// ==== LEGO END: 4 MemoryStore (Part 3 - Storing Turns & Entities) ====
 
 
 
@@ -2100,7 +2163,7 @@ class MemoryStore: ObservableObject {
 
 
 
-// ==== LEGO START: 05 MemoryStore (Part 4 â€“ Entities, Embeddings, Search) ====
+// ==== LEGO START: 5 MemoryStore (Part 4 - Entities, Embeddings, Search) ====
 
 // MARK: - Enhanced Notification Extensions (from Hal10000App.swift)
 extension Notification.Name {
@@ -2249,10 +2312,10 @@ extension MemoryStore {
     }
 }
 
-// ==== LEGO END: 05 MemoryStore (Part 4 â€“ Entities, Embeddings, Search) ====
+// ==== LEGO END: 5 MemoryStore (Part 4 - Entities, Embeddings, Search) ====
 
 
-// ==== LEGO START: 06 MemoryStore (Part 5 – Retrieval & Debug Functions) ====
+// ==== LEGO START: 6 MemoryStore (Part 5 - Retrieval & Debug Functions) ====
 
 // MARK: - Conversation Message Retrieval with Enhanced Schema (from Hal10000App.swift)
 extension MemoryStore {
@@ -2532,11 +2595,11 @@ extension MemoryStore {
     }
 }
 
-// ==== LEGO END: 06 MemoryStore (Part 5 – Retrieval & Debug Functions) ====
+// ==== LEGO END: 6 MemoryStore (Part 5 - Retrieval & Debug Functions) ====
         
 
                 
-// ==== LEGO START: 07 MemoryStore (Part 6 â€“ Search Functions with Full Metadata) ====
+// ==== LEGO START: 7 MemoryStore (Part 6 - Search Functions with Full Metadata) ====
 
 extension MemoryStore {
     
@@ -3979,11 +4042,11 @@ extension MemoryStore {
     }
 }
 
-// ==== LEGO END: 07 MemoryStore (Part 6 â€“ Search Functions with Full Metadata) ====
+// ==== LEGO END: 7 MemoryStore (Part 6 - Search Functions with Full Metadata) ====
 
 
 
-// ==== LEGO START: 07.5 HalModelLimits Configuration ====
+// ==== LEGO START: 8 HalModelLimits Configuration ====
 
 
 // MARK: - Centralized Hal Model Limits Configuration
@@ -4137,11 +4200,11 @@ struct HalModelLimits {
 }
 
 
-// ==== LEGO END: 07.5 HalModelLimits Configuration ====
+// ==== LEGO END: 8 HalModelLimits Configuration ====
 
 
 
-// ==== LEGO START: 07.6 Prompt Segment Budgeting & Compression ====
+// ==== LEGO START: 9 Prompt Segment Budgeting & Compression ====
 //
 // Implements the per-segment pre-flight check + compression architecture
 // described in Docs/Context_Budget_Implementation_Plan_2026-05-16.md.
@@ -4655,11 +4718,11 @@ extension MemoryStore: CompressedSegmentCache {
     }
 }
 
-// ==== LEGO END: 07.6 Prompt Segment Budgeting & Compression ====
+// ==== LEGO END: 9 Prompt Segment Budgeting & Compression ====
 
 
 
-// ==== LEGO START: 08 MLXWrapper & LLMService (Foundation + MLX Routing) ====
+// ==== LEGO START: 10 MLXWrapper & LLMService (Foundation + MLX Routing) ====
 
 // MARK: - Truncation-safe response trimming
 //
@@ -6037,11 +6100,11 @@ class LLMService: ObservableObject {
     }
 }
 
-// ==== LEGO END: 08 MLXWrapper & LLMService (Foundation + MLX Routing) ====
+// ==== LEGO END: 10 MLXWrapper & LLMService (Foundation + MLX Routing) ====
 
 
 
-// ==== LEGO START: 8.5 Text Summarization Utilities (LLM + Verification) ====
+// ==== LEGO START: 11 Text Summarization Utilities (LLM + Verification) ====
 
 // MARK: - Text Summarization with Verification
 // Battle-tested logic adapted from WikiDB's UnifiedSummarizer
@@ -6534,39 +6597,14 @@ struct TextSummarizer {
     }
 }
 
-// ==== LEGO END: 8.5 Text Summarization Utilities (LLM + Verification) ====
+// ==== LEGO END: 11 Text Summarization Utilities (LLM + Verification) ====
 
 
 
-// ==== LEGO START: 09 App Entry & iOSChatView (UI Shell) ====
-//
-// EXTRACTED 2026-05-26 (refactor #6): LEGO 09 and 09.5 now live
-// together with LEGO 13 + 13.5 in `Hal Universal/ChatViews.swift`.
-// Same Swift module — fully accessible from this file. The @main
-// `Hal10000App` struct (the app entry point) moved with the lift.
-//
-// ==== LEGO END: 09.5 ThreadPanelView ====
-
-
-// ==== LEGO START: 10.1 MainSettingsView ====
-//
-// EXTRACTED 2026-05-26 (refactor #5): LEGO 10.1, 10.2, 10.3,
-// 10.3.5, and 10.4 now live together in
-// `Hal Universal/SettingsViews.swift`. Same Swift module — fully
-// accessible from this file. The five LEGO blocks are preserved
-// verbatim inside the new file so the numbering chain still
-// reads end-to-end through Hal_Source.txt.
-//
-// Naming note: the LEGO 10.1 title says "MainSettingsView" but
-// the actual entry-point struct is `ActionsView` (historical
-// holdover from v1.x). Search SettingsViews.swift for `ActionsView`
-// when you want the top-level settings sheet.
-//
-// ==== LEGO END: 10.4 SalonModeView (Multi-LLM Configuration) ====
 
 
 
-// ==== LEGO START: 11.5 Model Library UI ====
+// ==== LEGO START: 12 Model Library UI ====
 
 // MARK: - Unified Model Status Dot
 //
@@ -7616,10 +7654,10 @@ struct ModelLicenseSheet: View {
     }
 }
 
-// ==== LEGO END: 11.5 Model Library UI ====
+// ==== LEGO END: 12 Model Library UI ====
 
 
-// ==== LEGO START: 11.6 UI Helper Components ====
+// ==== LEGO START: 13 UI Helper Components ====
 
 // MARK: - Reusable UI Helper Components
 // These components eliminate deep nesting and provide consistent UI patterns throughout the app.
@@ -8092,11 +8130,11 @@ struct WidgetTestView: View {
     }
 }
 
-// ==== LEGO END: 11.6 UI Helper Components ====
+// ==== LEGO END: 13 UI Helper Components ====
     
 
     
-// ==== LEGO START: 12.6 SelfReflectionView (Read-Only Viewer) ====
+// ==== LEGO START: 14 SelfReflectionView (Read-Only Viewer) ====
 
     struct SelfReflectionView: View {
         @Environment(\.dismiss) var dismiss
@@ -8535,33 +8573,10 @@ struct WidgetTestView: View {
         }
     }
 
-// ==== LEGO END: 12.6 SelfReflectionView (Read-Only Viewer) ====
+// ==== LEGO END: 14 SelfReflectionView (Read-Only Viewer) ====
 
 
     
-// ==== LEGO START: 13 ChatBubbleView & TimerView (Message UI Components) ====
-//
-// EXTRACTED 2026-05-26 (refactor #6): LEGO 13 and 13.5 now live
-// together with LEGO 09 + 09.5 in `Hal Universal/ChatViews.swift`.
-// Same Swift module — fully accessible from this file. LEGO 13's
-// orphan 4-space indentation was stripped during the lift
-// (cosmetic; no behavior change). LEGO markers preserved verbatim
-// inside the new file.
-//
-// ==== LEGO END: 13.5 MarkdownView (Block-Level Markdown Renderer) ====
-
-
-    
-    
-    
-// ==== LEGO START: 14 PromptDetailView (extracted file) ====
-    // PromptDetailView was extracted to Hal Universal/PromptDetailView.swift
-    // on 2026-05-17 as part of the color-coded-segments + collapsible-
-    // sections rebuild. The legacy single-blob viewer that lived here is
-    // gone — see PromptDetailView.swift for the current implementation.
-    // The contextMenu entry that surfaces it lives on ChatBubbleView's
-    // assistant-side branch (LEGO 13).
-// ==== LEGO END: 14 PromptDetailView (extracted file) ====
     
     
     
@@ -9975,7 +9990,7 @@ class ChatViewModel: ObservableObject {
 
     
     
-// ==== LEGO START: 20.1 ChatViewModel (Session Tracking & Main Prompt Builder) ====
+// ==== LEGO START: 20 ChatViewModel (Session Tracking & Main Prompt Builder) ====
 
                                                                         
                                                                         // MARK: - Phase 1 Self-Knowledge: Session & Timing Tracking
@@ -10740,11 +10755,11 @@ class ChatViewModel: ObservableObject {
                                                                         }
 
 
-// ==== LEGO END: 20.1 ChatViewModel (Session Tracking & Main Prompt Builder) ====
+// ==== LEGO END: 20 ChatViewModel (Session Tracking & Main Prompt Builder) ====
     
     
     
-// ==== LEGO START: 20.2 ChatViewModel (Temporal Context Builder) ====
+// ==== LEGO START: 21 ChatViewModel (Temporal Context Builder) ====
 
                                                 // MARK: - Phase 1 Self-Knowledge: Temporal Context Builder
                                                 
@@ -10902,11 +10917,11 @@ class ChatViewModel: ObservableObject {
                                                 }
                                                 
                                                 
-// ==== LEGO END: 20.2 ChatViewModel (Temporal Context Builder) ====
+// ==== LEGO END: 21 ChatViewModel (Temporal Context Builder) ====
     
     
 
-// ==== LEGO START: 20.3 ChatViewModel (Self-Awareness Context Builder) ====
+// ==== LEGO START: 22 ChatViewModel (Self-Awareness Context Builder) ====
 
                                             // MARK: - Phase 1 Self-Knowledge: Self-Awareness Context Builder
                                             
@@ -10918,9 +10933,11 @@ class ChatViewModel: ObservableObject {
                                             // - Conversation count: How many separate threads I've had (across all time)
                                             // - Message count: Total turns of dialogue (my experience depth)
                                             // - Documents processed: How much external knowledge I've ingested
-                                            // - Available models: What "brains" can process for me (AFM, Phi-3, Llama, etc.)
+                                            // - Available models: What "brains" can process for me (Apple Foundation Models,
+                                            //   plus any on-device MLX models the user has downloaded)
                                             // - Memory system: How I store and recall information (SQLite RAG with semantic search)
-                                            // - Architecture: How I'm built (30 LEGO blocks of Swift code - modular and transparent)
+                                            // - Architecture: How I'm built (modular Swift in numbered LEGO blocks - see the
+                                            //   master index at the top of Hal.swift)
                                             // - Session duration: How long this conversation has been going (helps infer user fatigue)
                                             // - App uptime: How long the app has been running (helps infer user fatigue)
                                             //
@@ -10998,7 +11015,7 @@ class ChatViewModel: ObservableObject {
                                                 - Currently using: \(activeModel)
                                                 - Available models: \(modelList)
                                                 - Memory system: SQLite-based RAG with semantic search across all conversations
-                                                - Architecture: 32 modular LEGO blocks of Swift code (you can read your own source)
+                                                - Architecture: modular Swift, organized into numbered LEGO blocks you can read in your own source
                                                 - Storage: All memories persistent via encrypted local database
                                                 
                                                 Temporal context (helps infer user fatigue):
@@ -11038,11 +11055,11 @@ class ChatViewModel: ObservableObject {
                                             }
 
                                             
-// ==== LEGO END: 20.3 ChatViewModel (Self-Awareness Context Builder) ====
+// ==== LEGO END: 22 ChatViewModel (Self-Awareness Context Builder) ====
 
 
     
-// ==== LEGO START: 20.4 ChatViewModel (Self-Knowledge Context Builder) ====
+// ==== LEGO START: 23 ChatViewModel (Self-Knowledge Context Builder) ====
 
                                         // MARK: - Phase 2 Self-Knowledge: Persistent Identity Context Builder
                                         
@@ -11198,11 +11215,11 @@ class ChatViewModel: ObservableObject {
                                         }
 
                                         
-// ==== LEGO END: 20.4 ChatViewModel (Self-Knowledge Context Builder) ====
+// ==== LEGO END: 23 ChatViewModel (Self-Knowledge Context Builder) ====
 
 
     
-// ==== LEGO START: 21 ChatViewModel (Send Message Flow) ====
+// ==== LEGO START: 24 ChatViewModel (Send Message Flow) ====
 
                                                                 @Published var showInlineDetails: Bool = false
 
@@ -12309,11 +12326,11 @@ class ChatViewModel: ObservableObject {
                                                                     )
                                                                 }
 
-// ==== LEGO END: 21 ChatViewModel (Send Message Flow) ====
+// ==== LEGO END: 24 ChatViewModel (Send Message Flow) ====
     
 
     
-// ==== LEGO START: 22 ChatViewModel (Short-Term Memory Helpers) ====
+// ==== LEGO START: 25 ChatViewModel (Short-Term Memory Helpers) ====
         private func getShortTermTurns(currentTurns: Int) -> [Int] {
             if lastSummarizedTurnCount == 0 {
                 let startTurn = max(1, currentTurns - effectiveMemoryDepth + 1)
@@ -12373,10 +12390,10 @@ class ChatViewModel: ObservableObject {
             return history.trimmingCharacters(in: .whitespacesAndNewlines)
         }
 
-// ==== LEGO END: 22 ChatViewModel (Short-Term Memory Helpers) ====
+// ==== LEGO END: 25 ChatViewModel (Short-Term Memory Helpers) ====
     
 
-// ==== LEGO START: 23 ChatViewModel (Repetition Removal Utility) ====
+// ==== LEGO START: 26 ChatViewModel (Repetition Removal Utility) ====
     // MARK: - Simplified Repetition Removal (removed hardcoded phrases)
     func removeRepetitivePatterns(from text: String) -> String {
         var cleanedText = text
@@ -12435,11 +12452,11 @@ class ChatViewModel: ObservableObject {
         return finalCleanedText
     }
 
-// ==== LEGO END: 23 ChatViewModel (Repetition Removal Utility) ====
+// ==== LEGO END: 26 ChatViewModel (Repetition Removal Utility) ====
     
 
     
-// ==== LEGO START: 24 ChatViewModel (Conversation & Database Reset) ====
+// ==== LEGO START: 27 ChatViewModel (Conversation & Database Reset) ====
     // Clear all messages and reset conversation state
     func startNewConversation() {
         messages.removeAll()
@@ -12473,11 +12490,11 @@ class ChatViewModel: ObservableObject {
         print("HALDEBUG-UI: Nuclear reset process complete")
     }
 }
-// ==== LEGO END: 24 ChatViewModel (Conversation & Database Reset) ====
+// ==== LEGO END: 27 ChatViewModel (Conversation & Database Reset) ====
 
 
 
-// ==== LEGO START: 25 ChatVM â€” Export Chat History ====
+// ==== LEGO START: 28 ChatViewModel (Export Chat History) ====
 // MARK: - ChatViewModel Extension for Export (Text-based Export)
 extension ChatViewModel {
     func exportChatHistory() -> String {
@@ -12541,11 +12558,11 @@ extension ChatViewModel {
         return exportContent
     }
 }
-// ==== LEGO END: 25 ChatVM â€” Export Chat History ====
+// ==== LEGO END: 28 ChatViewModel (Export Chat History) ====
 
 
 
-// ==== LEGO START: 26 DocumentPicker (UIKit Bridge) ====
+// ==== LEGO START: 29 DocumentPicker (UIKit Bridge) ====
 // MARK: - DocumentPicker (iOS-Specific Document Picker)
 struct DocumentPicker: UIViewControllerRepresentable {
     @Environment(\.dismiss) var dismiss
@@ -12608,52 +12625,7 @@ struct DocumentPicker: UIViewControllerRepresentable {
         }
     }
 }
-// ==== LEGO END: 26 DocumentPicker (UIKit Bridge) ====
+// ==== LEGO END: 29 DocumentPicker (UIKit Bridge) ====
 
 
 
-// ==== LEGO START: 27 DocumentImportManager (Ingest & Entities) ====
-//
-// EXTRACTED 2026-05-26 (refactor #4): LEGO 27, 27.1, and 28 now
-// live together in `Hal Universal/DocumentImportManager.swift`.
-// Same Swift module — fully accessible from this file via
-// DocumentImportManager.shared. The three LEGO blocks are
-// preserved verbatim inside the new file so the numbering chain
-// still reads end-to-end when sync_hal_source.sh concatenates
-// for Hal_Source.txt.
-//
-// ==== LEGO END: 28 Import Models (ProcessedDocument & Summary) ====
-
-
-
-// ==== LEGO 29: MLX Model Downloader — extracted 2026-05-26 ====
-//
-// BackgroundDownloadCoordinator + MLXModelDownloader + .mlxModelDidDownload
-// extension now live in Hal Universal/MLXModelDownloader.swift. Both
-// types are singletons (`.shared`) and reachable from any file in the
-// target. See the extracted file's header for module structure.
-// ==== END LEGO 29 ====
-
-
-
-
-// ==== LEGO START: 30 Model Catalog Service (Hugging Face Integration) ====
-//
-// EXTRACTED 2026-05-26: this block now lives in its own file at
-// `Hal Universal/ModelCatalogService.swift`. Contains ModelSource,
-// MaximScorecard, ModelSettings, ModelSettingsStore, ModelConfiguration
-// (with AFM + curated MLX seeds), HF API DTOs, ModelCatalogService
-// singleton, and CatalogError. Same Swift module — fully accessible
-// from this file without changes to call sites.
-//
-// ==== LEGO END: 30 Model Catalog Service (Hugging Face Integration) ====
-
-
-
-// EXTRACTED 2026-05-26 (refactor #3): the MemoryStore and
-// DocumentImportManager API-helper extensions, plus LEGO 32
-// (HalTestConsole + LocalAPIServer + shared executeCommand
-// dispatcher), now live in `Hal Universal/LocalAPIServer.swift`.
-// Same Swift module — fully accessible from this file. The LEGO
-// numbering chain ends here; new top-level subsystems belong in
-// their own files going forward, not new LEGO blocks.

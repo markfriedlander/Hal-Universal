@@ -1,104 +1,23 @@
 // ChatViews.swift
 // Hal Universal
 //
-// The user-facing chat surface. Every SwiftUI View struct the user
-// looks at when Hal is on screen — plus the app bootstrap scaffolding
-// that puts iOSChatView on screen in the first place. Extracted from
-// Hal.swift on 2026-05-26 as refactor #6 of the refactor-as-you-go
-// sweep.
+// The user-facing chat UI plus the app bootstrap that puts it on screen:
+// the @main entry point and HalAppDelegate, the iOSChatView chat shell,
+// the slide-out thread panel, the message-bubble renderer, and a small
+// zero-dependency block-level markdown renderer. See the master index in
+// Hal.swift for this file's blocks.
 //
-// Four LEGO blocks preserved below as this file's outline:
-//
-//   LEGO 09   — App bootstrap. `HistoricalContext` value type,
-//               `HalAppDelegate` (UIApplicationDelegate handling
-//               background-URLSession completion + watch-bridge
-//               bootstrap + embedding warm-up + MaintenanceTasks.
-//               runAtLaunch), `@main Hal10000App` (StateObject wiring
-//               for ChatViewModel / DocumentImportManager /
-//               MLXModelDownloader and the WindowGroup), and the
-//               primary `iOSChatView` chat surface. iOSChatView holds
-//               the ScrollViewReader + ForEach(messages) + composer
-//               and every .sheet presentation route (settings, thread
-//               panel, document picker, API-driven nav surfaces).
-//
-//   LEGO 09.5 — `ThreadPanelView`. Slide-out hamburger panel listing
-//               all conversation threads, most recent first. New-
-//               thread button, thread switching, swipe-to-delete with
-//               confirmation, "Reset Thread" semantics that special-
-//               case the currently-active thread.
-//
-//   LEGO 13   — Chat bubble rendering. `BubbleContainerWidthKey`
-//               PreferenceKey (the GeometryReader-based fix for
-//               rotation reflow), `ChatBubbleView` (the per-message
-//               bubble with user/assistant differentiation, partial-
-//               message timer, footer metadata, compression/truncation
-//               badge popover, context-menu actions for copy/share/
-//               inline-detail toggle, and PromptDetailView sheet
-//               trigger), `CompressionExplanationView` (popover
-//               content for the footer badge), and `TimerView`
-//               (TimelineView-based generation-time indicator).
-//
-//   LEGO 13.5 — `MarkdownView`. Zero-dependency block-level markdown
-//               renderer. `MDBlock` private enum + parser + per-block
-//               SwiftUI view dispatch. Handles headers, ordered/
-//               unordered lists, fenced code blocks, paragraphs;
-//               inline styles (bold, italic, inline code, links) via
-//               AttributedString.
-//
-// Why one file: all four are user-facing UI surfaces in the same
-// conceptual area ("the chat screen the user looks at, plus what
-// gets it on screen at launch"). They share helper sub-views and
-// EnvironmentObject bindings; the @main entry point, the chat shell,
-// the thread panel, the bubble renderer, and the markdown renderer
-// all live on the same code path that runs every time a user opens
-// the app. Splitting them would create a synthetic 2-3 file unit with
-// no reduction in coupling.
-//
-// Coupling profile (clean — recon 2026-05-26):
-//   - All ChatViewModel access is surface-level: reads of @Published
-//     properties (messages, threads, conversationId, currentMessage,
-//     isSendingMessage, showingSettings/showingThreadPanel/showing
-//     DocumentPicker, apiNav* sheet flags, salonConfig.activeSeats,
-//     showInlineDetails, messagesVersion), calls into explicit
-//     entry points (sendMessage, startNewConversation, switchToThread,
-//     loadThreads, exportChatHistory, exportChatHistoryDetailed), and
-//     UI-state toggle (showInlineDetails.toggle from a context menu).
-//   - Single reach-through: ThreadPanelView's resetThread calls
-//     chatViewModel.memoryStore.deleteThread(id:) — preserved as-is
-//     because going through ChatViewModel keeps thread-lifecycle
-//     observers wired correctly.
-//   - No mid-flow state access anywhere. Bug diagnosis path is
-//     unchanged from pre-extraction.
-//
-// Cosmetic fix applied during the lift: LEGO 13's contents were
-// indented 4 spaces for no structural reason (orphan indentation from
-// a long-ago refactor that removed an outer wrapper without
-// unindenting). Stripped during the cut. LEGO 13.5 was at proper
-// indentation already.
-//
-// Known follow-up (deferred): `HistoricalContext` is logically a
-// MemoryStore concept (carries conversationCount, relevantConversations,
-// contextSnippets, relevanceScores) that happens to be defined in
-// LEGO 09 for historical reasons. Used by
-// `MemoryStore.currentHistoricalContext` and one ChatBubbleView writer.
-// Left here for now to keep the LEGO 09 unit intact; could move to
-// MemoryStore eventually as a small targeted cleanup.
-//
-// Standing rules followed here:
-//   - LEGO markers preserved verbatim from Hal.swift so the numbering
-//     chain still reads end-to-end through Hal_Source.txt.
-//   - Comments throughout the body are evergreen — they explain why
-//     the code is shaped the way it is, including the screenWidth
-//     scene-resolution history, the rotation-reflow PreferenceKey
-//     fix, and the post-May-17 scroll behavior (single rule: user
-//     message scrolls to top on send, then user is in control).
+// Note: HistoricalContext (conversationCount, relevantConversations,
+// contextSnippets, relevanceScores) is defined here but is conceptually a
+// MemoryStore value type; it's used by MemoryStore.currentHistoricalContext
+// and one ChatBubbleView writer.
 
 import Foundation
 import SwiftUI
 import Combine
 import UIKit
 
-// ==== LEGO START: 09 App Entry & iOSChatView (UI Shell) ====
+// ==== LEGO START: 56 App Entry & iOSChatView (UI Shell) ====
 
 
 // MARK: - HistoricalContext (from Hal10000App.swift)
@@ -535,10 +454,10 @@ struct iOSChatView: View {
 }
 
 
-// ==== LEGO END: 09 App Entry & iOSChatView (UI Shell) ====
+// ==== LEGO END: 56 App Entry & iOSChatView (UI Shell) ====
 
 
-// ==== LEGO START: 09.5 ThreadPanelView ====
+// ==== LEGO START: 57 ThreadPanelView ====
 
 // MARK: - Thread Panel
 /// Slide-out panel accessed via hamburger icon. Lists all conversation threads, most recent first.
@@ -661,10 +580,10 @@ struct ThreadPanelView: View {
     }
 }
 
-// ==== LEGO END: 09.5 ThreadPanelView ====
+// ==== LEGO END: 57 ThreadPanelView ====
 
 
-// ==== LEGO START: 13 ChatBubbleView & TimerView (Message UI Components) ====
+// ==== LEGO START: 58 ChatBubbleView & TimerView (Message UI Components) ====
 
 // PreferenceKey used by ChatBubbleView to read the bubble's actual
 // container width via GeometryReader. This is what fixes rotation
@@ -1281,9 +1200,9 @@ struct TimerView: View {
         }
     }
 }
-// ==== LEGO END: 13 ChatBubbleView & TimerView (Message UI Components) ====
+// ==== LEGO END: 58 ChatBubbleView & TimerView (Message UI Components) ====
 
-// ==== LEGO START: 13.5 MarkdownView (Block-Level Markdown Renderer) ====
+// ==== LEGO START: 59 MarkdownView (Block-Level Markdown Renderer) ====
 
 // MARK: - Markdown Block Renderer
 // Parses markdown into typed blocks and renders each as a distinct SwiftUI view.
@@ -1458,4 +1377,4 @@ struct MarkdownView: View {
     }
 }
 
-// ==== LEGO END: 13.5 MarkdownView (Block-Level Markdown Renderer) ====
+// ==== LEGO END: 59 MarkdownView (Block-Level Markdown Renderer) ====

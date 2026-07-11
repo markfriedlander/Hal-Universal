@@ -1,21 +1,13 @@
+// ==== LEGO START: 39 ProcessMemoryGuard (Load-Time Memory Headroom) ====
 // ProcessMemoryGuard.swift
 // Hal Universal
 //
 // iOS process-memory introspection and load-time headroom waiting.
-// Created 2026-05-18 to address Item 11: Gemma jetsam crash during
-// model swap (see NEXT.md / HISTORY.md 2026-05-18).
+// Guards MLX model loads against jetsam: unloading a model and clearing
+// MLX's cache frees pages, but iOS reclaims Mach VM lazily, so a fresh
+// load can still cross the dirty-memory cliff and get the process killed.
 //
-// Background:
-//
-// During the Phase 2 live test, switching from Qwen 3.5 2B (loaded
-// with heavy chat context) to Gemma 4 E2B (3.4 GB) jetsam-killed Hal
-// mid-load. The MLX→MLX swap path correctly calls unloadModel() +
-// MLX.Memory.clearCache() before the new load, but iOS doesn't drop
-// the freed pages instantly — Mach VM reclamation is lazy. A fixed
-// 500 ms settle in the swap path was empirical and insufficient
-// under heavy prior load.
-//
-// Two-pronged fix lives in this file:
+// Two-pronged mechanism:
 //
 //   1. Pre-flight refusal. Before LLMModelFactory.shared.loadContainer
 //      runs (which mmaps the safetensors and faults pages), we check
@@ -23,44 +15,25 @@
 //      requirement. If insufficient, we surface a user-facing error
 //      instead of letting iOS terminate the process for jetsam.
 //
-//   2. Headroom poll. Replaces the fixed 500 ms swap-settle with a
-//      poll on `os_proc_available_memory()` every ~150 ms for up to
-//      `timeoutSeconds`. Returns as soon as the target is met, or on
-//      timeout (which the caller can either treat as fatal or pass
+//   2. Headroom poll. Polls `os_proc_available_memory()` every ~150 ms
+//      for up to `timeoutSeconds`, returning as soon as the target is
+//      met or on timeout (which the caller can treat as fatal or pass
 //      through to the pre-flight check).
 //
 // `os_proc_available_memory()` reports bytes remaining before the
 // process hits its current dirty-memory limit. It is iOS-only
-// (API_UNAVAILABLE(macos)); since Hal's iPhone target is the only
-// build that loads MLX models, this lives behind `#if !os(macOS)`
-// for safety in case future targets change.
+// (API_UNAVAILABLE(macos)); since Hal's iPhone target is the only build
+// that loads MLX models, this lives behind `#if !os(macOS)`.
 //
 // Required-memory formula (`requiredMemoryMBForLoad`):
 //
-//   sizeGB × 1024 × 0.75 + 250
+//   sizeGB * 1024 * 0.75 + 250
 //
-// where:
-//   - 0.75 ≈ effective dirty-memory ratio for 4-bit quantized
-//     safetensors loaded via mmap. Empirical: Qwen 3.5 2B is 1.8 GB
-//     on disk but reports ~1.0 GB MLX-active footprint when fully
-//     loaded (ratio 0.56); the 0.75 multiplier is a conservative
-//     ceiling that also covers tokenizer/vocab residency and the
-//     first prefill's scratch alloc.
-//   - 250 MB safety margin = process baseline (Swift/SwiftUI ~150 MB)
-//     + KV-cache headroom for the chat context + buffer above
-//     iOS's dirty-memory cliff so we don't dance on the jetsam line.
-//
+// where 0.75 is a conservative effective dirty-memory ratio for 4-bit
+// quantized safetensors loaded via mmap (also covering tokenizer/vocab
+// residency and the first prefill's scratch alloc), and 250 MB is a
+// safety margin above the process baseline and iOS's dirty-memory cliff.
 // For unknown `sizeGB` (catalog miss), conservatively assume 2.5 GB.
-//
-// Calibration note (Item 11, 2026-05-18): the first cut of this
-// formula used 1.05× and 300 MB margin, which refused Gemma 4 E2B
-// (3.6 GB) at cold launch where the iPhone 16 Plus reports only
-// ~3.3 GB available. That was over-conservative — Gemma loaded
-// fine in practice. The 0.75× ratio lets cold-launch Gemma succeed
-// (need 3015 MB, have ~3300) while still catching the swap-after-
-// heavy-context case that originally crashed Hal (~3271 MB available
-// after Qwen unload was below the 3015 MB Gemma threshold when
-// chat-context KV cache pressure inflated the actual need).
 
 import Foundation
 #if canImport(Darwin)
@@ -181,3 +154,4 @@ nonisolated func memoryRefusalMessage(
     let requiredStr = String(format: "%.1f GB", requiredGB)
     return "Not enough memory to load \(model.displayName) right now. I need roughly \(requiredStr) but only have \(availableStr) available. Try closing other apps, switching back to a smaller model, or restarting Hal — sometimes iOS needs a moment to reclaim memory after a model swap."
 }
+// ==== LEGO END: 39 ProcessMemoryGuard (Load-Time Memory Headroom) ====

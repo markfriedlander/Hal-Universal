@@ -1,23 +1,17 @@
+// ==== LEGO START: 34 PromptDetailView (Color-Coded Prompt Inspector) ====
 // PromptDetailView.swift
 // Hal Universal
 //
-// Created 2026-05-17 (per Mark's directive: "color-coded segments so
-// users can visually distinguish system prompt, self-knowledge, RAG
-// snippets, conversation history, and user message. Collapsible
-// sections for dense content. This is an educational surface and it
-// should feel like one.").
+// Shows the full prompt that produced a given assistant turn, broken into
+// structurally-meaningful, color-coded sections that the user can expand
+// and collapse independently. This is an educational surface: the colors
+// let users visually distinguish system prompt, self-knowledge, RAG
+// snippets, conversation history, and user message.
 //
-// The PromptDetailView shows the full prompt that produced a given
-// assistant turn, broken into structurally-meaningful, color-coded
-// sections that the user can expand and collapse independently.
 // Sections map to how Hal actually assembles his prompts in
-// buildChatMessages (system persona → temporal context → conversation
-// summary → self-awareness → self-knowledge → RAG snippets → watch
-// delivery → conversation history → current user input).
-//
-// Refactor-as-you-go: lives in its own file rather than nested inside
-// the iOSChatView struct (which is where the previous unused
-// PromptDetailView was defined).
+// buildChatMessages (system persona -> temporal context -> conversation
+// summary -> self-awareness -> self-knowledge -> RAG snippets ->
+// conversation history -> current user input).
 
 import SwiftUI
 
@@ -619,3 +613,4 @@ nonisolated func buildPromptDetailExportText(
     }
     return lines.joined(separator: "\n")
 }
+// ==== LEGO END: 34 PromptDetailView (Color-Coded Prompt Inspector) ====

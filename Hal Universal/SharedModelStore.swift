@@ -1,20 +1,19 @@
 // SharedModelStore.swift
 // Hal Universal
 //
-// Hal's half of the cross-app model-sharing contract (v2.1). This is a
-// deliberate near-verbatim port of Posey's `SharedModelStore.swift` — the two
-// apps MUST agree on the App Group id, the on-disk layout, AND the
-// `manifest.json` format, or sharing silently breaks. Posey shipped this
-// contract first (2026-06); Hal adopts it here so a model downloaded by either
-// app is a single shared copy both can load, and neither app's delete can pull
-// the files out from under the other.
+// Hal's half of the cross-app model-sharing contract. This is a
+// deliberate near-verbatim port of Posey's `SharedModelStore.swift` - the
+// two apps MUST agree on the App Group id, the on-disk layout, AND the
+// `manifest.json` format, or sharing silently breaks. It mirrors Posey so
+// a model downloaded by either app is a single shared copy both can load,
+// and neither app's delete can pull the files out from under the other.
 //
 // The shared container lives at:
-//   <AppGroup>/Models/huggingface/models/<repoID>/     ← MLX models + Nomic asset
-//   <AppGroup>/Models/manifest.json                    ← co-ownership refcount
+//   <AppGroup>/Models/huggingface/models/<repoID>/     <- MLX models + Nomic asset
+//   <AppGroup>/Models/manifest.json                    <- co-ownership refcount
 //
 // The `Models/` subfolder is Posey's namespacing (so other shared state can
-// coexist in the container later) and is part of the contract — Hal must match
+// coexist in the container later) and is part of the contract - Hal must match
 // it exactly or it looks one folder too high and sees nothing.
 //
 // Ownership: each app records a claim (its bundle id) on every model it uses.
@@ -25,7 +24,7 @@
 
 import Foundation
 
-// ========== BLOCK SMS.1: SHARED MODEL STORE - PATHS - START ==========
+// ==== LEGO START: 42 Shared Model Store (App-Group Paths) ====
 
 /// The on-device store for Hal's downloadable AI models (the MLX chat LLMs and
 /// the Nomic embedder asset), in the App Group container shared with Posey.
@@ -89,9 +88,9 @@ enum SharedModelStore {
         try? dir.setResourceValues(values)
     }
 }
-// ========== BLOCK SMS.1: SHARED MODEL STORE - PATHS - END ==========
+// ==== LEGO END: 42 Shared Model Store (App-Group Paths) ====
 
-// ========== BLOCK SMS.3: REFCOUNT MANIFEST (app-family co-ownership) - START ==========
+// ==== LEGO START: 43 Shared Model Store (Refcount Manifest) ====
 
 extension SharedModelStore {
 
@@ -185,9 +184,9 @@ extension SharedModelStore {
         }
     }
 }
-// ========== BLOCK SMS.3: REFCOUNT MANIFEST - END ==========
+// ==== LEGO END: 43 Shared Model Store (Refcount Manifest) ====
 
-// ========== BLOCK SMS.4: CROSS-APP DOWNLOAD LOCK - START ==========
+// ==== LEGO START: 44 Shared Model Store (Cross-App Download Lock) ====
 
 extension SharedModelStore {
 
@@ -349,4 +348,4 @@ extension SharedModelStore {
         }
     }
 }
-// ========== BLOCK SMS.4: CROSS-APP DOWNLOAD LOCK - END ==========
+// ==== LEGO END: 44 Shared Model Store (Cross-App Download Lock) ====

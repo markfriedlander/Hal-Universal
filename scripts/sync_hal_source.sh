@@ -16,9 +16,12 @@ REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 cd "$REPO_ROOT"
 
 # Order matters only for readability — the concatenation is for ingestion,
-# not compilation. Smaller / foundational files first; Hal.swift (the big
-# remainder) last.
+# not compilation. Hal.swift comes FIRST because its header carries the
+# MASTER LEGO INDEX (a table of contents for every file and block); the
+# supporting files follow. Reading order = LEGO numbering order = index
+# order, so Hal_Source.txt reads front-to-back as 1..N.
 FILES=(
+  "Hal Universal/Hal.swift"
   "Hal Universal/EmbeddingBackend.swift"
   "Hal Universal/EmbeddingProvider.swift"
   "Hal Universal/EmbedderMigrationCoordinator.swift"
@@ -36,7 +39,6 @@ FILES=(
   "Hal Universal/DocumentImportManager.swift"
   "Hal Universal/SettingsViews.swift"
   "Hal Universal/ChatViews.swift"
-  "Hal Universal/Hal.swift"
 )
 
 OUT="Hal Universal/Hal_Source.txt"

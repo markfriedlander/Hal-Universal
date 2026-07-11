@@ -1,16 +1,12 @@
+// ==== LEGO START: 40 MaintenanceTasks (Launch Housekeeping) ====
 // MaintenanceTasks.swift
 // Hal Universal
 //
-// Background housekeeping that runs once at app launch. Today: garbage-
-// collect cached model files for embedding backends that have been
-// removed from the codebase since the last install.
-//
-// Why this exists: when EmbeddingGemma was pulled in v2.0.1 (2026-05-20),
-// any user who had already downloaded its ~210 MB of weights (whether
-// via the pre-bug-fix App Store install, or a Debug build) would have
-// those files sitting orphaned in Caches/huggingface/models/. The
-// runtime path that uses them is commented out, so they're pure dead
-// weight on disk. Hal cleans them up automatically at next launch.
+// Background housekeeping that runs once at app launch:
+//   - garbage-collects cached model files for embedding backends that
+//     have been removed from the codebase, so retired weights don't sit
+//     orphaned on disk.
+//   - migrates legacy model caches into the shared App-Group store.
 //
 // Extensible by design: add a backend's modelID to
 // `removedEmbeddingBackendModelIDs` whenever a backend is retired, and
@@ -257,3 +253,4 @@ enum MaintenanceTasks {
         _ = SharedModelStore.releaseClaim(modelID: repoID)
     }
 }
+// ==== LEGO END: 40 MaintenanceTasks (Launch Housekeeping) ====

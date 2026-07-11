@@ -1,32 +1,30 @@
+// ==== LEGO START: 33 Query Expansion (LLM-Assisted Weak-Retrieval Recovery) ====
 // QueryExpansion.swift
 // Hal Universal
 //
-// LLM-driven query expansion for weak RAG retrieval. Created
-// 2026-05-17 afternoon. Design lives in NEXT.md (2026-05-17 entry).
+// LLM-driven query expansion for weak RAG retrieval.
 //
-// The premise: hybrid retrieval (semantic + BM25 + RRF) does well when
-// the query shares either content words or concept-level meaning with
-// stored memories. It fails when both signals are weak — e.g. "Where do
-// I live now?" against "house in Berkeley". Even Nomic Embed v1.5
-// (asymmetric-retrieval tuned) still misses "What kind of car?" → "Subaru
-// Outback" because neither side of the relationship has lexical overlap
-// or sufficient semantic proximity in the embedding space.
+// Hybrid retrieval (semantic + BM25 + RRF) does well when the query
+// shares either content words or concept-level meaning with stored
+// memories, and fails when both signals are weak — e.g. "Where do I live
+// now?" against "house in Berkeley", or "What kind of car?" against
+// "Subaru Outback", where neither side has lexical overlap or enough
+// semantic proximity.
 //
-// Fix: when the initial retrieval comes back weak, ask the active LLM
-// to extract 5-10 related concept terms for the query, then re-run the
-// BM25 side of the hybrid pipeline with `(original-tokens) OR (expansion-
-// tokens)`. Cache results in SQLite so repeated queries don't re-call
-// the LLM. AFM-safe — prompt + response budget is < 200 tokens total.
+// Fix: when the initial retrieval comes back weak, ask the active LLM to
+// extract 5-10 related concept terms for the query, then re-run the BM25
+// side of the hybrid pipeline with `(original-tokens) OR (expansion-
+// tokens)`. AFM-safe — prompt + response budget is < 200 tokens total.
 //
 // Trigger: top-1 RRF score < 0.020 AND top-1.isEntityMatch == false.
-// RRF max single-list score is 1/(60+1) ≈ 0.0164; both lists agreeing
-// yields ≈ 0.0328. Queries that fail consistently sit at ≈ 0.0164 with
-// isEntityMatch=false (semantic only, no BM25 contribution at all).
-// Working queries top out at ≈ 0.0323 with isEntityMatch=true.
+// RRF max single-list score is 1/(60+1) ~ 0.0164; both lists agreeing
+// yields ~ 0.0328. Consistently-failing queries sit at ~ 0.0164 with
+// isEntityMatch=false (semantic only, no BM25 contribution).
 //
-// Cache invalidation: clear on model switch (different models extract
-// different concepts) or on user request. The cache is keyed by
-// SHA-256 of the normalized (lowercased + trimmed) query.
+// Results are cached in SQLite, keyed by SHA-256 of the normalized
+// (lowercased + trimmed) query, so repeated queries don't re-call the
+// LLM. Invalidated on model switch (different models extract different
+// concepts) or on user request.
 
 import Foundation
 import CryptoKit
@@ -261,3 +259,4 @@ extension MemoryStore {
         return sqlite3_step(stmt) == SQLITE_ROW ? Int(sqlite3_column_int(stmt, 0)) : 0
     }
 }
+// ==== LEGO END: 33 Query Expansion (LLM-Assisted Weak-Retrieval Recovery) ====

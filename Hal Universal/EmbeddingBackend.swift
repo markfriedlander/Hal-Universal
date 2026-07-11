@@ -1,92 +1,39 @@
+// ==== LEGO START: 30 Embedding Backends (NLContextual + Nomic + mxbai) ====
 // EmbeddingBackend.swift
 // Hal Universal
 //
-// Extracted from Hal.swift 2026-05-17 afternoon as part of the standing
-// refactor-as-you-go directive. Lives separately so the embedder backend
-// system has a clearly named home and doesn't bloat Hal.swift further.
+// The switchable embedding-backend system: the backend enum, its per-backend
+// vector-column mapping, and the load/embed plumbing each backend needs.
 //
-// Two switchable embedding backends in v2.0.1+:
-//   - "nlcontextual" (default): NLContextualEmbedding, Apple's transformer-
-//     based replacement for the older NLEmbedding.sentenceEmbedding API.
-//     iOS 17+, on-device via Neural Engine, 512-dim, lazy asset download.
-//   - "nomicswift": Nomic AI's Nomic Embed Text v1.5, 137M params, 768-dim,
-//     via Apple's MLTensor (no MLX). Asymmetric retrieval, 522 MB on disk.
+// Two active backends:
+//   - "nlcontextual" (default): NLContextualEmbedding, Apple's on-device
+//     transformer embedder. 512-dim, lazy asset download.
+//   - "nomicswift": Nomic Embed Text v1.5, 768-dim, via Apple's MLTensor
+//     (no MLX). Asymmetric retrieval, ~522 MB on disk.
+// (mxbai is also selectable; its seed lives in ModelCatalogService.)
 //
-// The backend is selected via UserDefaults key "embeddingBackend"; default
-// is "nlcontextual". As of v2.1 step 2, each backend owns a permanent
-// per-backend vector column (`vectorColumn`) in unified_content and all
-// vector sets coexist — switching backends just reads a different column
-// (no destructive wipe). An inactive backend's column is filled in the
-// background by `MemoryStore.backfillEmbeddings(for:)`.
+// The active backend is chosen via the UserDefaults key "embeddingBackend"
+// (default "nlcontextual"). Each backend owns a permanent per-backend vector
+// column in unified_content and all vector sets coexist, so switching just
+// reads a different column - no destructive wipe. An inactive backend's
+// column is backfilled in the background by MemoryStore.backfillEmbeddings(for:).
 //
-// =====================================================================
-// HISTORY — EmbeddingGemma (removed 2026-05-20 as part of v2.0.1 hotfix)
-// =====================================================================
-//
-// A third backend, "embeddinggemma" (Google EmbeddingGemma 300M, MLX 4-bit,
-// 768-dim, ~210 MB), was added 2026-05-17 (Proposal A). It hit a hard wall:
-// the upstream MLX iOS Metal initializer crashes on iOS 26.5 the first
-// time the model loads. The crash is in MLX's framework code, not ours;
-// upstream fix is pending.
-//
-// We initially compile-gated it behind `HAL_ENABLE_EMBEDDING_GEMMA` so
-// Debug builds could iterate while Release shipped without it. That gate
-// allowed a subtle bug: `EmbedderMigrationCoordinator.startDownload()` was
-// hardcoded to download EmbeddingGemma's weights regardless of which
-// backend row the user actually tapped. In Release builds where the
-// Gemma row was filtered out of the UI, tapping Download on Nomic still
-// downloaded Gemma's weights (210 MB wasted, status messages mislabeled
-// "EmbeddingGemma already downloaded"). The mismatch between the
-// compile-gated UI surface and the un-gated download path is exactly the
-// kind of build-config drift the compile flag introduced.
-//
-// 2026-05-20 hotfix decision: remove the flag entirely. Comment out all
-// Gemma code so it's discoverable but completely inert in all builds.
-// No flag, no Debug/Release gap, no possibility of accidental Gemma
-// activation. Orphaned weights from prior installs are cleaned up by
-// MaintenanceTasks.runAtLaunch().
-//
-// =====================================================================
-// HOW TO RE-ENABLE EMBEDDINGGEMMA WHEN THE UPSTREAM FIX LANDS
-// =====================================================================
-//
-// All Gemma code is preserved as comments. To re-enable:
-//
-//  1. Uncomment in this file:
-//     - The `case embeddingGemma = "embeddinggemma"` enum case.
-//     - Each commented `case .embeddingGemma:` switch arm (10 sites).
-//     - The crash-guard block in `applyCrashGuardAtLaunch()`.
-//     - `crashGuardKey` if you want crash-guard semantics back.
-//
-//  2. Uncomment in EmbeddingProvider.swift:
-//     - The `import MLX / MLXEmbedders / MLXLMCommon / MLXHuggingFace /
-//       Tokenizers` block at the top.
-//     - The `gemmaContainer` / `gemmaLoadAttempted` stored properties.
-//     - The `.embeddingGemma:` arms in `embed()`, `isLoaded`, `warmUp()`.
-//     - The entire `embedEmbeddingGemma(_:)` + `ensureGemmaLoadedBlocking()`
-//       block at the bottom of the file.
-//
-//  3. Uncomment in EmbedderMigrationCoordinator.swift:
-//     - The Gemma-specific UI label fallback in `EmbedderMigrationStatusRow`
-//       (currently uses `activeBackend.displayName`, no change needed).
-//
-//  4. Uncomment in Hal.swift:
-//     - `import MLXEmbedders`.
-//     - The boot-time Gemma-specific warm-up delay (`if backendAtBoot ==
-//       .embeddingGemma { ... }`).
-//     - The `.embeddingGemma: sizeGB = 0.21` arm in DOWNLOAD_EMBEDDING_MODEL.
-//
-//  5. Run: search the codebase for `// REMOVED 2026-05-20:` — that
-//     prefix marks every commented-out region, so you can find them all
-//     with a single search and uncomment in one pass.
-//
-//  6. Remove this history block and rev the file header back to the
-//     three-backend prose at the top.
-//
-// The crash guard / `crashGuardKey` / `recordLoadAttempt` machinery was
-// specifically about Gemma's load instability. If a future third backend
-// has the same risk profile, the guard can be generalized.
-// =====================================================================
+// EmbeddingGemma is currently DISABLED: the upstream MLX iOS Metal initializer
+// crashes on first load (a framework bug, not ours; fix pending upstream). All
+// its code is preserved as comments, each tagged `// REMOVED 2026-05-20:` so a
+// single grep finds every region. Re-enable recipe:
+//   1. This file: uncomment the `case embeddingGemma` enum case, each
+//      `case .embeddingGemma:` switch arm (10 sites), and the crash-guard block
+//      in applyCrashGuardAtLaunch() (plus crashGuardKey for crash-guard semantics).
+//   2. EmbeddingProvider.swift: the MLX/MLXEmbedders/MLXLMCommon/MLXHuggingFace/
+//      Tokenizers import block, the gemmaContainer / gemmaLoadAttempted properties,
+//      the .embeddingGemma arms in embed()/isLoaded/warmUp(), and
+//      embedEmbeddingGemma(_:) + ensureGemmaLoadedBlocking() at the bottom.
+//   3. Hal.swift: `import MLXEmbedders`, the boot-time Gemma warm-up delay, and
+//      the `.embeddingGemma: sizeGB = 0.21` arm in DOWNLOAD_EMBEDDING_MODEL.
+//   4. Grep `// REMOVED 2026-05-20:` to find every region in one pass.
+// The crash-guard / recordLoadAttempt machinery was specific to Gemma's load
+// instability; generalize it if a future backend needs the same guard.
 
 import Foundation
 
@@ -401,3 +348,4 @@ nonisolated enum EmbeddingBackend: String, Sendable, CaseIterable {
         }
     }
 }
+// ==== LEGO END: 30 Embedding Backends (NLContextual + Nomic + mxbai) ====

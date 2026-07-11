@@ -2,75 +2,39 @@
 // Hal Universal
 //
 // The Settings + Actions UI surface — every View struct a user reaches
-// by tapping the gear icon. Extracted from Hal.swift on 2026-05-26 as
-// refactor #5 of the refactor-as-you-go sweep.
+// by tapping the gear icon. The pieces here:
 //
-// Naming note: the LEGO 10.1 block was historically titled
-// "MainSettingsView", but the actual entry-point struct in that block
-// is `ActionsView`. The name dates back to v1.x when Hal's settings
-// sheet was titled "Actions" in the UI; the struct kept the original
-// name through subsequent UI reorganizations. Don't be confused by the
-// LEGO title — `ActionsView` IS the top-level settings sheet that
-// iOSChatView presents.
+//   PowerUserMode enum + ActionsView — the user-facing entry sheet.
+//   Top-level rows: model picker, document import/export, memory tools,
+//   About, Developer API toggle, links into Power User and Salon Mode
+//   sheets. (Note: the entry-point struct is `ActionsView`, not
+//   `MainSettingsView` — the settings sheet is titled "Actions".)
 //
-// The five LEGO blocks preserved below are this file's outline:
+//   PowerUserView — single-LLM advanced configuration: temperature,
+//   memory depth, RAG budget, repetition controls, system-prompt
+//   framing, self-knowledge toggle. Drives ModelSettingsStore's
+//   per-model snapshot/apply flow on model switch.
 //
-//   LEGO 10.1   — `PowerUserMode` enum + `ActionsView` (the user-facing
-//                 entry sheet). Top-level rows: model picker, document
-//                 import/export, memory tools, About, Developer API
-//                 toggle, links into Power User and Salon Mode sheets.
+//   SystemPromptEditorView — multi-line editor with character counter
+//   and reset-to-default. Edits the user-authored Layer 2 of the
+//   effective system prompt (Layer 1 is the per-model framing on
+//   ModelConfiguration.layerOnePrompt).
 //
-//   LEGO 10.2   — `PowerUserView`. Single-LLM advanced configuration:
-//                 temperature, memory depth, RAG budget, repetition
-//                 controls, system-prompt framing, self-knowledge
-//                 toggle. The settings here drive `ModelSettingsStore`'s
-//                 per-model snapshot/apply flow on model switch.
+//   ModelFramingDetailView — read-only viewer for the current model's
+//   Layer 1 prompt + the toggle to enable/disable it per model, so
+//   users can see what framing each model carries.
 //
-//   LEGO 10.3   — `SystemPromptEditorView`. Multi-line editor with
-//                 character counter and reset-to-default. Edits the
-//                 user-authored Layer 2 of the effective system prompt
-//                 (Layer 1 is the per-model framing on
-//                 ModelConfiguration.layerOnePrompt).
-//
-//   LEGO 10.3.5 — `ModelFramingDetailView`. Read-only viewer for the
-//                 current model's Layer 1 prompt + the toggle to
-//                 enable/disable it on a per-model basis. Surfaces the
-//                 §4 layered-prompt architecture so users can see what
-//                 framing each model carries.
-//
-//   LEGO 10.4   — `SalonModeView`. Multi-LLM Salon configuration: up to
-//                 four seats, per-seat model assignment, behavioral
-//                 mode (Independent vs Context-Aware), moderator/
-//                 summarizer seat, transcript options. Surfaces only
-//                 when PowerUserMode == .multi.
-//
-// Why one file: all five are UI surfaces in the same conceptual area
-// ("how the user configures Hal"). Each is a SwiftUI View struct with
-// EnvironmentObject bindings to ChatViewModel, DocumentImportManager,
-// MLXModelDownloader (and ModelCatalogService via @StateObject inside
-// PowerUserView). They share helper sub-views and styling conventions
-// that read more naturally side-by-side than scattered.
-//
-// External dependencies (all in the Hal Universal target):
-//   - ChatViewModel              — primary @EnvironmentObject binding
-//   - DocumentImportManager      — bound in ActionsView for import UI
-//   - MLXModelDownloader.shared  — model download status rows
-//   - ModelCatalogService.shared — model picker / library list
-//   - ModelSettingsStore.shared  — apply/snapshot per-model settings
-//   - halLog                     — global logging
-//   - Various value types from Hal.swift (ChatViewModel state, etc.)
-//
-// Standing rules followed here:
-//   - LEGO markers preserved verbatim from Hal.swift so the
-//     numbering chain still reads end-to-end through Hal_Source.txt.
-//   - Comments evergreen — what each view does and why it exists.
+//   SalonModeView — multi-LLM Salon configuration: up to four seats,
+//   per-seat model assignment, behavioral mode (Independent vs
+//   Context-Aware), moderator/summarizer seat, transcript options.
+//   Surfaces only when PowerUserMode == .multi.
 
 import Foundation
 import SwiftUI
 import Combine
 import UniformTypeIdentifiers  // file picker UTType references
 
-// ==== LEGO START: 10.1 MainSettingsView ====
+// ==== LEGO START: 51 Main Settings (ActionsView) ====
 
 // MARK: - Power User Mode Selection
 
@@ -676,11 +640,11 @@ struct ActionsView: View {
 }
 
 
-// ==== LEGO END: 10.1 MainSettingsView ====
+// ==== LEGO END: 51 Main Settings (ActionsView) ====
 
 
 
-// ==== LEGO START: 10.2 PowerUserView ====
+// ==== LEGO START: 52 PowerUserView ====
 
 // SELF-AWARENESS NOTE (for Hal reading this code):
 // This is Power User mode for Single LLM operation. Users come here to fine-tune performance:
@@ -1199,11 +1163,11 @@ struct PowerUserView: View {
 }
 
 
-// ==== LEGO END: 10.2 PowerUserView ====
+// ==== LEGO END: 52 PowerUserView ====
 
 
 
-// ==== LEGO START: 10.3 SystemPromptEditorView ====
+// ==== LEGO START: 53 SystemPromptEditorView ====
 
 
 struct SystemPromptEditorView: View {
@@ -1344,10 +1308,10 @@ struct SystemPromptEditorView: View {
 }
 
 
-// ==== LEGO END: 10.3 SystemPromptEditorView ====
+// ==== LEGO END: 53 SystemPromptEditorView ====
 
 
-// ==== LEGO START: 10.3.5 ModelFramingDetailView ====
+// ==== LEGO START: 54 ModelFramingDetailView ====
 //
 // Per-model "Layer 1" framing prompt detail screen. Replaces the earlier
 // inline display (toggle + greyed-text block) that lived directly in the
@@ -1442,11 +1406,11 @@ struct ModelFramingDetailView: View {
     }
 }
 
-// ==== LEGO END: 10.3.5 ModelFramingDetailView ====
+// ==== LEGO END: 54 ModelFramingDetailView ====
 
 
 
-// ==== LEGO START: 10.4 SalonModeView (Multi-LLM Configuration) ====
+// ==== LEGO START: 55 SalonModeView (Multi-LLM Configuration) ====
 
 struct SalonModeView: View {
     @EnvironmentObject var chatViewModel: ChatViewModel
@@ -1581,4 +1545,4 @@ struct SalonModeView: View {
     }
 }
 
-// ==== LEGO END: 10.4 SalonModeView (Multi-LLM Configuration) ====
+// ==== LEGO END: 55 SalonModeView (Multi-LLM Configuration) ====

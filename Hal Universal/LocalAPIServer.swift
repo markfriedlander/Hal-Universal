@@ -1,11 +1,9 @@
 // LocalAPIServer.swift
 // Hal Universal
 //
-// Extracted from Hal.swift on 2026-05-26 as part of the refactor-as-you-go
-// directive. The "Developer API" subsystem — every path by which an
-// external process can drive Hal without going through the SwiftUI shell.
-//
-// Five cooperating pieces in one file, all sharing one dispatcher:
+// The "Developer API" subsystem — every path by which an external process
+// can drive Hal without going through the SwiftUI shell. Five cooperating
+// pieces in one file, all sharing one dispatcher:
 //
 //   extension MemoryStore { listDocuments / deleteDocument }
 //       — Document API helpers the HTTP layer calls to surface LIST_DOCS
@@ -49,11 +47,6 @@
 //   - MLXModelDownloader.shared     — sibling extracted module
 //   - HuggingFace / MLX / Apple Foundation Models — only via vm.* calls,
 //     never directly here
-//
-// Pre-extraction this was the unmarked MemoryStore/DocumentImportManager
-// extension block (Hal.swift ~16292-16389) plus LEGO block 32 (~16391-
-// 18252). The LEGO 32 markers are removed here; Hal.swift retains a
-// pointer comment at the old slot so the LEGO numbering still reads.
 
 import Foundation
 import SwiftUI
@@ -161,7 +154,7 @@ extension DocumentImportManager {
 }
 
 
-// ==== LEGO START: 32 HalTestConsole (macOS Test Harness) ====
+// ==== LEGO START: 47 Developer API (HTTP Server + File-Channel Test Console) ====
 //
 // SELF-AWARENESS NOTE (for Hal reading this code):
 // This is a development tool that lets Claude Code converse with your pipeline directly,
@@ -2340,4 +2333,4 @@ class LocalAPIServer {
     }
 }
 
-// ==== LEGO END: 32 HalTestConsole (macOS Test Harness) ====
+// ==== LEGO END: 47 Developer API (HTTP Server + File-Channel Test Console) ====
