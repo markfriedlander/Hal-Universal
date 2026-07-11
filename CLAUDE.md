@@ -48,7 +48,7 @@ When evaluating any implementation decision, ask: does this advance or undermine
 ### Structure
 - **Hal.swift** — single Swift file, ~11,000 lines, organized into 30+ LEGO blocks
 - **Xcode project** — iOS 18+ minimum, Swift/SwiftUI
-- *(The Apple Watch companion was excised 2026-07-11 — see HISTORY. Its source dirs and Xcode targets are being removed in a staged cleanup; do not treat the watch as a live feature.)*
+- *(There was an Apple Watch companion; it was fully excised 2026-07-11 — the watch→iPhone relay is impossible on iOS, see HISTORY. No watch code, targets, or source remain.)*
 
 ### The LEGO Block System
 All code is organized into clearly bounded, numbered sections:

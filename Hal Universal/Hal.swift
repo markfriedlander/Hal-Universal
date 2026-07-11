@@ -11079,34 +11079,18 @@ class ChatViewModel: ObservableObject {
 
                                                                 @Published var showInlineDetails: Bool = false
 
-                                                                /// Send a chat turn through the full pipeline.
-                                                                ///
-                                                                /// Two calling conventions, single implementation:
-                                                                ///
-                                                                /// 1. **iPhone Send button** — call as `sendMessage()`. Reads from
-                                                                ///    the bound `currentMessage` TextField, clears it on success,
-                                                                ///    resigns the keyboard. Returns nil.
-                                                                ///
-                                                                /// 2. **Programmatic caller** — call as
-                                                                ///    `sendMessage(externalText: "...")`. DOES NOT touch
-                                                                ///    `currentMessage` (no race with a user typing on the iPhone)
-                                                                ///    and does NOT resign the keyboard. Returns the assistant's
-                                                                ///    reply text on success so the caller can forward it wherever
-                                                                ///    the message originated. General affordance for any external
-                                                                ///    text source that needs the reply back without touching the
-                                                                ///    bound TextField.
-                                                                @discardableResult
-                                                                func sendMessage(externalText: String? = nil) async -> String? {
-                                                                    let raw = externalText ?? currentMessage
-                                                                    let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
-                                                                    guard !trimmed.isEmpty else { return nil }
+                                                                /// Send a chat turn through the full pipeline. Reads the bound
+                                                                /// `currentMessage` TextField, clears it on success, and resigns
+                                                                /// the keyboard.
+                                                                func sendMessage() async {
+                                                                    let trimmed = currentMessage.trimmingCharacters(in: .whitespacesAndNewlines)
+                                                                    guard !trimmed.isEmpty else { return }
 
                                                                     isAIResponding = true
                                                                     thinkingStart = Date()
                                                                     isSendingMessage = true
 
-                                                                    let originLabel = externalText == nil ? "iPhone send" : "external"
-                                                                    print("HALDEBUG-MODEL: Starting message send (\(originLabel)) - '\(trimmed.prefix(50))....'")
+                                                                    print("HALDEBUG-MODEL: Starting message send (iPhone send) - '\(trimmed.prefix(50))....'")
 
                                                                     // Seed thread title from first user message, touch last_active_at
                                                                     seedThreadTitleIfNeeded(trimmed)
@@ -11115,17 +11099,11 @@ class ChatViewModel: ObservableObject {
                                                                     let currentTurn = memoryStore.getCurrentTurnNumber(conversationId: conversationId) + 1
                                                                     messages.append(ChatMessage(content: trimmed, isFromUser: true, recordedByModel: "user", turnNumber: currentTurn))
 
-                                                                    // UI side-effects only when invoked from the iPhone Send button.
-                                                                    if externalText == nil {
-                                                                        currentMessage = ""
-                                                                        #if os(iOS)
-                                                                        UIApplication.shared.sendAction(#selector(UIResponder.resignFirstResponder), to: nil, from: nil, for: nil)
-                                                                        #endif
-                                                                    }
-
-                                                                    // Snapshot messages-count BEFORE the turn so we can locate the
-                                                                    // assistant reply for external callers afterwards.
-                                                                    let startingCount = messages.count
+                                                                    // UI side-effects: clear the field and dismiss the keyboard.
+                                                                    currentMessage = ""
+                                                                    #if os(iOS)
+                                                                    UIApplication.shared.sendAction(#selector(UIResponder.resignFirstResponder), to: nil, from: nil, for: nil)
+                                                                    #endif
 
                                                                     // Branch based on Salon Mode.
                                                                     // Guard: Salon "enabled but no seats" is a degenerate
@@ -11147,13 +11125,6 @@ class ChatViewModel: ObservableObject {
                                                                     isAIResponding = false
                                                                     thinkingStart = nil
                                                                     isSendingMessage = false
-
-                                                                    // External callers get the reply text back so they can forward it.
-                                                                    if externalText != nil {
-                                                                        let newMessages = messages.suffix(from: startingCount)
-                                                                        return newMessages.last(where: { !$0.isFromUser && !$0.isPartial })?.content
-                                                                    }
-                                                                    return nil
                                                                 }
 
                                                                 // Single-model turn execution (existing behavior)
@@ -12550,14 +12521,6 @@ struct DocumentPicker: UIViewControllerRepresentable {
 //
 // ==== LEGO END: 30 Model Catalog Service (Hugging Face Integration) ====
 
-
-// LEGO 31 (Hal Watch Bridge) removed 2026-07-11 — the Apple Watch
-// companion was excised. The watch→iPhone relay could never deliver on
-// its purpose: iOS forbids sustained GPU/Metal inference while the app is
-// backgrounded or the phone is locked (measured ~175× throttle), so Hal
-// could not generate a reply from a pocketed phone. Apple's own answer
-// (watchOS 27) routes wrist AI to Private Cloud Compute, not local
-// on-device compute. See HISTORY 2026-07-11 for the full finding.
 
 
 // EXTRACTED 2026-05-26 (refactor #3): the MemoryStore and

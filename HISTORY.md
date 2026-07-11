@@ -4472,3 +4472,24 @@ bridge, so its doc comment was de-watched and it stays as a general "send this t
 the reply" affordance. Device build clean, no new warnings; Hal_Source.txt re-synced. The
 two watch Xcode targets still compile as a dependency (untouched watch source), which is
 exactly what Stage 2 removes. LEGO numbering now skips 31 (30 → 32) by design.
+
+**Stages 2 + 3 landed same day.** Mark deleted both watch targets
+(`Hal Universal Watch Watch App`, `HalWatchComplicationExtension`) and the
+`WatchConnectivity.framework` link in Xcode (the atomic, undoable UI path — no
+hand-editing the project file), which also dropped the target dependency so the
+archive no longer builds a watch app. Xcode left three orphans behind, which we
+cleaned: the two watch source folders (deleted → Trash, removing files + their
+synchronized-folder group refs together), and the empty "Embed Watch Content"
+copy-files phase that had been sitting in the iOS target (removed via Build
+Phases). Final `grep -i watch` over `project.pbxproj` returns nothing; both source
+dirs gone from disk; device build clean, no warnings.
+
+Two small cleanups rode along on Mark's read of the Stage-1 diff. (1) The tombstone
+comment CC had left where LEGO 31 used to be was removed — the *why* belongs in this
+chronicle, not as a comment corpse in the source (the LEGO index's 30 → 32 gap plus
+git blame are enough). (2) `sendMessage(externalText:)` was simplified back to a plain
+`sendMessage() async`: the `externalText` parameter, the `@discardableResult`/`-> String?`
+return, and the reply-snapshot machinery had only ever served the watch bridge, so with
+the bridge gone they were vestigial (every remaining caller — the iPhone Send button and
+the two API-harness sites — calls it bare and ignores any return). The Apple Watch
+companion is now fully and cleanly gone.
