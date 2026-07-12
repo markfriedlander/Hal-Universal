@@ -5,6 +5,14 @@ Forward-looking work. Items completed move out of here and into `HISTORY.md`.
 For where Hal is right now: `HANDOFF_BRIEF.md`.
 For how we got here: `HISTORY.md` (especially the 2026-05-19/20 entry).
 
+> **Side project (2026-07-12): the studio website.** Mark's public pages are being
+> unified under one "house style" (started from Posey's look). **Hal's own site
+> (index/privacy/support) is DONE + deployed** to `markfriedlander.github.io/Hal-Universal/`.
+> A personal **studio hub** (links to all his apps + résumé/LinkedIn/Medium + his book
+> "Make Change") is scaffolded at `~/Desktop/Fun/markfriedlander.github.io/` (a separate
+> future repo). **Full status + the house-style system + the remaining TODO live in
+> `~/Desktop/Fun/markfriedlander.github.io/PLAN.md`** — read that before continuing the site.
+
 ---
 
 ## ⭐ NEXT UP — v2.5 is IN REVIEW; small follow-ups
