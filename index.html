@@ -1,0 +1,145 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Hal · A transparent AI companion for iPhone</title>
+<meta name="description" content="Hal is a private, on-device AI assistant for iPhone that shows you exactly how it works: many model voices, a memory that persists, and a window into every prompt.">
+<link rel="icon" href="assets/hal-icon-512.png">
+<style>
+  :root {
+    --bg: #0a0a0b;
+    --surface: #151417;
+    --text: #e9eaec;
+    --muted: #8a8a93;
+    --accent: #e2543a;        /* HAL lens, red-orange */
+    --accent-glow: #ff9d5c;   /* HAL pupil, gold */
+    --border: #26252a;
+  }
+
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+
+  html, body {
+    background: var(--bg);
+    color: var(--text);
+    font-family: -apple-system, "SF Pro Text", "SF Pro Display", "Helvetica Neue", Helvetica, Arial, sans-serif;
+    font-size: 18px;
+    line-height: 1.6;
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
+  }
+
+  /* Single-light-source red wash, the HAL eye extended into the page. */
+  body {
+    background:
+      radial-gradient(ellipse 90% 60% at 50% 7%,
+                      rgba(226, 84, 58, 0.12) 0%,
+                      rgba(226, 84, 58, 0.00) 60%),
+      var(--bg);
+    min-height: 100vh;
+  }
+
+  main { max-width: 720px; margin: 0 auto; padding: 4rem 1.5rem 3rem; }
+
+  .hero { text-align: center; padding: 2rem 0 3rem; }
+
+  .hero-icon {
+    display: inline-block;
+    width: 168px; height: 168px;
+    border-radius: 38px;
+    overflow: hidden;
+    margin-bottom: 2rem;
+    box-shadow: 0 0 60px rgba(226, 84, 58, 0.30), 0 8px 24px rgba(0, 0, 0, 0.5);
+  }
+  .hero-icon img { width: 100%; height: 100%; display: block; }
+
+  .wordmark { font-size: 2.75rem; font-weight: 600; letter-spacing: -0.02em; margin-bottom: 0.5rem; }
+  .tagline { font-style: italic; font-size: 1.15rem; color: var(--accent); letter-spacing: 0.01em; }
+
+  .lead {
+    font-size: 1.2rem; line-height: 1.55; text-align: center;
+    max-width: 36rem; margin: 0 auto 3.5rem;
+  }
+
+  .features { display: grid; grid-template-columns: repeat(2, 1fr); gap: 1.25rem; margin: 3rem 0; }
+  @media (max-width: 540px) { .features { grid-template-columns: 1fr; } }
+
+  .feature { background: var(--surface); border: 1px solid var(--border); border-radius: 14px; padding: 1.5rem 1.25rem; }
+  .feature h3 { font-size: 1.05rem; font-weight: 600; color: var(--accent); margin-bottom: 0.6rem; }
+  .feature p { font-size: 0.95rem; line-height: 1.55; margin: 0; }
+
+  .closing {
+    text-align: center; margin: 4rem 0 3rem; padding: 2.5rem 1rem;
+    border-top: 1px solid var(--border); border-bottom: 1px solid var(--border);
+  }
+  .closing p { font-style: italic; font-size: 1.4rem; }
+
+  a { color: var(--accent); text-decoration: none; transition: color 0.15s ease; }
+  a:hover { color: var(--accent-glow); text-decoration: underline; }
+
+  footer { margin-top: 3rem; text-align: center; font-size: 0.9rem; color: var(--muted); line-height: 1.9; }
+  footer a { color: var(--accent); }
+  footer .sep { color: var(--border); padding: 0 0.4rem; }
+</style>
+</head>
+<body>
+  <main>
+
+    <section class="hero">
+      <div class="hero-icon">
+        <img src="assets/hal-icon-512.png" alt="Hal app icon, the red HAL 9000 eye with a glowing gold center.">
+      </div>
+      <h1 class="wordmark">Hal</h1>
+      <p class="tagline">A transparent AI companion for iPhone.</p>
+    </section>
+
+    <p class="lead">
+      A private AI assistant that runs on your device, and shows you exactly how it works.
+      Many model voices, a memory that persists, and a window into every prompt.
+    </p>
+
+    <section class="features">
+
+      <div class="feature">
+        <h3>On-device &amp; private</h3>
+        <p>Local models run entirely on your iPhone. No accounts, no servers, no tracking. When you run a local model, nothing leaves your device.</p>
+      </div>
+
+      <div class="feature">
+        <h3>Many voices</h3>
+        <p>Apple Intelligence built in, plus a curated library of on-device models: Gemma, Llama, Qwen, Dolphin, and the 8-billion-parameter Ternary Bonsai. Each has a distinct character.</p>
+      </div>
+
+      <div class="feature">
+        <h3>A memory that persists</h3>
+        <p>Semantic memory across conversations, weighted by recency and relevance. You can see exactly what Hal remembers, and why.</p>
+      </div>
+
+      <div class="feature">
+        <h3>See the prompt</h3>
+        <p>Open any reply to see the exact prompt that produced it, color-coded by section, with a token budget. Nothing is hidden.</p>
+      </div>
+
+      <div class="feature">
+        <h3>Salon Mode</h3>
+        <p>Put up to four AI voices in conversation with each other, each on its own or building on what came before.</p>
+      </div>
+
+      <div class="feature">
+        <h3>A self, forming</h3>
+        <p>Over time, Hal builds a self-model and writes short reflections in his own first-person voice. It becomes a record of who he is becoming, and it is yours to read and to edit.</p>
+      </div>
+
+    </section>
+
+    <div class="closing">
+      <p>Transparency isn't a feature. It's the architecture.</p>
+    </div>
+
+    <footer>
+      <a href="https://apps.apple.com/app/id6754847753">App Store</a><span class="sep">·</span><a href="privacy.html">Privacy</a><span class="sep">·</span><a href="support.html">Support</a><span class="sep">·</span><a href="https://github.com/markfriedlander/Hal-Universal">Source</a><span class="sep">·</span><a href="index.html">Home</a><span class="sep">·</span>© 2026 Mark Friedlander
+    </footer>
+
+  </main>
+</body>
+</html>

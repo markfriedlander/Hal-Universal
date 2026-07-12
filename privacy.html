@@ -3,89 +3,103 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Privacy — Hal Universal</title>
+<title>Privacy · Hal</title>
+<meta name="description" content="Hal Universal collects no data. Everything runs and stays on your device.">
+<link rel="icon" href="assets/hal-icon-512.png">
 <style>
-  :root { color-scheme: dark; }
+  :root {
+    --bg: #0a0a0b;
+    --surface: #151417;
+    --text: #e9eaec;
+    --muted: #8a8a93;
+    --accent: #e2543a;
+    --accent-glow: #ff9d5c;
+    --border: #26252a;
+  }
+
   * { box-sizing: border-box; margin: 0; padding: 0; }
+
   html, body {
-    background: #000;
-    color: #fff;
-    font-family: -apple-system, "Helvetica Neue", Helvetica, Arial, sans-serif;
-    font-weight: 300;
+    background: var(--bg);
+    color: var(--text);
+    font-family: -apple-system, "SF Pro Text", "SF Pro Display", "Helvetica Neue", Helvetica, Arial, sans-serif;
+    font-size: 18px;
     line-height: 1.6;
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
+  }
+
+  body {
+    background:
+      radial-gradient(ellipse 90% 60% at 50% 6%,
+                      rgba(226, 84, 58, 0.11) 0%,
+                      rgba(226, 84, 58, 0.00) 60%),
+      var(--bg);
     min-height: 100vh;
   }
-  body {
-    max-width: 640px;
-    margin: 0 auto;
-    padding: 12vh 32px 12vh 32px;
+
+  main { max-width: 640px; margin: 0 auto; padding: 3.5rem 1.5rem 3rem; }
+
+  /* Sub-page masthead: small icon + wordmark + title, then a rule. */
+  .brand {
+    display: flex; align-items: center; gap: 1rem;
+    padding-bottom: 1.5rem; margin-bottom: 2.5rem;
+    border-bottom: 1px solid var(--border);
   }
-  .eyebrow {
-    font-size: 11px;
-    font-weight: 400;
-    text-transform: uppercase;
-    letter-spacing: 0.28em;
-    color: rgba(255,255,255,0.55);
-    margin-bottom: 4em;
+  .brand-icon {
+    width: 56px; height: 56px; border-radius: 13px; overflow: hidden; flex-shrink: 0;
+    display: block;
+    box-shadow: 0 0 24px rgba(226, 84, 58, 0.20), 0 2px 8px rgba(0, 0, 0, 0.4);
   }
-  h1 {
-    font-size: 13px;
-    font-weight: 400;
-    text-transform: uppercase;
-    letter-spacing: 0.32em;
-    color: #fff;
-    margin-bottom: 2.5em;
-  }
-  hr {
-    border: 0;
-    border-top: 1px solid rgba(255,255,255,0.18);
-    margin: 3.5em 0;
-  }
-  p {
-    font-size: 17px;
-    color: rgba(255,255,255,0.92);
-    margin-bottom: 1.5em;
-    max-width: 560px;
-  }
-  p.small {
-    font-size: 13px;
-    color: rgba(255,255,255,0.55);
-  }
-  a {
-    color: #fff;
-    text-decoration: none;
-    border-bottom: 1px solid rgba(255,255,255,0.35);
-    padding-bottom: 1px;
-  }
-  a:hover { border-bottom-color: #fff; }
+  .brand-icon img { width: 100%; height: 100%; display: block; }
+  .brand-text { flex: 1; }
+  .app-name { font-size: 0.95rem; color: var(--accent); letter-spacing: 0.04em; margin-bottom: 0.2rem; }
+  .app-name a { color: inherit; text-decoration: none; }
+  .app-name a:hover { color: var(--accent-glow); text-decoration: none; }
+  .page-title { font-size: 2rem; font-weight: 600; letter-spacing: -0.02em; line-height: 1.15; }
+
+  .doc p { margin-bottom: 1.3rem; }
+
+  a { color: var(--accent); text-decoration: none; transition: color 0.15s ease; }
+  a:hover { color: var(--accent-glow); text-decoration: underline; }
+
   footer {
-    margin-top: 6em;
-    font-size: 11px;
-    text-transform: uppercase;
-    letter-spacing: 0.28em;
-    color: rgba(255,255,255,0.4);
+    margin-top: 3rem; padding-top: 2rem; border-top: 1px solid var(--border);
+    text-align: center; font-size: 0.9rem; color: var(--muted); line-height: 1.9;
   }
+  footer a { color: var(--accent); }
+  footer .sep { color: var(--border); padding: 0 0.4rem; }
 </style>
 </head>
 <body>
-  <div class="eyebrow">Hal Universal</div>
+  <main>
 
-  <h1>Privacy</h1>
+    <header class="brand">
+      <a class="brand-icon" href="index.html">
+        <img src="assets/hal-icon-512.png" alt="Hal icon">
+      </a>
+      <div class="brand-text">
+        <p class="app-name"><a href="index.html">Hal</a></p>
+        <h1 class="page-title">Privacy</h1>
+      </div>
+    </header>
 
-  <p>Hal Universal does not collect, store, transmit, or share any personal data of any kind.</p>
+    <div class="doc">
+      <p>Hal Universal does not collect, store, transmit, or share any personal data of any kind.</p>
 
-  <p>It has no accounts, no analytics, no telemetry, no advertising identifiers, no third-party SDKs. There are no servers operated by the developer. All conversations, memories, and reflections are stored exclusively on your device in a local SQLite database, protected by iOS Data Protection — the file-level encryption iOS applies to app data when your device is locked.</p>
+      <p>It has no accounts, no analytics, no telemetry, no advertising identifiers, no third-party SDKs. There are no servers operated by the developer. All conversations, memories, and reflections are stored exclusively on your device in a local SQLite database, protected by iOS Data Protection: the file-level encryption iOS applies to app data when your device is locked.</p>
 
-  <p>When you use a local MLX model (Gemma, Llama, Qwen, or Dolphin), inference runs entirely on your device with no network calls of any kind. When you use Apple Intelligence, inference occurs on-device when offline. When connected, Apple's Private Cloud Compute may be used — your prompts are encrypted in transit and processed only in short-lived, non-persistent memory on Apple-controlled servers. Apple states no data is retained after processing. The developer of Hal Universal does not see or have access to any data Apple Intelligence processes.</p>
+      <p>When you use a local model, inference runs entirely on your device with no network calls of any kind. When you use Apple Intelligence, inference occurs on-device when offline. When connected, Apple's Private Cloud Compute may be used: your prompts are encrypted in transit and processed only in short-lived, non-persistent memory on Apple-controlled servers. Apple states no data is retained after processing. The developer of Hal Universal does not see or have access to any data Apple Intelligence processes.</p>
 
-  <p>MLX model downloads are fetched from Hugging Face over standard HTTPS at your explicit request. Once downloaded, models run entirely on your device.</p>
+      <p>Model downloads are fetched from Hugging Face over standard HTTPS at your explicit request. Once downloaded, models run entirely on your device.</p>
 
-  <p>You can delete all of Hal's local data at any time via Settings → Power User → Database → Nuclear Reset.</p>
+      <p>You can delete all of Hal's local data at any time via Settings → Power User → Database → Nuclear Reset.</p>
+    </div>
 
-  <hr>
+    <footer>
+      <a href="https://apps.apple.com/app/id6754847753">App Store</a><span class="sep">·</span><a href="privacy.html">Privacy</a><span class="sep">·</span><a href="support.html">Support</a><span class="sep">·</span><a href="https://github.com/markfriedlander/Hal-Universal">Source</a><span class="sep">·</span><a href="index.html">Home</a><span class="sep">·</span>© 2026 Mark Friedlander
+    </footer>
 
-  <p class="small">Questions: <a href="support.html">Support</a></p>
-
-  <footer>© 2026 Mark Friedlander</footer>
+  </main>
 </body>
 </html>
