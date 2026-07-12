@@ -4598,3 +4598,45 @@ notice that in the conversation, I hesitated before responding...") and the corr
 self-knowledge ("Scope: all the source files that make me"), humanized and pink — every
 recent fix visible on one screen. Six PNGs committed over the flawed set. Next: the ship
 sequence (SHIP_BLOCKER flip, build bump, Mark's version-name call, ASC upload).
+
+### v2.5 submitted to the App Store (late night, same day)
+
+Mark decided the version name — **v2.5**, not v2.1 — given how much had shipped since v2.0.
+CC made the three ship-prep changes: flipped the SHIP_BLOCKER (`kLocalAPIEnabledOnLaunch`
+true → false, so production users boot with the developer API antenna off), bumped
+`MARKETING_VERSION` 2.0 → 2.5 and `CURRENT_PROJECT_VERSION` 6 → 7, re-synced Hal_Source.txt,
+committed and pushed. A couple of doc-truth fixes rode along: the stale "Mac UI rendering is
+broken" line in CLAUDE.md was corrected (Mark ran v2.5 on his M2 Air and it works fine — the
+"iPad, and Mac" store claim stands), and the public README was refreshed for v2.5 (Bonsai,
+mxbai, privacy lock, the self-readable-architecture section, and an internal "CC-authored"
+reference scrubbed from public copy).
+
+**The archive couldn't be built locally** — stable Xcode won't launch on Mark's beta macOS,
+and you can't submit an App Store build made with a beta Xcode. So we pivoted to **Xcode
+Cloud**, which builds in Apple's cloud on a release Xcode (26.5). First archive failed fast
+(exit 65): *"Macro MLXHuggingFaceMacros from package mlx-swift-lm must be enabled before it
+can be used"* — Swift package macros are untrusted in a clean CI environment (the non-
+interactive version of the local "Trust & Enable" prompt). Fix was a `ci_scripts/
+ci_post_clone.sh` that sets `IDESkipMacroFingerprintValidation` (+ the package-plugin
+equivalent). A fresh build off that commit ran the full 9 minutes and **succeeded**, delivering
+to TestFlight as **2.5 (4)** (Xcode Cloud manages its own build numbers, so it overrode our
+CFBundleVersion 7 → its run number 4 — cosmetic, App Store only needs uniqueness). The 4
+build warnings were all in mlx-swift's `steel_attention.metal` ("constexpr if is a C++17
+extension") — third-party, the sanctioned exception to the warnings-are-errors rule.
+
+**The ASC submission was driven via the Chrome extension** (which finally connected after
+several dead attempts — the fix was signing into the extension's side panel, not the site
+permissions). CC created the Version 2.5 record, added Ternary Bonsai 8B to the description,
+pasted the v2.5 What's New, and attached build 2.5 (4). Export compliance: option 2 (standard
+algorithms — Hal bundles swift-crypto for download verification, in addition to Apple's OS
+HTTPS) → exempt, France = No (Hal is non-EU). Mark uploaded the six new screenshots (file
+uploads being the one thing the browser tools can't do) and answered Apple's newly required
+age-rating social-media questionnaire (all No/None — Hal has no UGC, social, or messaging;
+stays 4+). Submitted **~10:30pm, "Waiting for Review"** (up to 48h; email on completion).
+
+Two things logged for later: (1) the analytics show the app reaching some countries, which is
+worth reconciling against the non-EU/DSA availability setting; (2) the Apple Watch screenshot
+slot still appears on the version page (leftover from when v2.0's build carried the watch app)
+— harmless, left empty. And a nice grace note: the six screenshots on the live-bound listing
+show Hal answering a consciousness question with genuine uncertainty and a first-person
+reflection in his own voice — the week's work, visible on the store page.

@@ -7,23 +7,33 @@ For how we got here: `HISTORY.md` (especially the 2026-05-19/20 entry).
 
 ---
 
-## ⭐ NEXT UP — the ship sequence (screenshots DONE)
+## ⭐ NEXT UP — v2.5 is IN REVIEW; small follow-ups
 
-Both the DNA cleanup and the App Store screenshots landed 2026-07-11 (full story in
-HISTORY). The 6 dark-mode 6.5"/1242×2688 shots in `AppStore/screenshots/6.5-inch/` were
-recaptured with a real status bar (`devicectl device capture screenshot`) off a clean
-install of the corrected build — so the self-model shot shows Hal's genuine first-person
-reflection + the fixed "all the source files that make me" self-knowledge, not "32 blocks."
+**v2.5 (build 4) was submitted to the App Store 2026-07-11 (~10:30pm) — "Waiting for
+Review"** (up to 48h; email on completion). Full story in HISTORY. The whole ship sequence
+landed: SHIP_BLOCKER flipped, archived via Xcode Cloud (macro-trust fix in
+`ci_scripts/ci_post_clone.sh`), ASC metadata + 6 new screenshots + build 2.5(4) + export
+compliance + the new age-rating social-media questionnaire, submitted.
 
-**What's left before submit (Mark in the loop):**
-1. **SHIP_BLOCKER flip** — `kLocalAPIEnabledOnLaunch` → `false` (grep `SHIP_BLOCKER`).
-2. **Bump `CFBundleVersion` → 7.**
-3. **Decide the version name** — Mark is weighing **v2.5** vs v2.1 given how much shipped.
-4. **ASC** (Mark drives, CC can assist in Chrome): upload the new screenshots, audit all
-   text / "What's New" for stale **Phi** naming, review, submit. (Non-EU only; DSA
-   non-trader — unchanged.)
+**Nothing required while it's in review.** If Apple approves → it goes live (release option
+set at submit). If they come back with a question → address the feedback and resubmit.
 
-See "v2.0.1 ship sequence" further below for the exact ASC steps.
+**Agreed follow-ups (Mark, 2026-07-11):**
+- **Public-facing pages tidy** — Mark wants to clean up some public pages: `privacy.html`,
+  `support.html`, and/or the GitHub Pages site (`markfriedlander.github.io/Hal-Universal/`).
+  Scope TBD with Mark. (README was already refreshed for v2.5 this session.)
+- **Reconcile availability vs. analytics** — the Analytics show the app reaching some
+  countries; check this against the **non-EU / DSA non-trader** availability setting to make
+  sure territory settings match intent. (Noted during the export-compliance step.)
+
+**Also parked (from earlier):** 0a per-embedder RRF tuning; 0d long-conversation gate
+latency; Gemma-empty-reflection quirk; low-relevance confabulation refinement; Posey CC
+`getModelPath` symmetric fix. Bigger arcs still explicitly OUT until Mark's ready: Proposals
+system, Soul Document.
+
+**Cosmetic notes for a future build (not urgent):** set `ITSAppUsesNonExemptEncryption` in
+Info.plist to skip the export-compliance question next time; the Apple Watch screenshot slot
+still appears on the version page (leftover from v2.0's watch app) — harmless, left empty.
 
 ---
 
