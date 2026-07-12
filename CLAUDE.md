@@ -71,7 +71,7 @@ This system exists for AI-assisted collaboration — it enables surgical edits a
 ### Known Issues / Incomplete Work
 - Self-knowledge table exists but is NOT being injected into prompts correctly
 - Salon Mode (multi-model conversations) — architecture fully specified, not yet implemented
-- Mac UI rendering is broken
+- Mac: runs as an iOS app on Apple Silicon — verified working on an M2 MacBook Air (2026-07-11). (An earlier "Mac UI rendering is broken" note here was stale.)
 - Various bugs documented in `Docs/Hal_2_0_Master_Development_Plan.md`
 
 ### The Honest Assessment
