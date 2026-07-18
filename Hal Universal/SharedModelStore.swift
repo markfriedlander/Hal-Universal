@@ -75,6 +75,34 @@ enum SharedModelStore {
         return !contents.isEmpty
     }
 
+    /// Filename of the completion sentinel written into a model's directory the
+    /// instant its download is verified complete. Its PRESENCE is the durable
+    /// "this finished" signal. Dot-prefixed so the MLX loader (which reads named
+    /// files like config.json / *.safetensors) ignores it, and so it never
+    /// affects `isRepoDownloaded`'s content check in a way that matters.
+    private static let completeSentinelName = ".hal-download-complete"
+
+    /// Mark a model's download as VERIFIED COMPLETE (call only from the success
+    /// finalizer, when every file has landed). Writes the sentinel.
+    static func markRepoComplete(_ repo: String) {
+        let dir = mlxModelDir(repo)
+        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        let sentinel = dir.appendingPathComponent(completeSentinelName)
+        FileManager.default.createFile(atPath: sentinel.path, contents: Data())
+    }
+
+    /// Whether a model's download actually COMPLETED — distinct from
+    /// ``isRepoDownloaded`` (which is true for a merely non-empty dir, so a
+    /// half-finished download reads as "present"). Only true once the success
+    /// finalizer wrote the sentinel. Used by the in-flight RESUME path to decide
+    /// whether a marker can be cleared vs. must be resumed. NOT a load-gate — a
+    /// model fetched by a sibling app is loadable via `isRepoDownloaded` even
+    /// though it carries no sentinel written by THIS app.
+    static func isRepoComplete(_ repo: String) -> Bool {
+        let sentinel = mlxModelDir(repo).appendingPathComponent(completeSentinelName)
+        return FileManager.default.fileExists(atPath: sentinel.path)
+    }
+
     /// Exclude a model directory from iCloud backup. MANDATORY for App Group
     /// containers: unlike `Library/Caches` (auto-excluded), the shared container
     /// IS backed up by default, so without this every user would burn multiple
@@ -150,6 +178,46 @@ extension SharedModelStore {
     static func claimants(modelID: String) -> [String] {
         let coordinator = NSFileCoordinator()
         return readManifest(coordinator).models[modelID]?.claimedBy ?? []
+    }
+
+    /// Read-only: every model id THIS app currently claims. The inverse of
+    /// ``claimants(modelID:)`` — that answers "who owns this model," this answers
+    /// "what do I own."
+    ///
+    /// **The manifest is the authority here, deliberately — never the disk.** A
+    /// model can be present in the shared container without Hal claiming it (a
+    /// sibling app downloaded it and Hal hasn't adopted it yet; the Model Library
+    /// shows it as instantly selectable). Those files are not Hal's to release or
+    /// delete. Enumerating from disk instead would sweep them up — and because
+    /// ``releaseClaim(modelID:)`` reports `true` for a model with no manifest
+    /// entry at all, an unclaimed model would look "safe to delete" and be
+    /// destroyed. Ask the ledger what we own; don't infer it from what we can see.
+    static func modelsClaimedByThisApp() -> [String] {
+        let coordinator = NSFileCoordinator()
+        return readManifest(coordinator).models
+            .filter { $0.value.claimedBy.contains(thisAppID) }
+            .map(\.key)
+            .sorted()
+    }
+
+    /// A human display name for a family app's bundle id, for UI that has to
+    /// explain co-ownership ("also used by Posey").
+    ///
+    /// **Derived, not a hardcoded table — deliberately.** Every app in the family is
+    /// `com.MarkFriedlander.<AppName>`, so the last component is the name. That means
+    /// a new tenant (AI Camera, and whatever follows it) names itself correctly the
+    /// day it ships, with no change here and no release of Hal required. A lookup
+    /// table would need editing for every new sibling and would silently say the
+    /// wrong thing until someone remembered to.
+    ///
+    /// Falls back to a generic phrase if a bundle id ever doesn't fit the shape, so
+    /// the copy degrades to "another app" rather than showing the user a raw
+    /// identifier.
+    static func displayName(forAppID appID: String) -> String {
+        guard let last = appID.split(separator: ".").last, !last.isEmpty else {
+            return "another app"
+        }
+        return last.replacingOccurrences(of: "-", with: " ")
     }
 
     // MARK: coordinated read / write

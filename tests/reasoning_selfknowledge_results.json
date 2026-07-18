@@ -1,0 +1,68 @@
+[
+  {
+    "correct": null,
+    "looped": true,
+    "gen_s": null,
+    "think_chars": 296,
+    "think_derail": 0,
+    "ans_derail": 0,
+    "answer": "",
+    "prompt": "train",
+    "condition": "sk_on"
+  },
+  {
+    "correct": true,
+    "looped": false,
+    "gen_s": 21.3,
+    "think_chars": 0,
+    "think_derail": 0,
+    "ans_derail": 0,
+    "answer": "The train's speed is **40 mph**.  This is calculated by dividing the distance (60 miles) by the time (1.5 hours): $$ 60 \\div 1.5 = 40 $$  You can also simplify ",
+    "prompt": "train",
+    "condition": "sk_off"
+  },
+  {
+    "correct": null,
+    "looped": true,
+    "gen_s": null,
+    "think_chars": 1363,
+    "think_derail": 0,
+    "ans_derail": 0,
+    "answer": "",
+    "prompt": "eggs",
+    "condition": "sk_on"
+  },
+  {
+    "correct": null,
+    "looped": false,
+    "gen_s": 20.4,
+    "think_chars": 0,
+    "think_derail": 0,
+    "ans_derail": 0,
+    "answer": "No. The ratio of eggs per cookie is $12 / 3 = 4$ (using the provided fact). Scaling this up by a factor of 10: $4 \\times 10 = 40$. So, there are **40** eggs for",
+    "prompt": "eggs",
+    "condition": "sk_off"
+  },
+  {
+    "correct": null,
+    "looped": false,
+    "gen_s": 34.9,
+    "think_chars": 602,
+    "think_derail": 0,
+    "ans_derail": 0,
+    "answer": "No. It isn't prime because its factors include 7 and 13 ($7 \\times 13 = 91$), which makes it a composite number with divisors greater than one (specifically 7 a",
+    "prompt": "pens",
+    "condition": "sk_on"
+  },
+  {
+    "correct": null,
+    "looped": true,
+    "gen_s": null,
+    "think_chars": 483,
+    "think_derail": 1,
+    "ans_derail": 0,
+    "answer": "",
+    "prompt": "pens",
+    "condition": "sk_off"
+  }
+]

@@ -113,6 +113,10 @@ import SwiftUI
 import Foundation
 import Combine
 import Observation
+import os // Unified logging (os.Logger) — RuntimeLog mirrors to a dedicated subsystem
+       // so device logs can be streamed live from a Mac (`log stream` / Console)
+       // even while the app is backgrounded or the phone is locked, without the
+       // foreground-only test antenna. See RuntimeLog.
 import FoundationModels // Keep for FoundationModels option
 import UniformTypeIdentifiers // For file types in document import
 import SQLite3 // For MemoryStore - Direct C API for consistency with Mac version
@@ -172,6 +176,17 @@ final class RuntimeLog: @unchecked Sendable {
     private let capacity: Int = 1000
     private let formatter: DateFormatter
 
+    /// Unified-logging mirror. Every line ALSO goes here, which the OS stamps
+    /// with the process id and a real system timestamp and makes streamable from
+    /// a Mac — `log stream --predicate 'subsystem == "com.MarkFriedlander.Hal-Universal"'`
+    /// — LIVE, even while the app is backgrounded or the device is locked (unlike
+    /// the in-memory buffer, which is only readable via the foreground test
+    /// antenna). The PID stamp means two app instances can never be confused for
+    /// one in a capture. `privacy: .public` is REQUIRED: os.Logger redacts
+    /// interpolated strings to "<private>" by default, which would make every
+    /// streamed line useless. These are developer diagnostics with no PII.
+    private let osLogger = Logger(subsystem: "com.MarkFriedlander.Hal-Universal", category: "runtime")
+
     init() {
         let f = DateFormatter()
         f.dateFormat = "HH:mm:ss.SSS"
@@ -188,6 +203,9 @@ final class RuntimeLog: @unchecked Sendable {
         }
         lock.unlock()
         print(entry)
+        // Mirror to unified logging at .notice (the default level — always
+        // captured by `log stream` without extra flags, unlike .debug).
+        osLogger.notice("\(message, privacy: .public)")
     }
 
     nonisolated func snapshot(limit: Int) -> [String] {
@@ -215,6 +233,61 @@ final class RuntimeLog: @unchecked Sendable {
 /// caller that runs off the main actor.
 nonisolated func halLog(_ message: String) {
     RuntimeLog.shared.log(message)
+}
+
+/// Test/tuning knobs for the reasoning path (2026-07). Set via API verbs
+/// (SET_REASONING_PROMPT / SET_REPETITION_PENALTY / SET_MEMORY_ISOLATION) and
+/// read during prompt assembly + generation. `nonisolated` + `@unchecked
+/// Sendable` so the off-main MLX generation task can read them, mirroring
+/// RuntimeLog. Values are set-then-read sequentially by the tuning harness
+/// (tests/reasoning_tuning_matrix.py), so no locking is needed for that use.
+/// See Docs/Think_Tokens_Reasoning_Transparency.md.
+final class ReasoningTuning: @unchecked Sendable {
+    nonisolated static let shared = ReasoningTuning()
+    /// Overrides the default Layer-0 reasoning directive. nil/empty = default.
+    var promptOverride: String? = nil
+    /// Overrides the repetition penalty on reasoning turns. nil = model default.
+    var repetitionPenalty: Double? = nil
+    /// Live sweep overrides for the rest of the reasoning sampler (2026-07-14).
+    /// nil = use the model's reasoningSettings. Set via API verbs so the harness
+    /// can sweep temp × top_p × top_k × presence WITHOUT a rebuild-per-config.
+    /// Only applied on reasoning turns. See the reasoning memo.
+    var temperatureOverride: Double? = nil
+    var topPOverride: Float? = nil
+    var topKOverride: Int? = nil
+    var presencePenaltyOverride: Float? = nil
+    /// Skip ALL memory / RAG / self-knowledge injection for a clean footprint.
+    var memoryIsolation: Bool = false
+
+    // Raw reasoning capture buffer. The generator appends EVERY streamed
+    // chunk here as it arrives (generateChatStream), so the complete raw
+    // reasoning is retained and readable *mid-flight* via the
+    // GET_THINK_STREAM API verb — including a runaway that never closes
+    // </think>. This is the only place a non-completing (looping)
+    // generation leaves a full trace: HALDEBUG-THINK-RAW logs only after a
+    // finished answer, so a loop that times out logs nothing. Lock-guarded
+    // because the off-main MLX generation task writes while the API-server
+    // task reads. See Docs/Think_Tokens_Reasoning_Transparency.md.
+    private let rawStreamLock = NSLock()
+    private var _rawStream = ""
+
+    /// Clear the buffer at the start of a reasoning turn.
+    func resetRawStream() {
+        rawStreamLock.lock(); defer { rawStreamLock.unlock() }
+        _rawStream = ""
+    }
+    /// Append one streamed delta as it arrives.
+    func appendRawStream(_ s: String) {
+        rawStreamLock.lock(); defer { rawStreamLock.unlock() }
+        _rawStream += s
+    }
+    /// The complete raw stream so far (readable while generation is live).
+    var rawStream: String {
+        rawStreamLock.lock(); defer { rawStreamLock.unlock() }
+        return _rawStream
+    }
+
+    private init() {}
 }
 
 // MARK: - Named Entity Support
@@ -342,6 +415,12 @@ struct ChatMessage: Identifiable, Equatable { // Added Equatable for ForEach
     let timestamp: Date
     var isPartial: Bool // Changed to var for streaming updates
     var thinkingDuration: TimeInterval? // Changed to var for mutability
+    /// The model's reasoning trace — a reasoning model's <think>…</think>
+    /// content, separated from the visible answer in `content`. Shown in a
+    /// collapsible "Thinking" panel; never written to memory/RAG. nil for
+    /// non-reasoning models. Distinct from `thinkingDuration` (timing only).
+    /// See Docs/Think_Tokens_Reasoning_Transparency.md.
+    var thinking: String?
     var fullPromptUsed: String? // NEW: To store the exact prompt for Hal's response
     var usedContextSnippets: [UnifiedSearchResult]? // NEW: To store the RAG snippets used
     var tokenBreakdown: TokenBreakdown? // NEW: To store token usage breakdown
@@ -365,13 +444,14 @@ struct ChatMessage: Identifiable, Equatable { // Added Equatable for ForEach
     /// Should be rare in normal use.
     var truncatedSegments: Set<PromptSegmentKind>
 
-    init(id: UUID = UUID(), content: String, isFromUser: Bool, timestamp: Date = Date(), isPartial: Bool = false, thinkingDuration: TimeInterval? = nil, fullPromptUsed: String? = nil, usedContextSnippets: [UnifiedSearchResult]? = nil, tokenBreakdown: TokenBreakdown? = nil, toolsUsed: [String]? = nil, recordedByModel: String, turnNumber: Int, seatNumber: Int? = nil, deliberationRound: Int = 1, compressedSegments: Set<PromptSegmentKind> = [], truncatedSegments: Set<PromptSegmentKind> = []) {
+    init(id: UUID = UUID(), content: String, isFromUser: Bool, timestamp: Date = Date(), isPartial: Bool = false, thinkingDuration: TimeInterval? = nil, thinking: String? = nil, fullPromptUsed: String? = nil, usedContextSnippets: [UnifiedSearchResult]? = nil, tokenBreakdown: TokenBreakdown? = nil, toolsUsed: [String]? = nil, recordedByModel: String, turnNumber: Int, seatNumber: Int? = nil, deliberationRound: Int = 1, compressedSegments: Set<PromptSegmentKind> = [], truncatedSegments: Set<PromptSegmentKind> = []) {
         self.id = id
         self.content = content
         self.isFromUser = isFromUser
         self.timestamp = timestamp
         self.isPartial = isPartial
         self.thinkingDuration = thinkingDuration
+        self.thinking = thinking
         self.fullPromptUsed = fullPromptUsed
         self.usedContextSnippets = usedContextSnippets
         self.tokenBreakdown = tokenBreakdown
@@ -383,6 +463,30 @@ struct ChatMessage: Identifiable, Equatable { // Added Equatable for ForEach
         self.compressedSegments = compressedSegments
         self.truncatedSegments = truncatedSegments
     }
+}
+
+/// Split a reasoning model's output into its reasoning trace vs the visible
+/// answer. Qwen-style templates seed the opening `<think>` into the *prompt*,
+/// so the output looks like `<reasoning></think><answer>`: everything before
+/// the first `</think>` is reasoning, everything after is the answer.
+///
+/// The split is content-driven and reliable whenever `</think>` is present
+/// (regardless of `isReasoning`), which keeps reasoning out of memory/RAG even
+/// on the Salon path. `isReasoning` only governs the mid-stream case before the
+/// closing tag arrives: for a reasoning model the text so far is all reasoning
+/// (answer empty, shown live in the panel); for others it's all answer.
+/// See Docs/Think_Tokens_Reasoning_Transparency.md.
+func splitThinkTokens(_ raw: String, isReasoning: Bool) -> (thinking: String?, answer: String) {
+    if let r = raw.range(of: "</think>") {
+        let think = raw[..<r.lowerBound].trimmingCharacters(in: .whitespacesAndNewlines)
+        let answer = String(raw[r.upperBound...]).trimmingCharacters(in: .whitespacesAndNewlines)
+        return (think.isEmpty ? nil : think, answer)
+    }
+    if isReasoning {
+        let think = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        return (think.isEmpty ? nil : think, "")
+    }
+    return (nil, raw)
 }
 
 // MARK: - RAG Snippet with Full Metadata
@@ -5330,7 +5434,7 @@ class MLXWrapper: ObservableObject {
     /// model chunk, so callers can update UI in real time. The final yield
     /// is the complete trimmed response; stream then finishes. Errors are
     /// thrown via the stream's failure path.
-    func generateChatStream(messages: [HalChatMessage], temperature: Double = 0.7) -> AsyncThrowingStream<String, Error> {
+    func generateChatStream(messages: [HalChatMessage], temperature: Double = 0.7, reasoningActive: Bool = false) -> AsyncThrowingStream<String, Error> {
         AsyncThrowingStream { continuation in
             Task {
                 guard isModelLoaded, let container = self.modelContainer else {
@@ -5359,9 +5463,24 @@ class MLXWrapper: ObservableObject {
                     // reasoning and no visible output.
                     MLX.seed(UInt64(Date.timeIntervalSinceReferenceDate * 1000))
 
+                    // Reasoning models (chat template honors enable_thinking and
+                    // emits <think>…</think>, e.g. Qwen 3.5 2B) get the thinking
+                    // branch turned ON; the streamed output is split on the closing
+                    // </think> downstream into the thinking panel vs the visible
+                    // answer. Non-reasoning models leave the flag false (no-op for
+                    // their templates). Gated on the model's isReasoningModel flag.
+                    // See Docs/Think_Tokens_Reasoning_Transparency.md.
+                    // Gated on BOTH the user's per-turn reasoning toggle
+                    // (reasoningActive, threaded from the ViewModel) AND the
+                    // model's intrinsic capability, so a reasoning model only
+                    // thinks when the user has actually asked to see it.
+                    let enableThinking = reasoningActive && (self.currentModelConfig?.isReasoningModel == true)
+                    if enableThinking {
+                        halLog("HALDEBUG-THINK: enable_thinking=true for \(self.currentModelConfig?.displayName ?? "?")")
+                    }
                     let userInput = UserInput(
                         chat: chatMessages,
-                        additionalContext: ["enable_thinking": false]
+                        additionalContext: ["enable_thinking": enableThinking]
                     )
                     let lmInput = try await container.prepare(input: userInput)
                     let promptTokenCount = lmInput.text.tokens.size
@@ -5409,10 +5528,36 @@ class MLXWrapper: ObservableObject {
                     // Phi-4 baseline investigation. A subsequent increment will
                     // route through ModelSettingsStore.effectiveSettings(for:) to
                     // honor any user override; for now we read defaults directly.
-                    let settings = self.currentModelConfig?.defaultSettings ?? ModelSettings()
-                    let modelPenalty = settings.repetitionPenalty
+                    // Effective per-model settings. Reasoning turns merge the
+                    // model's reasoningSettings OVER defaultSettings (thinking and
+                    // non-thinking want different samplers — Qwen ships separate
+                    // recipes); non-reasoning turns use defaultSettings as-is. The
+                    // new sampler fields are nil until a model is seeded, so this
+                    // is a no-op for un-seeded models. See the reasoning memo.
+                    let baseSettings = self.currentModelConfig?.defaultSettings ?? ModelSettings()
+                    let settings: ModelSettings = enableThinking
+                        ? (self.currentModelConfig?.reasoningSettings.map { baseSettings.merged(with: $0) } ?? baseSettings)
+                        : baseSettings
+                    // Reasoning turns may override the repetition penalty via the
+                    // tuning harness (ReasoningTuning); else use the effective setting.
+                    let reasoningPenaltyOverride: Float? = enableThinking ? ReasoningTuning.shared.repetitionPenalty.map { Float($0) } : nil
+                    let modelPenalty = reasoningPenaltyOverride ?? settings.repetitionPenalty
                     let modelPenaltyCtx = settings.repetitionContextSize ?? 20
-                    halLog("HALDEBUG-MLX-CHAT: Penalty config for \(self.currentModelConfig?.displayName ?? "unknown"): penalty=\(modelPenalty.map { String($0) } ?? "nil"), ctx=\(modelPenaltyCtx)")
+                    // Temperature: a reasoning turn prefers the effective reasoning
+                    // temperature (Qwen thinking-text = 1.0, bounded by top_k/top_p);
+                    // otherwise the caller's temperature. (The old hardcoded 0.6
+                    // reasoning override in the stream consumers is removed.)
+                    // Live sweep overrides (ReasoningTuning) win on reasoning turns so
+                    // the harness can tune the sampler without a rebuild; else the
+                    // model's effective reasoningSettings; else the mlx default.
+                    let effectiveTemperature = enableThinking
+                        ? (ReasoningTuning.shared.temperatureOverride ?? settings.temperature ?? temperature)
+                        : temperature
+                    let modelTopP = (enableThinking ? ReasoningTuning.shared.topPOverride : nil) ?? settings.topP ?? 1.0
+                    let modelTopK = (enableThinking ? ReasoningTuning.shared.topKOverride : nil) ?? settings.topK ?? 0
+                    let modelMinP = settings.minP ?? 0.0
+                    let modelPresencePenalty = (enableThinking ? ReasoningTuning.shared.presencePenaltyOverride : nil) ?? settings.presencePenalty
+                    halLog("HALDEBUG-MLX-CHAT: Sampler for \(self.currentModelConfig?.displayName ?? "unknown") [\(enableThinking ? "reasoning" : "normal")]: temp=\(String(format: "%.2f", effectiveTemperature)) topP=\(modelTopP) topK=\(modelTopK) minP=\(modelMinP) repPen=\(modelPenalty.map { String($0) } ?? "nil") presPen=\(modelPresencePenalty.map { String($0) } ?? "nil")")
                     // Token budget. Per Mark's clarification (May 13 evening):
                     // this is a *runaway* safeguard, not a normal-response
                     // ceiling. Models should be free to complete their thought
@@ -5434,6 +5579,12 @@ class MLXWrapper: ObservableObject {
                     //   - 1536: better, but per Mark's intent still a ceiling
                     //     on the normal-response distribution rather than a
                     //     true runaway cap.
+                    // Token ceiling — kept at 4096 even for reasoning turns. A
+                    // larger reasoning budget (8192) let a looping 2B model grow
+                    // its KV cache past the iOS memory cliff and jetsam the app
+                    // (2026-07-13). 4096 bounds generation-KV growth; the tuning
+                    // levers (temperature / rep-penalty / Layer-0 directive) are
+                    // what stop the loop, not a bigger budget.
                     let maxOutputTokens = 4096
                     // Per-model KV cache quantization (Item 11 follow-up,
                     // 2026-05-18 evening). When the model config sets
@@ -5451,9 +5602,13 @@ class MLXWrapper: ObservableObject {
                     let parameters = GenerateParameters(
                         maxTokens: maxOutputTokens,
                         kvBits: kvBits,
-                        temperature: Float(temperature),
+                        temperature: Float(effectiveTemperature),
+                        topP: modelTopP,
+                        topK: modelTopK,
+                        minP: modelMinP,
                         repetitionPenalty: modelPenalty,
-                        repetitionContextSize: modelPenaltyCtx
+                        repetitionContextSize: modelPenaltyCtx,
+                        presencePenalty: modelPresencePenalty
                     )
                     let mlxStream = try await container.generate(input: lmInput, parameters: parameters)
                     let streamStart = Date.timeIntervalSinceReferenceDate
@@ -5465,6 +5620,12 @@ class MLXWrapper: ObservableObject {
                     let repetitionCheckEvery = 50  // chars between checks
                     var stoppedForRepetition = false
 
+                    // Start a fresh raw-reasoning capture for this turn. The
+                    // buffer is appended per-chunk below and stays readable
+                    // mid-flight (GET_THINK_STREAM), so a looping turn that
+                    // never finishes still leaves a complete trace to diagnose.
+                    if enableThinking { ReasoningTuning.shared.resetRawStream() }
+
                     streamLoop: while let event = await iterator.next() {
                         switch event {
                         case .chunk(let text):
@@ -5474,6 +5635,11 @@ class MLXWrapper: ObservableObject {
                                 sawFirstToken = true
                             }
                             fullText += text
+                            // Capture the raw delta into the mid-flight buffer
+                            // (reasoning turns only) so the complete stream is
+                            // inspectable even if this turn loops and never
+                            // completes. Cheap lock-guarded append.
+                            if enableThinking { ReasoningTuning.shared.appendRawStream(text) }
                             // Yield the cumulative text so the caller's UI can
                             // render the partial response as it grows.
                             continuation.yield(fullText)
@@ -5521,6 +5687,17 @@ class MLXWrapper: ObservableObject {
                         halLog("HALDEBUG-MLX-CHAT: Truncation safeguard trimmed \(whitespaceTrimmed.count - finalText.count) chars from a mid-word cut")
                     }
                     halLog("HALDEBUG-MLX-CHAT: Returning fullText (\(finalText.count) chars): \(finalText.prefix(150))")
+                    if enableThinking {
+                        // Log the RAW reasoning trace so it's queryable via
+                        // GET_LOGS — the ViewModel splits it out of the stored
+                        // message, so this is the only place to inspect what the
+                        // model actually thought (essential for tuning). Two
+                        // chunks so a loop is visible near its start.
+                        halLog("HALDEBUG-THINK-RAW (\(finalText.count) chars): \(finalText.prefix(1200))")
+                        if finalText.count > 1200 {
+                            halLog("HALDEBUG-THINK-RAW-cont: …\(finalText.dropFirst(1200).prefix(1200))")
+                        }
+                    }
                     // Final yield with the cleaned version so callers settle on a
                     // string with no mid-word truncation. Then finish the stream.
                     if finalText != fullText {
@@ -5942,7 +6119,7 @@ class LLMService: ObservableObject {
     /// `session.streamResponse` already produces snapshots whose
     /// `.content` is the cumulative text; MLX via `MLXWrapper.generateChatStream`
     /// produces incremental chunks that we accumulate inside the wrapper.
-    func generateChatResponseStream(messages: [HalChatMessage], temperature: Double = 0.7) -> AsyncThrowingStream<String, Error> {
+    func generateChatResponseStream(messages: [HalChatMessage], temperature: Double = 0.7, reasoningActive: Bool = false) -> AsyncThrowingStream<String, Error> {
         halLog("HALDEBUG-RESPONSE: \(currentModel.displayName) (\(currentModel.source)) is responding [chat-path, streaming]")
         halLog("HALDEBUG-LLM: generateChatResponseStream called - \(messages.count) messages, currentModel: \(currentModel.displayName)")
 
@@ -6023,7 +6200,7 @@ class LLMService: ObservableObject {
         case .mlx:
             // Fast path: model resident → generate directly.
             if mlxWrapper.isModelLoaded {
-                return mlxWrapper.generateChatStream(messages: messages, temperature: temperature)
+                return mlxWrapper.generateChatStream(messages: messages, temperature: temperature, reasoningActive: reasoningActive)
             }
             // RELOAD-ON-DEMAND. The MLX model may not be resident for two reasons,
             // and neither should dead-end a chat with "model could not be loaded":
@@ -6060,7 +6237,7 @@ class LLMService: ObservableObject {
                     }
                     // 4. Bridge the inner generation stream through to the caller.
                     do {
-                        for try await chunk in self.mlxWrapper.generateChatStream(messages: messages, temperature: temperature) {
+                        for try await chunk in self.mlxWrapper.generateChatStream(messages: messages, temperature: temperature, reasoningActive: reasoningActive) {
                             continuation.yield(chunk)
                         }
                         continuation.finish()
@@ -9072,9 +9249,20 @@ class ChatViewModel: ObservableObject {
         let layerOneRaw = layerOneEnabled ? (model.layerOnePrompt ?? "") : ""
         let layerOne = layerOneRaw.trimmingCharacters(in: .whitespacesAndNewlines)
 
-        if layerOne.isEmpty { return layerTwo }
-        if layerTwo.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty { return layerOne }
-        return layerOne + "\n\n" + layerTwo
+        var base: String
+        if layerOne.isEmpty { base = layerTwo }
+        else if layerTwo.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty { base = layerOne }
+        else { base = layerOne + "\n\n" + layerTwo }
+
+        // Layer 0: when reasoning is active, PREPEND the reasoning directive so
+        // the identity layers (Layer 1 + Layer 2) still have the last word and
+        // personality is preserved. Overridable for tuning via ReasoningTuning.
+        if reasoningActive {
+            let override = ReasoningTuning.shared.promptOverride
+            let directive = (override?.isEmpty == false ? override! : Self.reasoningLayerPrompt)
+            base = base.isEmpty ? directive : directive + "\n\n" + base
+        }
+        return base
     }
     @Published var injectedSummary: String = ""
     @AppStorage("memoryDepth") var memoryDepth: Int = 5
@@ -9084,7 +9272,48 @@ class ChatViewModel: ObservableObject {
     
     // NEW: Temperature control (0.0 = deterministic, 1.0 = creative)
     @AppStorage("temperature") var temperature: Double = 0.7
-    
+
+    // MARK: - Reasoning / think-token toggle (2026-07)
+    //
+    // User-facing, sticky (persists across launches). Only meaningful when the
+    // active model can reason (ModelConfiguration.isReasoningModel). When the
+    // toggle is on AND the model is a reasoning model (see `reasoningActive`),
+    // Hal passes enable_thinking=true, drops the turn temperature to 0.6,
+    // appends `reasoningLayerPrompt` to keep it from rambling, and splits
+    // <think>…</think> into the collapsible "Thinking" panel. Surfaced as a
+    // brain toggle beside the lock. See Docs/Think_Tokens_Reasoning_Transparency.md.
+    @AppStorage("reasoningEnabled") var reasoningEnabled: Bool = false
+
+    /// True only when the active model can reason AND the user has reasoning on.
+    var reasoningActive: Bool { (selectedModel.isReasoningModel == true) && reasoningEnabled }
+
+    /// Default Layer-0 reasoning directive — PREPENDED to the effective system
+    /// prompt when reasoning is active (so the identity layers keep the last
+    /// word and personality is preserved). Targets repetition/looping, NOT
+    /// thinking depth, and explicitly preserves the answer voice. Overridable
+    /// for tuning via ReasoningTuning.shared.promptOverride.
+    static let reasoningLayerPrompt = "Before you answer, you may reason inside <think> and </think>. Reason as thoroughly as the question needs, but do not repeat yourself or restate points you have already made. When you reach a conclusion, close </think> and answer. This governs only your thinking; it does not change your voice, your identity, or how you write your final answer. Answer exactly as you otherwise would."
+
+    /// Toggle reasoning on/off and narrate the change into the chat, mirroring
+    /// the model-switch narration pattern. Sticky until toggled again.
+    func setReasoning(_ on: Bool) {
+        guard on != reasoningEnabled else { return }
+        reasoningEnabled = on
+        let modelName = selectedModel.displayName
+        let userMsg: String
+        let halMsg: String
+        if on {
+            userMsg = "Hal, show me your reasoning."
+            halMsg = "Reasoning is on. Before each answer you'll see me think it through in a panel above the reply. It makes \(modelName) slower and more deliberate. Tap the brain again anytime to switch back to direct replies."
+        } else {
+            userMsg = "Hal, go back to direct replies."
+            halMsg = "Reasoning is off. Back to direct answers from \(modelName)."
+        }
+        let currentTurn = memoryStore.getCurrentTurnNumber(conversationId: conversationId) + 1
+        messages.append(ChatMessage(content: userMsg, isFromUser: true, recordedByModel: "user", turnNumber: currentTurn))
+        messages.append(ChatMessage(content: halMsg, isFromUser: false, recordedByModel: selectedModel.id, turnNumber: currentTurn))
+    }
+
     // NEW: Self-knowledge toggle (enables/disables temporal, self-awareness, self-knowledge context)
     @AppStorage("enableSelfKnowledge") var enableSelfKnowledge: Bool = true
 
@@ -9159,7 +9388,7 @@ class ChatViewModel: ObservableObject {
     /// this in init() means every launch overrides whatever was
     /// persisted previously, so a fresh install/reinstall always boots
     /// with the antenna in the dev-friendly default state.
-    private static let kLocalAPIEnabledOnLaunch: Bool = false
+    private static let kLocalAPIEnabledOnLaunch: Bool = false  // Production default: API antenna OFF at launch (opt-in via Settings). Flip to true only for local device testing; revert before commit/ship.
 
     init() {
         // STEP 0: Apply launch-time default for the Local API antenna.
@@ -10591,6 +10820,11 @@ class ChatViewModel: ObservableObject {
                                                                             // Original intent: situate Hal in time + carry compressed and retrieved
                                                                             // context + give Hal awareness of himself. Chat form folds it all into
                                                                             // the system message as background.
+                                                                            // Memory isolation (tuning harness): when on, skip all memory /
+                                                                            // RAG / self-knowledge / summary / history injection for a clean
+                                                                            // footprint, so tuning isn't confounded by retrieved context.
+                                                                            // Temporal awareness stays (it isn't "memory"). See ReasoningTuning.
+                                                                            let isolated = ReasoningTuning.shared.memoryIsolation
                                                                             var contextSections: [String] = []
 
                                                                             let temporalRaw = buildTemporalContext()
@@ -10602,7 +10836,7 @@ class ChatViewModel: ObservableObject {
                                                                                 contextSections.append(temporalBody)
                                                                             }
 
-                                                                            if !injectedSummary.isEmpty {
+                                                                            if !injectedSummary.isEmpty && !isolated {
                                                                                 let resolvedSummary = await resolveSegment(.autoSummary, rawContent: injectedSummary, budgetTokens: summaryBudgetTokens)
                                                                                 contextSections.append("Summary of earlier conversation:\n\(resolvedSummary)")
                                                                             }
@@ -10623,7 +10857,7 @@ class ChatViewModel: ObservableObject {
                                                                             // identity and small enough to never overflow.
                                                                             let isActiveAFM = (llmService.activeModelID == ModelConfiguration.appleFoundation.id)
 
-                                                                            if enableSelfKnowledge {
+                                                                            if enableSelfKnowledge && !isolated {
                                                                                 let selfAwarenessRaw = buildSelfAwarenessContext()
                                                                                 let selfAwarenessBody = selfAwarenessRaw
                                                                                     .replacingOccurrences(of: "#=== BEGIN SELF_AWARENESS ===#", with: "")
@@ -10658,7 +10892,7 @@ class ChatViewModel: ObservableObject {
                                                                             // for speed and stability — see decideTools comments). executeTools
                                                                             // runs the memory search and returns up to 10 snippets within the
                                                                             // model's RAG token budget.
-                                                                            if !currentInput.isEmpty {
+                                                                            if !currentInput.isEmpty && !isolated {
                                                                                 let toolDecision = await decideTools(userInput: currentInput)
                                                                                 let shortTermTurns = getShortTermTurns(currentTurns: countCompletedTurns())
                                                                                 let toolResults = await executeTools(
@@ -10717,7 +10951,7 @@ class ChatViewModel: ObservableObject {
                                                                             // but we'll add it ourselves at the end so role order is correct.
                                                                             //
                                                                             // Depth: effectiveMemoryDepth turns × 2 messages-per-turn.
-                                                                            let historyDepth = effectiveMemoryDepth * 2
+                                                                            let historyDepth = isolated ? 0 : effectiveMemoryDepth * 2
                                                                             // History source: if `historyOverride` is provided (used by
                                                                             // Salon Mode's independent path — each seat must see the
                                                                             // conversation as it was BEFORE any seat ran this turn, not
@@ -11365,12 +11599,20 @@ class ChatViewModel: ObservableObject {
                                                                         // first token. Generation timing (modelTime) is captured
                                                                         // around the whole stream so thinkingDuration stays meaningful.
                                                                         finalText = ""
+                                                                        // Reasoning models emit <think>…</think> before the answer; split
+                                                                        // it out live so the reasoning streams into the collapsible panel
+                                                                        // (message.thinking) and only the answer fills the bubble
+                                                                        // (message.content). See splitThinkTokens.
+                                                                        let isReasoning = self.reasoningActive
+                                                                        let turnTemp = temperature  // reasoning temp now comes from the model's reasoningSettings (was a hardcoded 0.6)
                                                                         do {
-                                                                            let stream = llmService.generateChatResponseStream(messages: chatMessages, temperature: temperature)
+                                                                            let stream = llmService.generateChatResponseStream(messages: chatMessages, temperature: turnTemp, reasoningActive: isReasoning)
                                                                             for try await chunk in stream {
                                                                                 finalText = chunk
                                                                                 if let i = messages.firstIndex(where: { $0.id == pid }) {
-                                                                                    messages[i].content = chunk
+                                                                                    let split = splitThinkTokens(chunk, isReasoning: isReasoning)
+                                                                                    messages[i].thinking = split.thinking
+                                                                                    messages[i].content = split.answer
                                                                                 }
                                                                             }
                                                                         } catch let memError as LLMService.LLMError {
@@ -11404,7 +11646,15 @@ class ChatViewModel: ObservableObject {
                                                                             print("HALDEBUG-RAG: Stored \(ctx.count) items ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬ ÃƒÂ¢Ã¢â€šÂ¬Ã¢â€žÂ¢ scores: \(ctx.map{$0.relevance})")
                                                                         }
 
-                                                                        let text = removeRepetitivePatterns(from: finalText).trimmingCharacters(in: .whitespacesAndNewlines)
+                                                                        let cleanedFull = removeRepetitivePatterns(from: finalText).trimmingCharacters(in: .whitespacesAndNewlines)
+                                                                        // Separate reasoning from answer. Only `text` (the answer) flows
+                                                                        // into message content, memory, and RAG; the reasoning goes to
+                                                                        // the collapsible panel and is never stored. Fallback: if a
+                                                                        // reasoning model never closed </think>, keep the full text as
+                                                                        // the answer so the bubble isn't blank.
+                                                                        let finalSplit = splitThinkTokens(cleanedFull, isReasoning: isReasoning)
+                                                                        let thinkingText: String? = finalSplit.answer.isEmpty ? nil : finalSplit.thinking
+                                                                        let text = finalSplit.answer.isEmpty ? cleanedFull : finalSplit.answer
 
                                                                         // Calculate token breakdown for this response
                                                                         let tokenBreakdown = calculateTokenBreakdown(
@@ -11429,6 +11679,7 @@ class ChatViewModel: ObservableObject {
                                                                             self.isSendingMessage = false
                                                                             if let i = self.messages.firstIndex(where: { $0.id == pid }) {
                                                                                 self.messages[i].content = text
+                                                                                self.messages[i].thinking = thinkingText
                                                                                 self.messages[i].isPartial = false
                                                                                 self.messages[i].thinkingDuration = thinking
                                                                                 self.lastInferenceTime = thinking
@@ -11869,12 +12120,19 @@ class ChatViewModel: ObservableObject {
                                                                         // perspectives; the visual rhythm matches the underlying
                                                                         // sequential thinking.
                                                                         finalText = ""
+                                                                        // Same reasoning-model split as the single-LLM path. The final
+                                                                        // store below (settle) splits by </think> content, so a reasoning
+                                                                        // seat's <think> trace never reaches memory/RAG regardless.
+                                                                        let isReasoning = self.reasoningActive
+                                                                        let turnTemp = temperature  // reasoning temp now comes from the model's reasoningSettings (was a hardcoded 0.6)
                                                                         do {
-                                                                            let stream = llmService.generateChatResponseStream(messages: chatMessages, temperature: temperature)
+                                                                            let stream = llmService.generateChatResponseStream(messages: chatMessages, temperature: turnTemp, reasoningActive: isReasoning)
                                                                             for try await chunk in stream {
                                                                                 finalText = chunk
                                                                                 if let i = messages.firstIndex(where: { $0.id == pid }) {
-                                                                                    messages[i].content = chunk
+                                                                                    let split = splitThinkTokens(chunk, isReasoning: isReasoning)
+                                                                                    messages[i].thinking = split.thinking
+                                                                                    messages[i].content = split.answer
                                                                                 }
                                                                             }
                                                                         } catch let memError as LLMService.LLMError {
@@ -11900,7 +12158,10 @@ class ChatViewModel: ObservableObject {
                                                                         modelTime = Date().timeIntervalSince(t0)
                                                                         halLog("HALDEBUG-SALON: Context-aware streaming complete. Length: \(finalText.count), elapsed: \(String(format: "%.2f", modelTime))s")
 
-                                                                        let text = removeRepetitivePatterns(from: finalText).trimmingCharacters(in: .whitespacesAndNewlines)
+                                                                        let cleanedFull = removeRepetitivePatterns(from: finalText).trimmingCharacters(in: .whitespacesAndNewlines)
+                                                                        let finalSplit = splitThinkTokens(cleanedFull, isReasoning: isReasoning)
+                                                                        let thinkingText: String? = finalSplit.answer.isEmpty ? nil : finalSplit.thinking
+                                                                        let text = finalSplit.answer.isEmpty ? cleanedFull : finalSplit.answer
 
                                                                         // Calculate token breakdown
                                                                         let tokenBreakdown = calculateTokenBreakdown(
@@ -11921,6 +12182,7 @@ class ChatViewModel: ObservableObject {
                                                                         await MainActor.run {
                                                                             if let i = self.messages.firstIndex(where: { $0.id == pid }) {
                                                                                 self.messages[i].content = text
+                                                                                self.messages[i].thinking = thinkingText
                                                                                 self.messages[i].isPartial = false
                                                                                 self.messages[i].thinkingDuration = thinking
                                                                                 self.lastInferenceTime = thinking

@@ -565,6 +565,118 @@ class HalTestConsole: ObservableObject {
             }
             return "{\"status\":\"error\",\"message\":\"SET_TEMPERATURE: must be 0.0–1.0\"}"
 
+        } else if trimmed.hasPrefix("SET_REASONING:") {
+            // Test hook for the reasoning / think-token toggle. Sets the sticky
+            // flag directly; the in-chat narration is exercised by the actual
+            // brain toggle in the UI. reasoningActive reflects flag × capability.
+            let valStr = String(trimmed.dropFirst("SET_REASONING:".count)).trimmingCharacters(in: .whitespaces).lowercased()
+            if valStr == "true" || valStr == "false" || valStr == "1" || valStr == "0" {
+                let on = (valStr == "true" || valStr == "1")
+                vm.reasoningEnabled = on
+                writeStateJSON(vm: vm)
+                return "{\"status\":\"ok\",\"reasoningEnabled\":\(on),\"reasoningActive\":\(vm.reasoningActive)}"
+            }
+            return "{\"status\":\"error\",\"message\":\"SET_REASONING: must be true/false\"}"
+
+        } else if trimmed.hasPrefix("SET_REASONING_PROMPT:") {
+            // Tuning: override the Layer-0 reasoning directive. Empty value or
+            // "default" clears the override (back to the built-in default).
+            let raw = String(trimmed.dropFirst("SET_REASONING_PROMPT:".count))
+            let val = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+            if val.isEmpty || val.lowercased() == "default" {
+                ReasoningTuning.shared.promptOverride = nil
+                return "{\"status\":\"ok\",\"reasoningPromptOverride\":null}"
+            }
+            ReasoningTuning.shared.promptOverride = raw
+            return "{\"status\":\"ok\",\"reasoningPromptOverrideChars\":\(raw.count)}"
+
+        } else if trimmed.hasPrefix("SET_REPETITION_PENALTY:") {
+            // Tuning: override repetition penalty on reasoning turns. "default"
+            // clears it (back to the model's own setting).
+            let val = String(trimmed.dropFirst("SET_REPETITION_PENALTY:".count)).trimmingCharacters(in: .whitespaces).lowercased()
+            if val == "default" || val == "nil" {
+                ReasoningTuning.shared.repetitionPenalty = nil
+                return "{\"status\":\"ok\",\"repetitionPenalty\":null}"
+            }
+            if let d = Double(val), d >= 1.0, d <= 2.0 {
+                ReasoningTuning.shared.repetitionPenalty = d
+                return "{\"status\":\"ok\",\"repetitionPenalty\":\(d)}"
+            }
+            return "{\"status\":\"error\",\"message\":\"SET_REPETITION_PENALTY: must be 1.0–2.0 or default\"}"
+
+        } else if trimmed.hasPrefix("SET_REASONING_TEMP:") {
+            // Tuning: override the reasoning-turn temperature (live sweep knob).
+            // "default" clears it (back to the model's reasoningSettings).
+            let val = String(trimmed.dropFirst("SET_REASONING_TEMP:".count)).trimmingCharacters(in: .whitespaces).lowercased()
+            if val == "default" || val == "nil" {
+                ReasoningTuning.shared.temperatureOverride = nil
+                return "{\"status\":\"ok\",\"reasoningTemp\":null}"
+            }
+            if let d = Double(val), d >= 0.0, d <= 2.0 {
+                ReasoningTuning.shared.temperatureOverride = d
+                return "{\"status\":\"ok\",\"reasoningTemp\":\(d)}"
+            }
+            return "{\"status\":\"error\",\"message\":\"SET_REASONING_TEMP: must be 0.0–2.0 or default\"}"
+
+        } else if trimmed.hasPrefix("SET_TOP_P:") {
+            // Tuning: override reasoning top-p. "default" clears it.
+            let val = String(trimmed.dropFirst("SET_TOP_P:".count)).trimmingCharacters(in: .whitespaces).lowercased()
+            if val == "default" || val == "nil" {
+                ReasoningTuning.shared.topPOverride = nil
+                return "{\"status\":\"ok\",\"topP\":null}"
+            }
+            if let d = Float(val), d > 0.0, d <= 1.0 {
+                ReasoningTuning.shared.topPOverride = d
+                return "{\"status\":\"ok\",\"topP\":\(d)}"
+            }
+            return "{\"status\":\"error\",\"message\":\"SET_TOP_P: must be 0.0–1.0 or default\"}"
+
+        } else if trimmed.hasPrefix("SET_TOP_K:") {
+            // Tuning: override reasoning top-k (0 disables). "default" clears it.
+            let val = String(trimmed.dropFirst("SET_TOP_K:".count)).trimmingCharacters(in: .whitespaces).lowercased()
+            if val == "default" || val == "nil" {
+                ReasoningTuning.shared.topKOverride = nil
+                return "{\"status\":\"ok\",\"topK\":null}"
+            }
+            if let i = Int(val), i >= 0, i <= 500 {
+                ReasoningTuning.shared.topKOverride = i
+                return "{\"status\":\"ok\",\"topK\":\(i)}"
+            }
+            return "{\"status\":\"error\",\"message\":\"SET_TOP_K: must be 0–500 or default\"}"
+
+        } else if trimmed.hasPrefix("SET_PRESENCE_PENALTY:") {
+            // Tuning: override reasoning presence penalty (Qwen's anti-loop lever,
+            // 0–2). "default" clears it.
+            let val = String(trimmed.dropFirst("SET_PRESENCE_PENALTY:".count)).trimmingCharacters(in: .whitespaces).lowercased()
+            if val == "default" || val == "nil" {
+                ReasoningTuning.shared.presencePenaltyOverride = nil
+                return "{\"status\":\"ok\",\"presencePenalty\":null}"
+            }
+            if let d = Float(val), d >= 0.0, d <= 2.0 {
+                ReasoningTuning.shared.presencePenaltyOverride = d
+                return "{\"status\":\"ok\",\"presencePenalty\":\(d)}"
+            }
+            return "{\"status\":\"error\",\"message\":\"SET_PRESENCE_PENALTY: must be 0.0–2.0 or default\"}"
+
+        } else if trimmed.hasPrefix("SET_MEMORY_ISOLATION:") {
+            // Tuning: skip all memory / RAG / self-knowledge / history injection
+            // for a clean footprint (no confounding retrieved context).
+            let val = String(trimmed.dropFirst("SET_MEMORY_ISOLATION:".count)).trimmingCharacters(in: .whitespaces).lowercased()
+            if val == "true" || val == "false" || val == "1" || val == "0" {
+                ReasoningTuning.shared.memoryIsolation = (val == "true" || val == "1")
+                return "{\"status\":\"ok\",\"memoryIsolation\":\(ReasoningTuning.shared.memoryIsolation)}"
+            }
+            return "{\"status\":\"error\",\"message\":\"SET_MEMORY_ISOLATION: must be true/false\"}"
+
+        } else if trimmed == "GET_THINK_STREAM" {
+            // Tuning: return the complete RAW reasoning captured for the most
+            // recent (or in-flight) reasoning turn. Unlike HALDEBUG-THINK-RAW
+            // (logged only after a finished answer), this buffer is appended
+            // per-chunk, so a runaway that never closes </think> is still
+            // fully inspectable. Readable mid-generation.
+            let raw = ReasoningTuning.shared.rawStream
+            return "{\"status\":\"ok\",\"chars\":\(raw.count),\"stream\":\"\(jsonStringEscape(raw))\"}"
+
         } else if trimmed.hasPrefix("SET_SELF_KNOWLEDGE:") {
             let valStr = String(trimmed.dropFirst("SET_SELF_KNOWLEDGE:".count)).trimmingCharacters(in: .whitespaces).lowercased()
             if valStr == "true" || valStr == "false" {
@@ -2016,9 +2128,31 @@ class HalTestConsole: ObservableObject {
     }
 
     private func jsonStringEscape(_ s: String) -> String {
-        s.replacingOccurrences(of: "\\", with: "\\\\")
-         .replacingOccurrences(of: "\"", with: "\\\"")
-         .replacingOccurrences(of: "\n", with: "\\n")
+        // Fully JSON-compliant string escaping. The earlier version handled
+        // only \, ", and \n — leaving tabs, carriage returns, and other
+        // control chars (< 0x20) raw, which yields INVALID JSON that strict
+        // parsers reject ("invalid control character"). That was a latent bug
+        // for every verb echoing free-form content (GET_LOGS, GET_THINK_STREAM,
+        // imported-doc names, …); reasoning streams are especially rich in
+        // control chars. Escape the named ones and \u-escape the rest.
+        var out = ""
+        out.reserveCapacity(s.count + 16)
+        for scalar in s.unicodeScalars {
+            switch scalar {
+            case "\\": out += "\\\\"
+            case "\"": out += "\\\""
+            case "\n": out += "\\n"
+            case "\r": out += "\\r"
+            case "\t": out += "\\t"
+            default:
+                if scalar.value < 0x20 {
+                    out += String(format: "\\u%04x", scalar.value)
+                } else {
+                    out.unicodeScalars.append(scalar)
+                }
+            }
+        }
+        return out
     }
 }
 

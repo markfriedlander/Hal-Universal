@@ -102,6 +102,17 @@ struct ModelSettings: Codable, Equatable {
     var ragDedupThreshold: Double?
     var repetitionPenalty: Float?
     var repetitionContextSize: Int?
+    /// Full sampler knobs (2026-07-14). Qwen — and most curated models —
+    /// publish recommended `top_p`/`top_k`/`min_p`/`presence_penalty`; we had
+    /// been passing only temperature + repetitionPenalty, running every model
+    /// outside its recommended sampling envelope. nil = the mlx default
+    /// (topP 1.0 / topK 0 / minP 0 / no presence penalty = disabled), so these
+    /// are no-ops until a model is deliberately seeded. Qwen uses PRESENCE
+    /// penalty (not repetition) as its anti-loop lever. See the reasoning memo.
+    var topP: Float?
+    var topK: Int?
+    var minP: Float?
+    var presencePenalty: Float?
     /// Whether the model's Layer 1 (per-model framing) is prepended to the
     /// user's system prompt. Per Strategic §4. Defaults to true. The Layer 1
     /// TEXT itself lives on ModelConfiguration.layerOnePrompt (read-only);
@@ -117,6 +128,10 @@ struct ModelSettings: Codable, Equatable {
         ragDedupThreshold: Double? = nil,
         repetitionPenalty: Float? = nil,
         repetitionContextSize: Int? = nil,
+        topP: Float? = nil,
+        topK: Int? = nil,
+        minP: Float? = nil,
+        presencePenalty: Float? = nil,
         layerOnePromptEnabled: Bool? = nil
     ) {
         self.temperature = temperature
@@ -127,6 +142,10 @@ struct ModelSettings: Codable, Equatable {
         self.ragDedupThreshold = ragDedupThreshold
         self.repetitionPenalty = repetitionPenalty
         self.repetitionContextSize = repetitionContextSize
+        self.topP = topP
+        self.topK = topK
+        self.minP = minP
+        self.presencePenalty = presencePenalty
         self.layerOnePromptEnabled = layerOnePromptEnabled
     }
 
@@ -143,6 +162,10 @@ struct ModelSettings: Codable, Equatable {
             ragDedupThreshold: overrides.ragDedupThreshold ?? self.ragDedupThreshold,
             repetitionPenalty: overrides.repetitionPenalty ?? self.repetitionPenalty,
             repetitionContextSize: overrides.repetitionContextSize ?? self.repetitionContextSize,
+            topP: overrides.topP ?? self.topP,
+            topK: overrides.topK ?? self.topK,
+            minP: overrides.minP ?? self.minP,
+            presencePenalty: overrides.presencePenalty ?? self.presencePenalty,
             layerOnePromptEnabled: overrides.layerOnePromptEnabled ?? self.layerOnePromptEnabled
         )
     }
@@ -418,6 +441,14 @@ struct ModelConfiguration: Identifiable, Codable, Equatable, Hashable {
     // disk. No migration needed.
     var defaultSettings: ModelSettings?
 
+    // Per-model REASONING-mode sampler (2026-07-14). Thinking and non-thinking
+    // modes want different sampling — Qwen publishes separate recipes. On a
+    // reasoning turn (reasoningActive), these are merged OVER defaultSettings;
+    // any nil field falls through to defaultSettings. nil here = reasoning uses
+    // defaultSettings unchanged. Symmetric to defaultSettings so a future
+    // visionSettings drops in the same way. See the reasoning memo.
+    var reasoningSettings: ModelSettings?
+
     // MARK: - Per-Model Layer 1 System Prompt (Strategic §4)
     //
     // Layer 1 is per-model behavioral framing — short, focused instructions
@@ -511,6 +542,20 @@ struct ModelConfiguration: Identifiable, Codable, Equatable, Hashable {
     // Codable-optional so older persisted configs decode cleanly.
     var kvCacheBytesPerPromptToken: Int?
 
+    // MARK: - Reasoning model / think tokens (2026-07)
+    //
+    // True for models whose chat template supports an `enable_thinking`
+    // branch and emit their reasoning wrapped in <think>…</think> (e.g.
+    // Qwen 3.5 2B — verified in its chat_template.jinja). When set,
+    // MLXWrapper.generateChatStream passes enable_thinking=true, and the
+    // streamed output is split on the closing </think> tag into a separate
+    // "thinking" region (shown in a collapsible panel) vs the visible
+    // answer. Only the answer is stored in memory / RAG. Models without a
+    // thinking template leave this nil and are unaffected. See
+    // Docs/Think_Tokens_Reasoning_Transparency.md.
+    // Codable-optional so older persisted configs decode cleanly.
+    var isReasoningModel: Bool?
+
     var isLocal: Bool { source == .mlx }
     var requiresDownload: Bool { source == .mlx && !isDownloaded }
 
@@ -528,13 +573,15 @@ struct ModelConfiguration: Identifiable, Codable, Equatable, Hashable {
         isDownloaded: Bool,
         localPath: URL?,
         defaultSettings: ModelSettings? = nil,
+        reasoningSettings: ModelSettings? = nil,
         layerOnePrompt: String? = nil,
         voiceTag: String? = nil,
         generationTokensPerSec: Double? = nil,
         prefillTokensPerSec: Double? = nil,
         maximCompliance: MaximScorecard? = nil,
         kvCacheBytesPerPromptToken: Int? = nil,
-        kvCacheQuantizationBits: Int? = nil
+        kvCacheQuantizationBits: Int? = nil,
+        isReasoningModel: Bool? = nil
     ) {
         self.id = id
         self.displayName = displayName
@@ -546,6 +593,7 @@ struct ModelConfiguration: Identifiable, Codable, Equatable, Hashable {
         self.isDownloaded = isDownloaded
         self.localPath = localPath
         self.defaultSettings = defaultSettings
+        self.reasoningSettings = reasoningSettings
         self.layerOnePrompt = layerOnePrompt
         self.voiceTag = voiceTag
         self.generationTokensPerSec = generationTokensPerSec
@@ -553,6 +601,7 @@ struct ModelConfiguration: Identifiable, Codable, Equatable, Hashable {
         self.maximCompliance = maximCompliance
         self.kvCacheBytesPerPromptToken = kvCacheBytesPerPromptToken
         self.kvCacheQuantizationBits = kvCacheQuantizationBits
+        self.isReasoningModel = isReasoningModel
     }
     
     func hash(into hasher: inout Hasher) {
@@ -787,6 +836,23 @@ struct ModelConfiguration: Identifiable, Codable, Equatable, Hashable {
             repetitionPenalty: 1.1,
             repetitionContextSize: 64
         ),
+        // Reasoning-mode sampler (2026-07-14) — Qwen's published THINKING-text
+        // recipe (model-card "Best Practices"), merged OVER defaultSettings on
+        // reasoning turns: temp 1.0 (bounded by top_k/top_p, deliberately NOT
+        // lowered — the old hardcoded 0.6 with no top_k/top_p is what loops),
+        // top_p 0.95, top_k 20, min_p 0, presence_penalty 1.5 (Qwen's stated
+        // anti-loop lever), repetition_penalty 1.0 = OFF (overrides the 1.1
+        // default — Qwen uses PRESENCE, not repetition). Vision/coding recipe
+        // (temp 0.6, presence 0.0) is parked for when image input ships. See
+        // Docs/Think_Tokens_Reasoning_Transparency.md.
+        reasoningSettings: ModelSettings(
+            temperature: 1.0,
+            repetitionPenalty: 1.0,
+            topP: 0.95,
+            topK: 20,
+            minP: 0.0,
+            presencePenalty: 1.5
+        ),
         // Layer 1 (§4) — addresses two Qwen-specific failure modes from
         // the §2 Maxim sweep:
         //   1. Verbosity: Qwen produced 4× more output tokens than peers
@@ -821,7 +887,12 @@ struct ModelConfiguration: Identifiable, Codable, Equatable, Hashable {
         // catalog. 50 KB/token leaves plenty of headroom even at long
         // prompts; in stress testing Qwen handled 8000-token prompts
         // on iPhone 16 Plus without jetsam risk.
-        kvCacheBytesPerPromptToken: 50 * 1024
+        kvCacheBytesPerPromptToken: 50 * 1024,
+        // Verified thinker: its chat_template.jinja honors enable_thinking and
+        // emits <think>…</think> (2026-07 template read). Enables the reasoning
+        // panel + enable_thinking for this model. See
+        // Docs/Think_Tokens_Reasoning_Transparency.md.
+        isReasoningModel: true
     )
 
     /// Llama 3.2 3B Instruct 4-bit — the workhorse voice. Meta's proven small

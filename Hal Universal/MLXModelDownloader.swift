@@ -342,6 +342,11 @@ class BackgroundDownloadCoordinator: NSObject, URLSessionDownloadDelegate, Obser
     @Published var bytesWrittenByModel: [String: Int64] = [:]
     @Published var bytesExpectedByModel: [String: Int64] = [:]
     private var filesPendingByModel: [String: Set<String>] = [:]
+    /// Per-model record of files whose move-into-place failed: modelID → (file →
+    /// error). A model with any entry here when its last file settles is a FAILED
+    /// download — it must not be claimed or marked downloaded. Cleared when the
+    /// failure is reported (or, implicitly, when a fresh download re-seeds pending).
+    private var filesFailedByModel: [String: [String: String]] = [:]
 
     func progress(for modelID: String) -> Double {
         let expected = bytesExpectedByModel[modelID] ?? 0
@@ -359,7 +364,14 @@ class BackgroundDownloadCoordinator: NSObject, URLSessionDownloadDelegate, Obser
     // GET https://huggingface.co/api/models/<repo>/tree/main
     // Returns a JSON array of {"type": "file"|"directory", "path": "...", "size": Int}
     private func fetchRepoFileList(repoID: String) async throws -> [String] {
-        guard let url = URL(string: "https://huggingface.co/api/models/\(repoID)/tree/main") else {
+        // `?recursive=1` is REQUIRED. Without it the HF tree API returns only the
+        // top level: root files, plus subfolders as `type: "directory"` entries
+        // (which the `type == "file"` filter below then drops). So every file
+        // inside a subfolder — `1_Pooling/config.json`, `unet/…`, `onnx/…` — is
+        // invisible, and the model downloads "successfully" while silently missing
+        // its nested files. Flat repos (all of Hal's Picks today) are unaffected;
+        // this matters for the Community browser, which points at arbitrary repos.
+        guard let url = URL(string: "https://huggingface.co/api/models/\(repoID)/tree/main?recursive=1") else {
             throw NSError(domain: "BackgroundDownloadCoordinator", code: 2, userInfo: [
                 NSLocalizedDescriptionKey: "Bad repo ID: \(repoID)"
             ])
@@ -422,6 +434,45 @@ class BackgroundDownloadCoordinator: NSObject, URLSessionDownloadDelegate, Obser
         NotificationCenter.default.post(name: .mlxModelDidDownload, object: nil, userInfo: ["modelID": modelID])
     }
 
+    /// The failure counterpart to ``notifyModelDownloadComplete``. Called when a
+    /// model's last file settles and one or more files failed to move into place.
+    ///
+    /// It is the mirror image of the success path, and the asymmetry is the point:
+    /// it does **NOT** `claim` the model and does **NOT** mark it downloaded — those
+    /// two lines are exactly what wrote a phantom into the shared manifest. It DOES
+    /// release the cross-app download lock (Hal is no longer downloading, so a
+    /// sibling may try) and delete the partial model directory (a half-model is
+    /// unusable; a clean slate lets a retry start fresh). The dir is model-scoped
+    /// (`mlxModelDir(id)`), never the shared root.
+    ///
+    /// It posts `.mlxModelDownloadFailed` so `waitForModelCompletion` — which waits
+    /// on the success notification with no timeout — throws instead of spinning
+    /// forever, and the UI can surface the error.
+    @MainActor
+    private func notifyModelDownloadFailed(modelID: String, failures: [String: String]) {
+        let summary = failures.map { "\($0.key): \($0.value)" }.joined(separator: "; ")
+        halLog("HALDEBUG-BGDL: ❌ Model \(modelID) FAILED — \(failures.count) file(s) did not save. Not claiming, not marking downloaded. [\(summary)]")
+
+        // Release the lock; do NOT claim, do NOT mark downloaded.
+        SharedModelStore.releaseDownloadLock(modelID: modelID)
+
+        // Remove the partial model directory so a retry starts clean and no
+        // half-model masquerades as present. Model-scoped (the coordinator's own
+        // `modelDirectory(for:)` = `mlxModelDir(id)`) — never the shared root.
+        let dir = modelDirectory(for: modelID)
+        if FileManager.default.fileExists(atPath: dir.path) {
+            try? FileManager.default.removeItem(at: dir)
+        }
+
+        // DownloadState lives on MLXModelDownloader, not the coordinator — mirror
+        // the success path, which delegates its state bookkeeping to `.shared`.
+        MLXModelDownloader.shared.markModelFailedFromBackground(modelID: modelID, failureCount: failures.count)
+
+        // Clear the failure ledger for this model and post the failure signal.
+        self.filesFailedByModel[modelID] = nil
+        NotificationCenter.default.post(name: .mlxModelDownloadFailed, object: nil, userInfo: ["modelID": modelID])
+    }
+
     // MARK: - URLSessionDownloadDelegate
 
     func urlSession(_ session: URLSession, downloadTask: URLSessionDownloadTask, didFinishDownloadingTo location: URL) {
@@ -435,22 +486,52 @@ class BackgroundDownloadCoordinator: NSObject, URLSessionDownloadDelegate, Obser
         // synchronously inside the delegate callback — iOS deletes `location`
         // as soon as we return.
         let target = URL(fileURLWithPath: context.targetPath)
+        // Create the file's PARENT directory first. For a nested file
+        // (`1_Pooling/config.json`), `target` lives in a subfolder that
+        // `createDirectory(modelDir)` at enqueue time did NOT create, and
+        // `moveItem` will not make intermediates — so without this the move
+        // throws and (because iOS reclaims `location` the instant we return) the
+        // bytes are simply gone. No-op for a root-level file.
+        try? FileManager.default.createDirectory(
+            at: target.deletingLastPathComponent(), withIntermediateDirectories: true)
         try? FileManager.default.removeItem(at: target)
+        var moveError: String?
         do {
             try FileManager.default.moveItem(at: location, to: target)
             halLog("HALDEBUG-BGDL: Moved \(context.filename) → \(target.path) (\(kind == .foreground ? "fg" : "bg") task \(downloadTask.taskIdentifier))")
         } catch {
+            moveError = error.localizedDescription
             halLog("HALDEBUG-BGDL: ❌ Move failed for \(context.filename): \(error.localizedDescription)")
         }
 
         // Update bookkeeping. Note: didCompleteWithError will fire shortly
         // after this; final cleanup happens there.
+        //
+        // A failed move must NOT be allowed to count as a finished file. The old
+        // code removed `filename` from `pending` unconditionally, so a model whose
+        // files all failed to move still emptied `pending`, fired
+        // notifyModelDownloadComplete, and — the dangerous part — CLAIMED the model
+        // in the shared manifest and marked it downloaded. The ledger then asserted
+        // Hal owned a model that wasn't on disk (the same shape of lie that made the
+        // clearHubCache bug destructive), and the user saw "Model ready" for a model
+        // that would fail to load later. So we track per-file move failures and, when
+        // the last file settles, route to success ONLY if none failed.
+        // Bind an immutable copy for the concurrently-executing Task (capturing the
+        // `var` directly is a Swift 6 data-race error).
+        let moveErrorResult = moveError
         Task { @MainActor in
             var pending = self.filesPendingByModel[context.modelID] ?? []
             pending.remove(context.filename)
             self.filesPendingByModel[context.modelID] = pending
+            if let moveErrorResult {
+                self.filesFailedByModel[context.modelID, default: [:]][context.filename] = moveErrorResult
+            }
             if pending.isEmpty {
-                self.notifyModelDownloadComplete(modelID: context.modelID)
+                if let failures = self.filesFailedByModel[context.modelID], !failures.isEmpty {
+                    self.notifyModelDownloadFailed(modelID: context.modelID, failures: failures)
+                } else {
+                    self.notifyModelDownloadComplete(modelID: context.modelID)
+                }
             }
         }
     }
@@ -870,10 +951,18 @@ class MLXModelDownloader: ObservableObject {
         halLog("HALDEBUG-DOWNLOAD: resumeInFlightDownloadsIfAny: settle complete, evaluating each marker")
 
         for modelID in pending {
-            if isModelDownloaded(modelID) {
-                // Already done — clean up the stale in-flight marker.
+            // Use COMPLETION (sentinel), not mere disk-presence, to decide a marker
+            // is stale. A marker persists to next launch ONLY when the download did
+            // not finish (completion clears it) — so a partial dir must never be
+            // declared "done" here. The old `isModelDownloaded` check ("dir has any
+            // files") did exactly that: it cleared the marker for a half-downloaded
+            // model, leaving it permanently incomplete but reading as present.
+            // Partial models now fall through to the branches below, which either
+            // let recovered background tasks keep running or re-fetch and download
+            // only the missing files.
+            if SharedModelStore.isRepoComplete(modelID) {
                 clearInFlight(modelID)
-                halLog("HALDEBUG-DOWNLOAD: \(modelID) is already downloaded; clearing in-flight marker")
+                halLog("HALDEBUG-DOWNLOAD: \(modelID) is verified complete (sentinel); clearing in-flight marker")
                 continue
             }
 
@@ -943,7 +1032,11 @@ class MLXModelDownloader: ObservableObject {
             let sizeGB = modelMeta["sizeGB"] as? Double
             let size = (sizeGB ?? 0.0) > 0.0 ? sizeGB : nil
             halLog("HALDEBUG-DOWNLOAD: Auto-resuming download for \(modelID) (no in-flight BGDL tasks found)")
-            Task { await self.startDownload(modelID: modelID, repoID: repoID, sizeGB: size) }
+            // forceResume: this model has a persisted in-flight marker and no
+            // completion sentinel — it is verifiably PARTIAL. Skip startDownload's
+            // disk-presence "already downloaded" guard, which would otherwise see
+            // the partial dir and refuse to finish it.
+            Task { await self.startDownload(modelID: modelID, repoID: repoID, sizeGB: size, forceResume: true) }
         }
     }
     
@@ -1171,9 +1264,17 @@ class MLXModelDownloader: ObservableObject {
         return "Downloading \(modelDisplayName) needs about \(requiredStr) free, but only \(availableStr) is available on this device. Free up some space and try again."
     }
 
-    func startDownload(modelID: String, repoID: String, sizeGB: Double? = nil) async {
-        // Check if already downloaded
-        if isModelDownloaded(modelID) {
+    /// - Parameter forceResume: set by the in-flight RESUME path, which has already
+    ///   determined (via the completion sentinel) that this model is PARTIAL and
+    ///   needs finishing. It skips the "already downloaded" early-return below —
+    ///   that guard uses `isModelDownloaded` (disk-presence: true for a merely
+    ///   non-empty dir), so for a half-downloaded model it would wrongly declare
+    ///   "already downloaded" and refuse to resume, leaving the model permanently
+    ///   partial. Normal callers keep the guard so a present (or sibling-downloaded)
+    ///   model isn't needlessly re-fetched.
+    func startDownload(modelID: String, repoID: String, sizeGB: Double? = nil, forceResume: Bool = false) async {
+        // Check if already downloaded (skipped on an explicit resume — see above).
+        if !forceResume && isModelDownloaded(modelID) {
             await MainActor.run {
                 print("HALDEBUG-DOWNLOAD: Model already downloaded: \(modelID)")
                 if var state = self.downloadStates[modelID] {
@@ -1615,6 +1716,21 @@ class MLXModelDownloader: ObservableObject {
     func deleteModel(modelID: String) async {
         let expectedPath = modelPath(for: modelID)
 
+        // Abnormal-path cleanup FIRST — before releasing the claim or removing
+        // files. If the model is mid-download (or was interrupted), three pieces of
+        // state would otherwise outlive the delete:
+        //   1. In-flight background URLSession tasks — a straggler completing after
+        //      we remove the directory would MOVE its file back in and re-create the
+        //      model on disk (observed 2026-07-16: DELETE returned ok, model
+        //      reappeared). Cancel them first.
+        //   2. The cross-app download lock — `releaseClaim` does not touch it, so the
+        //      lock lingered after delete (observed: lockCount stayed 1). Release it.
+        //   3. The in-flight resume marker — otherwise the next launch's resume path
+        //      would try to re-download a model the user deliberately deleted.
+        await BackgroundDownloadCoordinator.shared.cancelDownload(modelID: modelID)
+        SharedModelStore.releaseDownloadLock(modelID: modelID)
+        clearInFlight(modelID)
+
         // v2.1 shared store: release Hal's claim FIRST. The files are removed
         // only when NO other app (Posey) still claims the model. So deleting a
         // shared model in Hal drops Hal's claim and leaves Posey's copy on disk;
@@ -1708,12 +1824,33 @@ class MLXModelDownloader: ObservableObject {
     /// immediately after enqueueing the file tasks. Cancellation propagates
     /// through Task.checkCancellation.
     private func waitForModelCompletion(modelID: String) async throws {
-        let notifications = NotificationCenter.default.notifications(named: .mlxModelDidDownload)
-        for await notification in notifications {
-            try Task.checkCancellation()
-            if let id = notification.userInfo?["modelID"] as? String, id == modelID {
-                return
+        // Race success against failure: whichever fires for this modelID first
+        // wins. Without the failure arm, a failed download (which no longer posts
+        // .mlxModelDidDownload) would leave this waiting forever and the download
+        // UI spinning. The failure arm throws so the caller's existing catch treats
+        // it as a failed download and tears the task down.
+        try await withThrowingTaskGroup(of: Void.self) { group in
+            group.addTask {
+                let succeeded = NotificationCenter.default.notifications(named: .mlxModelDidDownload)
+                for await n in succeeded {
+                    try Task.checkCancellation()
+                    if (n.userInfo?["modelID"] as? String) == modelID { return }
+                }
             }
+            group.addTask {
+                let failed = NotificationCenter.default.notifications(named: .mlxModelDownloadFailed)
+                for await n in failed {
+                    try Task.checkCancellation()
+                    if (n.userInfo?["modelID"] as? String) == modelID {
+                        throw NSError(domain: "BackgroundDownloadCoordinator", code: 10, userInfo: [
+                            NSLocalizedDescriptionKey: "Download failed for \(modelID) — one or more files could not be saved."
+                        ])
+                    }
+                }
+            }
+            // Take the first arm to finish (return or throw), then cancel the other.
+            defer { group.cancelAll() }
+            try await group.next()
         }
     }
 
@@ -1724,6 +1861,15 @@ class MLXModelDownloader: ObservableObject {
     /// DownloadState, clear the in-flight marker, and refresh the catalog.
     func markModelAsDownloadedFromBackground(modelID: String) {
         let finalURL = modelPath(for: modelID)
+
+        // Durably record that this download VERIFIABLY completed, BEFORE clearing
+        // the in-flight marker below. If the process dies in the tiny window
+        // between here and clearInFlight, the next launch's resume path sees the
+        // sentinel and correctly treats the model as done. Without it, resume fell
+        // back to "dir has any files," so a half-downloaded model read as complete,
+        // its marker got cleared, and it was left permanently partial-but-"done".
+        SharedModelStore.markRepoComplete(modelID)
+
         var modelIDs = self.downloadedModelIDs
         modelIDs.insert(modelID)
         self.downloadedModelIDs = modelIDs
@@ -1759,6 +1905,25 @@ class MLXModelDownloader: ObservableObject {
         // Process the next queued download, if any.
         self.processNextInQueue()
     }
+
+    /// The failure counterpart to ``markModelAsDownloadedFromBackground``. Surfaces
+    /// the failure in the model's DownloadState. Deliberately does NOT insert into
+    /// `downloadedModelIDs` and does NOT clear the in-flight marker — the coordinator
+    /// path that threw will decide resume policy (a move failure is preserved for a
+    /// next-launch retry, same as other hard failures). Lock release, partial-dir
+    /// cleanup, and the manifest (non-)claim are handled by the coordinator's
+    /// `notifyModelDownloadFailed` before this is called.
+    func markModelFailedFromBackground(modelID: String, failureCount: Int) {
+        var state = self.downloadStates[modelID] ?? DownloadState(
+            isDownloading: false, progress: 0, message: "", error: nil, localPath: nil)
+        state.isDownloading = false
+        state.progress = 0
+        state.message = "Download failed."
+        state.error = "\(failureCount) file(s) couldn't be saved. Tap to retry."
+        state.localPath = nil
+        self.downloadStates[modelID] = state
+        halLog("HALDEBUG-DOWNLOAD: ❌ Background download marked FAILED for \(modelID) (\(failureCount) file(s))")
+    }
     
     func getModelPath(_ modelID: String) -> URL? {
         // Gate on the SAME shared-store disk-truth that `isModelDownloaded` uses,
@@ -1787,28 +1952,111 @@ class MLXModelDownloader: ObservableObject {
         isCacheCalculating = false
     }
     
-    func clearHubCache() {
-        if FileManager.default.fileExists(atPath: hubCacheDirectory.path) {
-            do {
-                try FileManager.default.removeItem(at: hubCacheDirectory)
-                
-                // Clear all model states since cache is gone
-                downloadedModelIDs = []
-                downloadStates = [:]
-                hubCacheSize = "No cache"
-                
-                print("HALDEBUG-CACHE: ✅ Cleared Hub cache and all model states")
-            } catch {
-                if var state = downloadStates.values.first {
-                    state.error = "Failed to clear cache: \(error.localizedDescription)"
-                    state.message = "Cache clear failed."
+    /// What a "clear Hal's models" pass will do, expressed per model so the UI can
+    /// tell the truth before the user commits.
+    struct ClearModelsPlan {
+        /// Hal is the only claimant — releasing drops the refcount to zero and the
+        /// files go.
+        var willDelete: [String] = []
+        /// A sibling app in the family still claims these. Hal's claim is released
+        /// but the bytes stay on disk.
+        var willStayForOthers: [String] = []
+        /// Display names of the sibling apps holding those claims, so the
+        /// confirmation can name them ("also used by Posey"). Populated by
+        /// ``previewClearHalsModels()`` only — the post-hoc result doesn't need it,
+        /// since `releaseClaim` reports a verdict rather than a claimant list.
+        var otherClaimants: Set<String> = []
+
+        var isEmpty: Bool { willDelete.isEmpty && willStayForOthers.isEmpty }
+        var totalClaimed: Int { willDelete.count + willStayForOthers.count }
+    }
+
+    /// Dry run of ``clearHalsModels()``. Drives the confirmation copy so the
+    /// button's promise matches its behavior — the old alert said "this will
+    /// delete all cached model files," which was the other half of the bug.
+    @MainActor
+    func previewClearHalsModels() -> ClearModelsPlan {
+        var plan = ClearModelsPlan()
+        for modelID in SharedModelStore.modelsClaimedByThisApp() {
+            let others = SharedModelStore.claimants(modelID: modelID)
+                .filter { $0 != SharedModelStore.thisAppID }
+            if others.isEmpty {
+                plan.willDelete.append(modelID)
+            } else {
+                plan.willStayForOthers.append(modelID)
+                for appID in others {
+                    plan.otherClaimants.insert(SharedModelStore.displayName(forAppID: appID))
                 }
-                print("HALDEBUG-CACHE: ❌ Failed to clear cache: \(error.localizedDescription)")
             }
-        } else {
-            hubCacheSize = "No cache"
-            print("HALDEBUG-CACHE: No cache directory found to clear")
         }
+        return plan
+    }
+
+    /// Release Hal's claim on every model Hal claims, and delete from disk ONLY
+    /// the ones no sibling app still wants.
+    ///
+    /// This deliberately does **not** remove `hubCacheDirectory`. That directory is
+    /// `SharedModelStore.huggingFaceRoot` — the App-Group container shared with
+    /// Posey and the rest of the family — so a `removeItem` there took out every
+    /// app's models in one shot: no manifest read, no claim check, no notification
+    /// to the app whose files just vanished. And because `manifest.json` lives one
+    /// level ABOVE `huggingface/`, it survived the wipe and went on describing
+    /// files that no longer existed, so the next `releaseClaim` reasoned from
+    /// fiction. (Found 2026-07-15 from the AI Camera project; the call predated the
+    /// shared store, was correct when the cache was Hal's alone, and never got
+    /// re-read when the store moved underneath it.)
+    ///
+    /// The contract, from `SharedModelStore`'s own header: *releasing in one app
+    /// releases only that app's claim; files go only when NO app still claims the
+    /// model.* The per-model Delete path already honored it. This now does too.
+    ///
+    /// Deletes are scoped to `mlxModelDir(id)` — one model at a time, never a root
+    /// delete. Returns what actually happened.
+    @MainActor
+    @discardableResult
+    func clearHalsModels() -> ClearModelsPlan {
+        var result = ClearModelsPlan()
+
+        for modelID in SharedModelStore.modelsClaimedByThisApp() {
+            // Release first, then act on the answer. `true` means the refcount hit
+            // zero — nobody else is holding this model.
+            guard SharedModelStore.releaseClaim(modelID: modelID) else {
+                result.willStayForOthers.append(modelID)
+                print("HALDEBUG-CACHE: kept \(modelID) — still claimed by another app")
+                continue
+            }
+
+            let dir = modelPath(for: modelID)
+            guard FileManager.default.fileExists(atPath: dir.path) else {
+                // Claimed in the ledger but already gone from disk. The release
+                // above is the useful half; nothing to remove.
+                result.willDelete.append(modelID)
+                continue
+            }
+            do {
+                try FileManager.default.removeItem(at: dir)
+                result.willDelete.append(modelID)
+                print("HALDEBUG-CACHE: ✅ deleted \(modelID)")
+            } catch {
+                // The claim is already released, so leave it out of both lists
+                // rather than report a delete that didn't happen.
+                print("HALDEBUG-CACHE: ❌ failed to delete \(modelID): \(error.localizedDescription)")
+            }
+        }
+
+        // Hal now claims nothing, regardless of what stayed on disk for a sibling.
+        // Anything still present shows up via the shared-store disk-truth path
+        // (`isModelDownloaded`) as present-but-unclaimed, which is correct.
+        downloadedModelIDs = []
+        downloadStates = [:]
+
+        // Do NOT assert "No cache" — a sibling app's models may still be sitting in
+        // the shared container, and claiming the store is empty would be the same
+        // kind of lie this fix exists to remove. Re-measure instead.
+        Task { @MainActor in await updateCacheSize() }
+
+        print("HALDEBUG-CACHE: cleared Hal's models — \(result.willDelete.count) deleted, \(result.willStayForOthers.count) kept for other apps")
+        return result
     }
     
     // MARK: - Utility Methods
@@ -1864,7 +2112,14 @@ class MLXModelDownloader: ObservableObject {
 
 // MARK: - Notification
 extension Notification.Name {
-    static let mlxModelDidDownload = Notification.Name("mlxModelDidDownload")
+    // `nonisolated` so these constants can be read from Sendable/detached contexts
+    // (e.g. the task-group arms in `waitForModelCompletion`). Notification-name
+    // constants carry no state and were never meaningfully actor-bound.
+    nonisolated static let mlxModelDidDownload = Notification.Name("mlxModelDidDownload")
+    /// Posted when a model's download settles with one or more files that failed
+    /// to save. Distinct from success so waiters can throw rather than hang and the
+    /// UI can show an error. `userInfo["modelID"]`.
+    nonisolated static let mlxModelDownloadFailed = Notification.Name("mlxModelDownloadFailed")
 }
 
 // ==== LEGO END: 45 BackgroundDownloadCoordinator + MLXModelDownloader ====

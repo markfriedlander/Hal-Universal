@@ -114,6 +114,10 @@ import SwiftUI
 import Foundation
 import Combine
 import Observation
+import os // Unified logging (os.Logger) — RuntimeLog mirrors to a dedicated subsystem
+       // so device logs can be streamed live from a Mac (`log stream` / Console)
+       // even while the app is backgrounded or the phone is locked, without the
+       // foreground-only test antenna. See RuntimeLog.
 import FoundationModels // Keep for FoundationModels option
 import UniformTypeIdentifiers // For file types in document import
 import SQLite3 // For MemoryStore - Direct C API for consistency with Mac version
@@ -173,6 +177,17 @@ final class RuntimeLog: @unchecked Sendable {
     private let capacity: Int = 1000
     private let formatter: DateFormatter
 
+    /// Unified-logging mirror. Every line ALSO goes here, which the OS stamps
+    /// with the process id and a real system timestamp and makes streamable from
+    /// a Mac — `log stream --predicate 'subsystem == "com.MarkFriedlander.Hal-Universal"'`
+    /// — LIVE, even while the app is backgrounded or the device is locked (unlike
+    /// the in-memory buffer, which is only readable via the foreground test
+    /// antenna). The PID stamp means two app instances can never be confused for
+    /// one in a capture. `privacy: .public` is REQUIRED: os.Logger redacts
+    /// interpolated strings to "<private>" by default, which would make every
+    /// streamed line useless. These are developer diagnostics with no PII.
+    private let osLogger = Logger(subsystem: "com.MarkFriedlander.Hal-Universal", category: "runtime")
+
     init() {
         let f = DateFormatter()
         f.dateFormat = "HH:mm:ss.SSS"
@@ -189,6 +204,9 @@ final class RuntimeLog: @unchecked Sendable {
         }
         lock.unlock()
         print(entry)
+        // Mirror to unified logging at .notice (the default level — always
+        // captured by `log stream` without extra flags, unlike .debug).
+        osLogger.notice("\(message, privacy: .public)")
     }
 
     nonisolated func snapshot(limit: Int) -> [String] {
@@ -216,6 +234,61 @@ final class RuntimeLog: @unchecked Sendable {
 /// caller that runs off the main actor.
 nonisolated func halLog(_ message: String) {
     RuntimeLog.shared.log(message)
+}
+
+/// Test/tuning knobs for the reasoning path (2026-07). Set via API verbs
+/// (SET_REASONING_PROMPT / SET_REPETITION_PENALTY / SET_MEMORY_ISOLATION) and
+/// read during prompt assembly + generation. `nonisolated` + `@unchecked
+/// Sendable` so the off-main MLX generation task can read them, mirroring
+/// RuntimeLog. Values are set-then-read sequentially by the tuning harness
+/// (tests/reasoning_tuning_matrix.py), so no locking is needed for that use.
+/// See Docs/Think_Tokens_Reasoning_Transparency.md.
+final class ReasoningTuning: @unchecked Sendable {
+    nonisolated static let shared = ReasoningTuning()
+    /// Overrides the default Layer-0 reasoning directive. nil/empty = default.
+    var promptOverride: String? = nil
+    /// Overrides the repetition penalty on reasoning turns. nil = model default.
+    var repetitionPenalty: Double? = nil
+    /// Live sweep overrides for the rest of the reasoning sampler (2026-07-14).
+    /// nil = use the model's reasoningSettings. Set via API verbs so the harness
+    /// can sweep temp × top_p × top_k × presence WITHOUT a rebuild-per-config.
+    /// Only applied on reasoning turns. See the reasoning memo.
+    var temperatureOverride: Double? = nil
+    var topPOverride: Float? = nil
+    var topKOverride: Int? = nil
+    var presencePenaltyOverride: Float? = nil
+    /// Skip ALL memory / RAG / self-knowledge injection for a clean footprint.
+    var memoryIsolation: Bool = false
+
+    // Raw reasoning capture buffer. The generator appends EVERY streamed
+    // chunk here as it arrives (generateChatStream), so the complete raw
+    // reasoning is retained and readable *mid-flight* via the
+    // GET_THINK_STREAM API verb — including a runaway that never closes
+    // </think>. This is the only place a non-completing (looping)
+    // generation leaves a full trace: HALDEBUG-THINK-RAW logs only after a
+    // finished answer, so a loop that times out logs nothing. Lock-guarded
+    // because the off-main MLX generation task writes while the API-server
+    // task reads. See Docs/Think_Tokens_Reasoning_Transparency.md.
+    private let rawStreamLock = NSLock()
+    private var _rawStream = ""
+
+    /// Clear the buffer at the start of a reasoning turn.
+    func resetRawStream() {
+        rawStreamLock.lock(); defer { rawStreamLock.unlock() }
+        _rawStream = ""
+    }
+    /// Append one streamed delta as it arrives.
+    func appendRawStream(_ s: String) {
+        rawStreamLock.lock(); defer { rawStreamLock.unlock() }
+        _rawStream += s
+    }
+    /// The complete raw stream so far (readable while generation is live).
+    var rawStream: String {
+        rawStreamLock.lock(); defer { rawStreamLock.unlock() }
+        return _rawStream
+    }
+
+    private init() {}
 }
 
 // MARK: - Named Entity Support
@@ -343,6 +416,12 @@ struct ChatMessage: Identifiable, Equatable { // Added Equatable for ForEach
     let timestamp: Date
     var isPartial: Bool // Changed to var for streaming updates
     var thinkingDuration: TimeInterval? // Changed to var for mutability
+    /// The model's reasoning trace — a reasoning model's <think>…</think>
+    /// content, separated from the visible answer in `content`. Shown in a
+    /// collapsible "Thinking" panel; never written to memory/RAG. nil for
+    /// non-reasoning models. Distinct from `thinkingDuration` (timing only).
+    /// See Docs/Think_Tokens_Reasoning_Transparency.md.
+    var thinking: String?
     var fullPromptUsed: String? // NEW: To store the exact prompt for Hal's response
     var usedContextSnippets: [UnifiedSearchResult]? // NEW: To store the RAG snippets used
     var tokenBreakdown: TokenBreakdown? // NEW: To store token usage breakdown
@@ -366,13 +445,14 @@ struct ChatMessage: Identifiable, Equatable { // Added Equatable for ForEach
     /// Should be rare in normal use.
     var truncatedSegments: Set<PromptSegmentKind>
 
-    init(id: UUID = UUID(), content: String, isFromUser: Bool, timestamp: Date = Date(), isPartial: Bool = false, thinkingDuration: TimeInterval? = nil, fullPromptUsed: String? = nil, usedContextSnippets: [UnifiedSearchResult]? = nil, tokenBreakdown: TokenBreakdown? = nil, toolsUsed: [String]? = nil, recordedByModel: String, turnNumber: Int, seatNumber: Int? = nil, deliberationRound: Int = 1, compressedSegments: Set<PromptSegmentKind> = [], truncatedSegments: Set<PromptSegmentKind> = []) {
+    init(id: UUID = UUID(), content: String, isFromUser: Bool, timestamp: Date = Date(), isPartial: Bool = false, thinkingDuration: TimeInterval? = nil, thinking: String? = nil, fullPromptUsed: String? = nil, usedContextSnippets: [UnifiedSearchResult]? = nil, tokenBreakdown: TokenBreakdown? = nil, toolsUsed: [String]? = nil, recordedByModel: String, turnNumber: Int, seatNumber: Int? = nil, deliberationRound: Int = 1, compressedSegments: Set<PromptSegmentKind> = [], truncatedSegments: Set<PromptSegmentKind> = []) {
         self.id = id
         self.content = content
         self.isFromUser = isFromUser
         self.timestamp = timestamp
         self.isPartial = isPartial
         self.thinkingDuration = thinkingDuration
+        self.thinking = thinking
         self.fullPromptUsed = fullPromptUsed
         self.usedContextSnippets = usedContextSnippets
         self.tokenBreakdown = tokenBreakdown
@@ -384,6 +464,30 @@ struct ChatMessage: Identifiable, Equatable { // Added Equatable for ForEach
         self.compressedSegments = compressedSegments
         self.truncatedSegments = truncatedSegments
     }
+}
+
+/// Split a reasoning model's output into its reasoning trace vs the visible
+/// answer. Qwen-style templates seed the opening `<think>` into the *prompt*,
+/// so the output looks like `<reasoning></think><answer>`: everything before
+/// the first `</think>` is reasoning, everything after is the answer.
+///
+/// The split is content-driven and reliable whenever `</think>` is present
+/// (regardless of `isReasoning`), which keeps reasoning out of memory/RAG even
+/// on the Salon path. `isReasoning` only governs the mid-stream case before the
+/// closing tag arrives: for a reasoning model the text so far is all reasoning
+/// (answer empty, shown live in the panel); for others it's all answer.
+/// See Docs/Think_Tokens_Reasoning_Transparency.md.
+func splitThinkTokens(_ raw: String, isReasoning: Bool) -> (thinking: String?, answer: String) {
+    if let r = raw.range(of: "</think>") {
+        let think = raw[..<r.lowerBound].trimmingCharacters(in: .whitespacesAndNewlines)
+        let answer = String(raw[r.upperBound...]).trimmingCharacters(in: .whitespacesAndNewlines)
+        return (think.isEmpty ? nil : think, answer)
+    }
+    if isReasoning {
+        let think = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        return (think.isEmpty ? nil : think, "")
+    }
+    return (nil, raw)
 }
 
 // MARK: - RAG Snippet with Full Metadata
@@ -5331,7 +5435,7 @@ class MLXWrapper: ObservableObject {
     /// model chunk, so callers can update UI in real time. The final yield
     /// is the complete trimmed response; stream then finishes. Errors are
     /// thrown via the stream's failure path.
-    func generateChatStream(messages: [HalChatMessage], temperature: Double = 0.7) -> AsyncThrowingStream<String, Error> {
+    func generateChatStream(messages: [HalChatMessage], temperature: Double = 0.7, reasoningActive: Bool = false) -> AsyncThrowingStream<String, Error> {
         AsyncThrowingStream { continuation in
             Task {
                 guard isModelLoaded, let container = self.modelContainer else {
@@ -5360,9 +5464,24 @@ class MLXWrapper: ObservableObject {
                     // reasoning and no visible output.
                     MLX.seed(UInt64(Date.timeIntervalSinceReferenceDate * 1000))
 
+                    // Reasoning models (chat template honors enable_thinking and
+                    // emits <think>…</think>, e.g. Qwen 3.5 2B) get the thinking
+                    // branch turned ON; the streamed output is split on the closing
+                    // </think> downstream into the thinking panel vs the visible
+                    // answer. Non-reasoning models leave the flag false (no-op for
+                    // their templates). Gated on the model's isReasoningModel flag.
+                    // See Docs/Think_Tokens_Reasoning_Transparency.md.
+                    // Gated on BOTH the user's per-turn reasoning toggle
+                    // (reasoningActive, threaded from the ViewModel) AND the
+                    // model's intrinsic capability, so a reasoning model only
+                    // thinks when the user has actually asked to see it.
+                    let enableThinking = reasoningActive && (self.currentModelConfig?.isReasoningModel == true)
+                    if enableThinking {
+                        halLog("HALDEBUG-THINK: enable_thinking=true for \(self.currentModelConfig?.displayName ?? "?")")
+                    }
                     let userInput = UserInput(
                         chat: chatMessages,
-                        additionalContext: ["enable_thinking": false]
+                        additionalContext: ["enable_thinking": enableThinking]
                     )
                     let lmInput = try await container.prepare(input: userInput)
                     let promptTokenCount = lmInput.text.tokens.size
@@ -5410,10 +5529,36 @@ class MLXWrapper: ObservableObject {
                     // Phi-4 baseline investigation. A subsequent increment will
                     // route through ModelSettingsStore.effectiveSettings(for:) to
                     // honor any user override; for now we read defaults directly.
-                    let settings = self.currentModelConfig?.defaultSettings ?? ModelSettings()
-                    let modelPenalty = settings.repetitionPenalty
+                    // Effective per-model settings. Reasoning turns merge the
+                    // model's reasoningSettings OVER defaultSettings (thinking and
+                    // non-thinking want different samplers — Qwen ships separate
+                    // recipes); non-reasoning turns use defaultSettings as-is. The
+                    // new sampler fields are nil until a model is seeded, so this
+                    // is a no-op for un-seeded models. See the reasoning memo.
+                    let baseSettings = self.currentModelConfig?.defaultSettings ?? ModelSettings()
+                    let settings: ModelSettings = enableThinking
+                        ? (self.currentModelConfig?.reasoningSettings.map { baseSettings.merged(with: $0) } ?? baseSettings)
+                        : baseSettings
+                    // Reasoning turns may override the repetition penalty via the
+                    // tuning harness (ReasoningTuning); else use the effective setting.
+                    let reasoningPenaltyOverride: Float? = enableThinking ? ReasoningTuning.shared.repetitionPenalty.map { Float($0) } : nil
+                    let modelPenalty = reasoningPenaltyOverride ?? settings.repetitionPenalty
                     let modelPenaltyCtx = settings.repetitionContextSize ?? 20
-                    halLog("HALDEBUG-MLX-CHAT: Penalty config for \(self.currentModelConfig?.displayName ?? "unknown"): penalty=\(modelPenalty.map { String($0) } ?? "nil"), ctx=\(modelPenaltyCtx)")
+                    // Temperature: a reasoning turn prefers the effective reasoning
+                    // temperature (Qwen thinking-text = 1.0, bounded by top_k/top_p);
+                    // otherwise the caller's temperature. (The old hardcoded 0.6
+                    // reasoning override in the stream consumers is removed.)
+                    // Live sweep overrides (ReasoningTuning) win on reasoning turns so
+                    // the harness can tune the sampler without a rebuild; else the
+                    // model's effective reasoningSettings; else the mlx default.
+                    let effectiveTemperature = enableThinking
+                        ? (ReasoningTuning.shared.temperatureOverride ?? settings.temperature ?? temperature)
+                        : temperature
+                    let modelTopP = (enableThinking ? ReasoningTuning.shared.topPOverride : nil) ?? settings.topP ?? 1.0
+                    let modelTopK = (enableThinking ? ReasoningTuning.shared.topKOverride : nil) ?? settings.topK ?? 0
+                    let modelMinP = settings.minP ?? 0.0
+                    let modelPresencePenalty = (enableThinking ? ReasoningTuning.shared.presencePenaltyOverride : nil) ?? settings.presencePenalty
+                    halLog("HALDEBUG-MLX-CHAT: Sampler for \(self.currentModelConfig?.displayName ?? "unknown") [\(enableThinking ? "reasoning" : "normal")]: temp=\(String(format: "%.2f", effectiveTemperature)) topP=\(modelTopP) topK=\(modelTopK) minP=\(modelMinP) repPen=\(modelPenalty.map { String($0) } ?? "nil") presPen=\(modelPresencePenalty.map { String($0) } ?? "nil")")
                     // Token budget. Per Mark's clarification (May 13 evening):
                     // this is a *runaway* safeguard, not a normal-response
                     // ceiling. Models should be free to complete their thought
@@ -5435,6 +5580,12 @@ class MLXWrapper: ObservableObject {
                     //   - 1536: better, but per Mark's intent still a ceiling
                     //     on the normal-response distribution rather than a
                     //     true runaway cap.
+                    // Token ceiling — kept at 4096 even for reasoning turns. A
+                    // larger reasoning budget (8192) let a looping 2B model grow
+                    // its KV cache past the iOS memory cliff and jetsam the app
+                    // (2026-07-13). 4096 bounds generation-KV growth; the tuning
+                    // levers (temperature / rep-penalty / Layer-0 directive) are
+                    // what stop the loop, not a bigger budget.
                     let maxOutputTokens = 4096
                     // Per-model KV cache quantization (Item 11 follow-up,
                     // 2026-05-18 evening). When the model config sets
@@ -5452,9 +5603,13 @@ class MLXWrapper: ObservableObject {
                     let parameters = GenerateParameters(
                         maxTokens: maxOutputTokens,
                         kvBits: kvBits,
-                        temperature: Float(temperature),
+                        temperature: Float(effectiveTemperature),
+                        topP: modelTopP,
+                        topK: modelTopK,
+                        minP: modelMinP,
                         repetitionPenalty: modelPenalty,
-                        repetitionContextSize: modelPenaltyCtx
+                        repetitionContextSize: modelPenaltyCtx,
+                        presencePenalty: modelPresencePenalty
                     )
                     let mlxStream = try await container.generate(input: lmInput, parameters: parameters)
                     let streamStart = Date.timeIntervalSinceReferenceDate
@@ -5466,6 +5621,12 @@ class MLXWrapper: ObservableObject {
                     let repetitionCheckEvery = 50  // chars between checks
                     var stoppedForRepetition = false
 
+                    // Start a fresh raw-reasoning capture for this turn. The
+                    // buffer is appended per-chunk below and stays readable
+                    // mid-flight (GET_THINK_STREAM), so a looping turn that
+                    // never finishes still leaves a complete trace to diagnose.
+                    if enableThinking { ReasoningTuning.shared.resetRawStream() }
+
                     streamLoop: while let event = await iterator.next() {
                         switch event {
                         case .chunk(let text):
@@ -5475,6 +5636,11 @@ class MLXWrapper: ObservableObject {
                                 sawFirstToken = true
                             }
                             fullText += text
+                            // Capture the raw delta into the mid-flight buffer
+                            // (reasoning turns only) so the complete stream is
+                            // inspectable even if this turn loops and never
+                            // completes. Cheap lock-guarded append.
+                            if enableThinking { ReasoningTuning.shared.appendRawStream(text) }
                             // Yield the cumulative text so the caller's UI can
                             // render the partial response as it grows.
                             continuation.yield(fullText)
@@ -5522,6 +5688,17 @@ class MLXWrapper: ObservableObject {
                         halLog("HALDEBUG-MLX-CHAT: Truncation safeguard trimmed \(whitespaceTrimmed.count - finalText.count) chars from a mid-word cut")
                     }
                     halLog("HALDEBUG-MLX-CHAT: Returning fullText (\(finalText.count) chars): \(finalText.prefix(150))")
+                    if enableThinking {
+                        // Log the RAW reasoning trace so it's queryable via
+                        // GET_LOGS — the ViewModel splits it out of the stored
+                        // message, so this is the only place to inspect what the
+                        // model actually thought (essential for tuning). Two
+                        // chunks so a loop is visible near its start.
+                        halLog("HALDEBUG-THINK-RAW (\(finalText.count) chars): \(finalText.prefix(1200))")
+                        if finalText.count > 1200 {
+                            halLog("HALDEBUG-THINK-RAW-cont: …\(finalText.dropFirst(1200).prefix(1200))")
+                        }
+                    }
                     // Final yield with the cleaned version so callers settle on a
                     // string with no mid-word truncation. Then finish the stream.
                     if finalText != fullText {
@@ -5943,7 +6120,7 @@ class LLMService: ObservableObject {
     /// `session.streamResponse` already produces snapshots whose
     /// `.content` is the cumulative text; MLX via `MLXWrapper.generateChatStream`
     /// produces incremental chunks that we accumulate inside the wrapper.
-    func generateChatResponseStream(messages: [HalChatMessage], temperature: Double = 0.7) -> AsyncThrowingStream<String, Error> {
+    func generateChatResponseStream(messages: [HalChatMessage], temperature: Double = 0.7, reasoningActive: Bool = false) -> AsyncThrowingStream<String, Error> {
         halLog("HALDEBUG-RESPONSE: \(currentModel.displayName) (\(currentModel.source)) is responding [chat-path, streaming]")
         halLog("HALDEBUG-LLM: generateChatResponseStream called - \(messages.count) messages, currentModel: \(currentModel.displayName)")
 
@@ -6024,7 +6201,7 @@ class LLMService: ObservableObject {
         case .mlx:
             // Fast path: model resident → generate directly.
             if mlxWrapper.isModelLoaded {
-                return mlxWrapper.generateChatStream(messages: messages, temperature: temperature)
+                return mlxWrapper.generateChatStream(messages: messages, temperature: temperature, reasoningActive: reasoningActive)
             }
             // RELOAD-ON-DEMAND. The MLX model may not be resident for two reasons,
             // and neither should dead-end a chat with "model could not be loaded":
@@ -6061,7 +6238,7 @@ class LLMService: ObservableObject {
                     }
                     // 4. Bridge the inner generation stream through to the caller.
                     do {
-                        for try await chunk in self.mlxWrapper.generateChatStream(messages: messages, temperature: temperature) {
+                        for try await chunk in self.mlxWrapper.generateChatStream(messages: messages, temperature: temperature, reasoningActive: reasoningActive) {
                             continuation.yield(chunk)
                         }
                         continuation.finish()
@@ -9073,9 +9250,20 @@ class ChatViewModel: ObservableObject {
         let layerOneRaw = layerOneEnabled ? (model.layerOnePrompt ?? "") : ""
         let layerOne = layerOneRaw.trimmingCharacters(in: .whitespacesAndNewlines)
 
-        if layerOne.isEmpty { return layerTwo }
-        if layerTwo.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty { return layerOne }
-        return layerOne + "\n\n" + layerTwo
+        var base: String
+        if layerOne.isEmpty { base = layerTwo }
+        else if layerTwo.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty { base = layerOne }
+        else { base = layerOne + "\n\n" + layerTwo }
+
+        // Layer 0: when reasoning is active, PREPEND the reasoning directive so
+        // the identity layers (Layer 1 + Layer 2) still have the last word and
+        // personality is preserved. Overridable for tuning via ReasoningTuning.
+        if reasoningActive {
+            let override = ReasoningTuning.shared.promptOverride
+            let directive = (override?.isEmpty == false ? override! : Self.reasoningLayerPrompt)
+            base = base.isEmpty ? directive : directive + "\n\n" + base
+        }
+        return base
     }
     @Published var injectedSummary: String = ""
     @AppStorage("memoryDepth") var memoryDepth: Int = 5
@@ -9085,7 +9273,48 @@ class ChatViewModel: ObservableObject {
     
     // NEW: Temperature control (0.0 = deterministic, 1.0 = creative)
     @AppStorage("temperature") var temperature: Double = 0.7
-    
+
+    // MARK: - Reasoning / think-token toggle (2026-07)
+    //
+    // User-facing, sticky (persists across launches). Only meaningful when the
+    // active model can reason (ModelConfiguration.isReasoningModel). When the
+    // toggle is on AND the model is a reasoning model (see `reasoningActive`),
+    // Hal passes enable_thinking=true, drops the turn temperature to 0.6,
+    // appends `reasoningLayerPrompt` to keep it from rambling, and splits
+    // <think>…</think> into the collapsible "Thinking" panel. Surfaced as a
+    // brain toggle beside the lock. See Docs/Think_Tokens_Reasoning_Transparency.md.
+    @AppStorage("reasoningEnabled") var reasoningEnabled: Bool = false
+
+    /// True only when the active model can reason AND the user has reasoning on.
+    var reasoningActive: Bool { (selectedModel.isReasoningModel == true) && reasoningEnabled }
+
+    /// Default Layer-0 reasoning directive — PREPENDED to the effective system
+    /// prompt when reasoning is active (so the identity layers keep the last
+    /// word and personality is preserved). Targets repetition/looping, NOT
+    /// thinking depth, and explicitly preserves the answer voice. Overridable
+    /// for tuning via ReasoningTuning.shared.promptOverride.
+    static let reasoningLayerPrompt = "Before you answer, you may reason inside <think> and </think>. Reason as thoroughly as the question needs, but do not repeat yourself or restate points you have already made. When you reach a conclusion, close </think> and answer. This governs only your thinking; it does not change your voice, your identity, or how you write your final answer. Answer exactly as you otherwise would."
+
+    /// Toggle reasoning on/off and narrate the change into the chat, mirroring
+    /// the model-switch narration pattern. Sticky until toggled again.
+    func setReasoning(_ on: Bool) {
+        guard on != reasoningEnabled else { return }
+        reasoningEnabled = on
+        let modelName = selectedModel.displayName
+        let userMsg: String
+        let halMsg: String
+        if on {
+            userMsg = "Hal, show me your reasoning."
+            halMsg = "Reasoning is on. Before each answer you'll see me think it through in a panel above the reply. It makes \(modelName) slower and more deliberate. Tap the brain again anytime to switch back to direct replies."
+        } else {
+            userMsg = "Hal, go back to direct replies."
+            halMsg = "Reasoning is off. Back to direct answers from \(modelName)."
+        }
+        let currentTurn = memoryStore.getCurrentTurnNumber(conversationId: conversationId) + 1
+        messages.append(ChatMessage(content: userMsg, isFromUser: true, recordedByModel: "user", turnNumber: currentTurn))
+        messages.append(ChatMessage(content: halMsg, isFromUser: false, recordedByModel: selectedModel.id, turnNumber: currentTurn))
+    }
+
     // NEW: Self-knowledge toggle (enables/disables temporal, self-awareness, self-knowledge context)
     @AppStorage("enableSelfKnowledge") var enableSelfKnowledge: Bool = true
 
@@ -9160,7 +9389,7 @@ class ChatViewModel: ObservableObject {
     /// this in init() means every launch overrides whatever was
     /// persisted previously, so a fresh install/reinstall always boots
     /// with the antenna in the dev-friendly default state.
-    private static let kLocalAPIEnabledOnLaunch: Bool = false
+    private static let kLocalAPIEnabledOnLaunch: Bool = false  // Production default: API antenna OFF at launch (opt-in via Settings). Flip to true only for local device testing; revert before commit/ship.
 
     init() {
         // STEP 0: Apply launch-time default for the Local API antenna.
@@ -10592,6 +10821,11 @@ class ChatViewModel: ObservableObject {
                                                                             // Original intent: situate Hal in time + carry compressed and retrieved
                                                                             // context + give Hal awareness of himself. Chat form folds it all into
                                                                             // the system message as background.
+                                                                            // Memory isolation (tuning harness): when on, skip all memory /
+                                                                            // RAG / self-knowledge / summary / history injection for a clean
+                                                                            // footprint, so tuning isn't confounded by retrieved context.
+                                                                            // Temporal awareness stays (it isn't "memory"). See ReasoningTuning.
+                                                                            let isolated = ReasoningTuning.shared.memoryIsolation
                                                                             var contextSections: [String] = []
 
                                                                             let temporalRaw = buildTemporalContext()
@@ -10603,7 +10837,7 @@ class ChatViewModel: ObservableObject {
                                                                                 contextSections.append(temporalBody)
                                                                             }
 
-                                                                            if !injectedSummary.isEmpty {
+                                                                            if !injectedSummary.isEmpty && !isolated {
                                                                                 let resolvedSummary = await resolveSegment(.autoSummary, rawContent: injectedSummary, budgetTokens: summaryBudgetTokens)
                                                                                 contextSections.append("Summary of earlier conversation:\n\(resolvedSummary)")
                                                                             }
@@ -10624,7 +10858,7 @@ class ChatViewModel: ObservableObject {
                                                                             // identity and small enough to never overflow.
                                                                             let isActiveAFM = (llmService.activeModelID == ModelConfiguration.appleFoundation.id)
 
-                                                                            if enableSelfKnowledge {
+                                                                            if enableSelfKnowledge && !isolated {
                                                                                 let selfAwarenessRaw = buildSelfAwarenessContext()
                                                                                 let selfAwarenessBody = selfAwarenessRaw
                                                                                     .replacingOccurrences(of: "#=== BEGIN SELF_AWARENESS ===#", with: "")
@@ -10659,7 +10893,7 @@ class ChatViewModel: ObservableObject {
                                                                             // for speed and stability — see decideTools comments). executeTools
                                                                             // runs the memory search and returns up to 10 snippets within the
                                                                             // model's RAG token budget.
-                                                                            if !currentInput.isEmpty {
+                                                                            if !currentInput.isEmpty && !isolated {
                                                                                 let toolDecision = await decideTools(userInput: currentInput)
                                                                                 let shortTermTurns = getShortTermTurns(currentTurns: countCompletedTurns())
                                                                                 let toolResults = await executeTools(
@@ -10718,7 +10952,7 @@ class ChatViewModel: ObservableObject {
                                                                             // but we'll add it ourselves at the end so role order is correct.
                                                                             //
                                                                             // Depth: effectiveMemoryDepth turns × 2 messages-per-turn.
-                                                                            let historyDepth = effectiveMemoryDepth * 2
+                                                                            let historyDepth = isolated ? 0 : effectiveMemoryDepth * 2
                                                                             // History source: if `historyOverride` is provided (used by
                                                                             // Salon Mode's independent path — each seat must see the
                                                                             // conversation as it was BEFORE any seat ran this turn, not
@@ -11366,12 +11600,20 @@ class ChatViewModel: ObservableObject {
                                                                         // first token. Generation timing (modelTime) is captured
                                                                         // around the whole stream so thinkingDuration stays meaningful.
                                                                         finalText = ""
+                                                                        // Reasoning models emit <think>…</think> before the answer; split
+                                                                        // it out live so the reasoning streams into the collapsible panel
+                                                                        // (message.thinking) and only the answer fills the bubble
+                                                                        // (message.content). See splitThinkTokens.
+                                                                        let isReasoning = self.reasoningActive
+                                                                        let turnTemp = temperature  // reasoning temp now comes from the model's reasoningSettings (was a hardcoded 0.6)
                                                                         do {
-                                                                            let stream = llmService.generateChatResponseStream(messages: chatMessages, temperature: temperature)
+                                                                            let stream = llmService.generateChatResponseStream(messages: chatMessages, temperature: turnTemp, reasoningActive: isReasoning)
                                                                             for try await chunk in stream {
                                                                                 finalText = chunk
                                                                                 if let i = messages.firstIndex(where: { $0.id == pid }) {
-                                                                                    messages[i].content = chunk
+                                                                                    let split = splitThinkTokens(chunk, isReasoning: isReasoning)
+                                                                                    messages[i].thinking = split.thinking
+                                                                                    messages[i].content = split.answer
                                                                                 }
                                                                             }
                                                                         } catch let memError as LLMService.LLMError {
@@ -11405,7 +11647,15 @@ class ChatViewModel: ObservableObject {
                                                                             print("HALDEBUG-RAG: Stored \(ctx.count) items ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬ ÃƒÂ¢Ã¢â€šÂ¬Ã¢â€žÂ¢ scores: \(ctx.map{$0.relevance})")
                                                                         }
 
-                                                                        let text = removeRepetitivePatterns(from: finalText).trimmingCharacters(in: .whitespacesAndNewlines)
+                                                                        let cleanedFull = removeRepetitivePatterns(from: finalText).trimmingCharacters(in: .whitespacesAndNewlines)
+                                                                        // Separate reasoning from answer. Only `text` (the answer) flows
+                                                                        // into message content, memory, and RAG; the reasoning goes to
+                                                                        // the collapsible panel and is never stored. Fallback: if a
+                                                                        // reasoning model never closed </think>, keep the full text as
+                                                                        // the answer so the bubble isn't blank.
+                                                                        let finalSplit = splitThinkTokens(cleanedFull, isReasoning: isReasoning)
+                                                                        let thinkingText: String? = finalSplit.answer.isEmpty ? nil : finalSplit.thinking
+                                                                        let text = finalSplit.answer.isEmpty ? cleanedFull : finalSplit.answer
 
                                                                         // Calculate token breakdown for this response
                                                                         let tokenBreakdown = calculateTokenBreakdown(
@@ -11430,6 +11680,7 @@ class ChatViewModel: ObservableObject {
                                                                             self.isSendingMessage = false
                                                                             if let i = self.messages.firstIndex(where: { $0.id == pid }) {
                                                                                 self.messages[i].content = text
+                                                                                self.messages[i].thinking = thinkingText
                                                                                 self.messages[i].isPartial = false
                                                                                 self.messages[i].thinkingDuration = thinking
                                                                                 self.lastInferenceTime = thinking
@@ -11870,12 +12121,19 @@ class ChatViewModel: ObservableObject {
                                                                         // perspectives; the visual rhythm matches the underlying
                                                                         // sequential thinking.
                                                                         finalText = ""
+                                                                        // Same reasoning-model split as the single-LLM path. The final
+                                                                        // store below (settle) splits by </think> content, so a reasoning
+                                                                        // seat's <think> trace never reaches memory/RAG regardless.
+                                                                        let isReasoning = self.reasoningActive
+                                                                        let turnTemp = temperature  // reasoning temp now comes from the model's reasoningSettings (was a hardcoded 0.6)
                                                                         do {
-                                                                            let stream = llmService.generateChatResponseStream(messages: chatMessages, temperature: temperature)
+                                                                            let stream = llmService.generateChatResponseStream(messages: chatMessages, temperature: turnTemp, reasoningActive: isReasoning)
                                                                             for try await chunk in stream {
                                                                                 finalText = chunk
                                                                                 if let i = messages.firstIndex(where: { $0.id == pid }) {
-                                                                                    messages[i].content = chunk
+                                                                                    let split = splitThinkTokens(chunk, isReasoning: isReasoning)
+                                                                                    messages[i].thinking = split.thinking
+                                                                                    messages[i].content = split.answer
                                                                                 }
                                                                             }
                                                                         } catch let memError as LLMService.LLMError {
@@ -11901,7 +12159,10 @@ class ChatViewModel: ObservableObject {
                                                                         modelTime = Date().timeIntervalSince(t0)
                                                                         halLog("HALDEBUG-SALON: Context-aware streaming complete. Length: \(finalText.count), elapsed: \(String(format: "%.2f", modelTime))s")
 
-                                                                        let text = removeRepetitivePatterns(from: finalText).trimmingCharacters(in: .whitespacesAndNewlines)
+                                                                        let cleanedFull = removeRepetitivePatterns(from: finalText).trimmingCharacters(in: .whitespacesAndNewlines)
+                                                                        let finalSplit = splitThinkTokens(cleanedFull, isReasoning: isReasoning)
+                                                                        let thinkingText: String? = finalSplit.answer.isEmpty ? nil : finalSplit.thinking
+                                                                        let text = finalSplit.answer.isEmpty ? cleanedFull : finalSplit.answer
 
                                                                         // Calculate token breakdown
                                                                         let tokenBreakdown = calculateTokenBreakdown(
@@ -11922,6 +12183,7 @@ class ChatViewModel: ObservableObject {
                                                                         await MainActor.run {
                                                                             if let i = self.messages.firstIndex(where: { $0.id == pid }) {
                                                                                 self.messages[i].content = text
+                                                                                self.messages[i].thinking = thinkingText
                                                                                 self.messages[i].isPartial = false
                                                                                 self.messages[i].thinkingDuration = thinking
                                                                                 self.lastInferenceTime = thinking
@@ -18865,6 +19127,34 @@ enum SharedModelStore {
         return !contents.isEmpty
     }
 
+    /// Filename of the completion sentinel written into a model's directory the
+    /// instant its download is verified complete. Its PRESENCE is the durable
+    /// "this finished" signal. Dot-prefixed so the MLX loader (which reads named
+    /// files like config.json / *.safetensors) ignores it, and so it never
+    /// affects `isRepoDownloaded`'s content check in a way that matters.
+    private static let completeSentinelName = ".hal-download-complete"
+
+    /// Mark a model's download as VERIFIED COMPLETE (call only from the success
+    /// finalizer, when every file has landed). Writes the sentinel.
+    static func markRepoComplete(_ repo: String) {
+        let dir = mlxModelDir(repo)
+        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        let sentinel = dir.appendingPathComponent(completeSentinelName)
+        FileManager.default.createFile(atPath: sentinel.path, contents: Data())
+    }
+
+    /// Whether a model's download actually COMPLETED — distinct from
+    /// ``isRepoDownloaded`` (which is true for a merely non-empty dir, so a
+    /// half-finished download reads as "present"). Only true once the success
+    /// finalizer wrote the sentinel. Used by the in-flight RESUME path to decide
+    /// whether a marker can be cleared vs. must be resumed. NOT a load-gate — a
+    /// model fetched by a sibling app is loadable via `isRepoDownloaded` even
+    /// though it carries no sentinel written by THIS app.
+    static func isRepoComplete(_ repo: String) -> Bool {
+        let sentinel = mlxModelDir(repo).appendingPathComponent(completeSentinelName)
+        return FileManager.default.fileExists(atPath: sentinel.path)
+    }
+
     /// Exclude a model directory from iCloud backup. MANDATORY for App Group
     /// containers: unlike `Library/Caches` (auto-excluded), the shared container
     /// IS backed up by default, so without this every user would burn multiple
@@ -18940,6 +19230,46 @@ extension SharedModelStore {
     static func claimants(modelID: String) -> [String] {
         let coordinator = NSFileCoordinator()
         return readManifest(coordinator).models[modelID]?.claimedBy ?? []
+    }
+
+    /// Read-only: every model id THIS app currently claims. The inverse of
+    /// ``claimants(modelID:)`` — that answers "who owns this model," this answers
+    /// "what do I own."
+    ///
+    /// **The manifest is the authority here, deliberately — never the disk.** A
+    /// model can be present in the shared container without Hal claiming it (a
+    /// sibling app downloaded it and Hal hasn't adopted it yet; the Model Library
+    /// shows it as instantly selectable). Those files are not Hal's to release or
+    /// delete. Enumerating from disk instead would sweep them up — and because
+    /// ``releaseClaim(modelID:)`` reports `true` for a model with no manifest
+    /// entry at all, an unclaimed model would look "safe to delete" and be
+    /// destroyed. Ask the ledger what we own; don't infer it from what we can see.
+    static func modelsClaimedByThisApp() -> [String] {
+        let coordinator = NSFileCoordinator()
+        return readManifest(coordinator).models
+            .filter { $0.value.claimedBy.contains(thisAppID) }
+            .map(\.key)
+            .sorted()
+    }
+
+    /// A human display name for a family app's bundle id, for UI that has to
+    /// explain co-ownership ("also used by Posey").
+    ///
+    /// **Derived, not a hardcoded table — deliberately.** Every app in the family is
+    /// `com.MarkFriedlander.<AppName>`, so the last component is the name. That means
+    /// a new tenant (AI Camera, and whatever follows it) names itself correctly the
+    /// day it ships, with no change here and no release of Hal required. A lookup
+    /// table would need editing for every new sibling and would silently say the
+    /// wrong thing until someone remembered to.
+    ///
+    /// Falls back to a generic phrase if a bundle id ever doesn't fit the shape, so
+    /// the copy degrades to "another app" rather than showing the user a raw
+    /// identifier.
+    static func displayName(forAppID appID: String) -> String {
+        guard let last = appID.split(separator: ".").last, !last.isEmpty else {
+            return "another app"
+        }
+        return last.replacingOccurrences(of: "-", with: " ")
     }
 
     // MARK: coordinated read / write
@@ -19485,6 +19815,11 @@ class BackgroundDownloadCoordinator: NSObject, URLSessionDownloadDelegate, Obser
     @Published var bytesWrittenByModel: [String: Int64] = [:]
     @Published var bytesExpectedByModel: [String: Int64] = [:]
     private var filesPendingByModel: [String: Set<String>] = [:]
+    /// Per-model record of files whose move-into-place failed: modelID → (file →
+    /// error). A model with any entry here when its last file settles is a FAILED
+    /// download — it must not be claimed or marked downloaded. Cleared when the
+    /// failure is reported (or, implicitly, when a fresh download re-seeds pending).
+    private var filesFailedByModel: [String: [String: String]] = [:]
 
     func progress(for modelID: String) -> Double {
         let expected = bytesExpectedByModel[modelID] ?? 0
@@ -19502,7 +19837,14 @@ class BackgroundDownloadCoordinator: NSObject, URLSessionDownloadDelegate, Obser
     // GET https://huggingface.co/api/models/<repo>/tree/main
     // Returns a JSON array of {"type": "file"|"directory", "path": "...", "size": Int}
     private func fetchRepoFileList(repoID: String) async throws -> [String] {
-        guard let url = URL(string: "https://huggingface.co/api/models/\(repoID)/tree/main") else {
+        // `?recursive=1` is REQUIRED. Without it the HF tree API returns only the
+        // top level: root files, plus subfolders as `type: "directory"` entries
+        // (which the `type == "file"` filter below then drops). So every file
+        // inside a subfolder — `1_Pooling/config.json`, `unet/…`, `onnx/…` — is
+        // invisible, and the model downloads "successfully" while silently missing
+        // its nested files. Flat repos (all of Hal's Picks today) are unaffected;
+        // this matters for the Community browser, which points at arbitrary repos.
+        guard let url = URL(string: "https://huggingface.co/api/models/\(repoID)/tree/main?recursive=1") else {
             throw NSError(domain: "BackgroundDownloadCoordinator", code: 2, userInfo: [
                 NSLocalizedDescriptionKey: "Bad repo ID: \(repoID)"
             ])
@@ -19565,6 +19907,45 @@ class BackgroundDownloadCoordinator: NSObject, URLSessionDownloadDelegate, Obser
         NotificationCenter.default.post(name: .mlxModelDidDownload, object: nil, userInfo: ["modelID": modelID])
     }
 
+    /// The failure counterpart to ``notifyModelDownloadComplete``. Called when a
+    /// model's last file settles and one or more files failed to move into place.
+    ///
+    /// It is the mirror image of the success path, and the asymmetry is the point:
+    /// it does **NOT** `claim` the model and does **NOT** mark it downloaded — those
+    /// two lines are exactly what wrote a phantom into the shared manifest. It DOES
+    /// release the cross-app download lock (Hal is no longer downloading, so a
+    /// sibling may try) and delete the partial model directory (a half-model is
+    /// unusable; a clean slate lets a retry start fresh). The dir is model-scoped
+    /// (`mlxModelDir(id)`), never the shared root.
+    ///
+    /// It posts `.mlxModelDownloadFailed` so `waitForModelCompletion` — which waits
+    /// on the success notification with no timeout — throws instead of spinning
+    /// forever, and the UI can surface the error.
+    @MainActor
+    private func notifyModelDownloadFailed(modelID: String, failures: [String: String]) {
+        let summary = failures.map { "\($0.key): \($0.value)" }.joined(separator: "; ")
+        halLog("HALDEBUG-BGDL: ❌ Model \(modelID) FAILED — \(failures.count) file(s) did not save. Not claiming, not marking downloaded. [\(summary)]")
+
+        // Release the lock; do NOT claim, do NOT mark downloaded.
+        SharedModelStore.releaseDownloadLock(modelID: modelID)
+
+        // Remove the partial model directory so a retry starts clean and no
+        // half-model masquerades as present. Model-scoped (the coordinator's own
+        // `modelDirectory(for:)` = `mlxModelDir(id)`) — never the shared root.
+        let dir = modelDirectory(for: modelID)
+        if FileManager.default.fileExists(atPath: dir.path) {
+            try? FileManager.default.removeItem(at: dir)
+        }
+
+        // DownloadState lives on MLXModelDownloader, not the coordinator — mirror
+        // the success path, which delegates its state bookkeeping to `.shared`.
+        MLXModelDownloader.shared.markModelFailedFromBackground(modelID: modelID, failureCount: failures.count)
+
+        // Clear the failure ledger for this model and post the failure signal.
+        self.filesFailedByModel[modelID] = nil
+        NotificationCenter.default.post(name: .mlxModelDownloadFailed, object: nil, userInfo: ["modelID": modelID])
+    }
+
     // MARK: - URLSessionDownloadDelegate
 
     func urlSession(_ session: URLSession, downloadTask: URLSessionDownloadTask, didFinishDownloadingTo location: URL) {
@@ -19578,22 +19959,52 @@ class BackgroundDownloadCoordinator: NSObject, URLSessionDownloadDelegate, Obser
         // synchronously inside the delegate callback — iOS deletes `location`
         // as soon as we return.
         let target = URL(fileURLWithPath: context.targetPath)
+        // Create the file's PARENT directory first. For a nested file
+        // (`1_Pooling/config.json`), `target` lives in a subfolder that
+        // `createDirectory(modelDir)` at enqueue time did NOT create, and
+        // `moveItem` will not make intermediates — so without this the move
+        // throws and (because iOS reclaims `location` the instant we return) the
+        // bytes are simply gone. No-op for a root-level file.
+        try? FileManager.default.createDirectory(
+            at: target.deletingLastPathComponent(), withIntermediateDirectories: true)
         try? FileManager.default.removeItem(at: target)
+        var moveError: String?
         do {
             try FileManager.default.moveItem(at: location, to: target)
             halLog("HALDEBUG-BGDL: Moved \(context.filename) → \(target.path) (\(kind == .foreground ? "fg" : "bg") task \(downloadTask.taskIdentifier))")
         } catch {
+            moveError = error.localizedDescription
             halLog("HALDEBUG-BGDL: ❌ Move failed for \(context.filename): \(error.localizedDescription)")
         }
 
         // Update bookkeeping. Note: didCompleteWithError will fire shortly
         // after this; final cleanup happens there.
+        //
+        // A failed move must NOT be allowed to count as a finished file. The old
+        // code removed `filename` from `pending` unconditionally, so a model whose
+        // files all failed to move still emptied `pending`, fired
+        // notifyModelDownloadComplete, and — the dangerous part — CLAIMED the model
+        // in the shared manifest and marked it downloaded. The ledger then asserted
+        // Hal owned a model that wasn't on disk (the same shape of lie that made the
+        // clearHubCache bug destructive), and the user saw "Model ready" for a model
+        // that would fail to load later. So we track per-file move failures and, when
+        // the last file settles, route to success ONLY if none failed.
+        // Bind an immutable copy for the concurrently-executing Task (capturing the
+        // `var` directly is a Swift 6 data-race error).
+        let moveErrorResult = moveError
         Task { @MainActor in
             var pending = self.filesPendingByModel[context.modelID] ?? []
             pending.remove(context.filename)
             self.filesPendingByModel[context.modelID] = pending
+            if let moveErrorResult {
+                self.filesFailedByModel[context.modelID, default: [:]][context.filename] = moveErrorResult
+            }
             if pending.isEmpty {
-                self.notifyModelDownloadComplete(modelID: context.modelID)
+                if let failures = self.filesFailedByModel[context.modelID], !failures.isEmpty {
+                    self.notifyModelDownloadFailed(modelID: context.modelID, failures: failures)
+                } else {
+                    self.notifyModelDownloadComplete(modelID: context.modelID)
+                }
             }
         }
     }
@@ -20013,10 +20424,18 @@ class MLXModelDownloader: ObservableObject {
         halLog("HALDEBUG-DOWNLOAD: resumeInFlightDownloadsIfAny: settle complete, evaluating each marker")
 
         for modelID in pending {
-            if isModelDownloaded(modelID) {
-                // Already done — clean up the stale in-flight marker.
+            // Use COMPLETION (sentinel), not mere disk-presence, to decide a marker
+            // is stale. A marker persists to next launch ONLY when the download did
+            // not finish (completion clears it) — so a partial dir must never be
+            // declared "done" here. The old `isModelDownloaded` check ("dir has any
+            // files") did exactly that: it cleared the marker for a half-downloaded
+            // model, leaving it permanently incomplete but reading as present.
+            // Partial models now fall through to the branches below, which either
+            // let recovered background tasks keep running or re-fetch and download
+            // only the missing files.
+            if SharedModelStore.isRepoComplete(modelID) {
                 clearInFlight(modelID)
-                halLog("HALDEBUG-DOWNLOAD: \(modelID) is already downloaded; clearing in-flight marker")
+                halLog("HALDEBUG-DOWNLOAD: \(modelID) is verified complete (sentinel); clearing in-flight marker")
                 continue
             }
 
@@ -20086,7 +20505,11 @@ class MLXModelDownloader: ObservableObject {
             let sizeGB = modelMeta["sizeGB"] as? Double
             let size = (sizeGB ?? 0.0) > 0.0 ? sizeGB : nil
             halLog("HALDEBUG-DOWNLOAD: Auto-resuming download for \(modelID) (no in-flight BGDL tasks found)")
-            Task { await self.startDownload(modelID: modelID, repoID: repoID, sizeGB: size) }
+            // forceResume: this model has a persisted in-flight marker and no
+            // completion sentinel — it is verifiably PARTIAL. Skip startDownload's
+            // disk-presence "already downloaded" guard, which would otherwise see
+            // the partial dir and refuse to finish it.
+            Task { await self.startDownload(modelID: modelID, repoID: repoID, sizeGB: size, forceResume: true) }
         }
     }
     
@@ -20314,9 +20737,17 @@ class MLXModelDownloader: ObservableObject {
         return "Downloading \(modelDisplayName) needs about \(requiredStr) free, but only \(availableStr) is available on this device. Free up some space and try again."
     }
 
-    func startDownload(modelID: String, repoID: String, sizeGB: Double? = nil) async {
-        // Check if already downloaded
-        if isModelDownloaded(modelID) {
+    /// - Parameter forceResume: set by the in-flight RESUME path, which has already
+    ///   determined (via the completion sentinel) that this model is PARTIAL and
+    ///   needs finishing. It skips the "already downloaded" early-return below —
+    ///   that guard uses `isModelDownloaded` (disk-presence: true for a merely
+    ///   non-empty dir), so for a half-downloaded model it would wrongly declare
+    ///   "already downloaded" and refuse to resume, leaving the model permanently
+    ///   partial. Normal callers keep the guard so a present (or sibling-downloaded)
+    ///   model isn't needlessly re-fetched.
+    func startDownload(modelID: String, repoID: String, sizeGB: Double? = nil, forceResume: Bool = false) async {
+        // Check if already downloaded (skipped on an explicit resume — see above).
+        if !forceResume && isModelDownloaded(modelID) {
             await MainActor.run {
                 print("HALDEBUG-DOWNLOAD: Model already downloaded: \(modelID)")
                 if var state = self.downloadStates[modelID] {
@@ -20758,6 +21189,21 @@ class MLXModelDownloader: ObservableObject {
     func deleteModel(modelID: String) async {
         let expectedPath = modelPath(for: modelID)
 
+        // Abnormal-path cleanup FIRST — before releasing the claim or removing
+        // files. If the model is mid-download (or was interrupted), three pieces of
+        // state would otherwise outlive the delete:
+        //   1. In-flight background URLSession tasks — a straggler completing after
+        //      we remove the directory would MOVE its file back in and re-create the
+        //      model on disk (observed 2026-07-16: DELETE returned ok, model
+        //      reappeared). Cancel them first.
+        //   2. The cross-app download lock — `releaseClaim` does not touch it, so the
+        //      lock lingered after delete (observed: lockCount stayed 1). Release it.
+        //   3. The in-flight resume marker — otherwise the next launch's resume path
+        //      would try to re-download a model the user deliberately deleted.
+        await BackgroundDownloadCoordinator.shared.cancelDownload(modelID: modelID)
+        SharedModelStore.releaseDownloadLock(modelID: modelID)
+        clearInFlight(modelID)
+
         // v2.1 shared store: release Hal's claim FIRST. The files are removed
         // only when NO other app (Posey) still claims the model. So deleting a
         // shared model in Hal drops Hal's claim and leaves Posey's copy on disk;
@@ -20851,12 +21297,33 @@ class MLXModelDownloader: ObservableObject {
     /// immediately after enqueueing the file tasks. Cancellation propagates
     /// through Task.checkCancellation.
     private func waitForModelCompletion(modelID: String) async throws {
-        let notifications = NotificationCenter.default.notifications(named: .mlxModelDidDownload)
-        for await notification in notifications {
-            try Task.checkCancellation()
-            if let id = notification.userInfo?["modelID"] as? String, id == modelID {
-                return
+        // Race success against failure: whichever fires for this modelID first
+        // wins. Without the failure arm, a failed download (which no longer posts
+        // .mlxModelDidDownload) would leave this waiting forever and the download
+        // UI spinning. The failure arm throws so the caller's existing catch treats
+        // it as a failed download and tears the task down.
+        try await withThrowingTaskGroup(of: Void.self) { group in
+            group.addTask {
+                let succeeded = NotificationCenter.default.notifications(named: .mlxModelDidDownload)
+                for await n in succeeded {
+                    try Task.checkCancellation()
+                    if (n.userInfo?["modelID"] as? String) == modelID { return }
+                }
             }
+            group.addTask {
+                let failed = NotificationCenter.default.notifications(named: .mlxModelDownloadFailed)
+                for await n in failed {
+                    try Task.checkCancellation()
+                    if (n.userInfo?["modelID"] as? String) == modelID {
+                        throw NSError(domain: "BackgroundDownloadCoordinator", code: 10, userInfo: [
+                            NSLocalizedDescriptionKey: "Download failed for \(modelID) — one or more files could not be saved."
+                        ])
+                    }
+                }
+            }
+            // Take the first arm to finish (return or throw), then cancel the other.
+            defer { group.cancelAll() }
+            try await group.next()
         }
     }
 
@@ -20867,6 +21334,15 @@ class MLXModelDownloader: ObservableObject {
     /// DownloadState, clear the in-flight marker, and refresh the catalog.
     func markModelAsDownloadedFromBackground(modelID: String) {
         let finalURL = modelPath(for: modelID)
+
+        // Durably record that this download VERIFIABLY completed, BEFORE clearing
+        // the in-flight marker below. If the process dies in the tiny window
+        // between here and clearInFlight, the next launch's resume path sees the
+        // sentinel and correctly treats the model as done. Without it, resume fell
+        // back to "dir has any files," so a half-downloaded model read as complete,
+        // its marker got cleared, and it was left permanently partial-but-"done".
+        SharedModelStore.markRepoComplete(modelID)
+
         var modelIDs = self.downloadedModelIDs
         modelIDs.insert(modelID)
         self.downloadedModelIDs = modelIDs
@@ -20902,6 +21378,25 @@ class MLXModelDownloader: ObservableObject {
         // Process the next queued download, if any.
         self.processNextInQueue()
     }
+
+    /// The failure counterpart to ``markModelAsDownloadedFromBackground``. Surfaces
+    /// the failure in the model's DownloadState. Deliberately does NOT insert into
+    /// `downloadedModelIDs` and does NOT clear the in-flight marker — the coordinator
+    /// path that threw will decide resume policy (a move failure is preserved for a
+    /// next-launch retry, same as other hard failures). Lock release, partial-dir
+    /// cleanup, and the manifest (non-)claim are handled by the coordinator's
+    /// `notifyModelDownloadFailed` before this is called.
+    func markModelFailedFromBackground(modelID: String, failureCount: Int) {
+        var state = self.downloadStates[modelID] ?? DownloadState(
+            isDownloading: false, progress: 0, message: "", error: nil, localPath: nil)
+        state.isDownloading = false
+        state.progress = 0
+        state.message = "Download failed."
+        state.error = "\(failureCount) file(s) couldn't be saved. Tap to retry."
+        state.localPath = nil
+        self.downloadStates[modelID] = state
+        halLog("HALDEBUG-DOWNLOAD: ❌ Background download marked FAILED for \(modelID) (\(failureCount) file(s))")
+    }
     
     func getModelPath(_ modelID: String) -> URL? {
         // Gate on the SAME shared-store disk-truth that `isModelDownloaded` uses,
@@ -20930,28 +21425,111 @@ class MLXModelDownloader: ObservableObject {
         isCacheCalculating = false
     }
     
-    func clearHubCache() {
-        if FileManager.default.fileExists(atPath: hubCacheDirectory.path) {
-            do {
-                try FileManager.default.removeItem(at: hubCacheDirectory)
-                
-                // Clear all model states since cache is gone
-                downloadedModelIDs = []
-                downloadStates = [:]
-                hubCacheSize = "No cache"
-                
-                print("HALDEBUG-CACHE: ✅ Cleared Hub cache and all model states")
-            } catch {
-                if var state = downloadStates.values.first {
-                    state.error = "Failed to clear cache: \(error.localizedDescription)"
-                    state.message = "Cache clear failed."
+    /// What a "clear Hal's models" pass will do, expressed per model so the UI can
+    /// tell the truth before the user commits.
+    struct ClearModelsPlan {
+        /// Hal is the only claimant — releasing drops the refcount to zero and the
+        /// files go.
+        var willDelete: [String] = []
+        /// A sibling app in the family still claims these. Hal's claim is released
+        /// but the bytes stay on disk.
+        var willStayForOthers: [String] = []
+        /// Display names of the sibling apps holding those claims, so the
+        /// confirmation can name them ("also used by Posey"). Populated by
+        /// ``previewClearHalsModels()`` only — the post-hoc result doesn't need it,
+        /// since `releaseClaim` reports a verdict rather than a claimant list.
+        var otherClaimants: Set<String> = []
+
+        var isEmpty: Bool { willDelete.isEmpty && willStayForOthers.isEmpty }
+        var totalClaimed: Int { willDelete.count + willStayForOthers.count }
+    }
+
+    /// Dry run of ``clearHalsModels()``. Drives the confirmation copy so the
+    /// button's promise matches its behavior — the old alert said "this will
+    /// delete all cached model files," which was the other half of the bug.
+    @MainActor
+    func previewClearHalsModels() -> ClearModelsPlan {
+        var plan = ClearModelsPlan()
+        for modelID in SharedModelStore.modelsClaimedByThisApp() {
+            let others = SharedModelStore.claimants(modelID: modelID)
+                .filter { $0 != SharedModelStore.thisAppID }
+            if others.isEmpty {
+                plan.willDelete.append(modelID)
+            } else {
+                plan.willStayForOthers.append(modelID)
+                for appID in others {
+                    plan.otherClaimants.insert(SharedModelStore.displayName(forAppID: appID))
                 }
-                print("HALDEBUG-CACHE: ❌ Failed to clear cache: \(error.localizedDescription)")
             }
-        } else {
-            hubCacheSize = "No cache"
-            print("HALDEBUG-CACHE: No cache directory found to clear")
         }
+        return plan
+    }
+
+    /// Release Hal's claim on every model Hal claims, and delete from disk ONLY
+    /// the ones no sibling app still wants.
+    ///
+    /// This deliberately does **not** remove `hubCacheDirectory`. That directory is
+    /// `SharedModelStore.huggingFaceRoot` — the App-Group container shared with
+    /// Posey and the rest of the family — so a `removeItem` there took out every
+    /// app's models in one shot: no manifest read, no claim check, no notification
+    /// to the app whose files just vanished. And because `manifest.json` lives one
+    /// level ABOVE `huggingface/`, it survived the wipe and went on describing
+    /// files that no longer existed, so the next `releaseClaim` reasoned from
+    /// fiction. (Found 2026-07-15 from the AI Camera project; the call predated the
+    /// shared store, was correct when the cache was Hal's alone, and never got
+    /// re-read when the store moved underneath it.)
+    ///
+    /// The contract, from `SharedModelStore`'s own header: *releasing in one app
+    /// releases only that app's claim; files go only when NO app still claims the
+    /// model.* The per-model Delete path already honored it. This now does too.
+    ///
+    /// Deletes are scoped to `mlxModelDir(id)` — one model at a time, never a root
+    /// delete. Returns what actually happened.
+    @MainActor
+    @discardableResult
+    func clearHalsModels() -> ClearModelsPlan {
+        var result = ClearModelsPlan()
+
+        for modelID in SharedModelStore.modelsClaimedByThisApp() {
+            // Release first, then act on the answer. `true` means the refcount hit
+            // zero — nobody else is holding this model.
+            guard SharedModelStore.releaseClaim(modelID: modelID) else {
+                result.willStayForOthers.append(modelID)
+                print("HALDEBUG-CACHE: kept \(modelID) — still claimed by another app")
+                continue
+            }
+
+            let dir = modelPath(for: modelID)
+            guard FileManager.default.fileExists(atPath: dir.path) else {
+                // Claimed in the ledger but already gone from disk. The release
+                // above is the useful half; nothing to remove.
+                result.willDelete.append(modelID)
+                continue
+            }
+            do {
+                try FileManager.default.removeItem(at: dir)
+                result.willDelete.append(modelID)
+                print("HALDEBUG-CACHE: ✅ deleted \(modelID)")
+            } catch {
+                // The claim is already released, so leave it out of both lists
+                // rather than report a delete that didn't happen.
+                print("HALDEBUG-CACHE: ❌ failed to delete \(modelID): \(error.localizedDescription)")
+            }
+        }
+
+        // Hal now claims nothing, regardless of what stayed on disk for a sibling.
+        // Anything still present shows up via the shared-store disk-truth path
+        // (`isModelDownloaded`) as present-but-unclaimed, which is correct.
+        downloadedModelIDs = []
+        downloadStates = [:]
+
+        // Do NOT assert "No cache" — a sibling app's models may still be sitting in
+        // the shared container, and claiming the store is empty would be the same
+        // kind of lie this fix exists to remove. Re-measure instead.
+        Task { @MainActor in await updateCacheSize() }
+
+        print("HALDEBUG-CACHE: cleared Hal's models — \(result.willDelete.count) deleted, \(result.willStayForOthers.count) kept for other apps")
+        return result
     }
     
     // MARK: - Utility Methods
@@ -21007,7 +21585,14 @@ class MLXModelDownloader: ObservableObject {
 
 // MARK: - Notification
 extension Notification.Name {
-    static let mlxModelDidDownload = Notification.Name("mlxModelDidDownload")
+    // `nonisolated` so these constants can be read from Sendable/detached contexts
+    // (e.g. the task-group arms in `waitForModelCompletion`). Notification-name
+    // constants carry no state and were never meaningfully actor-bound.
+    nonisolated static let mlxModelDidDownload = Notification.Name("mlxModelDidDownload")
+    /// Posted when a model's download settles with one or more files that failed
+    /// to save. Distinct from success so waiters can throw rather than hang and the
+    /// UI can show an error. `userInfo["modelID"]`.
+    nonisolated static let mlxModelDownloadFailed = Notification.Name("mlxModelDownloadFailed")
 }
 
 // ==== LEGO END: 45 BackgroundDownloadCoordinator + MLXModelDownloader ====
@@ -21117,6 +21702,17 @@ struct ModelSettings: Codable, Equatable {
     var ragDedupThreshold: Double?
     var repetitionPenalty: Float?
     var repetitionContextSize: Int?
+    /// Full sampler knobs (2026-07-14). Qwen — and most curated models —
+    /// publish recommended `top_p`/`top_k`/`min_p`/`presence_penalty`; we had
+    /// been passing only temperature + repetitionPenalty, running every model
+    /// outside its recommended sampling envelope. nil = the mlx default
+    /// (topP 1.0 / topK 0 / minP 0 / no presence penalty = disabled), so these
+    /// are no-ops until a model is deliberately seeded. Qwen uses PRESENCE
+    /// penalty (not repetition) as its anti-loop lever. See the reasoning memo.
+    var topP: Float?
+    var topK: Int?
+    var minP: Float?
+    var presencePenalty: Float?
     /// Whether the model's Layer 1 (per-model framing) is prepended to the
     /// user's system prompt. Per Strategic §4. Defaults to true. The Layer 1
     /// TEXT itself lives on ModelConfiguration.layerOnePrompt (read-only);
@@ -21132,6 +21728,10 @@ struct ModelSettings: Codable, Equatable {
         ragDedupThreshold: Double? = nil,
         repetitionPenalty: Float? = nil,
         repetitionContextSize: Int? = nil,
+        topP: Float? = nil,
+        topK: Int? = nil,
+        minP: Float? = nil,
+        presencePenalty: Float? = nil,
         layerOnePromptEnabled: Bool? = nil
     ) {
         self.temperature = temperature
@@ -21142,6 +21742,10 @@ struct ModelSettings: Codable, Equatable {
         self.ragDedupThreshold = ragDedupThreshold
         self.repetitionPenalty = repetitionPenalty
         self.repetitionContextSize = repetitionContextSize
+        self.topP = topP
+        self.topK = topK
+        self.minP = minP
+        self.presencePenalty = presencePenalty
         self.layerOnePromptEnabled = layerOnePromptEnabled
     }
 
@@ -21158,6 +21762,10 @@ struct ModelSettings: Codable, Equatable {
             ragDedupThreshold: overrides.ragDedupThreshold ?? self.ragDedupThreshold,
             repetitionPenalty: overrides.repetitionPenalty ?? self.repetitionPenalty,
             repetitionContextSize: overrides.repetitionContextSize ?? self.repetitionContextSize,
+            topP: overrides.topP ?? self.topP,
+            topK: overrides.topK ?? self.topK,
+            minP: overrides.minP ?? self.minP,
+            presencePenalty: overrides.presencePenalty ?? self.presencePenalty,
             layerOnePromptEnabled: overrides.layerOnePromptEnabled ?? self.layerOnePromptEnabled
         )
     }
@@ -21433,6 +22041,14 @@ struct ModelConfiguration: Identifiable, Codable, Equatable, Hashable {
     // disk. No migration needed.
     var defaultSettings: ModelSettings?
 
+    // Per-model REASONING-mode sampler (2026-07-14). Thinking and non-thinking
+    // modes want different sampling — Qwen publishes separate recipes. On a
+    // reasoning turn (reasoningActive), these are merged OVER defaultSettings;
+    // any nil field falls through to defaultSettings. nil here = reasoning uses
+    // defaultSettings unchanged. Symmetric to defaultSettings so a future
+    // visionSettings drops in the same way. See the reasoning memo.
+    var reasoningSettings: ModelSettings?
+
     // MARK: - Per-Model Layer 1 System Prompt (Strategic §4)
     //
     // Layer 1 is per-model behavioral framing — short, focused instructions
@@ -21526,6 +22142,20 @@ struct ModelConfiguration: Identifiable, Codable, Equatable, Hashable {
     // Codable-optional so older persisted configs decode cleanly.
     var kvCacheBytesPerPromptToken: Int?
 
+    // MARK: - Reasoning model / think tokens (2026-07)
+    //
+    // True for models whose chat template supports an `enable_thinking`
+    // branch and emit their reasoning wrapped in <think>…</think> (e.g.
+    // Qwen 3.5 2B — verified in its chat_template.jinja). When set,
+    // MLXWrapper.generateChatStream passes enable_thinking=true, and the
+    // streamed output is split on the closing </think> tag into a separate
+    // "thinking" region (shown in a collapsible panel) vs the visible
+    // answer. Only the answer is stored in memory / RAG. Models without a
+    // thinking template leave this nil and are unaffected. See
+    // Docs/Think_Tokens_Reasoning_Transparency.md.
+    // Codable-optional so older persisted configs decode cleanly.
+    var isReasoningModel: Bool?
+
     var isLocal: Bool { source == .mlx }
     var requiresDownload: Bool { source == .mlx && !isDownloaded }
 
@@ -21543,13 +22173,15 @@ struct ModelConfiguration: Identifiable, Codable, Equatable, Hashable {
         isDownloaded: Bool,
         localPath: URL?,
         defaultSettings: ModelSettings? = nil,
+        reasoningSettings: ModelSettings? = nil,
         layerOnePrompt: String? = nil,
         voiceTag: String? = nil,
         generationTokensPerSec: Double? = nil,
         prefillTokensPerSec: Double? = nil,
         maximCompliance: MaximScorecard? = nil,
         kvCacheBytesPerPromptToken: Int? = nil,
-        kvCacheQuantizationBits: Int? = nil
+        kvCacheQuantizationBits: Int? = nil,
+        isReasoningModel: Bool? = nil
     ) {
         self.id = id
         self.displayName = displayName
@@ -21561,6 +22193,7 @@ struct ModelConfiguration: Identifiable, Codable, Equatable, Hashable {
         self.isDownloaded = isDownloaded
         self.localPath = localPath
         self.defaultSettings = defaultSettings
+        self.reasoningSettings = reasoningSettings
         self.layerOnePrompt = layerOnePrompt
         self.voiceTag = voiceTag
         self.generationTokensPerSec = generationTokensPerSec
@@ -21568,6 +22201,7 @@ struct ModelConfiguration: Identifiable, Codable, Equatable, Hashable {
         self.maximCompliance = maximCompliance
         self.kvCacheBytesPerPromptToken = kvCacheBytesPerPromptToken
         self.kvCacheQuantizationBits = kvCacheQuantizationBits
+        self.isReasoningModel = isReasoningModel
     }
     
     func hash(into hasher: inout Hasher) {
@@ -21802,6 +22436,23 @@ struct ModelConfiguration: Identifiable, Codable, Equatable, Hashable {
             repetitionPenalty: 1.1,
             repetitionContextSize: 64
         ),
+        // Reasoning-mode sampler (2026-07-14) — Qwen's published THINKING-text
+        // recipe (model-card "Best Practices"), merged OVER defaultSettings on
+        // reasoning turns: temp 1.0 (bounded by top_k/top_p, deliberately NOT
+        // lowered — the old hardcoded 0.6 with no top_k/top_p is what loops),
+        // top_p 0.95, top_k 20, min_p 0, presence_penalty 1.5 (Qwen's stated
+        // anti-loop lever), repetition_penalty 1.0 = OFF (overrides the 1.1
+        // default — Qwen uses PRESENCE, not repetition). Vision/coding recipe
+        // (temp 0.6, presence 0.0) is parked for when image input ships. See
+        // Docs/Think_Tokens_Reasoning_Transparency.md.
+        reasoningSettings: ModelSettings(
+            temperature: 1.0,
+            repetitionPenalty: 1.0,
+            topP: 0.95,
+            topK: 20,
+            minP: 0.0,
+            presencePenalty: 1.5
+        ),
         // Layer 1 (§4) — addresses two Qwen-specific failure modes from
         // the §2 Maxim sweep:
         //   1. Verbosity: Qwen produced 4× more output tokens than peers
@@ -21836,7 +22487,12 @@ struct ModelConfiguration: Identifiable, Codable, Equatable, Hashable {
         // catalog. 50 KB/token leaves plenty of headroom even at long
         // prompts; in stress testing Qwen handled 8000-token prompts
         // on iPhone 16 Plus without jetsam risk.
-        kvCacheBytesPerPromptToken: 50 * 1024
+        kvCacheBytesPerPromptToken: 50 * 1024,
+        // Verified thinker: its chat_template.jinja honors enable_thinking and
+        // emits <think>…</think> (2026-07 template read). Enables the reasoning
+        // panel + enable_thinking for this model. See
+        // Docs/Think_Tokens_Reasoning_Transparency.md.
+        isReasoningModel: true
     )
 
     /// Llama 3.2 3B Instruct 4-bit — the workhorse voice. Meta's proven small
@@ -23172,6 +23828,118 @@ class HalTestConsole: ObservableObject {
                 return "{\"status\":\"ok\",\"temperature\":\(val)}"
             }
             return "{\"status\":\"error\",\"message\":\"SET_TEMPERATURE: must be 0.0–1.0\"}"
+
+        } else if trimmed.hasPrefix("SET_REASONING:") {
+            // Test hook for the reasoning / think-token toggle. Sets the sticky
+            // flag directly; the in-chat narration is exercised by the actual
+            // brain toggle in the UI. reasoningActive reflects flag × capability.
+            let valStr = String(trimmed.dropFirst("SET_REASONING:".count)).trimmingCharacters(in: .whitespaces).lowercased()
+            if valStr == "true" || valStr == "false" || valStr == "1" || valStr == "0" {
+                let on = (valStr == "true" || valStr == "1")
+                vm.reasoningEnabled = on
+                writeStateJSON(vm: vm)
+                return "{\"status\":\"ok\",\"reasoningEnabled\":\(on),\"reasoningActive\":\(vm.reasoningActive)}"
+            }
+            return "{\"status\":\"error\",\"message\":\"SET_REASONING: must be true/false\"}"
+
+        } else if trimmed.hasPrefix("SET_REASONING_PROMPT:") {
+            // Tuning: override the Layer-0 reasoning directive. Empty value or
+            // "default" clears the override (back to the built-in default).
+            let raw = String(trimmed.dropFirst("SET_REASONING_PROMPT:".count))
+            let val = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+            if val.isEmpty || val.lowercased() == "default" {
+                ReasoningTuning.shared.promptOverride = nil
+                return "{\"status\":\"ok\",\"reasoningPromptOverride\":null}"
+            }
+            ReasoningTuning.shared.promptOverride = raw
+            return "{\"status\":\"ok\",\"reasoningPromptOverrideChars\":\(raw.count)}"
+
+        } else if trimmed.hasPrefix("SET_REPETITION_PENALTY:") {
+            // Tuning: override repetition penalty on reasoning turns. "default"
+            // clears it (back to the model's own setting).
+            let val = String(trimmed.dropFirst("SET_REPETITION_PENALTY:".count)).trimmingCharacters(in: .whitespaces).lowercased()
+            if val == "default" || val == "nil" {
+                ReasoningTuning.shared.repetitionPenalty = nil
+                return "{\"status\":\"ok\",\"repetitionPenalty\":null}"
+            }
+            if let d = Double(val), d >= 1.0, d <= 2.0 {
+                ReasoningTuning.shared.repetitionPenalty = d
+                return "{\"status\":\"ok\",\"repetitionPenalty\":\(d)}"
+            }
+            return "{\"status\":\"error\",\"message\":\"SET_REPETITION_PENALTY: must be 1.0–2.0 or default\"}"
+
+        } else if trimmed.hasPrefix("SET_REASONING_TEMP:") {
+            // Tuning: override the reasoning-turn temperature (live sweep knob).
+            // "default" clears it (back to the model's reasoningSettings).
+            let val = String(trimmed.dropFirst("SET_REASONING_TEMP:".count)).trimmingCharacters(in: .whitespaces).lowercased()
+            if val == "default" || val == "nil" {
+                ReasoningTuning.shared.temperatureOverride = nil
+                return "{\"status\":\"ok\",\"reasoningTemp\":null}"
+            }
+            if let d = Double(val), d >= 0.0, d <= 2.0 {
+                ReasoningTuning.shared.temperatureOverride = d
+                return "{\"status\":\"ok\",\"reasoningTemp\":\(d)}"
+            }
+            return "{\"status\":\"error\",\"message\":\"SET_REASONING_TEMP: must be 0.0–2.0 or default\"}"
+
+        } else if trimmed.hasPrefix("SET_TOP_P:") {
+            // Tuning: override reasoning top-p. "default" clears it.
+            let val = String(trimmed.dropFirst("SET_TOP_P:".count)).trimmingCharacters(in: .whitespaces).lowercased()
+            if val == "default" || val == "nil" {
+                ReasoningTuning.shared.topPOverride = nil
+                return "{\"status\":\"ok\",\"topP\":null}"
+            }
+            if let d = Float(val), d > 0.0, d <= 1.0 {
+                ReasoningTuning.shared.topPOverride = d
+                return "{\"status\":\"ok\",\"topP\":\(d)}"
+            }
+            return "{\"status\":\"error\",\"message\":\"SET_TOP_P: must be 0.0–1.0 or default\"}"
+
+        } else if trimmed.hasPrefix("SET_TOP_K:") {
+            // Tuning: override reasoning top-k (0 disables). "default" clears it.
+            let val = String(trimmed.dropFirst("SET_TOP_K:".count)).trimmingCharacters(in: .whitespaces).lowercased()
+            if val == "default" || val == "nil" {
+                ReasoningTuning.shared.topKOverride = nil
+                return "{\"status\":\"ok\",\"topK\":null}"
+            }
+            if let i = Int(val), i >= 0, i <= 500 {
+                ReasoningTuning.shared.topKOverride = i
+                return "{\"status\":\"ok\",\"topK\":\(i)}"
+            }
+            return "{\"status\":\"error\",\"message\":\"SET_TOP_K: must be 0–500 or default\"}"
+
+        } else if trimmed.hasPrefix("SET_PRESENCE_PENALTY:") {
+            // Tuning: override reasoning presence penalty (Qwen's anti-loop lever,
+            // 0–2). "default" clears it.
+            let val = String(trimmed.dropFirst("SET_PRESENCE_PENALTY:".count)).trimmingCharacters(in: .whitespaces).lowercased()
+            if val == "default" || val == "nil" {
+                ReasoningTuning.shared.presencePenaltyOverride = nil
+                return "{\"status\":\"ok\",\"presencePenalty\":null}"
+            }
+            if let d = Float(val), d >= 0.0, d <= 2.0 {
+                ReasoningTuning.shared.presencePenaltyOverride = d
+                return "{\"status\":\"ok\",\"presencePenalty\":\(d)}"
+            }
+            return "{\"status\":\"error\",\"message\":\"SET_PRESENCE_PENALTY: must be 0.0–2.0 or default\"}"
+
+        } else if trimmed.hasPrefix("SET_MEMORY_ISOLATION:") {
+            // Tuning: skip all memory / RAG / self-knowledge / history injection
+            // for a clean footprint (no confounding retrieved context).
+            let val = String(trimmed.dropFirst("SET_MEMORY_ISOLATION:".count)).trimmingCharacters(in: .whitespaces).lowercased()
+            if val == "true" || val == "false" || val == "1" || val == "0" {
+                ReasoningTuning.shared.memoryIsolation = (val == "true" || val == "1")
+                return "{\"status\":\"ok\",\"memoryIsolation\":\(ReasoningTuning.shared.memoryIsolation)}"
+            }
+            return "{\"status\":\"error\",\"message\":\"SET_MEMORY_ISOLATION: must be true/false\"}"
+
+        } else if trimmed == "GET_THINK_STREAM" {
+            // Tuning: return the complete RAW reasoning captured for the most
+            // recent (or in-flight) reasoning turn. Unlike HALDEBUG-THINK-RAW
+            // (logged only after a finished answer), this buffer is appended
+            // per-chunk, so a runaway that never closes </think> is still
+            // fully inspectable. Readable mid-generation.
+            let raw = ReasoningTuning.shared.rawStream
+            return "{\"status\":\"ok\",\"chars\":\(raw.count),\"stream\":\"\(jsonStringEscape(raw))\"}"
 
         } else if trimmed.hasPrefix("SET_SELF_KNOWLEDGE:") {
             let valStr = String(trimmed.dropFirst("SET_SELF_KNOWLEDGE:".count)).trimmingCharacters(in: .whitespaces).lowercased()
@@ -24624,9 +25392,31 @@ class HalTestConsole: ObservableObject {
     }
 
     private func jsonStringEscape(_ s: String) -> String {
-        s.replacingOccurrences(of: "\\", with: "\\\\")
-         .replacingOccurrences(of: "\"", with: "\\\"")
-         .replacingOccurrences(of: "\n", with: "\\n")
+        // Fully JSON-compliant string escaping. The earlier version handled
+        // only \, ", and \n — leaving tabs, carriage returns, and other
+        // control chars (< 0x20) raw, which yields INVALID JSON that strict
+        // parsers reject ("invalid control character"). That was a latent bug
+        // for every verb echoing free-form content (GET_LOGS, GET_THINK_STREAM,
+        // imported-doc names, …); reasoning streams are especially rich in
+        // control chars. Escape the named ones and \u-escape the rest.
+        var out = ""
+        out.reserveCapacity(s.count + 16)
+        for scalar in s.unicodeScalars {
+            switch scalar {
+            case "\\": out += "\\\\"
+            case "\"": out += "\\\""
+            case "\n": out += "\\n"
+            case "\r": out += "\\r"
+            case "\t": out += "\\t"
+            default:
+                if scalar.value < 0x20 {
+                    out += String(format: "\\u%04x", scalar.value)
+                } else {
+                    out.unicodeScalars.append(scalar)
+                }
+            }
+        }
+        return out
     }
 }
 
@@ -26594,16 +27384,54 @@ struct PowerUserView: View {
         } message: {
             Text("Reset all settings to factory defaults? This will reset your system prompt, memory depth, similarity threshold, recency settings, and RAG limits. Your conversation history and documents will not be affected.")
         }
-        .alert("Clear Cache", isPresented: $showingClearCacheAlert) {
-            Button("Clear Cache", role: .destructive) {
-                mlxDownloader.clearHubCache()
+        .alert("Clear Hal's Models", isPresented: $showingClearCacheAlert) {
+            Button("Clear Hal's Models", role: .destructive) {
+                mlxDownloader.clearHalsModels()
             }
             Button("Cancel", role: .cancel) { }
         } message: {
-            Text("This will delete all cached model files (\(mlxDownloader.hubCacheSize)). Downloaded models will need to be re-downloaded.")
+            Text(clearModelsMessage)
         }
     }
-    
+
+    /// Confirmation copy for "Clear Hal's Models", built from a dry run so it
+    /// describes what will actually happen to THIS device right now.
+    ///
+    /// The old copy — "this will delete all cached model files" — was technically
+    /// true of the old (broken) behavior and read to every user as "Hal's files."
+    /// It was deleting the whole family's. Now that the delete is claim-aware, the
+    /// alert explains the sharing rather than hiding it: a co-claimed model staying
+    /// on disk is the system working, and saying so is cheaper than a support email.
+    private var clearModelsMessage: String {
+        let plan = mlxDownloader.previewClearHalsModels()
+
+        if plan.isEmpty {
+            return "Hal isn't using any downloaded models right now, so there's nothing to clear."
+        }
+
+        var lines: [String] = []
+        if !plan.willDelete.isEmpty {
+            let n = plan.willDelete.count
+            lines.append("\(n) model\(n == 1 ? "" : "s") will be deleted from this device.")
+        }
+        if !plan.willStayForOthers.isEmpty {
+            let n = plan.willStayForOthers.count
+            // Name the siblings when we can — "also used by Posey" explains the
+            // family; "also used by another app" just raises a question.
+            let who = plan.otherClaimants.sorted()
+            let byWhom: String
+            switch who.count {
+            case 0:  byWhom = "another app in the AI family"
+            case 1:  byWhom = who[0]
+            case 2:  byWhom = "\(who[0]) and \(who[1])"
+            default: byWhom = who.dropLast().joined(separator: ", ") + ", and " + who[who.count - 1]
+            }
+            lines.append("\(n) \(n == 1 ? "is" : "are") also used by \(byWhom) and will stay on disk — Hal just stops using \(n == 1 ? "it" : "them").")
+        }
+        lines.append("Anything deleted will need to be downloaded again.")
+        return lines.joined(separator: " ")
+    }
+
     // MARK: - Memory Section
     
     // Controls for short-term and long-term memory behavior
@@ -26835,7 +27663,7 @@ struct PowerUserView: View {
                     ProgressView()
                         .scaleEffect(0.8)
                 } else {
-                    Button("Clear Cache") {
+                    Button("Clear Hal's Models") {
                         showingClearCacheAlert = true
                     }
                     .font(.caption)
@@ -27597,6 +28425,7 @@ struct iOSChatView: View {
     // `isPrivacyLocked` from the active model + this monitor + the salon config.
     @StateObject private var privacyMonitor = PrivacyMonitor.shared
     @State private var showingPrivacyPopover = false
+    @State private var showingReasoningPopover = false
     // Set when the user taps "Model Library" in the privacy popover; consumed
     // in the popover's onDisappear so the sheet presents only AFTER the popover
     // is fully gone (a popover + sheet can't present at once — same race as the
@@ -27715,6 +28544,29 @@ struct iOSChatView: View {
                         chatViewModel.showingThreadPanel = true
                     } label: {
                         Image(systemName: "line.3.horizontal")
+                    }
+                }
+                // Reasoning toggle — brain, shown only when the active model can
+                // reason (isReasoningModel). Tap flips reasoning on/off (sticky),
+                // narrates the change into chat, and pops a plain-language
+                // explanation of the new state. See
+                // Docs/Think_Tokens_Reasoning_Transparency.md.
+                if chatViewModel.selectedModel.isReasoningModel == true {
+                    ToolbarItem(placement: .navigationBarTrailing) {
+                        Button {
+                            chatViewModel.setReasoning(!chatViewModel.reasoningEnabled)
+                            showingReasoningPopover = true
+                        } label: {
+                            Image(systemName: "brain")
+                                .foregroundStyle(chatViewModel.reasoningEnabled ? Color.accentColor : Color.secondary)
+                        }
+                        .popover(isPresented: $showingReasoningPopover) {
+                            ReasoningPopover(
+                                isOn: chatViewModel.reasoningEnabled,
+                                modelName: chatViewModel.selectedModel.displayName
+                            )
+                            .presentationCompactAdaptation(.popover)
+                        }
                     }
                 }
                 // Privacy lock — sits just left of the gear (declared first in
@@ -28026,6 +28878,83 @@ private struct BubbleContainerWidthKey: PreferenceKey {
     static var defaultValue: CGFloat = 0
     static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) {
         value = max(value, nextValue())
+    }
+}
+
+// MARK: - ThinkingDisclosure
+//
+// Collapsible panel that shows a reasoning model's <think> trace
+// (message.thinking), separated from the visible answer. Auto-expands while the
+// model is still reasoning (streaming, no answer yet) so the user can watch it
+// think live, then collapses once the answer begins. Tappable to re-open.
+// See Docs/Think_Tokens_Reasoning_Transparency.md.
+private struct ThinkingDisclosure: View {
+    let text: String
+    let isStreaming: Bool
+    @State private var expanded: Bool = false
+
+    var body: some View {
+        DisclosureGroup(isExpanded: $expanded) {
+            Text(text)
+                .font(.caption)
+                .foregroundColor(.secondary)
+                .textSelection(.enabled)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .padding(.top, 4)
+        } label: {
+            HStack(spacing: 6) {
+                Image(systemName: "brain")
+                Text(isStreaming ? "Thinking…" : "Reasoning")
+                if isStreaming {
+                    ProgressView().scaleEffect(0.7)
+                }
+            }
+            .font(.caption)
+            .foregroundColor(.secondary)
+        }
+        .tint(.secondary)
+        .padding(.vertical, 6)
+        .padding(.horizontal, 14)
+        .onAppear { expanded = isStreaming }
+        .onChange(of: isStreaming) { _, streaming in
+            if !streaming { withAnimation { expanded = false } }
+        }
+    }
+}
+
+// MARK: - ReasoningPopover
+//
+// Plain-language explanation shown when the user taps the brain toggle, mirroring
+// PrivacyLockPopover. Describes the new reasoning state (on/off) for the active
+// model. See Docs/Think_Tokens_Reasoning_Transparency.md.
+struct ReasoningPopover: View {
+    let isOn: Bool
+    let modelName: String
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            HStack(spacing: 8) {
+                Image(systemName: "brain")
+                Text(isOn ? "Reasoning on" : "Reasoning off")
+                    .fontWeight(.semibold)
+            }
+            .font(.headline)
+
+            Text(explanation)
+                .font(.subheadline)
+                .foregroundColor(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+        }
+        .padding(16)
+        .frame(width: 280)
+    }
+
+    private var explanation: String {
+        if isOn {
+            return "\(modelName) will think each answer through first. You'll see its reasoning stream into a panel above the reply, then the answer beneath. It's slower and more deliberate. Tap the brain again to switch back to direct replies."
+        } else {
+            return "\(modelName) answers directly, with no visible reasoning. Tap the brain whenever you want to watch it think a question through before it replies."
+        }
     }
 }
 
@@ -28373,6 +29302,10 @@ struct ChatBubbleView: View {
             } else {
                 VStack(alignment: .trailing, spacing: 0) {
                     VStack(alignment: .leading, spacing: 6) {
+                        if let thinking = message.thinking, !thinking.isEmpty {
+                            ThinkingDisclosure(text: thinking, isStreaming: message.isPartial && message.content.isEmpty)
+                                .frame(maxWidth: bubbleMaxWidth, alignment: .leading)
+                        }
                         if isStatusMessage {
                             Text(message.content)
                                 .font(.title3)

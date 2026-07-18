@@ -715,16 +715,54 @@ struct PowerUserView: View {
         } message: {
             Text("Reset all settings to factory defaults? This will reset your system prompt, memory depth, similarity threshold, recency settings, and RAG limits. Your conversation history and documents will not be affected.")
         }
-        .alert("Clear Cache", isPresented: $showingClearCacheAlert) {
-            Button("Clear Cache", role: .destructive) {
-                mlxDownloader.clearHubCache()
+        .alert("Clear Hal's Models", isPresented: $showingClearCacheAlert) {
+            Button("Clear Hal's Models", role: .destructive) {
+                mlxDownloader.clearHalsModels()
             }
             Button("Cancel", role: .cancel) { }
         } message: {
-            Text("This will delete all cached model files (\(mlxDownloader.hubCacheSize)). Downloaded models will need to be re-downloaded.")
+            Text(clearModelsMessage)
         }
     }
-    
+
+    /// Confirmation copy for "Clear Hal's Models", built from a dry run so it
+    /// describes what will actually happen to THIS device right now.
+    ///
+    /// The old copy — "this will delete all cached model files" — was technically
+    /// true of the old (broken) behavior and read to every user as "Hal's files."
+    /// It was deleting the whole family's. Now that the delete is claim-aware, the
+    /// alert explains the sharing rather than hiding it: a co-claimed model staying
+    /// on disk is the system working, and saying so is cheaper than a support email.
+    private var clearModelsMessage: String {
+        let plan = mlxDownloader.previewClearHalsModels()
+
+        if plan.isEmpty {
+            return "Hal isn't using any downloaded models right now, so there's nothing to clear."
+        }
+
+        var lines: [String] = []
+        if !plan.willDelete.isEmpty {
+            let n = plan.willDelete.count
+            lines.append("\(n) model\(n == 1 ? "" : "s") will be deleted from this device.")
+        }
+        if !plan.willStayForOthers.isEmpty {
+            let n = plan.willStayForOthers.count
+            // Name the siblings when we can — "also used by Posey" explains the
+            // family; "also used by another app" just raises a question.
+            let who = plan.otherClaimants.sorted()
+            let byWhom: String
+            switch who.count {
+            case 0:  byWhom = "another app in the AI family"
+            case 1:  byWhom = who[0]
+            case 2:  byWhom = "\(who[0]) and \(who[1])"
+            default: byWhom = who.dropLast().joined(separator: ", ") + ", and " + who[who.count - 1]
+            }
+            lines.append("\(n) \(n == 1 ? "is" : "are") also used by \(byWhom) and will stay on disk — Hal just stops using \(n == 1 ? "it" : "them").")
+        }
+        lines.append("Anything deleted will need to be downloaded again.")
+        return lines.joined(separator: " ")
+    }
+
     // MARK: - Memory Section
     
     // Controls for short-term and long-term memory behavior
@@ -956,7 +994,7 @@ struct PowerUserView: View {
                     ProgressView()
                         .scaleEffect(0.8)
                 } else {
-                    Button("Clear Cache") {
+                    Button("Clear Hal's Models") {
                         showingClearCacheAlert = true
                     }
                     .font(.caption)

@@ -578,6 +578,20 @@ def main():
         else:
             file_send_command(cmd)
 
+    elif subcommand == "think_stream":
+        # Retrieve the COMPLETE captured raw reasoning for the last (or
+        # in-flight) turn, untruncated. `cmd` truncates its printout to 300
+        # chars; this hits the server directly and prints the whole stream.
+        if not config:
+            print("ERROR: HTTP config required. Run setup first.")
+            sys.exit(1)
+        result = http_post("/command", {"command": "GET_THINK_STREAM"}, config)
+        if "error" in result:
+            print(f"  ERROR: {result['error']}")
+        else:
+            print(f"CHARS: {result.get('chars', 0)}")
+            print(result.get("stream", ""))
+
     elif subcommand == "state":
         if config:
             get_state(config)

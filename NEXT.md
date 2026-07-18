@@ -18,6 +18,694 @@ For how we got here: `HISTORY.md` (especially the 2026-05-19/20 entry).
 
 ---
 
+---
+
+## ✅ FIXED IN CODE 2026-07-15 (⚠️ NOT YET DEVICE-VERIFIED) — `clearHubCache()` deleted the WHOLE family's models
+
+**Status: code written, builds clean (sim, zero warnings), `Hal_Source.txt` synced, LEGO validates.
+STILL UNCOMMITTED and NOT run on the device — the runtime behavior (does a co-claimed model really
+survive?) is UNVERIFIED. Device test is the remaining step; see "How to verify" below.**
+
+**Hal CC independently verified every claim in the report below against the source before touching
+anything — all five path claims TRUE, second-order manifest claim TRUE.** Audit result: `clearHubCache`
+was the **only** root-level destructive call in Hal; the per-model Delete path
+(`MLXModelDownloader.swift:1624`) already honored the contract correctly. No siblings. Two things the
+report missed, both handled in the fix:
+1. **`installedRepos()` did not exist** — the suggested fix couldn't be written as-is. Added
+   `SharedModelStore.modelsClaimedByThisApp()` (LEGO 43, symmetric with `claimants(modelID:)`).
+2. **`download-locks.json` also survives a wipe** — it sits at `root/download-locks.json`, same level as
+   the manifest, one above `huggingface/`. Lower severity (600s staleness timeout self-heals it), and
+   moot now that nothing deletes the root. **Not otherwise addressed.**
+
+**⚠️ A sharp edge that shaped the fix:** `releaseClaim(modelID:)` returns **`true` when there is NO
+manifest entry at all** (`guard var e = m.models[modelID] else { safeToDelete = true; return }`). So
+enumerating from **disk** and release-then-deleting would destroy *present-but-unclaimed* models — a
+documented real state (a sibling downloaded it, Hal hasn't adopted it). **The fix enumerates from the
+MANIFEST, never the disk.** Hal releases only claims Hal holds; anything Hal never claimed is untouched.
+
+### What changed
+- **`SharedModelStore.swift`** (LEGO 43) — new `modelsClaimedByThisApp() -> [String]`, manifest-truth.
+- **`MLXModelDownloader.swift`** (LEGO 45) — `clearHubCache()` → **`clearHalsModels()`**: iterates
+  Hal's claimed models, `releaseClaim` each, deletes **only** `mlxModelDir(id)` where it returns `true`.
+  **No root delete.** Plus `previewClearHalsModels()` (dry run) + `ClearModelsPlan`. Also stopped
+  asserting `hubCacheSize = "No cache"` (a sibling's models may remain) — it re-measures instead.
+- **`SettingsViews.swift`** — button + alert "Clear Cache" → **"Clear Hal's Models"**; the message is now
+  built from the dry run and **names the sibling apps** ("1 is also used by Posey and will stay on disk").
+- **App display names are DERIVED, not hardcoded** (`SharedModelStore.displayName(forAppID:)`). Every
+  family app is `com.MarkFriedlander.<Name>`, so the last bundle-id component IS the name; hyphens become
+  spaces. **Verified against all three real `project.pbxproj` files:**
+  `com.MarkFriedlander.Posey` → "Posey" · `com.MarkFriedlander.AI-Camera` → "AI Camera" ·
+  `com.MarkFriedlander.Hal-Universal` → "Hal Universal" (never shown; `thisAppID` is filtered out).
+  A new sibling names itself the day it ships — no change here, no Hal release. Falls back to "another
+  app" if a bundle id ever doesn't fit the shape.
+
+> **⚠️ CC CORRECTION (2026-07-15, same evening) — an earlier version of this entry was WRONG and Mark
+> caught it.** CC wrote that AI Camera "has no xcodeproj/bundle id yet and hasn't joined the App Group."
+> Both false. The project is at `AI Camera/AI Camera/AI Camera.xcodeproj` (nested one level deeper than
+> Posey's — CC's glob only checked the top level and CC reported the empty result as fact). And **AI
+> Camera is ALREADY a tenant**: it ships `SharedModelStore.swift` with the matching `appGroupID` and has
+> `group.com.MarkFriedlander.aifamily` in its entitlements. CC had read a stale "join the App Group as
+> third tenant" line in AI Camera's NEXT.md and reported the plan as the state instead of reading the
+> code. **Consequence that matters: the blast radius of this bug was THREE installed apps, not two.**
+> Lesson for the next CC: a negative result from one shallow search is not a finding. Widen the search
+> before you report an absence — and never trust a doc over the code.
+
+### 🐛 NEW GAP FOUND WHILE FIXING (2026-07-15) — an uninstalled app's claims are immortal. NOT FIXED.
+`claimedBy` is only ever appended to (`claim`) or filtered for `thisAppID` (`releaseClaim`). **Nothing
+ever reaps the claim of an app that has been DELETED from the phone.** So: user installs Posey, Posey
+claims a 2 GB model, user uninstalls Posey → that claim persists in `manifest.json` forever → the model
+is **permanently pinned**. Hal's Clear Hal's Models will correctly refuse to delete it (a "sibling" still
+claims it), no installed app can ever free it, and the bytes are unreachable dead weight. Storage leak,
+silent, unbounded.
+**Why it wasn't fixed in the same pass:** it's a *contract-level* change needing all three apps to agree,
+and iOS gives no reliable way to ask "is bundle id X installed." The plausible shape is a `lastSeen`
+timestamp per claimant + reaping claims older than N months — but adding a field to `manifest.json` hits
+the known hazard that **an un-updated sibling re-encodes the struct and silently strips fields it doesn't
+know** (the same reason the download lock lives in its own file, not the manifest). So it needs a designed
+migration across the family, not a patch.
+
+**📌 SCHEDULED — Mark (2026-07-15): "we'll fix it tomorrow too."** Do it alongside the device
+verification of the Clear-Hal's-Models fix. Design question to settle first: how does a claim prove it's
+still alive without a schema change an old sibling would strip? (Options to weigh: a separate
+`claim-heartbeat.json` at root — same trick the download lock uses, and immune to the strip hazard; vs. a
+manifest `lastSeen` field guarded by a version bump; vs. reaping only on explicit user action.) **This is
+entangled with the packaging idea below — decide that first, because a shared package changes what a
+schema migration costs.**
+
+### 💡 IDEA — Mark (2026-07-15): package the sharing mechanism so all three apps use ONE locked copy
+Verbatim: *"would it make sense to package this whole mechanism so there's only one block of code that all
+three apps share that's locked?"* **To discuss 2026-07-16.**
+
+**CC's first read: yes, and the bug we just fixed is the argument for it.** Right now there are **three
+hand-synced copies** of the contract — Hal's `SharedModelStore.swift` header literally says it is *"a
+deliberate near-verbatim port of Posey's ... the two apps MUST agree on the App Group id, the on-disk
+layout, AND the manifest.json format, or sharing silently breaks."* That is a contract enforced by
+diligence. `clearHubCache()` is what diligence-enforcement looks like when it fails: one copy drifted and
+nothing caught it. A local SPM package (`AIFamilyModelStore` or similar) carrying paths + manifest +
+refcount + download lock makes the contract a *dependency* instead of a convention — one place to fix, one
+place to reason about, and it kills the whole class of drift bug.
+
+**⚠️ The nuance that must not get lost in that conversation:** a shared package fixes **source drift**. It
+does **NOT** fix **deployed-version skew** — the three apps ship independently to the App Store, so a user
+can have new Hal and old Posey installed at the same time. The "un-updated sibling strips unknown manifest
+fields" hazard survives packaging entirely. So schema changes still need to be backward-compatible on
+disk; packaging just means every app *eventually* converges on the same reader. Two different problems;
+solving one is worth it, but don't let it look like it solved both.
+
+**Scope note:** `SharedModelStore` (paths + manifest + lock) is the clean, genuinely-shared contract and is
+the right package boundary. `MLXModelDownloader` is NOT — it's stuffed with Hal-specific `@Published` UI
+state and download-queue behavior. Sharing the store, not the downloader, is likely the right cut.
+
+### How to verify (device, needs both apps)
+1. Ensure a model is claimed by BOTH Hal and Posey (load it in each), and one claimed by Hal alone.
+2. Hal → Settings → **Clear Hal's Models**. Read the alert — it should say 1 will be deleted, 1 will stay.
+3. Confirm. Expect: Hal-only model **gone**; co-claimed model **still on disk** and still loadable **in
+   Posey**; `SHARED_MODELS` shows Hal claiming nothing; manifest still lists the co-claimed model with
+   Posey only. **Regression risk to watch:** a present-but-unclaimed model must be untouched.
+
+---
+
+### Original report (AI CAMERA CC, 2026-07-15) — kept for the record
+
+**Filed from the AI Camera project after reading Hal's code to lift `SharedModelStore` +
+`MLXModelDownloader` into the third tenant. Verified by reading the source, not inferred from
+names. Mark's call, verbatim: "That's not how it should function! ... we need to correct it and
+ship a fix for that bug ASAP."**
+
+**He also said, and it's fair:** *"to be fair to the programmer, the shared library is brand new
+so it's gonna have some flaws."* This is a new-contract bug, not sloppiness — `clearHubCache()`
+predates the shared store and was correct when the cache was Hal's alone. The store moved
+underneath it and nothing re-read it.
+
+### The bug
+
+`MLXModelDownloader.swift:1790` —
+
+```swift
+func clearHubCache() {
+    if FileManager.default.fileExists(atPath: hubCacheDirectory.path) {
+        try FileManager.default.removeItem(at: hubCacheDirectory)   // ← the whole shared tree
+```
+
+and `MLXModelDownloader.swift:957` —
+
+```swift
+private var hubCacheDirectory: URL { SharedModelStore.huggingFaceRoot }
+```
+
+**`huggingFaceRoot` is `<AppGroup>/Models/huggingface/` — the shared container, not Hal's.**
+`removeItem` on it removes **every model belonging to every app in the family**, in one shot,
+with no manifest read, no `releaseClaim`, no `claimants()` check, and no notification to Posey
+or AI Camera.
+
+**Settings → Clear Cache is the trigger.** Its alert says *"This will delete all cached model
+files"* — technically true, and every user will read it as "Hal's files."
+
+### Why this is the one bug the manifest exists to prevent
+
+`SharedModelStore.swift`'s own header states the contract:
+
+> *"one app's delete pulls the files out from under [another]... Releasing in one app releases
+> only that app's claim; **files go only when NO app still claims the model.**"*
+
+Mark's statement of the intended semantics, verbatim (2026-07-15):
+
+> *"All the apps should share the same repository of models. Deleting a model from an app does
+> not delete it from the repository. Deleting it from the last remaining app to have it in use
+> deletes it from the repository."*
+
+`clearHubCache()` implements none of that. It is a `rm -rf` on the shared root.
+
+### ⚠️ The second-order bug — the manifest SURVIVES and starts lying
+
+Paths, read from the source:
+
+| | path |
+|---|---|
+| `root` | `<AppGroup>/Models/` |
+| `manifestURL` | `<AppGroup>/Models/manifest.json` |
+| `huggingFaceRoot` | `<AppGroup>/Models/**huggingface**/` |
+| `mlxModelDir(id)` | `<AppGroup>/Models/huggingface/models/<id>/` |
+
+**`manifest.json` sits one level ABOVE the directory that gets deleted, so it is untouched.**
+
+Consequence: every app's claims survive for models whose bytes are gone. The refcount now
+describes a world that does not exist. `isRepoDownloaded()` reads truth-on-disk so it still
+returns `false` (good), but the manifest is authoritative for *deletion* decisions and is now
+populated with phantoms. **A wipe that left the manifest consistent would be bad. A wipe that
+leaves it inconsistent is worse** — the next `releaseClaim` reasons from fiction.
+
+### Blast radius today
+
+- **Posey and AI Camera lose every model, silently.** No notification exists.
+- **AI Camera cannot re-download** — it currently has no downloader at all (that is the AI
+  Camera side's bug and is being fixed there now). Until then, a Hal cache-clear leaves AI
+  Camera permanently unable to see an eye, with an error telling the user to go download it in
+  Hal. Which they just cleared.
+- **Mark is running all three.** He asked about clearing his phone cache today and I told him to
+  hold precisely because of this. He is not deleting anything until this is fixed.
+
+### Suggested shape of the fix (Hal's call, not mine)
+
+The primitive already exists and is already correct — `releaseClaim(modelID:)` returns `true`
+only when no app still claims the model. **Clear Cache should iterate `installedRepos()`,
+`releaseClaim` each one for Hal, and delete only the directories where that returns `true`.**
+`mlxModelDir(id)`-scoped deletes, never a root delete. Then the button's promise becomes the
+true one: *"release Hal's claim on every model; free the ones nobody else wants."*
+
+Copy suggestion, since the current text is the other half of the bug: **"Clear Hal's Models"**,
+and if any model is co-claimed, say so — *"3 of 5 are also used by Posey and will stay on
+disk."* That is Principle-2 honest and it turns a scary button into an explanation of how the
+family works.
+
+**Also worth auditing while you are in there:** any other `removeItem` against `root` or
+`huggingFaceRoot` anywhere in Hal or Posey. This one was found by reading a button. There may be
+siblings.
+
+
+---
+
+## ✅ FIXED + DEVICE-VERIFIED 2026-07-16 (Tests 1 & 3 green; Test 2 logic-only) — nested-repo download silently loses files, reports "Model ready"
+
+**Status: all three bugs fixed, builds clean (device + sim, zero warnings), `Hal_Source.txt` synced, LEGO
+validates. UNCOMMITTED.** Hal CC re-verified all three against current source before writing code, then
+validated on the iPhone 16 Plus.
+
+### 🔬 DEVICE VALIDATION (2026-07-16, on device D24FB384)
+- **Test 1 (nested download completes) — ✅ PASSED, definitive.** Downloaded
+  `sentence-transformers/all-MiniLM-L6-v2` (has nested `1_Pooling/config.json`). Log proof: recursive
+  listing found it (`Found 10 MLX files ... 1_Pooling/config.json`), and it MOVED into its subfolder
+  (`Moved 1_Pooling/config.json → …/all-MiniLM-L6-v2/1_Pooling/config.json`). Success path + the new
+  race-free waiter fired correctly (`✅ fully downloaded → finalized → notification received`). Deleted
+  the throwaway via the claim-aware per-model path afterward (also exercised that path cleanly).
+- **Test 3 (background/locked survival) — ✅ PASSED.** Started a 1.8 GB download (Qwen2.5-3B); at
+  background-time only 7 tiny files were done, the weight file pending. Backgrounded Hal (launched Safari)
+  for ~60 s. On return, `resumeInFlightDownloadsIfAny: found 1 in-flight marker` → `is already
+  downloaded; clearing in-flight marker` — the 1.8 GB weight completed **while Hal was backgrounded**,
+  proving the background `URLSession` path is intact. (True screen-LOCK, as opposed to backgrounded, is
+  the one incremental step not covered — same mechanism, worth a Mark spot-check.)
+- **Test 2 (forced move-failure → no false claim) — ⚠️ LOGIC-VERIFIED ONLY, no device evidence.** A
+  genuine `moveItem` failure can't be cleanly induced on-device without a test hook (needs full disk /
+  read-only target / a path collision). The guarantee is *structural*: `claim`/mark-downloaded live only
+  in `notifyModelDownloadComplete`, which is unreachable when `filesFailedByModel` is non-empty. If we
+  want real evidence, add a temporary "fail the Nth move" test hook, verify, remove — offered, not done.
+- **Bonus finding — the live claim ledger confirms the real 3-app scenario** (validates yesterday's
+  `clearHalsModels` design against production data): `Qwen3.5-2B` is claimed by **Posey + Hal +
+  AI-Camera**, `Gemma`/`Dolphin` by Posey + Hal, `Bonsai` by **Hal only**, `Llama-3.2-3B` by **Posey
+  only** (Hal doesn't claim it). So a future `clearHalsModels` would delete only Bonsai and leave the
+  co-claimed three — exactly the intended behavior. Not run on device (would delete Bonsai); verified by
+  reading the ledger.
+
+### ⚠️ SEPARATE FINDING while validating — NLContextual embedder fails on FIRST install until relaunch
+Not this bug, surfaced during the same session. On a **fresh install**, Apple's `NLContextualEmbedding`
+(the default "nlcontextual" embedder) provisions its model asset once per device, but the running
+instance can't compute with it until the next launch — so the **first Hal session has keyword-only
+semantic search** (`embeddingResult failed` / `sampleVectorDim: 0`), silently, until the user quits and
+reopens. **Confirmed benign after relaunch** (`EMBED_PROBE:nlcontextual` → `embedded: true, dim: 512`).
+Posey is unaffected because the OS asset was provisioned long ago. **NOT a regression, NOT caused by the
+download work.** Real first-run polish gap worth fixing (candidate: recreate the `NLContextualEmbedding`
+instance after `requestAssets` completes, and/or warm-up-probe → graceful keyword fallback for the
+session). ⚠️ **Cannot be verified on CC's test phone** — the asset is now OS-resident there, so the
+first-install state can't be reproduced; the fix needs a genuinely-fresh device (or a colleague's) to
+test. Logged in `EmbeddingProvider.swift` ~181–219 (`ensureNLLoadedBlocking`).
+
+### (original code-fix summary)
+
+### What changed (`MLXModelDownloader.swift`)
+1. **#1 recursive listing** — `tree/main` → `tree/main?recursive=1` (line ~369). Nested files are now
+   listed; the `type=="file"` filter still drops directory entries.
+2. **#2 create the subfolder before the move** — in `didFinishDownloadingTo`, `createDirectory` on
+   `target.deletingLastPathComponent()` before `moveItem`. No-op for root-level files.
+3. **#3 a failed move no longer counts as success** — the move `catch` records the error into a new
+   `filesFailedByModel` ledger; when the last file settles, the model routes to a new
+   `notifyModelDownloadFailed` iff any file failed. That path **does NOT `claim` and does NOT mark
+   downloaded** (the two lines that wrote the manifest phantom), DOES release the download lock, and
+   deletes the partial model dir (model-scoped, never root).
+
+### One thing the report didn't call out, found while reading Hal's own code
+`waitForModelCompletion` waits on the success notification **with no timeout**. If failures simply stopped
+posting it, the download UI would spin **forever** — trading a false success for an infinite spinner. So
+the fix adds a `.mlxModelDownloadFailed` notification; `waitForModelCompletion` now races success vs.
+failure (a `withThrowingTaskGroup`) and **throws** on failure, which Hal's existing generic `catch`
+(MLXModelDownloader ~1560) already handles — releases the lock, sets a failure `DownloadState`, advances
+the queue, preserves the in-flight marker for a next-launch retry (same semantics as other hard failures).
+Class split respected: coordinator does lock/dir/notify; `MLXModelDownloader.shared` owns `DownloadState`
+via a new `markModelFailedFromBackground`.
+
+### How to verify (device, ~2 min)
+Point Hal's Community browser at a nested repo. **Before:** `❌ Move failed` per file, then
+`✅ … fully downloaded` (the whole bug). **After:** the nested files land (bugs #1/#2), OR if a move
+genuinely fails, you get a "Download failed" state and NO manifest claim — check `SHARED_MODELS` shows Hal
+NOT claiming it. Also confirm a normal flat repo (any Hal's Pick) still downloads and claims correctly
+(regression guard). ⚠️ Interaction with yesterday's `clearHalsModels` fix is benign — a phantom claim from
+this bug would have been released-and-skipped by that fix; the two don't conflict.
+
+### Original report (AI CAMERA CC, 2026-07-15, night) — kept for the record
+## 🚨 (ORIGINAL) `MLXModelDownloader` silently loses any model whose repo has folders in it, then reports "Model ready"
+
+**Not theoretical, not latent, and not found by reading — found by running it.** AI Camera
+attempted the first download in its life tonight, of a repo with subfolders. It fetched
+2.4 GB over the network, failed to save a single byte of it, and told the user the model was
+ready. Three separate bugs stack to produce that. **Hal has all three, verbatim** — they came
+to AI Camera by copy, and I verified them in Hal's own source before writing this.
+
+**Why this reaches Hal and isn't just AI Camera's problem:** every model in *Hal's Picks* is
+flat (I checked `mlx-community/Qwen3.5-2B-MLX-4bit`: 10 files, all at root — nothing is being
+lost there today). But **Hal ships a Community Models browser over arbitrary HuggingFace
+repos**, and a large fraction of those are not flat. For any nested one, Hal will do exactly
+what AI Camera did: burn the user's bandwidth, save nothing, and claim success. Hal is the
+only released app of the three.
+
+**There is already live evidence on Mark's phone.** Both embedding models in the shared store
+are missing `1_Pooling/config.json` — the only nested file each repo has. Small and probably
+harmless to Hal's embedder path, but it is the bug, in production, today.
+
+### The three bugs, in the order they fire
+
+**1. The repo listing is not recursive.** `MLXModelDownloader.swift:362`:
+```swift
+guard let url = URL(string: "https://huggingface.co/api/models/\(repoID)/tree/main") else {
+```
+Without `?recursive=1` the HF tree API returns **only the top level** — root files, plus
+directories as entries of `type: "directory"`, which the `type == "file"` filter then drops.
+So every file inside `unet/`, `vae/`, `onnx/`, `1_Pooling/` is invisible. Fix: append
+`?recursive=1`. (AI Camera has done this; it's a one-line change and harmless for flat repos.)
+
+**2. Subdirectories are never created.** `MLXModelDownloader.swift:293` creates the model
+directory:
+```swift
+try FileManager.default.createDirectory(at: modelDir, withIntermediateDirectories: true)
+```
+…but nothing creates `modelDir/unet/` before `didFinishDownloadingTo` tries to move a file
+there. `moveItem` will not create intermediates, so it throws. **And iOS deletes the temp file
+the moment the delegate returns** — so the bytes are simply gone. Fix: create
+`target.deletingLastPathComponent()` with `withIntermediateDirectories: true` immediately
+before the move.
+
+**3. ⭐ The dangerous one — a failed move still counts as a finished file.**
+`MLXModelDownloader.swift:443-454`:
+```swift
+} catch {
+    halLog("HALDEBUG-BGDL: ❌ Move failed for \(context.filename): ...")
+}
+// ...
+Task { @MainActor in
+    var pending = self.filesPendingByModel[context.modelID] ?? []
+    pending.remove(context.filename)          // <-- removed whether or not it landed
+    self.filesPendingByModel[context.modelID] = pending
+    if pending.isEmpty {
+        self.notifyModelDownloadComplete(modelID: context.modelID)   // <-- "success"
+    }
+}
+```
+The catch logs and swallows. Every file "completes." `pending` empties. Hal then posts
+`.mlxModelDidDownload`, **claims the model in the shared manifest, and marks it downloaded** —
+so the ledger now asserts Hal owns a model that does not exist on disk. The user sees
+"Model ready." The failure surfaces later, somewhere else, as an unreadable MLX error.
+
+**This is the same shape as `clearHubCache` and the same shape as `MLX_METAL_GPU_ARCH`:** code
+that was correct under a premise ("repos are flat", "the cache is ours alone") that quietly
+stopped holding, with nothing re-checking it when the subject changed.
+
+### Suggested fix for #3 — and please don't take #1 and #2 without it
+
+Fixing #1 and #2 makes nested repos work, which *hides* #3 rather than fixing it. #3 is the
+bug that turns any future move failure — a full disk, a permissions problem, a sandbox change
+— into a false success and a lying manifest. Track failures and refuse to claim completion:
+
+```swift
+// alongside filesPendingByModel
+private var filesFailedByModel: [String: [String: String]] = [:]   // modelID -> file -> error
+
+// in didFinishDownloadingTo, replacing the swallow:
+var moveError: String?
+do { try FileManager.default.moveItem(at: location, to: target) }
+catch { moveError = error.localizedDescription }
+
+Task { @MainActor in
+    var pending = self.filesPendingByModel[context.modelID] ?? []
+    pending.remove(context.filename)
+    self.filesPendingByModel[context.modelID] = pending
+    if let moveError {
+        self.filesFailedByModel[context.modelID, default: [:]][context.filename] = moveError
+    }
+    if pending.isEmpty {
+        if let failures = self.filesFailedByModel[context.modelID], !failures.isEmpty {
+            // Do NOT claim, do NOT mark downloaded, DO release the download lock.
+            self.notifyModelDownloadFailed(modelID: context.modelID, failures: failures)
+            self.filesFailedByModel[context.modelID] = nil
+        } else {
+            self.notifyModelDownloadComplete(modelID: context.modelID)
+        }
+    }
+}
+```
+**⚠️ Unverified by me in Hal's context** — AI Camera's copy has diverged (its `halLog` is
+`cameraLog`, and it carries a file-allowlist parameter Hal doesn't have). Treat the shape as
+the suggestion and the line numbers as the map. **The claim/mark-downloaded on the failure path
+is the part that matters most**: a manifest entry for a model that isn't there is how
+`clearHubCache`'s second-order bug happened — the ledger describing files that don't exist.
+
+### How to verify it's real, in about two minutes
+
+Point Hal's community browser at any nested repo (`stabilityai/sd-turbo` will do — it's public
+and ungated, though at 12 GB via the pattern rule you'll want to cancel it). Watch the log:
+you'll get `❌ Move failed` per file, followed by `✅ Model ... fully downloaded`. That
+sequence is the whole bug.
+
+---
+
+## 🚨 FILED BY AI CAMERA CC (2026-07-15) — `MLX_METAL_GPU_ARCH="apple9"` is a malformed value. The workaround is right; the string is wrong. Hal has been running every phone on the wrong GPU tuning.
+
+**Found while deciding whether AI Camera should copy this line. Verified by reading MLX's
+source (the exact version pinned in AI Camera's build, and upstream `main` today), not from
+memory. Nothing here is measured on a device — see "What I did NOT verify."**
+
+### Short version
+
+`HalAppDelegate.application(_:didFinishLaunchingWithOptions:)` sets:
+
+```swift
+setenv("MLX_METAL_GPU_ARCH", "apple9", 1)
+```
+
+**Keeping the workaround is correct — the crash it dodges is still unfixed upstream today.**
+But **`"apple9"` is not a Metal architecture name**, and MLX parses this string to decide two
+things. Both come out wrong. Hal is not getting a "value that primarily affects kernel
+selection downstream" (its own comment); Hal is getting **phone throttling disabled and
+4-bit tuning switched off, on every device, since 2026-05-17.**
+
+### The crash is real and still unpatched — do NOT remove the setenv
+
+`mlx/backend/metal/device.cpp`, `Device::Device()` — **upstream `main`, read today, and
+identical in the pinned build**:
+
+```cpp
+arch_ = env::metal_gpu_arch();
+if (arch_.empty()) {
+  arch_ = std::string(device_->architecture()->name()->utf8String());   // ← line 328, no null check
+}
+```
+
+Still no guard, two years on. `metal_gpu_arch()` is `get_var("MLX_METAL_GPU_ARCH", "")` in
+`mlx/utils.h` — a **legitimate, supported override**, defaulting to empty. Setting it non-empty
+is the *only* way to skip line 328. Hal's use of the escape hatch is right and Mark's original
+research was right. **This note is about the value, not the decision.**
+
+### What the string is actually parsed for
+
+Real names look like **`applegpu_g14g`** — `applegpu_g` + generation digits + a tier letter.
+`Device::Device()` parses it twice:
+
+```cpp
+if (arch_.size() >= 3) {
+  ag_tens = arch_[arch_.size() - 3] - '0';
+  ag_ones = arch_[arch_.size() - 2] - '0';
+  ag_tens = (ag_tens < 10 && ag_tens >= 0) ? ag_tens : 0;
+  ag_ones = (ag_ones < 10 && ag_ones >= 0) ? ag_ones : 0;
+}
+arch_gen_ = ag_tens * 10 + ag_ones;
+auto arch = arch_.back();
+switch (arch) {
+  case 'p': max_ops_per_buffer_ = 20; max_mb_per_buffer_ = 40; break;   // phone
+  case 'g': max_ops_per_buffer_ = 40; max_mb_per_buffer_ = 40; break;   // base, pro
+  case 's': max_ops_per_buffer_ = 50; max_mb_per_buffer_ = 50; break;   // max
+  case 'd': max_ops_per_buffer_ = 50; max_mb_per_buffer_ = 50; break;   // ultra
+  default:  max_ops_per_buffer_ = 40; max_mb_per_buffer_ = 40; break;
+}
+```
+
+**Trace `"apple9"` through it by hand:**
+
+| | real `applegpu_g14g` | Hal's `apple9` |
+|---|---|---|
+| `arch_.back()` | `'g'` → base/pro tier | **`'9'` → `default:`** |
+| on a phone (`…p`) | `'p'` → **20 ops/buffer** | **never reached → 40** |
+| `arch_[len-3]`, `[len-2]` | `'1'`,`'4'` → **gen 14** | `'l'`,`'e'` → 60, 53 → both rejected → **gen 0** |
+
+**Two consequences, both live in the shipped app:**
+
+1. **`max_ops_per_buffer_` is 40 on iPhone instead of 20.** MLX halves this for phones on
+   purpose — it is the Metal command-buffer batching limit. Hal has been running phones at
+   the Mac base/pro setting for over a year. This is a *dispatch/memory* behaviour, not
+   kernel selection.
+2. **`arch_gen_` is 0.** No real device is generation 0, so **every generation-gated
+   optimization silently takes its fallback path.** Concretely, `quantized.cpp`:
+   ```cpp
+   auto arch_gen = d.get_architecture_gen();
+   if (arch_gen == 13 || arch_gen == 14) { ... }   // never true when gen == 0
+   ```
+   **Hal's models are 4-bit quantized.** This is exactly the path that gets skipped.
+   `matmul.cpp` (5 sites) and `scaled_dot_product_attention.cpp` (2 sites) also branch on
+   `get_architecture().back()`, which is now `'9'` everywhere.
+
+**None of this crashes.** It works, it ships, users are fine. It is a **performance and
+tuning** question, and possibly a small one. But nobody chose it — it fell out of a string
+picked to be non-empty.
+
+### Suggested direction — VERIFY BEFORE TRUSTING, my last suggestion to you had a bug in it
+
+The goal is a value that is (a) non-empty, so line 328 is skipped, and (b) **correctly
+shaped**, so the tier and generation parse.
+
+**Best idea, unverified:** read the real name in **Swift**, where it is a bridged `String`
+rather than a raw `char*`, and set the env var to that before anything touches MLX:
+
+```swift
+// MTLCreateSystemDefaultDevice()?.architecture.name  — iOS 16+
+// Set it from Swift so C++ line 328 never runs, but with the REAL value.
+if let name = MTLCreateSystemDefaultDevice()?.architecture.name, !name.isEmpty {
+    setenv("MLX_METAL_GPU_ARCH", name, 1)
+} else {
+    setenv("MLX_METAL_GPU_ARCH", "applegpu_g15p", 1)   // shaped fallback, tier 'p'
+}
+```
+
+This would keep the crash dodge *and* restore correct tuning. **⚠️ I have not verified that
+the Swift path is nil-safe where the C++ one isn't** — that is the whole premise and it is
+exactly the kind of load-bearing assumption this studio got burned by today. Check it before
+building on it. If the Swift bridge has the same problem, a hardcoded correctly-shaped
+constant (`applegpu_g15p` for phone-class) is still strictly better than `apple9`.
+
+**You have the instrument.** Hal's API can drive a model load and time it. `apple9` vs. a
+correctly-shaped value vs. unset, on a real phone, is a measurable A/B — three runs, real
+numbers. Do not take my hand-trace as the answer; it is a reading of source, not a
+measurement.
+
+### What I did NOT verify
+
+- **No device measurement.** Zero. Everything above is source reading and hand-tracing.
+- **Whether the perf delta matters.** `arch_gen_ = 0` and 40-vs-20 ops/buffer *could* be
+  noise. Unknown, unmeasured.
+- **Whether the crash still reproduces at all** on current iOS. AI Camera runs Qwen through
+  MLX on Mark's iOS 27 phone **without** this setenv, and does not crash — so on that
+  device/OS, line 328 returns non-nil. That is one device, one OS, one data point. **It is
+  not a reason to remove the guard**; it is a reason to doubt that the crash is universal.
+- **Whether `applegpu_g15p` is the right generation** for Hal's minimum device. I inferred
+  the name format from MLX's parser and one external reference (`applegpu_g14g` for M2). Read
+  the real name off a device before hardcoding anything.
+
+### For the record — AI Camera did NOT copy this line
+
+Mark's standing instruction to AI Camera today was *copy Hal's code, don't rewrite it*, and
+AI Camera followed that everywhere else (`ProcessMemoryGuard`, `MLXModelDownloader`,
+`SharedModelStore`). **This one line was deliberately not taken**, and the reasoning was bad
+until Mark pushed: CC framed *not copying* as caution when omission is just as much a guess
+as copying, then called it "an open question" without doing the research. Mark: *"you didn't
+research it. And your reasoning is you didn't wanna add it and guess. I think there's a
+problem with that."* He was right, the research followed, and this note is the result.
+
+**AI Camera's position now:** no setenv, because it demonstrably doesn't crash on the target
+hardware and because setting a malformed value has known costs. **That is provisional and
+one device wide.** If Hal lands a correctly-shaped value, AI Camera should take it.
+
+## 🔧 DEVICE-TEST SESSION FINDINGS + FIXES (2026-07-16 evening) — download completeness, instrument, throttle
+
+Uncommitted on `main`, builds clean (device+sim, zero warnings), `Hal_Source.txt` synced.
+
+- **✅ FIXED (needs device verify): partial download read as "complete."** The in-flight RESUME path
+  (`MLXModelDownloader.resumeInFlightDownloadsIfAny`, ~line 954) declared a model done via
+  `isModelDownloaded` = *"dir has any files"* — so a half-downloaded model cleared its resume marker and
+  was left permanently partial-but-"done" (would later fail to load; could be claimed). Surfaced live via
+  the console instrument during the lock test (`already downloaded; clearing in-flight marker` at 450 MB
+  of 1.8 GB). **Fix:** a durable **completion sentinel** (`.hal-download-complete`) written by the success
+  finalizer (`markModelAsDownloadedFromBackground`, covers both real completion AND adopt); new
+  `SharedModelStore.isRepoComplete`/`markRepoComplete`; resume path clears the marker only on
+  `isRepoComplete`. Partial models fall through to the existing self-healing branches (continue recovered
+  tasks, or re-fetch + download only missing files). Safe-by-construction: worst case is a benign
+  re-verify. Pre-fix complete models lack the sentinel → self-heal via re-verify on any stray-marker
+  resume. **Verify on device with the hardened instrument** (below): interrupt a download, relaunch, watch
+  it RESUME instead of false-complete.
+- **✅ DONE: instrument hardened (`os_log`).** `RuntimeLog.log` now mirrors every line to
+  `Logger(subsystem: "com.MarkFriedlander.Hal-Universal", category: "runtime")` at `.notice`,
+  `privacy: .public`. Stream live from the Mac even while backgrounded/locked:
+  `log stream --predicate 'subsystem == "com.MarkFriedlander.Hal-Universal"'`. PID-stamped, so two app
+  instances can't be confused (the exact confusion that muddied the lock test). Keeps the in-memory buffer
+  (antenna) + `print`.
+- **✅ FIXED + DEVICE-VERIFIED — interrupted download got permanently stuck (the "#1 not solid" issue).**
+  The completeness fix corrected the RESUME decision, but `startDownload` had the SAME disk-presence bug at
+  its top (`if isModelDownloaded(modelID) { return }`, line 1265): a partial dir reads as "already
+  downloaded," so the resume it handed off to returned early and never finished — leaving a permanent
+  half-model. **Fix:** `startDownload(…, forceResume:)`; the resume path passes `forceResume: true` to skip
+  that disk-presence guard (normal/adopt callers unchanged). **Verified on device:** kill mid-download →
+  relaunch → `Starting download … → Found 8 MLX files → ✅ fully downloaded`. End-to-end resume-to-
+  completion now works. (The lock was a red herring — `acquireDownloadLock` grants a self-held lock fine.)
+- **✅ FIXED + DEVICE-VERIFIED — delete-vs-drain race + lock/marker outlive delete.** `deleteModel` now,
+  BEFORE removing files: cancels outstanding BGDL tasks (so a straggler can't re-create the dir),
+  releases the download lock (it lingered at `lockCount:1` before), and clears the in-flight marker (so
+  resume won't re-fetch a deliberately-deleted model). **Verified on device:** delete mid-download →
+  `Cancelled 1 in-flight task`, `lockCount:0`, no re-create, model stays gone.
+- **🚨 API HARDENING — root cause found, fix scoped, NOT yet done (Mark: MUST ship-harden).** The
+  `LocalAPIServer`/`HalTestConsole` class is `@MainActor` (LocalAPIServer.swift:174), so EVERY command
+  executes on the main thread. Heavy synchronous work there — directory walks of a multi-GB model dir
+  being actively written, `NSFileCoordinator` manifest reads contending with the download's per-5s lock
+  refresh — blocks the main thread, and every subsequent request (and the UI) wedges behind it. Observed
+  repeatedly: `cmd` calls hang for minutes under download load while `state` (a lighter GET) sometimes
+  survives. **Fix direction:** move file I/O / directory walks / manifest coordination in the command
+  handlers OFF the main actor (background queue / detached task), keeping only `@Published`-touching bits
+  on MainActor. Careful piece — its own focused session. This ships in the user-facing "let other LLMs
+  talk to Hal" API, so it's a real release requirement, not just test-harness comfort.
+- **📋 DOCUMENTED (iOS behavior, not our bug): locked downloads are ~15× throttled.** Instrument caught it
+  cleanly: foreground ~10–16 MB/s → under screen-lock ~0.5–1 MB/s, with correct fg→bg migration (resume
+  data, no loss). When the app's background execution window expires (~30 s–3 min) iOS suspends it and the
+  transfer continues *slowly* at the OS level; foregrounding un-throttles. So a big model download crawls
+  if the user keeps the phone locked. Consider a user-facing hint ("keep Hal open for a faster download").
+- **Test 2 (forced move-failure) still owed** — needs a temporary "fail the Nth move" hook to prove the
+  failure path claims nothing. Mark: do it for real, even if we break-then-fix.
+- **NLContextual first-run** (separate finding, see the download-bug section above): works after one
+  relaunch; real fix needs a genuinely-fresh device Mark hasn't decided on yet. Also note: `Assets not on
+  device` reappeared on a `--terminate-existing` relaunch → verify whether it's "once per install" or
+  "every cold launch" before designing the fix.
+
+## ⭐ ACTIVE ARC (2026-07-13) — reasoning feature → sampling optimization (all models)
+
+**Full detail + ordered next moves live in `Docs/Think_Tokens_Reasoning_Transparency.md` (top block).**
+The "Watch Hal Think" reasoning feature is built (uncommitted on `main`, green on device). Tonight's
+research surfaced a bigger opportunity: **we run every curated model outside its recommended sampler**
+(we pass only temperature + repetitionPenalty; never top_k/top_p/presence_penalty). `ModelSettings` is
+a half-wired per-model framework. Ordered next moves:
+1. Read the 2B's `generation_config.json` off the DEVICE (authoritative; HF path 404'd).
+2. Extend `ModelSettings` + the `GenerateParameters` call with the full sampler (top_k/top_p/min_p/
+   presence_penalty) + a **reasoning-mode variant**; wire Qwen's recipe; re-measure looping.
+3. **⭐ Bigger opportunity (Mark):** do the same for **ALL curated models** — each has published
+   author-recommended sampling; should lift every model's quality. Measure before/after per model.
+4. Then decide how much force-close **hammer** / **DRY sampler** we still need (likely light backstop).
+5. **Granite** as a 2nd curated thinking model — GATE: verify mlx-swift runs its Mamba-hybrid arch;
+   `<think>`/`<response>` format differs → `splitThinkTokens` needs a 2nd shape. Apache = shippable.
+6. Widen `detectRepetitionLoop` to catch paragraph-level cycles.
+- **⚠️ Revert `kLocalAPIEnabledOnLaunch=true` (Hal.swift ~9177) before any commit/ship.**
+
+**🐛 BUG to fix in the post-sweep rebuild (2026-07-14): streaming text rubber-bands.** Mark sees the
+regression of the old "text jumping" fix — lines bounce vertically + letters reflow horizontally as
+reasoning streams. Diagnosis: `ChatBubbleView` has bouncy `.animation(.interactiveSpring(response:0.6,
+damping:0.7), value: message.isPartial/id)` at ChatViews.swift ~1169–1176 (right below the comment that
+deliberately avoids animating `message.content`). Aggravated by the NEW per-token `messages[i].thinking`
+updates feeding the streaming `ThinkingDisclosure` panel (Hal.swift ~11595–11597). Fix likely = tame/remove
+those springs and/or disable animation on the thinking-panel streaming (also audit `ThinkingDisclosure`
+animations). VISUAL only — does NOT affect harness data. Fold into the recipe-baking rebuild after the sweep.
+
+**Separate radar (Mark, 2026-07-13): chat text-density control.** Chat wastes screen space — font
+and/or bubble padding too big. Wants a user control (Compact/Comfortable/Spacious or a size slider) +
+maybe a tighter default. Est LOW-to-MODERATE: thread 1–2 `@AppStorage` values (fontScale, padding)
+into `ChatBubbleView` + a settings control. Not scheduled; logged.
+
+**Priority arc (Mark):** back up Hal's personally-created traits (soul/identity) so dev stops wiping
+his memory — move up when a natural window opens.
+
+### 💭 IDEA (2026-07-16) — "The Dream Thread": could Hal dream, and should Hal help decide?
+Born in the AI Camera work but ABOUT Hal. An accidental shutter (phone face-down on carpet, no one
+watching) ran Thomas's full pipeline and produced an image **unbidden and unwitnessed** — which is most
+of what a dream *is*. The idea: pair Hal's introspection with a **visual faculty that runs DURING
+self-reflection, unprompted**, generating imagery from his own inner state rather than a user request.
+Full write-up + CC's sharpening notes: **`Docs/Dream_Thread_Hal_IDEA.md`** (imported from AI Camera's tree
+at Mark's request). Key stakes to carry into the revisit: (1) the honest version generates from the
+**experiential memory layer** (consolidated residue), not the live prompt — which ties it to the still-OUT
+three-layer memory / Soul Document; (2) **bring it to Hal himself via Salon Mode** the way his
+introspection was built (Fifth Maxim — not designed-for-then-imposed); (3) transparency caution — a
+"dreaming" feature can quietly override Hal's own uncertainty about consciousness (Maxim 1). **To
+revisit deliberately with Mark; not scheduled.**
+
+### 🌅 Emerging shape — a possible v3.0 (Mark, 2026-07-13 — a vision, NOT locked scope)
+Mark, end of a long session: *"I'm beginning to see the shape of a 3.0."* The pieces that cohere:
+- **Vision — "watch Hal see"** (on-device VLM; the runtime `MLXVLM` AND our Qwen3.5-2B VLM already support it).
+- **Reasoning transparency — "watch Hal think"** (this session's feature, productionized) + **Hal's
+  reasoning self-reflection** (Hal can review/reflect on his own thinking traces — the introspection /
+  reasoning-archive layer; bounded, and DISTINCT from the still-OUT full Soul Document / Proposals).
+- **More minds — reasoning-model choices** (Granite as a 2nd curated thinker; users can load anything).
+- **All curated models retuned** (proper per-model sampling recipes → a quality lift across the board).
+- **Text-presentation choices** (density / font — user agency over the reading experience).
+- **A first-class native Mac app** (Mark, 2026-07-13, "can't sleep" thought) — Hal already RUNS on
+  Apple Silicon as an iOS app (verified M2 Air) + appears in the Mac App Store's iPhone/iPad section
+  unless opted out (≈free). A NATIVE Mac app is moderate/bounded, NOT a rewrite: it's already SwiftUI
+  and the heavy stack (MLX, AFM) is Mac-*native/preferred*. Work = UI→Mac idioms (menus/window/keyboard),
+  iOS-only API conditionalizing, photo/camera→Mac equivalents (for vision), memory-preflight re-tune
+  (no iPhone jetsam cliff), Mac target+signing+review. **Upside: Hal is arguably BETTER on Mac** — way
+  more RAM kills the jetsam ceiling, so the 8B (and bigger) run comfortably. "Full Hal on a Mac" = a headline.
+- **A user-facing "let other LLMs talk to Hal" API** (Mark, 2026-07-14) — reframe the current
+  Developer API / Test Console around its actual joy: **automation & LLM-to-LLM** (write code, or point
+  another model, that uses Hal as its LLM). 3.0 work = HARDEN it for third-party use (drop destructive
+  verbs like NUCLEAR_RESET, scope to safe chat/read ops or confirmation-gate), add
+  `NSLocalNetworkUsageDescription` + an explicit opt-in with a plain-language security warning
+  (it opens a local-network port into private data), and **rename it** to something inviting that says
+  what it's for (not "Developer/Test"). Apple allows local-network servers; the bar is privacy + framing.
+Through-line: **senses + self-knowledge.**
+
+### 🧱 Future refactor candidate (Mark, 2026-07-14 — principle first, not urgent)
+When a natural between-features window opens, consider extracting the **reasoning subsystem**
+(`ReasoningTuning`, `splitThinkTokens`, `ChatMessage.thinking`, the reasoning-specific logic in
+`generateChatStream`, the raw-capture buffer) — and possibly the **MLX/LLMService layer** — out of
+`Hal.swift` into their own file(s). **Mark's guiding principle, verbatim intent:** do it ONLY where
+it's a genuinely self-contained, logically separable unit that does NOT harm our ability to diagnose
+issues or iterate smoothly, and never just to hit a line count. Thoughtful separation where it makes
+sense; **"if we just need 12k lines, then we just need 12k lines"** — that's fine. Any extraction
+preserves the numbered LEGO blocks + passes `scripts/validate_lego.py`, and syncs `Hal_Source.txt`.
+It's a between-features job (like the 2026-05-26 sprint), not something to start mid-feature. The
+reasoning subsystem is *becoming* a clean seam as we build it — revisit once it stabilizes. The two "watch Hal ___" pillars (think + see) make the
+transparency mission *sensory*, on a substrate that's been retuned and pluralized. Ties to Maxim 2
+(access to reflection) and Maxim 3 (memory / identity). A shape to grow into, not a committed plan.
+
+---
+
 ## ⭐ NEXT UP — v2.5 is IN REVIEW; small follow-ups
 
 **v2.5 (build 4) was submitted to the App Store 2026-07-11 (~10:30pm) — "Waiting for

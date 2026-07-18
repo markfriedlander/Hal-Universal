@@ -4640,3 +4640,230 @@ slot still appears on the version page (leftover from when v2.0's build carried 
 — harmless, left empty. And a nice grace note: the six screenshots on the live-bound listing
 show Hal answering a consciousness question with genuine uncertainty and a first-person
 reflection in his own voice — the week's work, visible on the store page.
+
+---
+
+## 2026-07-15 (the Clear Cache bug — a button that deleted the whole family's models)
+
+A bug arrived from outside Hal. The Claude Code instance working on the AI Camera app —
+the third tenant of the shared model store — was reading Hal's `SharedModelStore` and
+`MLXModelDownloader` in order to lift them into a new app, and found something while
+reading a button.
+
+`clearHubCache()` did `removeItem` on `hubCacheDirectory`. And `hubCacheDirectory` had,
+at some point, quietly become `SharedModelStore.huggingFaceRoot` — the App-Group
+container shared with Posey. So Settings → Clear Cache was an `rm -rf` on the whole
+family's models: no manifest read, no `releaseClaim`, no claimant check, no notification
+to the app whose files just evaporated. The alert said "This will delete all cached model
+files," which was technically true and which every user on earth would read as "Hal's
+files."
+
+Mark's call: fix it ASAP, before another app ships into the same container. And, fairly:
+*"to be fair to the programmer, the shared library is brand new so it's gonna have some
+flaws."* That's the right read. This wasn't sloppiness — `clearHubCache` predated the
+shared store and was correct when the cache was Hal's alone. The store moved underneath
+it and nothing re-read it. One button got left behind.
+
+Mark asked us to verify the report rather than take it on faith, which was right, and we
+did — every path claim, line by line, against the source. All of them true. The
+second-order finding was true too, and it's the nastier half: `manifest.json` lives at
+`root/manifest.json`, one level *above* `huggingface/`, so the wipe left the ledger
+intact and describing files that no longer existed. A wipe that leaves the refcount
+consistent is bad. One that leaves it lying is worse — the next `releaseClaim` reasons
+from fiction.
+
+The audit came back clean and that was the good news: `clearHubCache` was the **only**
+root-level destructive call in Hal. The per-model Delete path at
+`MLXModelDownloader.swift:1624` already did it exactly right — `releaseClaim`, then delete
+only on `true`. The contract was understood. One call site just never got the memo.
+
+Two things the report missed, both of which changed the fix. Its suggested remedy was to
+iterate `installedRepos()` — **which does not exist anywhere in the codebase**. And
+`download-locks.json` also sits at the root, so it survived the wipe too (lower severity,
+self-healing after the 600s staleness timeout, and moot once nothing deletes the root).
+
+The sharp edge that actually shaped the code: `releaseClaim(modelID:)` returns `true` when
+there is *no manifest entry at all*. So the obvious implementation — walk the disk,
+release-then-delete each — would have destroyed present-but-unclaimed models, a documented
+real state (a sibling app downloaded it; Hal hasn't adopted it). We'd have shipped a
+smaller version of the same bug. **The fix enumerates from the manifest, never the disk.**
+Hal releases only claims Hal holds; anything Hal never claimed is none of Hal's business.
+That is Mark's rule stated precisely: *"Deleting a model from an app does not delete it
+from the repository. Deleting it from the last remaining app to have it in use deletes it
+from the repository."*
+
+What landed: `SharedModelStore.modelsClaimedByThisApp()` (LEGO 43, manifest-truth,
+symmetric with `claimants(modelID:)`); `clearHubCache()` → `clearHalsModels()`, which
+releases each claim and deletes only `mlxModelDir(id)` where the refcount hit zero, never
+a root delete; a `previewClearHalsModels()` dry run; and the button relabelled **"Clear
+Hal's Models"** with copy generated from that dry run — *"N are also used by another app in
+the AI family and will stay on disk."* The old copy was the other half of the bug. A
+co-claimed model surviving is the system *working*, and saying so out loud turns a scary
+button into an explanation of how the family fits together. Maxim 2, in a confirmation
+dialog.
+
+One small honesty rider: the old code asserted `hubCacheSize = "No cache"` after clearing.
+That would now be a lie whenever a sibling's models remain, so it re-measures instead.
+
+Builds clean, zero warnings, LEGO validates, `Hal_Source.txt` synced. **Not yet
+device-verified** — the phone was busy with the AI Camera, and the runtime question ("does
+a co-claimed model really survive?") is exactly the one a simulator build can't answer.
+Verification steps are in NEXT.md. Uncommitted on `main` alongside the reasoning work.
+
+The thing worth carrying forward: this bug was found by a *third* app reading the code in
+order to join the contract. Adding a tenant audited the landlord. Cross-app work keeps
+paying us back this way — Posey CC found the orphaned recency scoring the same way in June.
+
+**Rider, same evening.** Mark asked two good questions about the fix. First: couldn't we just read
+Posey's bundle id out of its repo rather than shipping generic copy? Yes — `com.MarkFriedlander.Posey`,
+straight out of `project.pbxproj`. Second, and better: *"these models are gonna be shared by AI
+camera/Thomas, will you need information on that one as well?"* That question changed the design. AI
+Camera has no bundle id yet (no xcodeproj; its own NEXT still lists joining the App Group as future
+work), so there was nothing to look up — and a hardcoded table would have needed editing for every new
+sibling and would have quietly said the wrong thing until someone remembered. Instead the display name is
+**derived**: every family app is `com.MarkFriedlander.<Name>`, so the last component is the name. Posey
+names itself today; Thomas will name himself the day he ships, with no change to Hal. The answer to
+Mark's question is "no" — and only because he asked it.
+
+And checking whether his refcount rule "made sense" turned up a gap in the implementation of it. The rule
+is sound — it's ordinary reference counting, last one out turns off the lights. But nothing ever reaps
+the claim of an app that's been *uninstalled*. Delete Posey from the phone and its claims live forever;
+the model is pinned permanently, no installed app can free it, and the bytes become unreachable dead
+weight. Not fixed: it needs a `lastSeen`-style field in `manifest.json`, which runs straight into the
+known hazard that an un-updated Posey re-encodes the struct and strips fields it doesn't know about (the
+exact reason the download lock lives in its own file). That's a designed migration across the family, not
+a patch. Logged in NEXT.
+
+**Correction, minutes later — and it made the bug worse than we'd said.** CC reported that AI Camera had
+"no xcodeproj yet" and hadn't joined the App Group. Mark pushed back with the obvious thing CC had
+skipped: *"doesn't this have to exist? ... In the apps on my phone. It does stuff. The codes on the
+laptop, you can see it, you can compile it. How can it not have a project file?"* He was right. The
+project is at `AI Camera/AI Camera/AI Camera.xcodeproj` — nested one level deeper than Posey's, and CC's
+glob had checked exactly one level, found nothing, and reported the absence as a fact. Worse, CC had
+claimed AI Camera hadn't joined the App Group on the strength of a stale "join the App Group as third
+tenant" line in AI Camera's *own NEXT.md* — while the code sitting next to it already had
+`appGroupID = "group.com.MarkFriedlander.aifamily"` and the matching entitlement. CC reported the plan as
+the state and never opened the source.
+
+That correction is not cosmetic: **the blast radius of `clearHubCache()` was three installed apps, not
+two.** AI Camera is in that container right now, on Mark's phone. His instinct to fix this ASAP was
+better calibrated than CC's assessment of it.
+
+The derivation survived, at least, and is now tested rather than asserted — all three real bundle ids
+produce correct names: `com.MarkFriedlander.AI-Camera` → "AI Camera", `com.MarkFriedlander.Posey` →
+"Posey", `com.MarkFriedlander.Hal-Universal` → "Hal Universal" (never displayed; `thisAppID` is filtered).
+
+The standing lesson, which is now the day's theme: **a negative result from one shallow search is not a
+finding, and a doc is not the code.** Every error today had the same shape — a plausible artifact taken
+as fact without verification. Every single correction came from Mark or from a test. None came from CC
+re-examining its own claim unprompted.
+
+## 2026-07-16 (the nested-repo download bug — a false "Model ready" over lost files)
+
+The AI Camera CC filed a second bug, and this one it found by *running* the code rather than reading it:
+AI Camera's first-ever download, of a repo with subfolders, fetched 2.4 GB over the network, saved not a
+single byte, and told the user the model was ready. Three bugs stacked to produce that, and Hal had all
+three verbatim — they'd reached AI Camera by copy.
+
+Per the day's standing lesson, CC verified all three against Hal's current source before touching
+anything. All confirmed. (1) The HF tree listing wasn't recursive (`tree/main`, no `?recursive=1`), so
+every file inside a subfolder was invisible — the model "completed" missing its nested files. (2) Nothing
+created the subfolders before the per-file move, and `moveItem` won't make intermediates, so for a nested
+file the move threw — and because iOS reclaims the temp file the instant the delegate returns, the bytes
+were simply gone. (3) The dangerous one: the move's `catch` logged and swallowed, then the file was
+removed from `pending` unconditionally, so a model whose files all failed to move still emptied `pending`,
+fired completion, **claimed the model in the shared manifest, and marked it downloaded**. The ledger then
+asserted Hal owned a model that wasn't on disk — the same shape of lie that made `clearHubCache`
+destructive, except manufactured at download time.
+
+The fix for all three is small. But reading Hal's own code turned up something the report hadn't:
+`waitForModelCompletion` waits on the success notification with **no timeout**. Naively fixing bug #3 —
+just stop posting success on failure — would have left the download UI spinning forever, trading a visible
+false-success for an invisible infinite hang. So the real fix adds a `.mlxModelDownloadFailed`
+notification; the waiter now races success against failure in a throwing task group and throws on failure,
+which Hal's existing generic `catch` already handles correctly (release the lock, set a failure state,
+advance the queue, keep the in-flight marker for a next-launch retry — the same semantics every other hard
+failure already gets). The failure path deletes the partial model directory (model-scoped, never the
+shared root) so a retry starts clean, and — the whole point — does NOT claim and does NOT mark downloaded.
+
+Two Swift 6 warnings surfaced during the work and were fixed in the same pass per Golden Rule #7: a `var
+moveError` captured in a concurrently-executing `Task` (bound to an immutable copy), and the two
+notification-name constants being read from the task-group's Sendable closures (marked `nonisolated`,
+which they always should have been). Builds clean, zero warnings, LEGO validates, `Hal_Source.txt` synced.
+**Not yet device-verified** — the phone was on camera duty; the runtime proof (point the Community browser
+at a nested repo) is written into NEXT.
+
+The through-line, now three bugs deep this week (`clearHubCache`, the GPU string, this): code that was
+correct under a premise — "the cache is ours alone," "the GPU arch string only nudges kernel choice,"
+"repos are flat" — that quietly stopped holding, with nothing re-checking it when the premise changed. And
+all three were surfaced by a *third* app joining the shared contract and reading the landlord's code.
+
+**Device validation, same day.** Mark held the phone and asked for the three not-yet-verified tests plus
+a real answer on the NLContextual embedding failures he'd (rightly) refused to accept as a "quirk."
+
+The embedder first. CC had been dismissive, then had to walk it back in both directions: it is NOT
+broken, but there IS a real narrow issue. `EMBED_PROBE:nlcontextual` returned `embedded:false` /
+`sampleVectorDim:0` in the just-reinstalled process, then `embedded:true, dim:512` after a single relaunch.
+Diagnosis: Apple's `NLContextualEmbedding` provisions its model asset once per device on first install,
+but the instance created during that first launch can't compute with it until the process restarts — so a
+genuinely fresh install's *first session* runs keyword-only semantic search, silently, until the user
+reopens the app. Posey works because that OS-level asset was provisioned long ago. Not a regression, not
+caused by the download work — but a real first-run polish gap. The catch: CC's test phone now has the
+asset resident, so the first-install state can't be reproduced there; a proper fix (recreate the instance
+after `requestAssets`, or warm-up-probe with graceful fallback) needs a fresh device to verify. Logged
+rather than rushed.
+
+Then the download tests. Test 1 (nested repo) passed cleanly and definitively: downloading
+`all-MiniLM-L6-v2` (which carries a nested `1_Pooling/config.json`), the log showed the recursive listing
+finding the nested file and then moving it into its created subfolder — the exact two-line proof that
+bugs #1 and #2 are dead, with the new race-free completion waiter firing correctly on success. Test 3
+(background survival — Mark's stated worry) passed too: a 1.8 GB weight file that was still pending when
+Hal got backgrounded had completed by the time Hal returned 60 seconds later, and Hal's resume-on-launch
+logic correctly recognized it as already downloaded. Test 2 (a failed move must not produce a false
+claim) is the honest gap — a real `moveItem` failure can't be induced on-device without a test hook, so
+it stands as logic-verified only: the claim is structurally unreachable while any file is in the failure
+ledger, but there's no device evidence, and CC said so rather than dressing up the code read as a test.
+
+One unplanned dividend: the live claim ledger, read during cleanup, showed the real three-tenant world —
+`Qwen3.5-2B` claimed by Posey, Hal, AND AI-Camera; Bonsai by Hal alone; Llama by Posey alone. That both
+confirms AI-Camera is a live tenant (as the earlier correction established) and validates yesterday's
+`clearHalsModels` design against production data: it would delete only Hal's sole-claimed Bonsai and leave
+the co-claimed models for their other owners. The device was returned to its exact starting state — both
+throwaway models deleted, the curated five intact, every original claim untouched.
+
+**Download-lifecycle hardening + Test 2, same session (2026-07-16, late).** Mark's push — "how is #1
+solid if there's half a model hanging around?" — was right, and chasing it turned one fix into a
+coherent hardening of the whole interrupted-download path.
+
+The completeness fix (sentinel) corrected the resume *decision*, but `startDownload` carried the SAME
+disk-presence bug at its very top: `if isModelDownloaded(modelID) { return }`. A partial dir reads as
+"present," so the resume that the sentinel logic correctly triggered then returned early and never
+finished — a permanent half-model. Fixed with a `forceResume:` parameter the resume path passes to skip
+that guard (normal/adopt callers untouched). Device-verified end to end: kill mid-download → relaunch →
+`Starting download → Found 8 files → ✅ fully downloaded`. The earlier suspicion that the download lock
+was to blame was wrong — `acquireDownloadLock` grants a self-held lock fine; the lock was a red herring
+and the real culprit was the early-return. (Lesson, again: verify the mechanism, don't infer it.)
+
+Two more lifecycle gaps fixed in `deleteModel`, which now — before removing files — cancels outstanding
+background tasks (so a straggler can't re-create the directory after the delete; observed earlier as
+"DELETE returned ok, model reappeared"), releases the download lock (it had lingered at lockCount 1), and
+clears the in-flight marker (so resume won't re-fetch a deliberately-deleted model). Device-verified:
+delete mid-download → `Cancelled 1 in-flight task`, lockCount 0, no re-create.
+
+Test 2 (a failed save must never produce a false claim) was done for real, per Mark — a temporary
+forced-move-failure hook (flag + `DEBUG_FAIL_MOVES` verb) exercised the failure path on device, then was
+removed cleanly. Result: all ten files' moves forced to fail → `Model ... FAILED — Not claiming, not
+marking downloaded`, lock released, partial dir removed, failure surfaced in state; and with the hook off
+the same model downloaded successfully (recovery works). The hook was fully removed and the build
+re-verified clean before commit.
+
+Also this session: the reasoning-instrument (`RuntimeLog`) was hardened to mirror every line to `os_log`
+(subsystem `com.MarkFriedlander.Hal-Universal`, category `runtime`, `.notice`, public) so device logs can
+be streamed from a Mac while the app is backgrounded or locked — which is how the download throttle and
+the partial-complete bug were caught in the first place. And a real, still-open finding: the
+`LocalAPIServer` is `@MainActor`, so every command runs on the main thread; heavy synchronous work there
+(directory walks, manifest coordination contending with the download's lock refresh) wedges the whole
+app under load. Root cause pinned, fix direction noted (move file work off the main actor in the command
+handlers), deferred to its own focused session because it ships in the public API and deserves full
+headroom — not an end-of-session rush. The `kLocalAPIEnabledOnLaunch` device-test flag was reverted to
+false before this commit.

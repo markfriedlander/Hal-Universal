@@ -1,0 +1,138 @@
+[
+  {
+    "temp": 0.6,
+    "presence": 0.5,
+    "prompts": {
+      "prime91": {
+        "converged": true,
+        "correct": true,
+        "gen_s": 10.3,
+        "wall_s": 10.5,
+        "think_chars": 719,
+        "timed_out": false,
+        "answer": "No, 91 is not a prime number.  To determine this, I need to check for factors other than 1 and itsel"
+      },
+      "prime337": {
+        "converged": false,
+        "correct": null,
+        "gen_s": null,
+        "wall_s": 75.0,
+        "think_chars": 6448,
+        "timed_out": true,
+        "answer": ""
+      },
+      "pens": {
+        "converged": true,
+        "correct": true,
+        "gen_s": 23.3,
+        "wall_s": 23.4,
+        "think_chars": 1562,
+        "timed_out": false,
+        "answer": "# Answer  12 pens cost $8.  Here's why: If three pens are $2, then one pen is $2 divided by 3 ($0.67"
+      }
+    },
+    "n_ok": 2
+  },
+  {
+    "temp": 0.6,
+    "presence": 1.5,
+    "prompts": {
+      "prime91": {
+        "converged": true,
+        "correct": true,
+        "gen_s": 10.1,
+        "wall_s": 10.3,
+        "think_chars": 527,
+        "timed_out": false,
+        "answer": "No, 91 is not a prime number. It is actually composite.  The reasoning is simple: 91 equals 7 \u00d7 13, "
+      },
+      "prime337": {
+        "converged": false,
+        "correct": null,
+        "gen_s": null,
+        "wall_s": 75.0,
+        "think_chars": 3966,
+        "timed_out": true,
+        "answer": ""
+      },
+      "pens": {
+        "converged": true,
+        "correct": true,
+        "gen_s": 21.2,
+        "wall_s": 21.5,
+        "think_chars": 938,
+        "timed_out": false,
+        "answer": "# Answer 12 pens cost **$4**  ## Calculation  First, find the price per pen: - 3 pens = $2 total - P"
+      }
+    },
+    "n_ok": 2
+  },
+  {
+    "temp": 0.8,
+    "presence": 0.5,
+    "prompts": {
+      "prime91": {
+        "converged": true,
+        "correct": true,
+        "gen_s": 17.2,
+        "wall_s": 17.4,
+        "think_chars": 1281,
+        "timed_out": false,
+        "answer": "No, 91 is not a prime number. It factors into 7 \u00d7 13."
+      },
+      "prime337": {
+        "converged": true,
+        "correct": true,
+        "gen_s": 41.3,
+        "wall_s": 41.6,
+        "think_chars": 1662,
+        "timed_out": false,
+        "answer": "Yes, 337 is a prime number.  I didn't have this information memorized initially, but it follows the "
+      },
+      "pens": {
+        "converged": true,
+        "correct": true,
+        "gen_s": 21.8,
+        "wall_s": 22.0,
+        "think_chars": 1108,
+        "timed_out": false,
+        "answer": "# 4 pens for $2 each = $8 total  The math is straightforward: divide by 3 to find the unit price, th"
+      }
+    },
+    "n_ok": 3
+  },
+  {
+    "temp": 0.8,
+    "presence": 1.5,
+    "prompts": {
+      "prime91": {
+        "converged": true,
+        "correct": true,
+        "gen_s": 27.2,
+        "wall_s": 27.4,
+        "think_chars": 1294,
+        "timed_out": false,
+        "answer": "No, **91 is not a prime number**.  The factors are: 7 \u00d7 13 = 91. This is divisible by 7 and 13, whic"
+      },
+      "prime337": {
+        "converged": false,
+        "correct": null,
+        "gen_s": null,
+        "wall_s": 75.0,
+        "think_chars": 4013,
+        "timed_out": true,
+        "answer": ""
+      },
+      "pens": {
+        "converged": true,
+        "correct": true,
+        "gen_s": 16.1,
+        "wall_s": 16.3,
+        "think_chars": 733,
+        "timed_out": false,
+        "answer": "12 pens cost $8.  To find the unit price: divide the total dollars by the number of items (2 divided"
+      }
+    },
+    "n_ok": 2
+  }
+]

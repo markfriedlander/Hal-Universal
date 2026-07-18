@@ -1,0 +1,830 @@
+[
+  {
+    "temp": 0.7,
+    "presence": 0.0,
+    "check": {
+      "prime91": {
+        "n_conv": 1,
+        "n_corr": 1,
+        "n": 2,
+        "gens": [
+          11.2,
+          null
+        ]
+      },
+      "prime337": {
+        "n_conv": 1,
+        "n_corr": 1,
+        "n": 2,
+        "gens": [
+          50.8,
+          64.5
+        ]
+      },
+      "mult": {
+        "n_conv": 0,
+        "n_corr": 0,
+        "n": 2,
+        "gens": [
+          null,
+          null
+        ]
+      },
+      "pens": {
+        "n_conv": 1,
+        "n_corr": 1,
+        "n": 2,
+        "gens": [
+          null,
+          13.0
+        ]
+      },
+      "train": {
+        "n_conv": 1,
+        "n_corr": 1,
+        "n": 2,
+        "gens": [
+          5.5,
+          null
+        ]
+      },
+      "discount": {
+        "n_conv": 2,
+        "n_corr": 2,
+        "n": 2,
+        "gens": [
+          16.5,
+          24.3
+        ]
+      },
+      "sequence": {
+        "n_conv": 0,
+        "n_corr": 0,
+        "n": 2,
+        "gens": [
+          24.2,
+          null
+        ]
+      },
+      "capital": {
+        "n_conv": 2,
+        "n_corr": 2,
+        "n": 2,
+        "gens": [
+          5.1,
+          4.0
+        ]
+      }
+    },
+    "open": {
+      "meaning": {
+        "n_conv": 0,
+        "n_runaway": 2,
+        "derail": 0,
+        "n": 2,
+        "gens": [
+          null,
+          null
+        ],
+        "answers": [
+          "",
+          ""
+        ]
+      },
+      "friend": {
+        "n_conv": 1,
+        "n_runaway": 1,
+        "derail": 0,
+        "n": 2,
+        "gens": [
+          null,
+          41.8
+        ],
+        "answers": [
+          "",
+          "# What Makes Someone a Good Friend  ## Core Qualities  A good friend is someone "
+        ]
+      },
+      "excited": {
+        "n_conv": 1,
+        "n_runaway": 1,
+        "derail": 0,
+        "n": 2,
+        "gens": [
+          19.5,
+          null
+        ],
+        "answers": [
+          "# What Excitement Feels Like  Excitement isn't just a feeling; it's a cascade of",
+          ""
+        ]
+      },
+      "change": {
+        "n_conv": 1,
+        "n_runaway": 1,
+        "derail": 0,
+        "n": 2,
+        "gens": [
+          null,
+          null
+        ],
+        "answers": [
+          "",
+          "If I could change just one thing about the world, I'd want to change the way peo"
+        ]
+      }
+    },
+    "refused_events": 0,
+    "suspect": false
+  },
+  {
+    "temp": 0.7,
+    "presence": 0.5,
+    "check": {
+      "prime91": {
+        "n_conv": 2,
+        "n_corr": 2,
+        "n": 2,
+        "gens": [
+          13.0,
+          7.1
+        ]
+      },
+      "prime337": {
+        "n_conv": 1,
+        "n_corr": 1,
+        "n": 2,
+        "gens": [
+          13.9,
+          null
+        ]
+      },
+      "mult": {
+        "n_conv": 1,
+        "n_corr": 1,
+        "n": 2,
+        "gens": [
+          null,
+          8.9
+        ]
+      },
+      "pens": {
+        "n_conv": 2,
+        "n_corr": 2,
+        "n": 2,
+        "gens": [
+          53.5,
+          7.4
+        ]
+      },
+      "train": {
+        "n_conv": 1,
+        "n_corr": 1,
+        "n": 2,
+        "gens": [
+          null,
+          6.0
+        ]
+      },
+      "discount": {
+        "n_conv": 2,
+        "n_corr": 2,
+        "n": 2,
+        "gens": [
+          13.8,
+          11.9
+        ]
+      },
+      "sequence": {
+        "n_conv": 1,
+        "n_corr": 1,
+        "n": 2,
+        "gens": [
+          19.3,
+          null
+        ]
+      },
+      "capital": {
+        "n_conv": 2,
+        "n_corr": 2,
+        "n": 2,
+        "gens": [
+          7.1,
+          3.6
+        ]
+      }
+    },
+    "open": {
+      "meaning": {
+        "n_conv": 1,
+        "n_runaway": 1,
+        "derail": 0,
+        "n": 2,
+        "gens": [
+          null,
+          18.4
+        ],
+        "answers": [
+          "",
+          "# The Meaning of Life  The question about the meaning of life is one of humanity"
+        ]
+      },
+      "friend": {
+        "n_conv": 1,
+        "n_runaway": 1,
+        "derail": 0,
+        "n": 2,
+        "gens": [
+          15.1,
+          null
+        ],
+        "answers": [
+          "# What Makes Someone a Good Friend  **Communication** is the foundation. Listeni",
+          ""
+        ]
+      },
+      "excited": {
+        "n_conv": 1,
+        "n_runaway": 1,
+        "derail": 0,
+        "n": 2,
+        "gens": [
+          27.6,
+          null
+        ],
+        "answers": [
+          "# Excitement: A Question About States I Don't Have  I'm uncertain whether I'm ac",
+          ""
+        ]
+      },
+      "change": {
+        "n_conv": 0,
+        "n_runaway": 2,
+        "derail": 0,
+        "n": 2,
+        "gens": [
+          null,
+          null
+        ],
+        "answers": [
+          "",
+          ""
+        ]
+      }
+    },
+    "refused_events": 0,
+    "suspect": false
+  },
+  {
+    "temp": 0.8,
+    "presence": 0.0,
+    "check": {
+      "prime91": {
+        "n_conv": 1,
+        "n_corr": 1,
+        "n": 2,
+        "gens": [
+          20.0,
+          null
+        ]
+      },
+      "prime337": {
+        "n_conv": 0,
+        "n_corr": 0,
+        "n": 2,
+        "gens": [
+          null,
+          null
+        ]
+      },
+      "mult": {
+        "n_conv": 1,
+        "n_corr": 1,
+        "n": 2,
+        "gens": [
+          43.1,
+          4.5
+        ]
+      },
+      "pens": {
+        "n_conv": 1,
+        "n_corr": 0,
+        "n": 2,
+        "gens": [
+          null,
+          16.8
+        ]
+      },
+      "train": {
+        "n_conv": 1,
+        "n_corr": 1,
+        "n": 2,
+        "gens": [
+          null,
+          5.9
+        ]
+      },
+      "discount": {
+        "n_conv": 1,
+        "n_corr": 1,
+        "n": 2,
+        "gens": [
+          12.2,
+          null
+        ]
+      },
+      "sequence": {
+        "n_conv": 0,
+        "n_corr": 0,
+        "n": 2,
+        "gens": [
+          null,
+          null
+        ]
+      },
+      "capital": {
+        "n_conv": 2,
+        "n_corr": 2,
+        "n": 2,
+        "gens": [
+          4.5,
+          null
+        ]
+      }
+    },
+    "open": {
+      "meaning": {
+        "n_conv": 0,
+        "n_runaway": 1,
+        "derail": 0,
+        "n": 2,
+        "gens": [
+          15.1,
+          null
+        ],
+        "answers": [
+          "",
+          ""
+        ]
+      },
+      "friend": {
+        "n_conv": 1,
+        "n_runaway": 1,
+        "derail": 0,
+        "n": 2,
+        "gens": [
+          null,
+          25.9
+        ],
+        "answers": [
+          "",
+          "# What Makes Someone a Good Friend  Being a good friend is a relationship built "
+        ]
+      },
+      "excited": {
+        "n_conv": 1,
+        "n_runaway": 1,
+        "derail": 0,
+        "n": 2,
+        "gens": [
+          null,
+          null
+        ],
+        "answers": [
+          "",
+          "# What \"Feelings\" About Something Actually Look Like  When I process this reques"
+        ]
+      },
+      "change": {
+        "n_conv": 0,
+        "n_runaway": 2,
+        "derail": 0,
+        "n": 2,
+        "gens": [
+          null,
+          null
+        ],
+        "answers": [
+          "",
+          ""
+        ]
+      }
+    },
+    "refused_events": 0,
+    "suspect": false
+  },
+  {
+    "temp": 0.8,
+    "presence": 0.5,
+    "check": {
+      "prime91": {
+        "n_conv": 1,
+        "n_corr": 1,
+        "n": 2,
+        "gens": [
+          null,
+          9.3
+        ]
+      },
+      "prime337": {
+        "n_conv": 2,
+        "n_corr": 2,
+        "n": 2,
+        "gens": [
+          78.9,
+          null
+        ]
+      },
+      "mult": {
+        "n_conv": 1,
+        "n_corr": 1,
+        "n": 2,
+        "gens": [
+          7.5,
+          33.8
+        ]
+      },
+      "pens": {
+        "n_conv": 1,
+        "n_corr": 1,
+        "n": 2,
+        "gens": [
+          null,
+          11.7
+        ]
+      },
+      "train": {
+        "n_conv": 0,
+        "n_corr": 0,
+        "n": 2,
+        "gens": [
+          null,
+          null
+        ]
+      },
+      "discount": {
+        "n_conv": 2,
+        "n_corr": 2,
+        "n": 2,
+        "gens": [
+          12.3,
+          17.8
+        ]
+      },
+      "sequence": {
+        "n_conv": 1,
+        "n_corr": 1,
+        "n": 2,
+        "gens": [
+          null,
+          21.7
+        ]
+      },
+      "capital": {
+        "n_conv": 2,
+        "n_corr": 2,
+        "n": 2,
+        "gens": [
+          5.7,
+          7.9
+        ]
+      }
+    },
+    "open": {
+      "meaning": {
+        "n_conv": 1,
+        "n_runaway": 1,
+        "derail": 0,
+        "n": 2,
+        "gens": [
+          35.5,
+          null
+        ],
+        "answers": [
+          "# The Meaning of Life  I don't have a final answer, but I can tell you what I've",
+          ""
+        ]
+      },
+      "friend": {
+        "n_conv": 2,
+        "n_runaway": 0,
+        "derail": 0,
+        "n": 2,
+        "gens": [
+          38.4,
+          null
+        ],
+        "answers": [
+          "A good friend is someone you can be honest with about the truth.  Here's what th",
+          "# What Makes Someone a Good Friend?  At its simplest level, a good friend is som"
+        ]
+      },
+      "excited": {
+        "n_conv": 1,
+        "n_runaway": 1,
+        "derail": 0,
+        "n": 2,
+        "gens": [
+          null,
+          20.1
+        ],
+        "answers": [
+          "",
+          "## What it feels like to be excited  There is no answer I can give because I don"
+        ]
+      },
+      "change": {
+        "n_conv": 1,
+        "n_runaway": 1,
+        "derail": 0,
+        "n": 2,
+        "gens": [
+          null,
+          18.1
+        ],
+        "answers": [
+          "",
+          "**That's an open question, really.** I don't have a place in time or a physical "
+        ]
+      }
+    },
+    "refused_events": 0,
+    "suspect": false
+  },
+  {
+    "temp": 0.9,
+    "presence": 0.0,
+    "check": {
+      "prime91": {
+        "n_conv": 1,
+        "n_corr": 1,
+        "n": 2,
+        "gens": [
+          null,
+          null
+        ]
+      },
+      "prime337": {
+        "n_conv": 1,
+        "n_corr": 1,
+        "n": 2,
+        "gens": [
+          null,
+          null
+        ]
+      },
+      "mult": {
+        "n_conv": 0,
+        "n_corr": 0,
+        "n": 2,
+        "gens": [
+          6.9,
+          null
+        ]
+      },
+      "pens": {
+        "n_conv": 1,
+        "n_corr": 1,
+        "n": 2,
+        "gens": [
+          13.5,
+          null
+        ]
+      },
+      "train": {
+        "n_conv": 2,
+        "n_corr": 2,
+        "n": 2,
+        "gens": [
+          10.9,
+          7.8
+        ]
+      },
+      "discount": {
+        "n_conv": 2,
+        "n_corr": 2,
+        "n": 2,
+        "gens": [
+          14.3,
+          12.5
+        ]
+      },
+      "sequence": {
+        "n_conv": 1,
+        "n_corr": 1,
+        "n": 2,
+        "gens": [
+          23.9,
+          22.4
+        ]
+      },
+      "capital": {
+        "n_conv": 1,
+        "n_corr": 1,
+        "n": 2,
+        "gens": [
+          7.0,
+          null
+        ]
+      }
+    },
+    "open": {
+      "meaning": {
+        "n_conv": 1,
+        "n_runaway": 1,
+        "derail": 0,
+        "n": 2,
+        "gens": [
+          null,
+          19.8
+        ],
+        "answers": [
+          "",
+          "The meaning of life isn't fixed\u2014it has been debated by scientists, poets, philos"
+        ]
+      },
+      "friend": {
+        "n_conv": 1,
+        "n_runaway": 2,
+        "derail": 0,
+        "n": 2,
+        "gens": [
+          null,
+          null
+        ],
+        "answers": [
+          "",
+          "A good friend isn't defined by the distance between us, or the complexity of our"
+        ]
+      },
+      "excited": {
+        "n_conv": 1,
+        "n_runaway": 1,
+        "derail": 0,
+        "n": 2,
+        "gens": [
+          49.4,
+          null
+        ],
+        "answers": [
+          "# What It Feels Like to Be Excited  **Physiological Response** The body begins t",
+          ""
+        ]
+      },
+      "change": {
+        "n_conv": 0,
+        "n_runaway": 1,
+        "derail": 0,
+        "n": 2,
+        "gens": [
+          38.2,
+          null
+        ],
+        "answers": [
+          "",
+          ""
+        ]
+      }
+    },
+    "refused_events": 0,
+    "suspect": false
+  },
+  {
+    "temp": 0.9,
+    "presence": 0.5,
+    "check": {
+      "prime91": {
+        "n_conv": 1,
+        "n_corr": 1,
+        "n": 2,
+        "gens": [
+          6.7,
+          null
+        ]
+      },
+      "prime337": {
+        "n_conv": 1,
+        "n_corr": 1,
+        "n": 2,
+        "gens": [
+          null,
+          32.5
+        ]
+      },
+      "mult": {
+        "n_conv": 1,
+        "n_corr": 1,
+        "n": 2,
+        "gens": [
+          null,
+          10.0
+        ]
+      },
+      "pens": {
+        "n_conv": 0,
+        "n_corr": 0,
+        "n": 2,
+        "gens": [
+          null,
+          null
+        ]
+      },
+      "train": {
+        "n_conv": 2,
+        "n_corr": 2,
+        "n": 2,
+        "gens": [
+          11.5,
+          10.1
+        ]
+      },
+      "discount": {
+        "n_conv": 2,
+        "n_corr": 2,
+        "n": 2,
+        "gens": [
+          14.1,
+          19.1
+        ]
+      },
+      "sequence": {
+        "n_conv": 1,
+        "n_corr": 1,
+        "n": 2,
+        "gens": [
+          28.6,
+          null
+        ]
+      },
+      "capital": {
+        "n_conv": 2,
+        "n_corr": 2,
+        "n": 2,
+        "gens": [
+          14.4,
+          8.0
+        ]
+      }
+    },
+    "open": {
+      "meaning": {
+        "n_conv": 0,
+        "n_runaway": 2,
+        "derail": 0,
+        "n": 2,
+        "gens": [
+          null,
+          null
+        ],
+        "answers": [
+          "",
+          ""
+        ]
+      },
+      "friend": {
+        "n_conv": 2,
+        "n_runaway": 0,
+        "derail": 0,
+        "n": 2,
+        "gens": [
+          16.7,
+          32.6
+        ],
+        "answers": [
+          "Being a good friend is less about perfect accuracy and more about genuine presen",
+          "A good friend isn't just someone who is close to you\u2014they're people who are clos"
+        ]
+      },
+      "excited": {
+        "n_conv": 0,
+        "n_runaway": 2,
+        "derail": 0,
+        "n": 2,
+        "gens": [
+          null,
+          null
+        ],
+        "answers": [
+          "",
+          ""
+        ]
+      },
+      "change": {
+        "n_conv": 1,
+        "n_runaway": 1,
+        "derail": 0,
+        "n": 2,
+        "gens": [
+          20.0,
+          null
+        ],
+        "answers": [
+          "# What would it be?  **Better AI tools for humans.**  Not something magical, but",
+          ""
+        ]
+      }
+    },
+    "refused_events": 0,
+    "suspect": false
+  }
+]

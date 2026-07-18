@@ -168,6 +168,7 @@ struct iOSChatView: View {
     // `isPrivacyLocked` from the active model + this monitor + the salon config.
     @StateObject private var privacyMonitor = PrivacyMonitor.shared
     @State private var showingPrivacyPopover = false
+    @State private var showingReasoningPopover = false
     // Set when the user taps "Model Library" in the privacy popover; consumed
     // in the popover's onDisappear so the sheet presents only AFTER the popover
     // is fully gone (a popover + sheet can't present at once — same race as the
@@ -286,6 +287,29 @@ struct iOSChatView: View {
                         chatViewModel.showingThreadPanel = true
                     } label: {
                         Image(systemName: "line.3.horizontal")
+                    }
+                }
+                // Reasoning toggle — brain, shown only when the active model can
+                // reason (isReasoningModel). Tap flips reasoning on/off (sticky),
+                // narrates the change into chat, and pops a plain-language
+                // explanation of the new state. See
+                // Docs/Think_Tokens_Reasoning_Transparency.md.
+                if chatViewModel.selectedModel.isReasoningModel == true {
+                    ToolbarItem(placement: .navigationBarTrailing) {
+                        Button {
+                            chatViewModel.setReasoning(!chatViewModel.reasoningEnabled)
+                            showingReasoningPopover = true
+                        } label: {
+                            Image(systemName: "brain")
+                                .foregroundStyle(chatViewModel.reasoningEnabled ? Color.accentColor : Color.secondary)
+                        }
+                        .popover(isPresented: $showingReasoningPopover) {
+                            ReasoningPopover(
+                                isOn: chatViewModel.reasoningEnabled,
+                                modelName: chatViewModel.selectedModel.displayName
+                            )
+                            .presentationCompactAdaptation(.popover)
+                        }
                     }
                 }
                 // Privacy lock — sits just left of the gear (declared first in
@@ -597,6 +621,83 @@ private struct BubbleContainerWidthKey: PreferenceKey {
     static var defaultValue: CGFloat = 0
     static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) {
         value = max(value, nextValue())
+    }
+}
+
+// MARK: - ThinkingDisclosure
+//
+// Collapsible panel that shows a reasoning model's <think> trace
+// (message.thinking), separated from the visible answer. Auto-expands while the
+// model is still reasoning (streaming, no answer yet) so the user can watch it
+// think live, then collapses once the answer begins. Tappable to re-open.
+// See Docs/Think_Tokens_Reasoning_Transparency.md.
+private struct ThinkingDisclosure: View {
+    let text: String
+    let isStreaming: Bool
+    @State private var expanded: Bool = false
+
+    var body: some View {
+        DisclosureGroup(isExpanded: $expanded) {
+            Text(text)
+                .font(.caption)
+                .foregroundColor(.secondary)
+                .textSelection(.enabled)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .padding(.top, 4)
+        } label: {
+            HStack(spacing: 6) {
+                Image(systemName: "brain")
+                Text(isStreaming ? "Thinking…" : "Reasoning")
+                if isStreaming {
+                    ProgressView().scaleEffect(0.7)
+                }
+            }
+            .font(.caption)
+            .foregroundColor(.secondary)
+        }
+        .tint(.secondary)
+        .padding(.vertical, 6)
+        .padding(.horizontal, 14)
+        .onAppear { expanded = isStreaming }
+        .onChange(of: isStreaming) { _, streaming in
+            if !streaming { withAnimation { expanded = false } }
+        }
+    }
+}
+
+// MARK: - ReasoningPopover
+//
+// Plain-language explanation shown when the user taps the brain toggle, mirroring
+// PrivacyLockPopover. Describes the new reasoning state (on/off) for the active
+// model. See Docs/Think_Tokens_Reasoning_Transparency.md.
+struct ReasoningPopover: View {
+    let isOn: Bool
+    let modelName: String
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            HStack(spacing: 8) {
+                Image(systemName: "brain")
+                Text(isOn ? "Reasoning on" : "Reasoning off")
+                    .fontWeight(.semibold)
+            }
+            .font(.headline)
+
+            Text(explanation)
+                .font(.subheadline)
+                .foregroundColor(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+        }
+        .padding(16)
+        .frame(width: 280)
+    }
+
+    private var explanation: String {
+        if isOn {
+            return "\(modelName) will think each answer through first. You'll see its reasoning stream into a panel above the reply, then the answer beneath. It's slower and more deliberate. Tap the brain again to switch back to direct replies."
+        } else {
+            return "\(modelName) answers directly, with no visible reasoning. Tap the brain whenever you want to watch it think a question through before it replies."
+        }
     }
 }
 
@@ -944,6 +1045,10 @@ struct ChatBubbleView: View {
             } else {
                 VStack(alignment: .trailing, spacing: 0) {
                     VStack(alignment: .leading, spacing: 6) {
+                        if let thinking = message.thinking, !thinking.isEmpty {
+                            ThinkingDisclosure(text: thinking, isStreaming: message.isPartial && message.content.isEmpty)
+                                .frame(maxWidth: bubbleMaxWidth, alignment: .leading)
+                        }
                         if isStatusMessage {
                             Text(message.content)
                                 .font(.title3)
