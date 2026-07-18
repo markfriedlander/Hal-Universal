@@ -11,6 +11,15 @@
 > active `xcode-select` but has no iOS 27 platform, so **every device build must prefix
 > `DEVELOPER_DIR=/Applications/Xcode-beta.app/Contents/Developer`**. Install/launch via `devicectl`.
 
+> **Xcode Cloud is OFF (deactivated 2026-07-18).** The "Default" workflow was building on
+> *every* push to `main` ("any file changes") and uploading each build to App Store Connect —
+> it ran up 10 builds (incl. website/docs commits) before we caught it. Master toggle is now
+> deactivated in App Store Connect → Hal Universal → Xcode Cloud → Manage Workflows → Default.
+> **A push to `main` no longer triggers a build — this is intentional, not a breakage.** To
+> ship the next version: either flip that workflow back on (and first change its start
+> condition off "any file changes on main"), or just archive+upload from Xcode on the Mac.
+> Full story in HISTORY (2026-07-18).
+
 ---
 
 ## Where Hal is right now

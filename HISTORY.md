@@ -4899,3 +4899,82 @@ relaunch, no silent empty-vector session. Un-verifiable on Mark's phone now (ass
 it will confirm itself in the wild the next time an OS update invalidates the cache and the launch log
 shows `warm-up produced NO vectors` followed by recovery. No TestFlight in the loop — Hal ships straight
 to the store.
+
+---
+
+## 2026-07-18 (Xcode Cloud runaway builds — diagnosed and shut off)
+
+### Setting
+
+Mark was about to sleep when a "strange message from Apple regarding Hal 2.5"
+stopped him: App Store Connect showed **far more builds than he had ever made**.
+He worried something was triggering continuous rebuilds via Xcode Cloud. Not a
+code problem — an infrastructure/App-Store-Connect problem. We looked at it
+together in his browser (Claude-in-Chrome; Mark logged in himself, CC drove and
+read the screens).
+
+### What was actually happening
+
+Back on **2026-07-11**, while getting v2.5 ready to ship, we turned on **Xcode
+Cloud** (commits `49835fc` "add workflow manifest" and `22fe378` "trust Swift
+macros/plugins in CI"). The reason was legitimate: the beta stack. Building/
+archiving locally on the beta toolchain was painful, so the cloud builder gave
+us a clean CI environment (the `ci_post_clone.sh` disables macro/plugin
+fingerprint validation so mlx-swift's macros archive without the interactive
+"Trust & Enable" prompt).
+
+The mistake was in **how the one workflow ("Default") was configured** — Apple's
+out-of-the-box defaults, which nobody changed:
+- **Start Condition = "Branch Changes" on `main`, "Start if any file changes."**
+  So *every* push to main fired a full archive build, regardless of whether the
+  commit touched app code.
+- **Archive → Distribution Preparation = "App Store Connect."** So every
+  successful build was *uploaded* to App Store Connect (landing in TestFlight,
+  each generating a "build has completed processing" email — that was the
+  message that alarmed Mark; it was for build 9).
+- Post-Actions was empty (good — nothing auto-*submitted* to review).
+
+The result: **10 builds (numbered 1–10)** where Mark intended exactly one (the
+real v2.5). The tell was unmistakable — builds 6–9 were fired by pure
+**website/docs commits** ("Site: redesign Hal's pages", "Site: cross-link
+footers", "NEXT: studio hub is live"), which have nothing to do with the app
+binary. Builds 1–2 failed (pre-macro-fix), 10 failed (last night's push). The
+successful uploads that reached TestFlight were 3, 4, 5, 7, 9 (all sat as
+"Missing Compliance" — never actually distributable to any tester; Groups 0 /
+Testers 0 on every one).
+
+Crucially, **none of this affected the live app.** The public v2.5 was safe and
+"Ready for Distribution" throughout; TestFlight builds are internal-only.
+
+### CC error caught mid-diagnosis (worth recording)
+
+Before verifying, CC's cleanup plan risked treating all uploaded builds as
+disposable. Checking the Distribution tab's **Build** section corrected that:
+**build 4 is the live App Store release** (matches the "2.5(4)" note in memory,
+now verified on-screen, not trusted). Build 4 had to be — and was — protected.
+Lesson reinforced: look at the target before deleting; the live release is
+*in* the same TestFlight list as the clutter.
+
+### Final disposition (this is the end state)
+
+- **The robot is OFF.** The "Default" workflow was **deactivated** via its master
+  toggle (Apple confirmed "Deactivating 'Default' will stop the start conditions
+  in this workflow from working"). No more automatic builds or uploads on any
+  push, period. Chosen over merely switching to manual-only ("Option B, for
+  safety" — Mark's call; re-enabling is a one-switch change and we won't ship
+  before iOS 27 is public anyway).
+- **The clutter is cleared.** The five stray TestFlight uploads — builds **3, 5,
+  7, 8, 9** — were **expired** one at a time (each verified: 0 groups, 0 testers
+  before expiring). **Build 4 (live release) left untouched.** Failed builds
+  (1, 2, 10) had nothing to expire.
+- **No code changed, no commit needed** — this was entirely App-Store-Connect
+  settings.
+
+### How not to repeat it
+
+When we ship the next version (post-iOS-27-public), either **flip the Xcode Cloud
+workflow back on** deliberately — and if we do, change the start condition off
+"any file changes on main" so docs/website commits don't trigger builds — or
+just **archive + upload straight from Xcode** on the Mac now that we're (soon)
+off the beta toolchain and don't need the cloud at all. Whichever we pick, the
+default "build on every push" is the trap; don't leave it on.
