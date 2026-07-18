@@ -185,13 +185,13 @@ final class EmbeddingProvider: @unchecked Sendable {
         nlLoadAttempted = true
         lock.unlock()
 
-        guard let candidate = NLContextualEmbedding(language: .english) else {
+        guard var candidate = NLContextualEmbedding(language: .english) else {
             halLog("HALDEBUG-EMBEDDING: NLContextualEmbedding(language:.english) returned nil — model unavailable")
             return
         }
 
         if !candidate.hasAvailableAssets {
-            halLog("HALDEBUG-EMBEDDING: Assets not on device; requesting download (this happens once per install)")
+            halLog("HALDEBUG-EMBEDDING: Assets not on device; requesting download (first launch after install)")
             let sem = DispatchSemaphore(value: 0)
             var assetError: Error?
             candidate.requestAssets(completionHandler: { _, err in
@@ -204,17 +204,50 @@ final class EmbeddingProvider: @unchecked Sendable {
                 lock.lock(); nlLoadAttempted = false; lock.unlock()  // allow retry next call
                 return
             }
+            // The instance created while assets were ABSENT often can't compute
+            // with the freshly-provisioned asset in the SAME process — Apple
+            // compiles the model into an OS cache the requesting instance doesn't
+            // pick up until relaunch (open radar FB22699606). Recreate a FRESH
+            // instance now that the asset exists; it is the one lever that MIGHT
+            // make first-run work in-session. Unverified — can't reproduce a
+            // never-provisioned device once the asset is resident — but harmless
+            // if it doesn't help, and the warm-up probe below is the real safety net.
+            if let fresh = NLContextualEmbedding(language: .english), fresh.hasAvailableAssets {
+                candidate = fresh
+            }
         }
 
         do {
             try candidate.load()
-            lock.lock()
-            self.nlModel = candidate
-            lock.unlock()
-            halLog("HALDEBUG-EMBEDDING: NLContextualEmbedding loaded — dimension=\(candidate.dimension)")
         } catch {
-            halLog("HALDEBUG-EMBEDDING: NLContextualEmbedding.load() failed: \(error.localizedDescription)")
+            halLog("HALDEBUG-EMBEDDING: NLContextualEmbedding.load() failed: \(error.localizedDescription) — will retry next call")
             lock.lock(); nlLoadAttempted = false; lock.unlock()  // allow retry next call
+            return
+        }
+
+        // WARM-UP PROBE — the real fix. `load()` can succeed while `embeddingResult`
+        // still fails immediately after a first-install asset provisioning: the
+        // model reports loaded (dimension is right) but produces NO vectors, so
+        // every embed call this session returns empty. Never cache a model that
+        // can't actually embed — probe it once. If the probe produces a vector,
+        // publish it. If not, leave `nlModel` nil and allow a retry: semantic
+        // retrieval degrades to keyword this session (the RRF fusion handles a nil
+        // semantic arm) and self-heals on the next launch, instead of silently
+        // serving empty embeddings until the user happens to restart.
+        var probeProducedVector = false
+        let probeText = "warm up"
+        if let result = try? candidate.embeddingResult(for: probeText, language: .english) {
+            result.enumerateTokenVectors(in: probeText.startIndex..<probeText.endIndex) { _, _ in
+                probeProducedVector = true
+                return false   // one vector is enough to confirm it computes
+            }
+        }
+        if probeProducedVector {
+            lock.lock(); self.nlModel = candidate; lock.unlock()
+            halLog("HALDEBUG-EMBEDDING: NLContextualEmbedding loaded + warm-up OK — dimension=\(candidate.dimension)")
+        } else {
+            halLog("HALDEBUG-EMBEDDING: NLContextualEmbedding loaded but warm-up produced NO vectors (first-install provisioning not yet usable) — semantic search unavailable THIS session, keyword search still works, will retry next launch")
+            lock.lock(); nlLoadAttempted = false; lock.unlock()  // allow retry next call/launch
         }
     }
 

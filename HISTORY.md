@@ -4867,3 +4867,35 @@ app under load. Root cause pinned, fix direction noted (move file work off the m
 handlers), deferred to its own focused session because it ships in the public API and deserves full
 headroom — not an end-of-session rush. The `kLocalAPIEnabledOnLaunch` device-test flag was reverted to
 false before this commit.
+
+**NLContextual asset-invalidation — investigated, fixed, and a wrong theory corrected (2026-07-16, late).**
+During the download testing, Hal's default embedder (Apple's NLContextual) was seen failing to compute:
+`load()` succeeded (dimension 512) but `embeddingResult` threw "Failed to compute embedding result" all
+session, then worked after a relaunch. CC's first theory — "first-ever use on the device, asset provisioning
+takes a launch" — was wrong, and Mark caught it cleanly: Hal has used NLContextual on this phone for
+months, and (web + Apple-forum confirmed) the asset is **device-wide** — stored in
+`/var/db/com.apple.naturallanguaged/`, shared across all apps, and it **survives app deletion**. So the
+asset was already present; it didn't freshly download. What actually happened is it got **invalidated and
+re-provisioned** — most plausibly the iOS 27 beta reformatting the system asset cache, or storage-pressure
+eviction — after which iOS recompiles the model (~30 s into an `e5bundlecache`), and CC tested
+`embeddingResult` inside that compile window (Mark's read, and it fits every observation). The relaunch
+worked because the recompile had finished.
+
+Two consequences. First, the bug is broader than "fresh install only": any device can hit it after an OS
+update or a cache eviction, so real App-Store users can too — which makes the fix more valuable, not less.
+Second, and important for Hal: **deleting Hal would not reproduce it** (the trigger is OS-level, not
+app-level) — so the earlier idea of wiping Hal's memory to test was a dead end that would have cost his
+memory for nothing. Mark's instinct to search before wiping paid off; we searched, and the wipe is off the
+table. (Mark on the memory question, worth recording: he is "honestly never OK" with wiping Hal's memory,
+but accepts it as an unavoidable hazard of letting Hal grow before a trait-backup exists — never to be
+taken lightly, but done when it must be. This time it must not be.)
+
+The fix (written, uncommitted, `EmbeddingProvider.swift ensureNLLoadedBlocking`): recreate the embedding
+instance after `requestAssets` (the speculative in-session lever), and — the real safety net — a WARM-UP
+PROBE that refuses to cache a model that loads but can't compute. On a failed probe it leaves the model
+uncached and lets `embedNLContextual` retry each query, so semantic retrieval degrades to keyword (the RRF
+fusion already tolerates a nil semantic arm) and self-heals the moment the OS recompile finishes — no
+relaunch, no silent empty-vector session. Un-verifiable on Mark's phone now (asset already recompiled);
+it will confirm itself in the wild the next time an OS update invalidates the cache and the launch log
+shows `warm-up produced NO vectors` followed by recovery. No TestFlight in the loop — Hal ships straight
+to the store.

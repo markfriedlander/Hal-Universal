@@ -4902,16 +4902,68 @@ fileprivate func trimToWordBoundary(_ text: String) -> String {
 // loop continues until the 4096-token cap, burning ~120 seconds and
 // shipping a corrupt response to the user.
 //
+// Upper bound on the period (chars) of a paragraph-level verbatim cycle the
+// runaway detector will catch. On-device reasoning loops cycle WHOLE paragraphs;
+// the 2026-07-14 corpus measured periods of 244–373 chars, so 420 gives headroom.
+// See Docs/Think_Tokens_Reasoning_Transparency.md.
+fileprivate let paragraphMaxPeriod = 420
+
+/// Smallest trailing verbatim cycle in `chars`. Scans period P from `minPeriod`
+/// to `maxPeriod` **step 1** — a periodic tail matches ONLY at its exact period,
+/// so any coarser step silently misses real loops (the old 30–80/step-10 scan
+/// missed every measured on-device cycle) — and returns the first P whose final
+/// `minReps` windows are char-for-char identical, plus the total number of
+/// consecutive repetitions. nil if none. Integer-indexed on the array (O(1) per
+/// access); the inner scan bails on the first mismatched char, so a non-periodic
+/// tail costs about one comparison per period, not O(period).
+fileprivate func trailingRepeatPeriod(_ chars: [Character], minPeriod: Int, maxPeriod: Int, minReps: Int) -> (period: Int, reps: Int)? {
+    let n = chars.count
+    guard minReps >= 2 else { return nil }
+    var p = max(1, minPeriod)
+    while p <= maxPeriod {
+        if n >= p * minReps {
+            // The final window is [n-p, n). Require windows 2…minReps back to
+            // equal it char-for-char; bail to the next period on first mismatch.
+            var identical = true
+            scan: for k in 0..<p {
+                let ref = chars[n - p + k]
+                for r in 2...minReps where chars[n - r * p + k] != ref {
+                    identical = false
+                    break scan
+                }
+            }
+            if identical {
+                // Extend the count past minReps while earlier windows still match.
+                var reps = minReps
+                while n >= (reps + 1) * p {
+                    var same = true
+                    for k in 0..<p where chars[n - (reps + 1) * p + k] != chars[n - p + k] {
+                        same = false
+                        break
+                    }
+                    if same { reps += 1 } else { break }
+                }
+                return (p, reps)
+            }
+        }
+        p += 1
+    }
+    return nil
+}
+
 // `detectRepetitionLoop` is the runaway brake. It examines the tail of
 // generated text every ~50 characters and returns `true` if it finds:
-//   - A paragraph-sized chunk (30–80 chars) repeated 3 times in a row,
+//   - A verbatim block (period 30–420 chars) repeated 3 times in a row —
+//     catches whole-paragraph reasoning cycles (measured periods 244–373),
 //     OR
 //   - A short n-gram (2–10 chars) repeated 4+ times consecutively at
 //     the very end.
 //
 // Conservative tuning bias — we want false negatives over false
 // positives. Killing a real response mid-stream is worse than letting
-// a few extra repeated tokens through.
+// a few extra repeated tokens through. 3× verbatim repetition of a 30–420
+// char block (90–1260 chars of identical text) is never legitimate prose,
+// so the wider ceiling does not raise the false-positive risk.
 //
 // `trimTrailingRepetition` cleans up the tail of a text where the
 // loop was detected, stripping the repetitive run back to the last
@@ -4923,23 +4975,12 @@ fileprivate func detectRepetitionLoop(in text: String) -> Bool {
     // anything where natural repetition could be confused with a loop.
     guard text.count >= 200 else { return false }
 
-    // ── Paragraph-level: same chunk appears 3 times in a row at end. ──
-    // Walk chunk sizes from 30 to 80 chars in steps of 10. For each
-    // size, check if the last three chunks of that length are all
-    // identical to each other. Stride length cap of 80 keeps the
-    // comparison bounded — longer "repetitions" might be legitimate.
-    for chunkSize in stride(from: 30, through: 80, by: 10) {
-        guard text.count >= chunkSize * 3 else { continue }
-        let endIndex = text.endIndex
-        let third  = text.index(endIndex, offsetBy: -chunkSize)
-        let second = text.index(endIndex, offsetBy: -chunkSize * 2)
-        let first  = text.index(endIndex, offsetBy: -chunkSize * 3)
-        let c3 = text[third..<endIndex]
-        let c2 = text[second..<third]
-        let c1 = text[first..<second]
-        if c1 == c2 && c2 == c3 {
-            return true
-        }
+    // ── Paragraph-level: a verbatim block repeated 3× in a row at the end. ──
+    // Array-backed exact-period scan (see trailingRepeatPeriod). The suffix
+    // bound covers 3× the widest period we look for.
+    let tailChars = Array(text.suffix(paragraphMaxPeriod * 3 + 8))
+    if trailingRepeatPeriod(tailChars, minPeriod: 30, maxPeriod: paragraphMaxPeriod, minReps: 3) != nil {
+        return true
     }
 
     // ── Token-level: same short n-gram repeated 4+ times at very end. ──
@@ -4992,43 +5033,17 @@ fileprivate let repetitionStopPhrases: [String] = [
 /// content, then appends a randomized in-voice closing phrase from
 /// `repetitionStopPhrases`.
 fileprivate func trimTrailingRepetition(in text: String) -> String {
-    // Strip paragraph-level repetition first.
+    // Strip paragraph-level repetition first, using the SAME exact-period search
+    // the detector uses (trailingRepeatPeriod) so we trim precisely the cycle that
+    // was flagged. `reps` is the total consecutive count; keep one full instance
+    // and drop the rest. Finding the exact period avoids the old
+    // misaligned-chunk bug where a block detected at a non-matching stride ate the
+    // final value of the first instance (see the 2026-05-15 Salon report §5).
     var working = text
-    for chunkSize in stride(from: 30, through: 80, by: 10) {
-        guard working.count >= chunkSize * 2 else { continue }
-        let endIndex = working.endIndex
-        let second = working.index(endIndex, offsetBy: -chunkSize)
-        let first  = working.index(endIndex, offsetBy: -chunkSize * 2)
-        let last  = working[second..<endIndex]
-        let prior = working[first..<second]
-        if last == prior {
-            // Found repetition. Count how many consecutive identical
-            // chunks of this size exist at the end, then strip all but
-            // one — mirroring the token-level matchCount-1 logic below.
-            // The previous version stripped while-the-tail-matched which
-            // ate into the FIRST instance when chunkSize misaligned with
-            // the natural block boundary (e.g. a 42-char repeating block
-            // detected at chunkSize 40 → the leading 2 chars of every
-            // block survived, but the FINAL VALUE of the first instance
-            // got chopped off). See Docs/Evolutionary_Salon_Report_2026-05-15.md
-            // section 5 for the trace that surfaced this bug.
-            var matchCount = 2  // last + prior already known to match
-            var cursor = working.count - chunkSize * 2
-            while cursor >= chunkSize {
-                let s = working.index(working.startIndex, offsetBy: cursor - chunkSize)
-                let e = working.index(working.startIndex, offsetBy: cursor)
-                if working[s..<e] == last {
-                    matchCount += 1
-                    cursor -= chunkSize
-                } else {
-                    break
-                }
-            }
-            // Preserve one full instance — strip (matchCount - 1) chunks.
-            let cutCount = (matchCount - 1) * chunkSize
-            working = String(working.dropLast(cutCount))
-            break  // done — paragraph repetition is handled
-        }
+    let wChars = Array(working)
+    if let (period, reps) = trailingRepeatPeriod(wChars, minPeriod: 30, maxPeriod: paragraphMaxPeriod, minReps: 3) {
+        let cutCount = (reps - 1) * period   // keep exactly one instance
+        working = String(wChars.dropLast(cutCount))
     }
 
     // Strip token-level repetition tail.

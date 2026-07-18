@@ -5,6 +5,37 @@ Forward-looking work. Items completed move out of here and into `HISTORY.md`.
 For where Hal is right now: `HANDOFF_BRIEF.md`.
 For how we got here: `HISTORY.md` (especially the 2026-05-19/20 entry).
 
+## ⭐ NEXT UP — in order (2026-07-16)
+
+> ⚠️ **COMMITTED BUT NOT DEVICE-TESTED — verify ASAP (top priority next session).** These landed in code
+> and build clean, but did NOT get a device pass before the night ended:
+> - **Qwen `reasoningSettings` re-seed** (temp 0.7 / presence 0.5) — confirm reasoning turns actually use it.
+> - **Widened `detectRepetitionLoop`** — offline-validated (8/8 loops, 0 false positives); confirm on-device
+>   it fires on a real runaway and doesn't false-trip on normal long answers.
+> - **NLContextual asset-invalidation fix** — can't be device-verified on Mark's phone at all (asset already
+>   recompiled); confirms itself in the wild after the next OS cache invalidation (item 4).
+> The download-lifecycle hardening from commit `cd39dd2` (clearHalsModels, nested repos, completeness/
+> resume/delete, instrument) IS device-verified. These three are the untested delta.
+
+1. **Device-verify the Qwen re-seed + widened `detectRepetitionLoop`** (quick, when the phone's free) —
+   see the ⚠️ banner above. First thing next session.
+2. **The reasoning "hammer"** — force-close `LogitProcessor` to bound runaways. **Discuss the KV-cache /
+   custom-processor architecture wrinkle with Mark BEFORE building.** Then measure hammer on/off (accuracy,
+   not just convergence). This is the keystone the reasoning feature is blocked on.
+3. **API hardening** — move `LocalAPIServer` command file-work off the main actor. Ship requirement (the
+   public "let other LLMs talk to Hal" API). Its own focused session.
+4. **NLContextual asset-invalidation fix** — WRITTEN (uncommitted). Confirm in the wild after the next OS
+   cache invalidation (un-reproducible on demand — the asset is device-wide and survives app deletion, so
+   deleting Hal does NOT reproduce it). Watch the launch log for `warm-up produced NO vectors` → recovery.
+5. **Streaming rubber-band fix** — visual, needs the phone + a look (investigation notes below/in the
+   2026-07-16 findings block).
+6. **Open lifecycle bug** — uninstalled-app claims never reaped (contract-level; deferred).
+
+**Priority arc (Mark):** back up Hal's personally-created traits so dev stops wiping his memory. Proposals
+system + Soul Document remain OUT until Mark's ready.
+
+---
+
 > **Side project (2026-07-12): the studio website — LIVE.** Mark's public pages are
 > unified under one "house style" (started from Posey's look). **Hal's own site
 > (index/privacy/support) is deployed** at `markfriedlander.github.io/Hal-Universal/`,
@@ -612,10 +643,21 @@ Uncommitted on `main`, builds clean (device+sim, zero warnings), `Hal_Source.txt
   if the user keeps the phone locked. Consider a user-facing hint ("keep Hal open for a faster download").
 - **Test 2 (forced move-failure) still owed** — needs a temporary "fail the Nth move" hook to prove the
   failure path claims nothing. Mark: do it for real, even if we break-then-fix.
-- **NLContextual first-run** (separate finding, see the download-bug section above): works after one
-  relaunch; real fix needs a genuinely-fresh device Mark hasn't decided on yet. Also note: `Assets not on
-  device` reappeared on a `--terminate-existing` relaunch → verify whether it's "once per install" or
-  "every cold launch" before designing the fix.
+- **NLContextual asset-invalidation — FIX WRITTEN (uncommitted), mechanism now understood.** The asset is
+  **device-wide** (`/var/db/com.apple.naturallanguaged/`, shared across apps, survives app deletion — web
+  + Apple-forum confirmed), NOT per-app. So the failure we saw was NOT a first-ever download: Hal had used
+  NLContextual on this phone for months, so the asset was already present and got **invalidated/re-
+  provisioned** (likely the iOS 27 beta reformatting the system asset cache, or storage-pressure eviction).
+  After re-provisioning iOS recompiles the model (~30 s → `e5bundlecache`); `load()` succeeds but
+  `embeddingResult` yields no vectors during that window (Mark's call — the test hit the compile window),
+  and a relaunch picked up the finished compile. **This makes it broader than "fresh install"** — any
+  device can hit it after an OS update or eviction, so real store users can too. **Fix**
+  (`EmbeddingProvider.swift ensureNLLoadedBlocking`): warm-up probe refuses to cache a non-computing model;
+  `embedNLContextual` retries per query → degrades to keyword (RRF handles nil semantic) and self-heals the
+  moment the recompile finishes, no relaunch. **Un-reproducible on Mark's phone** (asset already
+  recompiled; deleting Hal won't reproduce it — trigger is OS-level). Confirms in the wild on the next OS
+  cache invalidation. *(Corrected 2026-07-16: earlier "first-ever use / needs a fresh device" read was
+  wrong — Mark caught it.)*
 
 ## ⭐ ACTIVE ARC (2026-07-13) — reasoning feature → sampling optimization (all models)
 

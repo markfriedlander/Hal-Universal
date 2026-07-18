@@ -836,22 +836,29 @@ struct ModelConfiguration: Identifiable, Codable, Equatable, Hashable {
             repetitionPenalty: 1.1,
             repetitionContextSize: 64
         ),
-        // Reasoning-mode sampler (2026-07-14) — Qwen's published THINKING-text
-        // recipe (model-card "Best Practices"), merged OVER defaultSettings on
-        // reasoning turns: temp 1.0 (bounded by top_k/top_p, deliberately NOT
-        // lowered — the old hardcoded 0.6 with no top_k/top_p is what loops),
-        // top_p 0.95, top_k 20, min_p 0, presence_penalty 1.5 (Qwen's stated
-        // anti-loop lever), repetition_penalty 1.0 = OFF (overrides the 1.1
-        // default — Qwen uses PRESENCE, not repetition). Vision/coding recipe
-        // (temp 0.6, presence 0.0) is parked for when image input ships. See
-        // Docs/Think_Tokens_Reasoning_Transparency.md.
+        // Reasoning-mode sampler — MEASURED recipe (2026-07-14 battery sweep),
+        // NOT the raw model-card values. Merged OVER defaultSettings on reasoning
+        // turns: temp 0.7, top_p 0.95, top_k 20, min_p 0, presence_penalty 0.5,
+        // repetition_penalty 1.0 = OFF (Qwen uses PRESENCE, not repetition).
+        //   - The model card's temp 1.0 / presence 1.5 was tried and REJECTED:
+        //     temp 1.0 loops on deterministic math (91/337 spun for minutes);
+        //     the 144-turn battery (temp 0.7/0.8/0.9 × presence 0.0/0.5 × 12
+        //     prompts) put presence 0.5 ahead of 0.0 in every temp row, with
+        //     temp a plateau 0.7–0.9 (0.7 a slight, within-noise edge).
+        //   - This is the best sampler cell, but NOT sufficient alone: the best
+        //     cell still hangs ~25% of math and ~60% of open-ended prompts. It's
+        //     a *termination* problem, not a sampler one — the force-close hammer
+        //     (still to build) is what actually bounds the runaways. Baking the
+        //     good recipe first so the hammer is measured on top of it, not the
+        //     wrong temp-1.0 line. Vision/coding recipe (temp 0.6, presence 0.0)
+        //     parked for image input. See Docs/Think_Tokens_Reasoning_Transparency.md.
         reasoningSettings: ModelSettings(
-            temperature: 1.0,
+            temperature: 0.7,
             repetitionPenalty: 1.0,
             topP: 0.95,
             topK: 20,
             minP: 0.0,
-            presencePenalty: 1.5
+            presencePenalty: 0.5
         ),
         // Layer 1 (§4) — addresses two Qwen-specific failure modes from
         // the §2 Maxim sweep:
