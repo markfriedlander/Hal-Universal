@@ -150,7 +150,7 @@ struct AboutView: View {
                 }
             }
         }
-        .navigationTitle("About")
+        .navigationTitle("About \(appName)")
         .navigationBarTitleDisplayMode(.inline)
     }
 }

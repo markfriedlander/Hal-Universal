@@ -94,7 +94,7 @@ struct ActionsView: View {
                     NavigationLink {
                         AboutView.hal
                     } label: {
-                        Label("About", systemImage: "info.circle")
+                        Label("About Hal Universal", systemImage: "info.circle")
                     }
                 }
                 .id("about")
