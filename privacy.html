@@ -90,7 +90,7 @@
 
       <p>It has no accounts, no analytics, no telemetry, no advertising identifiers, no third-party SDKs. There are no servers operated by the developer. All conversations, memories, and reflections are stored exclusively on your device in a local SQLite database, protected by iOS Data Protection: the file-level encryption iOS applies to app data when your device is locked.</p>
 
-      <p>When you use a local model, inference runs entirely on your device with no network calls of any kind. When you use Apple Intelligence, inference occurs on-device when offline. When connected, Apple's Private Cloud Compute may be used: your prompts are encrypted in transit and processed only in short-lived, non-persistent memory on Apple-controlled servers. Apple states no data is retained after processing. The developer of Hal Universal does not see or have access to any data Apple Intelligence processes.</p>
+      <p>When you use a local model, inference runs entirely on your device with no network calls of any kind. When you use Apple Intelligence, Hal uses Apple's on-device foundation model, so that inference also runs entirely on your device. The developer of Hal Universal has no access to anything you type or anything Hal generates.</p>
 
       <p>Model downloads are fetched from Hugging Face over standard HTTPS at your explicit request. Once downloaded, models run entirely on your device.</p>
 

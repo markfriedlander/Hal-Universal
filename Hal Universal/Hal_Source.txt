@@ -18945,11 +18945,19 @@ enum MaintenanceTasks {
 // Hal Universal
 //
 // The privacy lock indicator's engine and UI. Surfaces - in the chat
-// toolbar - whether Hal is currently operating in a state where data
-// could leave the device, so the user can see it at a glance and choose.
-// This operationalizes the standing principle: PCC is the user's choice
-// via Airplane Mode; we don't block Apple's routing, we make the state
-// visible.
+// toolbar - that Hal's inference runs entirely on-device.
+//
+// EVERY model Hal runs is on-device: local MLX models, and Apple Intelligence
+// via `SystemLanguageModel.default`, which runs strictly on-device and never
+// routes to Apple's Private Cloud Compute. PCC is reachable only by explicitly
+// instantiating `PrivateCloudComputeLanguageModel` (a WWDC26 addition), which
+// Hal does NOT use. (Corrected 2026-07-18 after verifying against Apple's WWDC26
+// Foundation Models sessions — the earlier "AFM + network → cloud possible"
+// assumption was wrong; `SystemLanguageModel.default` does not self-route to PCC.)
+//
+// So the indicator reads on-device. The network monitor + truth table are kept
+// so that IF a cloud-capable model source is ever added (e.g. an opt-in PCC
+// model), the indicator unlocks correctly for it.
 //
 // Three pieces live here:
 //   1. `PrivacyMonitor` - an ObservableObject wrapping `NWPathMonitor`. Its
@@ -18979,10 +18987,9 @@ final class PrivacyMonitor: ObservableObject {
     static let shared = PrivacyMonitor()
 
     /// True when a usable network path exists (Wi-Fi, cellular, wired, or VPN).
-    /// Starts `false` so the lock reads "locked" (the safe default) until the
-    /// first `NWPathMonitor` update lands — we never want to briefly claim
-    /// "cloud possible" before we actually know, nor briefly claim "private"
-    /// when we don't yet know. Locked-until-known is the honest default.
+    /// Retained for the truth table's future cloud-source case; today it does
+    /// not change the lock outcome, since every model Hal runs is on-device.
+    /// Starts `false` (the safe default) until the first `NWPathMonitor` update.
     @Published private(set) var isNetworkAvailable: Bool = false
 
     private let monitor = NWPathMonitor()
@@ -19016,13 +19023,14 @@ final class PrivacyMonitor: ObservableObject {
     // MARK: - Lock decision (pure truth table)
 
     /// The lock/unlock decision, as a pure function of the inputs. See the
-    /// truth table in NEXT.md. `salonSeatSources` is the resolved `ModelSource`
-    /// of each ACTIVE salon seat (the caller looks these up; an unresolvable
-    /// seat should be passed as `.appleFoundation` — the conservative,
-    /// cloud-capable assumption, so we never falsely claim "private").
+    /// truth table above. `salonSeatSources` is the resolved `ModelSource` of
+    /// each ACTIVE salon seat (the caller looks these up; an unresolvable seat
+    /// is passed as `.appleFoundation`, which is on-device — harmless today,
+    /// since every source Hal has is on-device).
     ///
     /// Returns `true` = locked (no data can leave), `false` = unlocked
-    /// (a cloud-capable path is active).
+    /// (a cloud-capable source is active — not possible today, kept for the
+    /// future-cloud-source case).
     static func isLocked(
         activeModelSource: ModelSource,
         networkAvailable: Bool,
@@ -19030,21 +19038,27 @@ final class PrivacyMonitor: ObservableObject {
         salonSeatSources: [ModelSource]
     ) -> Bool {
         // No network → nothing can leave the device, whatever the model is.
+        // (Belt-and-suspenders: today every source below is on-device anyway.)
         guard networkAvailable else { return true }
 
-        // Network is up. In a salon, ANY cloud-capable (non-MLX) active seat
-        // unlocks the indicator — worst-case attribution. Locked only if every
-        // active seat runs on-device.
+        // Salon: locked only if every active seat runs on-device.
         if salonEnabled && !salonSeatSources.isEmpty {
-            return salonSeatSources.allSatisfy { $0 == .mlx }
+            return salonSeatSources.allSatisfy(Self.isOnDevice)
         }
 
         // Single-model path.
-        switch activeModelSource {
-        case .mlx:
-            return true                 // local model → always on-device
-        case .appleFoundation:
-            return false                // AFM + network → PCC possible → unlocked
+        return Self.isOnDevice(activeModelSource)
+    }
+
+    /// Whether a model source runs entirely on-device. BOTH of Hal's sources do:
+    /// local MLX models, and Apple Intelligence via `SystemLanguageModel.default`,
+    /// which runs strictly on-device and never routes to Private Cloud Compute
+    /// (Hal does not use the opt-in `PrivateCloudComputeLanguageModel`). If a
+    /// cloud-capable source is ever added, return `false` for it here.
+    nonisolated private static func isOnDevice(_ source: ModelSource) -> Bool {
+        switch source {
+        case .mlx, .appleFoundation:
+            return true
         }
     }
 
@@ -19091,9 +19105,11 @@ struct PrivacyLockPopover: View {
 
     private var explanation: String {
         if isLocked {
-            return "Hal is fully on-device right now. The active model (\(modelName)) runs on this iPhone — no request you send and no response you receive leaves your phone."
+            return "Hal is fully on-device right now. The active model (\(modelName)) runs on this device — no request you send and no response you receive leaves it. Apple Intelligence uses Apple's on-device model and does not route to Private Cloud Compute."
         } else {
-            return "Apple Intelligence may route some queries to Apple's Private Cloud Compute. To guarantee fully on-device operation, switch to Airplane Mode or pick a downloaded local model from the Model Library."
+            // Currently unreachable — Hal runs only on-device models. Kept in
+            // case a cloud-capable model source is ever added.
+            return "A cloud-capable model is active, so some requests may leave this device. To stay fully on-device, pick a downloaded local model from the Model Library or use Apple Intelligence."
         }
     }
 }
@@ -28713,13 +28729,13 @@ struct iOSChatView: View {
     }
 
     /// Whether the privacy lock reads "locked" (no data can leave the device)
-    /// right now. Recomputed on every render — because it reads @Published
-    /// state (the active model, the network monitor, and the salon config),
-    /// SwiftUI re-renders the toolbar the instant any of them changes, so the
-    /// glyph flips live on a model switch or an Airplane-Mode toggle. The pure
-    /// decision lives in PrivacyMonitor.isLocked; here we just resolve each
-    /// active salon seat's source (unknown → .appleFoundation, the
-    /// conservative cloud-capable assumption) and hand it the inputs.
+    /// right now. Recomputed on every render from @Published state (the active
+    /// model + salon config), so the toolbar updates the instant the user
+    /// switches models. Every model Hal runs is on-device (see PrivacyMonitor),
+    /// so this is currently always locked; the pure decision lives in
+    /// PrivacyMonitor.isLocked and the structure remains for a future cloud
+    /// source. An unresolvable salon seat falls back to .appleFoundation
+    /// (on-device) — harmless today, since every real source is on-device.
     private var isPrivacyLocked: Bool {
         let seatSources = chatViewModel.salonConfig.activeSeats.map { seat in
             ModelCatalogService.shared.getModel(byID: seat.modelID)?.source ?? .appleFoundation

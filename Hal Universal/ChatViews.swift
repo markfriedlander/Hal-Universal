@@ -411,13 +411,13 @@ struct iOSChatView: View {
     }
 
     /// Whether the privacy lock reads "locked" (no data can leave the device)
-    /// right now. Recomputed on every render — because it reads @Published
-    /// state (the active model, the network monitor, and the salon config),
-    /// SwiftUI re-renders the toolbar the instant any of them changes, so the
-    /// glyph flips live on a model switch or an Airplane-Mode toggle. The pure
-    /// decision lives in PrivacyMonitor.isLocked; here we just resolve each
-    /// active salon seat's source (unknown → .appleFoundation, the
-    /// conservative cloud-capable assumption) and hand it the inputs.
+    /// right now. Recomputed on every render from @Published state (the active
+    /// model + salon config), so the toolbar updates the instant the user
+    /// switches models. Every model Hal runs is on-device (see PrivacyMonitor),
+    /// so this is currently always locked; the pure decision lives in
+    /// PrivacyMonitor.isLocked and the structure remains for a future cloud
+    /// source. An unresolvable salon seat falls back to .appleFoundation
+    /// (on-device) — harmless today, since every real source is on-device.
     private var isPrivacyLocked: Bool {
         let seatSources = chatViewModel.salonConfig.activeSeats.map { seat in
             ModelCatalogService.shared.getModel(byID: seat.modelID)?.source ?? .appleFoundation
