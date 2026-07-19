@@ -109,6 +109,9 @@
 //   58  ChatBubbleView & TimerView (Message UI Components)
 //   59  MarkdownView (Block-Level Markdown Renderer)
 //
+//  About.swift
+//   60  About (Open-Source Licenses & Acknowledgements)
+//
 import SwiftUI
 import Foundation
 import Combine

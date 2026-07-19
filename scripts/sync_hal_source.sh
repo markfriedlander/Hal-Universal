@@ -39,6 +39,7 @@ FILES=(
   "Hal Universal/DocumentImportManager.swift"
   "Hal Universal/SettingsViews.swift"
   "Hal Universal/ChatViews.swift"
+  "Hal Universal/About.swift"
 )
 
 OUT="Hal Universal/Hal_Source.txt"
