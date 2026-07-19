@@ -92,7 +92,7 @@ struct ActionsView: View {
                 // inside the screen now (AboutView reads it from the bundle).
                 Section {
                     NavigationLink {
-                        AboutView.hal
+                        AboutView.hal(chatViewModel: chatViewModel)
                     } label: {
                         Label("About Hal Universal", systemImage: "info.circle")
                     }

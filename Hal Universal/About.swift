@@ -65,6 +65,24 @@ struct Acknowledgement: Identifiable {
     var notice: String? = nil
 }
 
+/// A model the app is *running*, as opposed to code it *ships*. These are downloaded (or
+/// built into the OS), never redistributed by us — so they don't belong in the acknowledgements
+/// above. They live in their own section, and the app supplies only the ones ACTUALLY in use,
+/// because an attribution you don't owe is a claim you shouldn't make.
+///
+/// `attribution` is a line some licenses require to be shown prominently; `notice` is the
+/// license's required Notice text. For Hal's models both are usually nil — the user is the
+/// licensee (they accepted each model's license at download), so this is informational
+/// transparency, not a redistribution claim by us.
+struct ModelCredit: Identifiable {
+    var id: String { name }
+    let name: String
+    let terms: String
+    let attribution: String?
+    let url: String?
+    var notice: String? = nil
+}
+
 // MARK: - The shared view
 
 /// The studio's About screen. Generic: it takes an app's identity and its list
@@ -76,6 +94,12 @@ struct AboutView: View {
     let ownLicense: String
     let ownCopyright: String
     let sourceURL: String?
+    /// The models actually in use right now — supplied by the app from live selection state,
+    /// so this section reflects what's genuinely running, not merely what's on disk. A model
+    /// that's installed but not selected isn't being *used*, so it doesn't appear here — and
+    /// crucially doesn't drag its terms with it. Terms you don't owe (because nothing is using
+    /// the model) are a claim you shouldn't make.
+    let models: [ModelCredit]
     let acknowledgements: [Acknowledgement]
 
     private var version: String {
@@ -129,6 +153,44 @@ struct AboutView: View {
                 Text("This app")
             } footer: {
                 Text("\(appName) is free and open source. You can read every line.")
+            }
+
+            if !models.isEmpty {
+                Section {
+                    ForEach(models) { m in
+                        VStack(alignment: .leading, spacing: 3) {
+                            Text(m.name)
+                                .font(.subheadline)
+                            Text(m.terms)
+                                .font(.caption2).foregroundStyle(.secondary)
+                            if let attribution = m.attribution {
+                                Text(attribution)
+                                    .font(.caption).fontWeight(.semibold)
+                                    .padding(.top, 1)
+                            }
+                            if let notice = m.notice {
+                                Text(notice)
+                                    .font(.caption2).foregroundStyle(.tertiary)
+                                    .fixedSize(horizontal: false, vertical: true)
+                            }
+                            if let urlStr = m.url, let url = URL(string: urlStr) {
+                                Link(destination: url) {
+                                    HStack(spacing: 3) {
+                                        Text("Terms")
+                                        Image(systemName: "arrow.up.right").font(.caption2)
+                                    }
+                                    .font(.caption2)
+                                }
+                                .padding(.top, 1)
+                            }
+                        }
+                        .padding(.vertical, 2)
+                    }
+                } header: {
+                    Text("Models in use")
+                } footer: {
+                    Text("The models \(appName) is actually running right now, and the terms they're used under. A model that's installed but not selected doesn't appear here — it isn't being used, so its terms don't apply. You accepted each model's license when you downloaded it.")
+                }
             }
 
             ForEach(groups, id: \.license) { group in
@@ -400,17 +462,80 @@ extension OpenSourceLicense {
 
 extension AboutView {
     /// Hal's About screen. To adopt in another app: copy everything above this
-    /// mark unchanged, then write your own factory and list from your app's
-    /// verified dependency inventory.
-    static var hal: AboutView {
+    /// mark unchanged, then write your own factory + lists from your app's
+    /// verified inventory and live model state.
+    static func hal(chatViewModel: ChatViewModel) -> AboutView {
         AboutView(
             appName: "Hal Universal",
             tagline: "Transparency isn't a feature. It's the architecture.",
             ownLicense: "MIT License",
             ownCopyright: "© 2026 Mark Friedlander",
             sourceURL: "https://github.com/markfriedlander/Hal-Universal",
+            models: halActiveModels(chatViewModel: chatViewModel),
             acknowledgements: halAcknowledgements
         )
+    }
+}
+
+/// The models Hal is ACTUALLY running right now — the selected chat model and the
+/// active embedder — mapped to their terms. Built from live state, so the section
+/// changes as the user switches models. Apple's on-device models (AFM, NLContextual)
+/// carry no third-party terms. We distribute only the framework; the user chose and
+/// accepted each downloaded model's license, so this is informational transparency,
+/// not a redistribution claim by us.
+private func halActiveModels(chatViewModel: ChatViewModel) -> [ModelCredit] {
+    var credits: [ModelCredit] = []
+
+    // 1. The active chat model.
+    let model = chatViewModel.selectedModel
+    if model.source == .appleFoundation {
+        credits.append(ModelCredit(
+            name: model.displayName,
+            terms: "Apple Foundation Models — built into iOS/macOS, no separate license",
+            attribution: nil, url: nil))
+    } else {
+        credits.append(ModelCredit(
+            name: model.displayName,
+            terms: halModelLicenseName(model.license),
+            attribution: nil,
+            url: "https://huggingface.co/\(model.id)"))
+    }
+
+    // 2. The active embedder.
+    switch EmbeddingBackend.current() {
+    case .nlContextual:
+        credits.append(ModelCredit(
+            name: "Apple NLContextual Embedding",
+            terms: "Apple Natural Language — built into iOS/macOS, no separate license",
+            attribution: nil, url: nil))
+    case .nomicSwift:
+        credits.append(ModelCredit(
+            name: "Nomic Embed Text v1.5",
+            terms: "Apache 2.0",
+            attribution: nil,
+            url: "https://huggingface.co/nomic-ai/nomic-embed-text-v1.5"))
+    case .mxbai:
+        credits.append(ModelCredit(
+            name: "mxbai-embed-large v1",
+            terms: "Apache 2.0",
+            attribution: nil,
+            url: "https://huggingface.co/mixedbread-ai/mxbai-embed-large-v1"))
+    }
+
+    return credits
+}
+
+/// Catalog license code → the same honest name the download sheet shows
+/// (keep in sync with ModelLibrary's `licenseName`).
+private func halModelLicenseName(_ code: String?) -> String {
+    switch (code ?? "").lowercased() {
+    case "mit": return "MIT License"
+    case "apache-2.0": return "Apache 2.0"
+    case "llama2": return "Llama 2 Community License"
+    case "llama3", "llama3.1", "llama3.2": return "Llama 3 Community License"
+    case "gemma": return "Gemma Terms of Use"
+    case "": return "See model card for license"
+    default: return "\((code ?? "").uppercased()) License"
     }
 }
 
