@@ -1,0 +1,46 @@
+# ============================================================================
+# Hal Universal — public repo ignore list
+#
+# THE RULE: public on GitHub = the app's code + its website + README.
+# Everything else is private. Process/design docs are versioned privately in a
+# second, local-only git (.hal-docs-git, never pushed) and backed up by iCloud.
+# Screenshots/secrets are simply hidden (iCloud-backed).
+#
+# NOTE: adding a path here does NOT remove it from git history — it only stops
+# it being tracked going forward. That's intentional (no history rewrite).
+# ============================================================================
+
+# ---- Private, versioned in .hal-docs-git (process & design docs) -----------
+/CLAUDE.md
+/HISTORY.md
+/NEXT.md
+/HANDOFF_BRIEF.md
+/HAL_CC_BRIEFING.md
+/STUDIO_REPO_HYGIENE.md
+/Docs/
+/AppStore/RELEASE_NOTES_DRAFT.md
+# Test harness + benchmark results: internal dev tooling + research (secrets
+# inside it are excluded from the private git too — see tools/docs.sh).
+/tests/
+
+# ---- Private, hidden only (dev screenshots; iCloud-backed, no git history) --
+/AppStore/screenshots/
+
+# ---- The local-only private-docs git + its wrapper — MUST stay ignored -----
+/.hal-docs-git/
+/tools/
+
+# ---- Secrets — NEVER commit (belt-and-suspenders; API tokens live here) -----
+*_api_config*.json
+tests/.hal_api_config.json
+tests/.hal_api_config_sim.json
+*.token
+*.p8
+*.mobileprovision
+.env
+secrets/
+
+# ---- Junk / build artifacts (should never have been tracked) ---------------
+__pycache__/
+*.pyc
+.DS_Store
