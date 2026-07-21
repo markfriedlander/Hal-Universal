@@ -121,10 +121,10 @@ final class PrivacyMonitor: ObservableObject {
 
 // MARK: - PrivacyLockPopover (tap explanation)
 
-/// The small popover shown when the user taps the lock. Explains the current
-/// state in plain language and offers a one-tap jump to the Model Library. The
-/// locked state just reassures; the unlocked state is where the user needs
-/// actionable detail, so that's where the explanation carries weight.
+/// The small popover shown when the user taps the lock. Shows the canonical
+/// privacy copy (identical in both lock states) and offers a one-tap jump to the
+/// Model Library. Only the glyph (lock / lock.open) changes with state; the words
+/// never change. See the DO-NOT-EDIT marker on `explanation` below.
 struct PrivacyLockPopover: View {
     let isLocked: Bool
     /// Invoked when the user taps "Model Library", the caller dismisses the
@@ -133,12 +133,9 @@ struct PrivacyLockPopover: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
-            HStack(spacing: 8) {
-                Image(systemName: isLocked ? "lock" : "lock.open")
-                Text(isLocked ? "On-device" : "Cloud possible")
-                    .fontWeight(.semibold)
-            }
-            .font(.headline)
+            // Only the glyph changes with state. No title text (removed 2026-07-20).
+            Image(systemName: isLocked ? "lock" : "lock.open")
+                .font(.headline)
 
             Text(explanation)
                 .font(.subheadline)
@@ -158,12 +155,15 @@ struct PrivacyLockPopover: View {
         .frame(width: 280)
     }
 
+    // ⛔️ CANONICAL PRIVACY COPY — DO NOT EDIT, REWRITE, "ALIGN", OR "MAKE HONEST".
+    // Written and locked by Mark on 2026-07-20 as the single definitive privacy
+    // statement, word for word the App Store description's "Genuinely Private"
+    // paragraph. It is shown VERBATIM in BOTH lock states; only the glyph
+    // (lock / lock.open) changes. It describes both conditions, so it is true in
+    // either state and can never mislead. Any future CC: leave it exactly as written.
+    // If a change is ever genuinely needed it comes from Mark, in his words, not yours.
     private var explanation: String {
-        if isLocked {
-            return "Nothing leaves your device right now."
-        } else {
-            return "Apple Intelligence is Apple's own system, and only Apple decides when things are processed in the cloud. To guarantee private, on-device-only behavior, choose a local model or shut off all networks."
-        }
+        "When you use a local MLX model, your conversations never leave your iPhone. No network calls. No server. When using Apple Intelligence, inference is on-device when offline; when connected, Apple's Private Cloud Compute may be used (encrypted in transit, processed in non-persistent memory on Apple-controlled servers)."
     }
 }
 
