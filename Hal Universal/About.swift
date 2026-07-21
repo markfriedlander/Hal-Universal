@@ -103,10 +103,10 @@ struct AboutView: View {
     let acknowledgements: [Acknowledgement]
 
     private var version: String {
-        Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "—"
+        Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "?"
     }
     private var build: String {
-        Bundle.main.infoDictionary?["CFBundleVersion"] as? String ?? "—"
+        Bundle.main.infoDictionary?["CFBundleVersion"] as? String ?? "?"
     }
 
     /// Grouped by license so identical terms sit together (all the MIT projects,
@@ -189,7 +189,7 @@ struct AboutView: View {
                 } header: {
                     Text("Models in use")
                 } footer: {
-                    Text("The models \(appName) is actually running right now, and the terms they're used under. A model that's installed but not selected doesn't appear here — it isn't being used, so its terms don't apply. You accepted each model's license when you downloaded it.")
+                    Text("The models \(appName) is actually running right now, and the terms they're used under. A model that's installed but not selected doesn't appear here, it isn't being used, so its terms don't apply. You accepted each model's license when you downloaded it.")
                 }
             }
 
@@ -491,7 +491,7 @@ private func halActiveModels(chatViewModel: ChatViewModel) -> [ModelCredit] {
     if model.source == .appleFoundation {
         credits.append(ModelCredit(
             name: model.displayName,
-            terms: "Apple Foundation Models — built into iOS/macOS, no separate license",
+            terms: "Apple Foundation Models, built into iOS/macOS, no separate license",
             attribution: nil, url: nil))
     } else {
         credits.append(ModelCredit(
@@ -506,7 +506,7 @@ private func halActiveModels(chatViewModel: ChatViewModel) -> [ModelCredit] {
     case .nlContextual:
         credits.append(ModelCredit(
             name: "Apple NLContextual Embedding",
-            terms: "Apple Natural Language — built into iOS/macOS, no separate license",
+            terms: "Apple Natural Language, built into iOS/macOS, no separate license",
             attribution: nil, url: nil))
     case .nomicSwift:
         credits.append(ModelCredit(

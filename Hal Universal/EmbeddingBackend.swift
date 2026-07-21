@@ -207,14 +207,14 @@ nonisolated enum EmbeddingBackend: String, Sendable, CaseIterable {
     var blurb: String {
         switch self {
         case .nlContextual:
-            return "Apple's built-in embedder (512-dim), running on the Neural Engine.\n• Good at: nothing to download, instant, fully private, tiny storage, fastest to embed — works out of the box.\n• Weaker at: precision. It's the least sharp of the three at telling closely-related memories apart, so it can occasionally surface a loosely-related memory instead of the exact one.\nBest when you want zero setup and the smallest footprint."
+            return "Apple's built-in embedder (512-dim), running on the Neural Engine.\n• Good at: nothing to download, instant, fully private, tiny storage, fastest to embed, works out of the box.\n• Weaker at: precision. It's the least sharp of the three at telling closely-related memories apart, so it can occasionally surface a loosely-related memory instead of the exact one.\nBest when you want zero setup and the smallest footprint."
         // REMOVED 2026-05-20:
         // case .embeddingGemma:
         //     return "Google's open embedding model, 308M params, MLX 4-bit quantized. 768-dim, state-of-the-art on MTEB Multilingual v2 among models under 500M. Adds ~210 MB on disk."
         case .nomicSwift:
-            return "Nomic Embed Text v1.5 (768-dim), purpose-built for search. On-device via Apple's MLTensor (no MLX).\n• Good at: a clear step up in precision over the built-in embedder — better at pulling the right memory rather than a merely on-topic one — while staying moderate in size and speed. It tests extremely well in Hal's own end-to-end retrieval, holding its own with the larger model.\n• Costs: a ~522 MB download and a bit more compute than the built-in option.\nA balanced middle ground."
+            return "Nomic Embed Text v1.5 (768-dim), purpose-built for search. On-device via Apple's MLTensor (no MLX).\n• Good at: a clear step up in precision over the built-in embedder (better at pulling the right memory rather than a merely on-topic one) while staying moderate in size and speed. It tests extremely well in Hal's own end-to-end retrieval, holding its own with the larger model.\n• Costs: a ~522 MB download and a bit more compute than the built-in option.\nA balanced middle ground."
         case .mxbai:
-            return "Mixedbread mxbai-embed-large (1024-dim, BERT-large). On-device via the same path as Nomic (no MLX).\n• Good at: the most detailed representation of the three — its 1024-dim vectors are the sharpest at telling near-identical passages apart in isolation, which can help with large or nuanced memories.\n• Costs: the largest download (~670 MB) and the slowest to embed, so building or rebuilding your memory index takes the longest; and in Hal's own end-to-end retrieval its edge over Nomic is subtle.\nBest when you want the most detailed embeddings and can spare the storage."
+            return "Mixedbread mxbai-embed-large (1024-dim, BERT-large). On-device via the same path as Nomic (no MLX).\n• Good at: the most detailed representation of the three: its 1024-dim vectors are the sharpest at telling near-identical passages apart in isolation, which can help with large or nuanced memories.\n• Costs: the largest download (~670 MB) and the slowest to embed, so building or rebuilding your memory index takes the longest; and in Hal's own end-to-end retrieval its edge over Nomic is subtle.\nBest when you want the most detailed embeddings and can spare the storage."
         }
     }
 

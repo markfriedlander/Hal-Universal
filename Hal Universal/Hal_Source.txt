@@ -13121,14 +13121,14 @@ nonisolated enum EmbeddingBackend: String, Sendable, CaseIterable {
     var blurb: String {
         switch self {
         case .nlContextual:
-            return "Apple's built-in embedder (512-dim), running on the Neural Engine.\n• Good at: nothing to download, instant, fully private, tiny storage, fastest to embed — works out of the box.\n• Weaker at: precision. It's the least sharp of the three at telling closely-related memories apart, so it can occasionally surface a loosely-related memory instead of the exact one.\nBest when you want zero setup and the smallest footprint."
+            return "Apple's built-in embedder (512-dim), running on the Neural Engine.\n• Good at: nothing to download, instant, fully private, tiny storage, fastest to embed, works out of the box.\n• Weaker at: precision. It's the least sharp of the three at telling closely-related memories apart, so it can occasionally surface a loosely-related memory instead of the exact one.\nBest when you want zero setup and the smallest footprint."
         // REMOVED 2026-05-20:
         // case .embeddingGemma:
         //     return "Google's open embedding model, 308M params, MLX 4-bit quantized. 768-dim, state-of-the-art on MTEB Multilingual v2 among models under 500M. Adds ~210 MB on disk."
         case .nomicSwift:
-            return "Nomic Embed Text v1.5 (768-dim), purpose-built for search. On-device via Apple's MLTensor (no MLX).\n• Good at: a clear step up in precision over the built-in embedder — better at pulling the right memory rather than a merely on-topic one — while staying moderate in size and speed. It tests extremely well in Hal's own end-to-end retrieval, holding its own with the larger model.\n• Costs: a ~522 MB download and a bit more compute than the built-in option.\nA balanced middle ground."
+            return "Nomic Embed Text v1.5 (768-dim), purpose-built for search. On-device via Apple's MLTensor (no MLX).\n• Good at: a clear step up in precision over the built-in embedder (better at pulling the right memory rather than a merely on-topic one) while staying moderate in size and speed. It tests extremely well in Hal's own end-to-end retrieval, holding its own with the larger model.\n• Costs: a ~522 MB download and a bit more compute than the built-in option.\nA balanced middle ground."
         case .mxbai:
-            return "Mixedbread mxbai-embed-large (1024-dim, BERT-large). On-device via the same path as Nomic (no MLX).\n• Good at: the most detailed representation of the three — its 1024-dim vectors are the sharpest at telling near-identical passages apart in isolation, which can help with large or nuanced memories.\n• Costs: the largest download (~670 MB) and the slowest to embed, so building or rebuilding your memory index takes the longest; and in Hal's own end-to-end retrieval its edge over Nomic is subtle.\nBest when you want the most detailed embeddings and can spare the storage."
+            return "Mixedbread mxbai-embed-large (1024-dim, BERT-large). On-device via the same path as Nomic (no MLX).\n• Good at: the most detailed representation of the three: its 1024-dim vectors are the sharpest at telling near-identical passages apart in isolation, which can help with large or nuanced memories.\n• Costs: the largest download (~670 MB) and the slowest to embed, so building or rebuilding your memory index takes the longest; and in Hal's own end-to-end retrieval its edge over Nomic is subtle.\nBest when you want the most detailed embeddings and can spare the storage."
         }
     }
 
@@ -14123,7 +14123,7 @@ struct EmbedderBackendRow: View {
             }
             Button("Cancel", role: .cancel) {}
         } message: {
-            Text("Nothing is deleted — each embedder keeps its own copy of your memory vectors, so you can switch back instantly. Hal will fill in \(backend.displayName)'s vectors in the background; that can take a few minutes depending on your memory size, during which some older memories rely on keyword search until they're ready.")
+            Text("Nothing is deleted. Each embedder keeps its own copy of your memory vectors, so you can switch back instantly. Hal will fill in \(backend.displayName)'s vectors in the background; that can take a few minutes depending on your memory size, during which some older memories rely on keyword search until they're ready.")
         }
         // Pre-download disclosure (aligned with the LLM Download flow). Records
         // intent on continue + dismisses; the download starts in onDismiss once
@@ -14271,17 +14271,17 @@ struct EmbedderDownloadDisclosureSheet: View {
                         Text("Optional memory-search model")
                             .font(.subheadline).foregroundColor(.secondary)
                     }
-                    Text("This embedder improves how Hal searches your memory. It runs entirely on your iPhone — nothing you store or ask leaves the device — and works offline once downloaded.")
+                    Text("This embedder improves how Hal searches your memory. It runs entirely on your iPhone (nothing you store or ask leaves the device) and works offline once downloaded.")
                         .font(.body)
                     VStack(alignment: .leading, spacing: 10) {
                         Label("Storage & download", systemImage: "internaldrive")
                             .font(.headline)
-                        bullet("\(backend.sizeBlurb ?? "A few hundred MB") — a one-time download")
+                        bullet("\(backend.sizeBlurb ?? "A few hundred MB"), a one-time download")
                         bullet("Wi-Fi recommended for the initial download")
                         bullet("Runs on-device afterward; no ongoing network use")
                         bullet("You can delete it anytime to reclaim the space")
                     }
-                    Text("Switching to it later is instant and non-destructive — your other embedders keep their own copies, and Hal fills this one in the background.")
+                    Text("Switching to it later is instant and non-destructive. Your other embedders keep their own copies, and Hal fills this one in the background.")
                         .font(.footnote).foregroundColor(.secondary)
                 }
                 .padding()
@@ -18944,36 +18944,39 @@ enum MaintenanceTasks {
 // PrivacyMonitor.swift
 // Hal Universal
 //
-// The privacy lock indicator's engine and UI. Surfaces - in the chat
-// toolbar - that Hal's inference runs entirely on-device.
+// The privacy lock indicator's engine and UI. Surfaces, in the chat toolbar,
+// whether Hal is currently in a state where data could leave the device, so the
+// user can see it at a glance.
 //
-// EVERY model Hal runs is on-device: local MLX models, and Apple Intelligence
-// via `SystemLanguageModel.default`, which runs strictly on-device and never
-// routes to Apple's Private Cloud Compute. PCC is reachable only by explicitly
-// instantiating `PrivateCloudComputeLanguageModel` (a WWDC26 addition), which
-// Hal does NOT use. (Corrected 2026-07-18 after verifying against Apple's WWDC26
-// Foundation Models sessions — the earlier "AFM + network → cloud possible"
-// assumption was wrong; `SystemLanguageModel.default` does not self-route to PCC.)
+// THE HONEST LINE (Mark, 2026-07-19): a LOCAL MLX model runs entirely on the
+// device. Nothing you type, and nothing Hal generates, ever leaves it. Apple
+// Intelligence is Apple's own system, and only Apple decides when things are
+// processed in the cloud, so while the device is online we CANNOT guarantee an
+// Apple Intelligence request stays on-device. We don't assert that it IS sent to
+// the cloud, only that it's possible, and we can't guarantee it isn't.
 //
-// So the indicator reads on-device. The network monitor + truth table are kept
-// so that IF a cloud-capable model source is ever added (e.g. an opt-in PCC
-// model), the indicator unlocks correctly for it.
+// So the lock is CLOSED (private) on a local model, or with no network, and OPEN
+// (cloud possible) on Apple Intelligence with a network available.
+// (This reverts a 2026-07-18 change that claimed Apple Intelligence is on-device
+// only. That was an unverified inference, not a fact; see HISTORY 2026-07-19.
+// Apple's documentation is incomplete on the point, so we hold the conservative
+// line rather than claim certainty we don't have.)
 //
 // Three pieces live here:
-//   1. `PrivacyMonitor` - an ObservableObject wrapping `NWPathMonitor`. Its
-//      only published state is `isNetworkAvailable`. It defaults to `false`
-//      (locked-is-the-safe-default) until the first network path arrives,
-//      then flips within ~1s of any change.
-//   2. `PrivacyMonitor.isLocked(...)` - a PURE, testable function holding the
-//      lock/unlock truth table. Kept free of catalog/UI dependencies so the
-//      logic can be reasoned about (and unit-tested) in isolation; the caller
-//      resolves salon seat sources and passes them in.
-//   3. `PrivacyLockPopover` - the small explain-yourself popover shown on tap.
+//   1. `PrivacyMonitor`, an ObservableObject wrapping `NWPathMonitor`. Its only
+//      published state is `isNetworkAvailable`. It defaults to `false` (locked is
+//      the safe default) until the first network path arrives, then flips within
+//      ~1s of any change.
+//   2. `PrivacyMonitor.isLocked(...)`, a PURE, testable function holding the
+//      lock/unlock truth table. Kept free of catalog/UI dependencies so the logic
+//      can be reasoned about (and unit-tested) in isolation; the caller resolves
+//      salon seat sources and passes them in.
+//   3. `PrivacyLockPopover`, the small explain-yourself popover shown on tap.
 //
-// The glyph itself (lock / lock.open) and the ToolbarItem live in
-// ChatViews.swift's iOSChatView, computed live from the active model + this
-// monitor's network state + the salon config, so it updates the instant the
-// user switches models or toggles Airplane Mode.
+// The glyph (lock / lock.open) and the ToolbarItem live in ChatViews.swift's
+// iOSChatView, computed live from the active model + this monitor's network state
+// + the salon config, so it updates the instant the user switches models or
+// toggles Airplane Mode.
 
 import SwiftUI
 import Network
@@ -18987,9 +18990,10 @@ final class PrivacyMonitor: ObservableObject {
     static let shared = PrivacyMonitor()
 
     /// True when a usable network path exists (Wi-Fi, cellular, wired, or VPN).
-    /// Retained for the truth table's future cloud-source case; today it does
-    /// not change the lock outcome, since every model Hal runs is on-device.
-    /// Starts `false` (the safe default) until the first `NWPathMonitor` update.
+    /// Drives the lock: with a network up and Apple Intelligence active, we can't
+    /// guarantee on-device processing, so the lock opens. Starts `false` (the safe
+    /// default, locked) until the first `NWPathMonitor` update lands, so we never
+    /// briefly claim "private" before we actually know.
     @Published private(set) var isNetworkAvailable: Bool = false
 
     private let monitor = NWPathMonitor()
@@ -18998,17 +19002,16 @@ final class PrivacyMonitor: ObservableObject {
 
     private init() {}
 
-    /// Begin monitoring. Idempotent — safe to call more than once. Call once
-    /// at app launch (see Hal10000App.init).
+    /// Begin monitoring. Idempotent, safe to call more than once. Call once at app
+    /// launch (see Hal10000App.init).
     func start() {
         guard !started else { return }
         started = true
         monitor.pathUpdateHandler = { [weak self] path in
-            // `.satisfied` means a usable path exists. VPN reports satisfied
-            // (it IS a usable, cloud-capable path — correctly treated as
-            // network-available). `.unsatisfied` / `.requiresConnection`
-            // (Airplane Mode, Wi-Fi up but unreachable, cellular off) → not
-            // available → the lock closes.
+            // `.satisfied` means a usable path exists. VPN reports satisfied (it IS
+            // a usable, cloud-capable path, correctly treated as network-available).
+            // `.unsatisfied` / `.requiresConnection` (Airplane Mode, Wi-Fi up but
+            // unreachable, cellular off) means not available, so the lock closes.
             let available = (path.status == .satisfied)
             DispatchQueue.main.async {
                 guard let self else { return }
@@ -19022,43 +19025,37 @@ final class PrivacyMonitor: ObservableObject {
 
     // MARK: - Lock decision (pure truth table)
 
-    /// The lock/unlock decision, as a pure function of the inputs. See the
-    /// truth table above. `salonSeatSources` is the resolved `ModelSource` of
-    /// each ACTIVE salon seat (the caller looks these up; an unresolvable seat
-    /// is passed as `.appleFoundation`, which is on-device — harmless today,
-    /// since every source Hal has is on-device).
+    /// The lock/unlock decision, as a pure function of the inputs. See the honest
+    /// line at the top of this file. `salonSeatSources` is the resolved
+    /// `ModelSource` of each ACTIVE salon seat (the caller looks these up; an
+    /// unresolvable seat is passed as `.appleFoundation`, the conservative,
+    /// cloud-possible assumption, so we never falsely claim "private").
     ///
-    /// Returns `true` = locked (no data can leave), `false` = unlocked
-    /// (a cloud-capable source is active — not possible today, kept for the
-    /// future-cloud-source case).
+    /// Returns `true` = locked (a local model, or no network, nothing leaves the
+    /// device), `false` = unlocked (Apple Intelligence active with a network up, we
+    /// can't guarantee it stays on-device).
     static func isLocked(
         activeModelSource: ModelSource,
         networkAvailable: Bool,
         salonEnabled: Bool,
         salonSeatSources: [ModelSource]
     ) -> Bool {
-        // No network → nothing can leave the device, whatever the model is.
-        // (Belt-and-suspenders: today every source below is on-device anyway.)
+        // No network means nothing can leave the device, whatever the model is.
         guard networkAvailable else { return true }
 
-        // Salon: locked only if every active seat runs on-device.
+        // Network is up. In a salon, ANY Apple Intelligence seat means we can't
+        // guarantee on-device, so it's locked only if every active seat is a local
+        // model.
         if salonEnabled && !salonSeatSources.isEmpty {
-            return salonSeatSources.allSatisfy(Self.isOnDevice)
+            return salonSeatSources.allSatisfy { $0 == .mlx }
         }
 
         // Single-model path.
-        return Self.isOnDevice(activeModelSource)
-    }
-
-    /// Whether a model source runs entirely on-device. BOTH of Hal's sources do:
-    /// local MLX models, and Apple Intelligence via `SystemLanguageModel.default`,
-    /// which runs strictly on-device and never routes to Private Cloud Compute
-    /// (Hal does not use the opt-in `PrivateCloudComputeLanguageModel`). If a
-    /// cloud-capable source is ever added, return `false` for it here.
-    nonisolated private static func isOnDevice(_ source: ModelSource) -> Bool {
-        switch source {
-        case .mlx, .appleFoundation:
-            return true
+        switch activeModelSource {
+        case .mlx:
+            return true                 // local model, entirely on-device
+        case .appleFoundation:
+            return false                // Apple Intelligence + network, can't guarantee on-device
         }
     }
 
@@ -19068,11 +19065,12 @@ final class PrivacyMonitor: ObservableObject {
 // MARK: - PrivacyLockPopover (tap explanation)
 
 /// The small popover shown when the user taps the lock. Explains the current
-/// state in plain language and offers a one-tap jump to the Model Library.
+/// state in plain language and offers a one-tap jump to the Model Library. The
+/// locked state just reassures; the unlocked state is where the user needs
+/// actionable detail, so that's where the explanation carries weight.
 struct PrivacyLockPopover: View {
     let isLocked: Bool
-    let modelName: String
-    /// Invoked when the user taps "Model Library" — the caller dismisses the
+    /// Invoked when the user taps "Model Library", the caller dismisses the
     /// popover and presents the library.
     let onOpenModelLibrary: () -> Void
 
@@ -19105,11 +19103,9 @@ struct PrivacyLockPopover: View {
 
     private var explanation: String {
         if isLocked {
-            return "Hal is fully on-device right now. The active model (\(modelName)) runs on this device — no request you send and no response you receive leaves it. Apple Intelligence uses Apple's on-device model and does not route to Private Cloud Compute."
+            return "Nothing leaves your device right now."
         } else {
-            // Currently unreachable — Hal runs only on-device models. Kept in
-            // case a cloud-capable model source is ever added.
-            return "A cloud-capable model is active, so some requests may leave this device. To stay fully on-device, pick a downloaded local model from the Model Library or use Apple Intelligence."
+            return "Apple Intelligence is Apple's own system, and only Apple decides when things are processed in the cloud. To guarantee private, on-device-only behavior, choose a local model or shut off all networks."
         }
     }
 }
@@ -28642,8 +28638,7 @@ struct iOSChatView: View {
                     }
                     .popover(isPresented: $showingPrivacyPopover) {
                         PrivacyLockPopover(
-                            isLocked: isPrivacyLocked,
-                            modelName: chatViewModel.selectedModel.displayName
+                            isLocked: isPrivacyLocked
                         ) {
                             // Record intent + dismiss the popover; the actual
                             // Model Library sheet is presented from onDisappear
@@ -28728,14 +28723,14 @@ struct iOSChatView: View {
         chatViewModel.threads.first(where: { $0.id == chatViewModel.conversationId })?.title ?? "Hal"
     }
 
-    /// Whether the privacy lock reads "locked" (no data can leave the device)
-    /// right now. Recomputed on every render from @Published state (the active
-    /// model + salon config), so the toolbar updates the instant the user
-    /// switches models. Every model Hal runs is on-device (see PrivacyMonitor),
-    /// so this is currently always locked; the pure decision lives in
-    /// PrivacyMonitor.isLocked and the structure remains for a future cloud
-    /// source. An unresolvable salon seat falls back to .appleFoundation
-    /// (on-device) — harmless today, since every real source is on-device.
+    /// Whether the privacy lock reads "locked" (nothing leaves the device) right
+    /// now. Recomputed on every render from @Published state (the active model,
+    /// the network monitor, and the salon config), so the toolbar updates the
+    /// instant any of them changes, so the glyph flips live on a model switch or
+    /// an Airplane-Mode toggle. The pure decision lives in PrivacyMonitor.isLocked;
+    /// here we just resolve each active salon seat's source (unknown →
+    /// .appleFoundation, the conservative cloud-possible assumption) and hand it
+    /// the inputs.
     private var isPrivacyLocked: Bool {
         let seatSources = chatViewModel.salonConfig.activeSeats.map { seat in
             ModelCatalogService.shared.getModel(byID: seat.modelID)?.source ?? .appleFoundation
@@ -29551,7 +29546,7 @@ struct CompressionExplanationView: View {
                 if !compressedSegments.isEmpty {
                     Text("Memory condensed")
                         .font(.headline)
-                    Text("The model you're using has a smaller context window than the size of Hal's full memory. To stay honest about everything Hal knows about you, Hal's full memory is preserved in the database — but for this turn it was condensed by the model itself to fit. Open Settings → Power User → Database to see Hal's full memory anytime.")
+                    Text("The model you're using has a smaller context window than the size of Hal's full memory. To stay honest about everything Hal knows about you, Hal's full memory is preserved in the database, but for this turn it was condensed by the model itself to fit. Open Settings → Power User → Database to see Hal's full memory anytime.")
                         .font(.callout)
                         .fixedSize(horizontal: false, vertical: true)
                 }
@@ -29563,7 +29558,7 @@ struct CompressionExplanationView: View {
                     Text("Memory truncated")
                         .font(.headline)
                         .foregroundColor(.red)
-                    Text("The model couldn't condense part of Hal's memory in time (the LLM was unavailable, took too long, or the condensed result didn't pass verification). For this turn, that part was cut at the budget limit rather than intelligently distilled. Hal's full memory is preserved in the database — this only affects what the model saw for this single turn.")
+                    Text("The model couldn't condense part of Hal's memory in time (the LLM was unavailable, took too long, or the condensed result didn't pass verification). For this turn, that part was cut at the budget limit rather than intelligently distilled. Hal's full memory is preserved in the database. This only affects what the model saw for this single turn.")
                         .font(.callout)
                         .fixedSize(horizontal: false, vertical: true)
                 }
@@ -29908,10 +29903,10 @@ struct AboutView: View {
     let acknowledgements: [Acknowledgement]
 
     private var version: String {
-        Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "—"
+        Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "?"
     }
     private var build: String {
-        Bundle.main.infoDictionary?["CFBundleVersion"] as? String ?? "—"
+        Bundle.main.infoDictionary?["CFBundleVersion"] as? String ?? "?"
     }
 
     /// Grouped by license so identical terms sit together (all the MIT projects,
@@ -29994,7 +29989,7 @@ struct AboutView: View {
                 } header: {
                     Text("Models in use")
                 } footer: {
-                    Text("The models \(appName) is actually running right now, and the terms they're used under. A model that's installed but not selected doesn't appear here — it isn't being used, so its terms don't apply. You accepted each model's license when you downloaded it.")
+                    Text("The models \(appName) is actually running right now, and the terms they're used under. A model that's installed but not selected doesn't appear here, it isn't being used, so its terms don't apply. You accepted each model's license when you downloaded it.")
                 }
             }
 
@@ -30296,7 +30291,7 @@ private func halActiveModels(chatViewModel: ChatViewModel) -> [ModelCredit] {
     if model.source == .appleFoundation {
         credits.append(ModelCredit(
             name: model.displayName,
-            terms: "Apple Foundation Models — built into iOS/macOS, no separate license",
+            terms: "Apple Foundation Models, built into iOS/macOS, no separate license",
             attribution: nil, url: nil))
     } else {
         credits.append(ModelCredit(
@@ -30311,7 +30306,7 @@ private func halActiveModels(chatViewModel: ChatViewModel) -> [ModelCredit] {
     case .nlContextual:
         credits.append(ModelCredit(
             name: "Apple NLContextual Embedding",
-            terms: "Apple Natural Language — built into iOS/macOS, no separate license",
+            terms: "Apple Natural Language, built into iOS/macOS, no separate license",
             attribution: nil, url: nil))
     case .nomicSwift:
         credits.append(ModelCredit(

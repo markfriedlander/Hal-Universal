@@ -291,7 +291,7 @@ struct EmbedderBackendRow: View {
             }
             Button("Cancel", role: .cancel) {}
         } message: {
-            Text("Nothing is deleted — each embedder keeps its own copy of your memory vectors, so you can switch back instantly. Hal will fill in \(backend.displayName)'s vectors in the background; that can take a few minutes depending on your memory size, during which some older memories rely on keyword search until they're ready.")
+            Text("Nothing is deleted. Each embedder keeps its own copy of your memory vectors, so you can switch back instantly. Hal will fill in \(backend.displayName)'s vectors in the background; that can take a few minutes depending on your memory size, during which some older memories rely on keyword search until they're ready.")
         }
         // Pre-download disclosure (aligned with the LLM Download flow). Records
         // intent on continue + dismisses; the download starts in onDismiss once
@@ -439,17 +439,17 @@ struct EmbedderDownloadDisclosureSheet: View {
                         Text("Optional memory-search model")
                             .font(.subheadline).foregroundColor(.secondary)
                     }
-                    Text("This embedder improves how Hal searches your memory. It runs entirely on your iPhone — nothing you store or ask leaves the device — and works offline once downloaded.")
+                    Text("This embedder improves how Hal searches your memory. It runs entirely on your iPhone (nothing you store or ask leaves the device) and works offline once downloaded.")
                         .font(.body)
                     VStack(alignment: .leading, spacing: 10) {
                         Label("Storage & download", systemImage: "internaldrive")
                             .font(.headline)
-                        bullet("\(backend.sizeBlurb ?? "A few hundred MB") — a one-time download")
+                        bullet("\(backend.sizeBlurb ?? "A few hundred MB"), a one-time download")
                         bullet("Wi-Fi recommended for the initial download")
                         bullet("Runs on-device afterward; no ongoing network use")
                         bullet("You can delete it anytime to reclaim the space")
                     }
-                    Text("Switching to it later is instant and non-destructive — your other embedders keep their own copies, and Hal fills this one in the background.")
+                    Text("Switching to it later is instant and non-destructive. Your other embedders keep their own copies, and Hal fills this one in the background.")
                         .font(.footnote).foregroundColor(.secondary)
                 }
                 .padding()

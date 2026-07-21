@@ -324,8 +324,7 @@ struct iOSChatView: View {
                     }
                     .popover(isPresented: $showingPrivacyPopover) {
                         PrivacyLockPopover(
-                            isLocked: isPrivacyLocked,
-                            modelName: chatViewModel.selectedModel.displayName
+                            isLocked: isPrivacyLocked
                         ) {
                             // Record intent + dismiss the popover; the actual
                             // Model Library sheet is presented from onDisappear
@@ -410,14 +409,14 @@ struct iOSChatView: View {
         chatViewModel.threads.first(where: { $0.id == chatViewModel.conversationId })?.title ?? "Hal"
     }
 
-    /// Whether the privacy lock reads "locked" (no data can leave the device)
-    /// right now. Recomputed on every render from @Published state (the active
-    /// model + salon config), so the toolbar updates the instant the user
-    /// switches models. Every model Hal runs is on-device (see PrivacyMonitor),
-    /// so this is currently always locked; the pure decision lives in
-    /// PrivacyMonitor.isLocked and the structure remains for a future cloud
-    /// source. An unresolvable salon seat falls back to .appleFoundation
-    /// (on-device) — harmless today, since every real source is on-device.
+    /// Whether the privacy lock reads "locked" (nothing leaves the device) right
+    /// now. Recomputed on every render from @Published state (the active model,
+    /// the network monitor, and the salon config), so the toolbar updates the
+    /// instant any of them changes, so the glyph flips live on a model switch or
+    /// an Airplane-Mode toggle. The pure decision lives in PrivacyMonitor.isLocked;
+    /// here we just resolve each active salon seat's source (unknown →
+    /// .appleFoundation, the conservative cloud-possible assumption) and hand it
+    /// the inputs.
     private var isPrivacyLocked: Bool {
         let seatSources = chatViewModel.salonConfig.activeSeats.map { seat in
             ModelCatalogService.shared.getModel(byID: seat.modelID)?.source ?? .appleFoundation
@@ -1233,7 +1232,7 @@ struct CompressionExplanationView: View {
                 if !compressedSegments.isEmpty {
                     Text("Memory condensed")
                         .font(.headline)
-                    Text("The model you're using has a smaller context window than the size of Hal's full memory. To stay honest about everything Hal knows about you, Hal's full memory is preserved in the database — but for this turn it was condensed by the model itself to fit. Open Settings → Power User → Database to see Hal's full memory anytime.")
+                    Text("The model you're using has a smaller context window than the size of Hal's full memory. To stay honest about everything Hal knows about you, Hal's full memory is preserved in the database, but for this turn it was condensed by the model itself to fit. Open Settings → Power User → Database to see Hal's full memory anytime.")
                         .font(.callout)
                         .fixedSize(horizontal: false, vertical: true)
                 }
@@ -1245,7 +1244,7 @@ struct CompressionExplanationView: View {
                     Text("Memory truncated")
                         .font(.headline)
                         .foregroundColor(.red)
-                    Text("The model couldn't condense part of Hal's memory in time (the LLM was unavailable, took too long, or the condensed result didn't pass verification). For this turn, that part was cut at the budget limit rather than intelligently distilled. Hal's full memory is preserved in the database — this only affects what the model saw for this single turn.")
+                    Text("The model couldn't condense part of Hal's memory in time (the LLM was unavailable, took too long, or the condensed result didn't pass verification). For this turn, that part was cut at the budget limit rather than intelligently distilled. Hal's full memory is preserved in the database. This only affects what the model saw for this single turn.")
                         .font(.callout)
                         .fixedSize(horizontal: false, vertical: true)
                 }
