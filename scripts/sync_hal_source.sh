@@ -40,6 +40,7 @@ FILES=(
   "Hal Universal/SettingsViews.swift"
   "Hal Universal/ChatViews.swift"
   "Hal Universal/About.swift"
+  "Hal Universal/ThermalGovernor.swift"
 )
 
 OUT="Hal Universal/Hal_Source.txt"

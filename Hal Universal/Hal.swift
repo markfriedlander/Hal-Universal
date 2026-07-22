@@ -112,6 +112,9 @@
 //  About.swift
 //   60  About (Open-Source Licenses & Acknowledgements)
 //
+//  ThermalGovernor.swift
+//   61  ThermalGovernor (Proactive Thermal Pacing)
+//
 import SwiftUI
 import Foundation
 import Combine
@@ -259,8 +262,22 @@ final class ReasoningTuning: @unchecked Sendable {
     var topPOverride: Float? = nil
     var topKOverride: Int? = nil
     var presencePenaltyOverride: Float? = nil
+    /// Overrides the generation output-token budget (the hammer's cap). nil =
+    /// default 4096. Set small (e.g. 150 / 600) to BOUND a reasoning phase: a
+    /// runaway then stops at the budget instead of growing its KV cache to the
+    /// jetsam cliff, and it always leaves a capturable partial. Applied to EVERY
+    /// MLX turn (not only reasoning turns) so the model-agnostic two-phase
+    /// synthetic-reasoning harness can bound any model. See the reasoning memo.
+    var maxOutputTokensOverride: Int? = nil
     /// Skip ALL memory / RAG / self-knowledge injection for a clean footprint.
     var memoryIsolation: Bool = false
+
+    /// DEBUG/experiment switch for the proactive ThermalGovernor (Block 61).
+    /// true = pace generation as usual; false = `pace()` is a no-op, so a run
+    /// gets a true NO-pacing baseline. Set via the SET_THERMAL_PACING API verb.
+    /// Default true (production always paces); only the thermal A/B experiment
+    /// turns it off to measure what pacing buys.
+    var thermalPacingEnabled: Bool = true
 
     // Raw reasoning capture buffer. The generator appends EVERY streamed
     // chunk here as it arrives (generateChatStream), so the complete raw
@@ -5556,25 +5573,34 @@ class MLXWrapper: ObservableObject {
                     let settings: ModelSettings = enableThinking
                         ? (self.currentModelConfig?.reasoningSettings.map { baseSettings.merged(with: $0) } ?? baseSettings)
                         : baseSettings
-                    // Reasoning turns may override the repetition penalty via the
-                    // tuning harness (ReasoningTuning); else use the effective setting.
-                    let reasoningPenaltyOverride: Float? = enableThinking ? ReasoningTuning.shared.repetitionPenalty.map { Float($0) } : nil
-                    let modelPenalty = reasoningPenaltyOverride ?? settings.repetitionPenalty
+                    // The live tuning overrides (ReasoningTuning) reach NORMAL
+                    // (non-reasoning) turns only in DEBUG, so the harness can sweep
+                    // regular chat. RELEASE builds keep the pristine reasoning-only
+                    // path: overrides can never touch a normal user's chat, even with
+                    // the Developer API on. (Overrides are nil in production anyway;
+                    // the DEBUG gate makes that guarantee structural, not incidental.)
+                    #if DEBUG
+                    let overridesApplyHere = true
+                    #else
+                    let overridesApplyHere = enableThinking
+                    #endif
+                    // Repetition penalty: override (when it applies here) else the
+                    // effective per-model setting.
+                    let penaltyOverride: Float? = overridesApplyHere ? ReasoningTuning.shared.repetitionPenalty.map { Float($0) } : nil
+                    let modelPenalty = penaltyOverride ?? settings.repetitionPenalty
                     let modelPenaltyCtx = settings.repetitionContextSize ?? 20
-                    // Temperature: a reasoning turn prefers the effective reasoning
-                    // temperature (Qwen thinking-text = 1.0, bounded by top_k/top_p);
-                    // otherwise the caller's temperature. (The old hardcoded 0.6
-                    // reasoning override in the stream consumers is removed.)
-                    // Live sweep overrides (ReasoningTuning) win on reasoning turns so
-                    // the harness can tune the sampler without a rebuild; else the
-                    // model's effective reasoningSettings; else the mlx default.
-                    let effectiveTemperature = enableThinking
-                        ? (ReasoningTuning.shared.temperatureOverride ?? settings.temperature ?? temperature)
-                        : temperature
-                    let modelTopP = (enableThinking ? ReasoningTuning.shared.topPOverride : nil) ?? settings.topP ?? 1.0
-                    let modelTopK = (enableThinking ? ReasoningTuning.shared.topKOverride : nil) ?? settings.topK ?? 0
+                    // Sampler resolution for every knob: live tuning override (only
+                    // when `overridesApplyHere` — always in DEBUG, reasoning-turns-only
+                    // in RELEASE) → per-model effective setting → mlx default. Reasoning
+                    // turns use the effective reasoning temperature (reasoningSettings
+                    // merged over defaults); normal turns use the caller's temperature.
+                    // The old hardcoded 0.6 reasoning temperature override is removed.
+                    let effectiveTemperature = (overridesApplyHere ? ReasoningTuning.shared.temperatureOverride : nil)
+                        ?? (enableThinking ? (settings.temperature ?? temperature) : temperature)
+                    let modelTopP = (overridesApplyHere ? ReasoningTuning.shared.topPOverride : nil) ?? settings.topP ?? 1.0
+                    let modelTopK = (overridesApplyHere ? ReasoningTuning.shared.topKOverride : nil) ?? settings.topK ?? 0
                     let modelMinP = settings.minP ?? 0.0
-                    let modelPresencePenalty = (enableThinking ? ReasoningTuning.shared.presencePenaltyOverride : nil) ?? settings.presencePenalty
+                    let modelPresencePenalty = (overridesApplyHere ? ReasoningTuning.shared.presencePenaltyOverride : nil) ?? settings.presencePenalty
                     halLog("HALDEBUG-MLX-CHAT: Sampler for \(self.currentModelConfig?.displayName ?? "unknown") [\(enableThinking ? "reasoning" : "normal")]: temp=\(String(format: "%.2f", effectiveTemperature)) topP=\(modelTopP) topK=\(modelTopK) minP=\(modelMinP) repPen=\(modelPenalty.map { String($0) } ?? "nil") presPen=\(modelPresencePenalty.map { String($0) } ?? "nil")")
                     // Token budget. Per Mark's clarification (May 13 evening):
                     // this is a *runaway* safeguard, not a normal-response
@@ -5603,7 +5629,11 @@ class MLXWrapper: ObservableObject {
                     // (2026-07-13). 4096 bounds generation-KV growth; the tuning
                     // levers (temperature / rep-penalty / Layer-0 directive) are
                     // what stop the loop, not a bigger budget.
-                    let maxOutputTokens = 4096
+                    //
+                    // The two-phase synthetic-reasoning harness (and, ultimately,
+                    // the production hammer) sets a SMALL override here to bound
+                    // the thinking phase deterministically. nil = the 4096 default.
+                    let maxOutputTokens = ReasoningTuning.shared.maxOutputTokensOverride ?? 4096
                     // Per-model KV cache quantization (Item 11 follow-up,
                     // 2026-05-18 evening). When the model config sets
                     // `kvCacheQuantizationBits` (e.g. 4 for Gemma 4 E2B),
@@ -5674,6 +5704,23 @@ class MLXWrapper: ObservableObject {
                                     stoppedForRepetition = true
                                     break streamLoop
                                 }
+                            }
+
+                            // Proactive thermal pacing (Block 61 ThermalGovernor).
+                            // ALL generation heats the GPU/ANE; a long or heavy
+                            // conversation is many back-to-back generations, and that
+                            // sustained load is what drives the device toward thermal
+                            // throttling. A small yield between chunks keeps any
+                            // generation from pegging at a 100% duty cycle. The yield
+                            // scales with thermal pressure (near-no-op when cool) and
+                            // honors Task cancellation, so a user stop is never held
+                            // behind a cooldown. Cadence is per-chunk for now;
+                            // device-tune if it costs too much throughput. The
+                            // SET_THERMAL_PACING off-switch is read HERE (this
+                            // isolation), not inside the governor actor, so we
+                            // never reach across into ReasoningTuning cross-actor.
+                            if ReasoningTuning.shared.thermalPacingEnabled {
+                                await ThermalGovernor.shared.pace()
                             }
                         case .info(let info):
                             halLog("HALDEBUG-MLX-CHAT: Generation complete: \(info.generationTokenCount) tokens at \(String(format: "%.1f", info.tokensPerSecond)) tok/s")
@@ -9341,6 +9388,14 @@ class ChatViewModel: ObservableObject {
     
     // Model state observer for download completions
     private var modelStateObserver: AnyCancellable?
+    /// Watches the device thermal state so Hal can note it IN THE THREAD, in his
+    /// own voice (the way he narrates any other change), when he is genuinely hot,
+    /// and again when he cools. `lastThermalLevel` de-dupes to crossings, so he
+    /// speaks once per transition, not on every OS thermal tick. Same reading the
+    /// ThermalGovernor (Block 61) paces on. Toast chrome was rejected: Hal talks
+    /// in the thread, so this does too.
+    private var thermalObserver: AnyCancellable?
+    private var lastThermalLevel: Int = ProcessInfo.processInfo.thermalState.rawValue
 
     // NEW: Full RAG context for metadata storage (populated during buildPromptHistory)
     @Published var fullRAGContext: [UnifiedSearchResult] = []
@@ -9406,7 +9461,14 @@ class ChatViewModel: ObservableObject {
     /// this in init() means every launch overrides whatever was
     /// persisted previously, so a fresh install/reinstall always boots
     /// with the antenna in the dev-friendly default state.
-    private static let kLocalAPIEnabledOnLaunch: Bool = false  // Production default: API antenna OFF at launch (opt-in via Settings). Flip to true only for local device testing; revert before commit/ship.
+    // Build-gated so it can NEVER ship on: DEBUG (every dev/device install) boots
+    // with the antenna ON so the test harness always connects; the Release /
+    // App Store build compiles the `false` branch. No manual revert, ever.
+    #if DEBUG
+    private static let kLocalAPIEnabledOnLaunch: Bool = true
+    #else
+    private static let kLocalAPIEnabledOnLaunch: Bool = false  // Release: antenna OFF at launch (opt-in via Settings).
+    #endif
 
     init() {
         // STEP 0: Apply launch-time default for the Local API antenna.
@@ -9558,7 +9620,17 @@ class ChatViewModel: ObservableObject {
                 self?.objectWillChange.send()
                 print("HALDEBUG-MODEL: Model state changed, refreshed catalog")
             }
-        
+
+        // Thermal narration: Hal notes it IN THE THREAD when he crosses into
+        // genuinely-hot territory (serious/critical), and again when he cools. A
+        // crossing, not a level, so he speaks once per transition. Same reading
+        // the ThermalGovernor (Block 61) paces on.
+        self.thermalObserver = NotificationCenter.default.publisher(for: ProcessInfo.thermalStateDidChangeNotification)
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] _ in
+                self?.handleThermalStateChange()
+            }
+
         // LLMService is already initialized with the correct model via LLMService(model: initialModel) above.
         // Do NOT call setupLLM here again -- selectedModel computed property falls back to AFM
         // when the catalog is cold at launch, which would override the correct initial model.
@@ -9748,7 +9820,57 @@ class ChatViewModel: ObservableObject {
             }
         }
     }
-    
+
+    /// React to an OS thermal-state change. Narrates only CROSSINGS (into hot, or
+    /// back to cool), so Hal speaks once per transition rather than on every tick.
+    /// Runs on the main thread (the observer is `.receive(on: .main)`).
+    private func handleThermalStateChange() {
+        let level = ProcessInfo.processInfo.thermalState.rawValue
+        let previous = lastThermalLevel
+        lastThermalLevel = level
+        guard level != previous else { return }
+        if level >= 2 && previous < 2 {
+            // Crossed from cool/warm straight into serious (or critical).
+            injectThermalNotice(level >= 3
+                ? "I'm getting quite hot right now, so I'm going to pause for a moment to cool down."
+                : "I'm running a little warm, so I'm going to slow down for a moment.")
+        } else if level >= 3 && previous == 2 {
+            // Serious escalated to critical.
+            injectThermalNotice("I'm getting quite hot now, so I'm pausing for a moment to cool down.")
+        } else if level < 2 && previous >= 2 {
+            // Cooled back below serious.
+            injectThermalNotice("Cooled back down. I'm at full speed again.")
+        }
+    }
+
+    /// Inject a single Hal-voiced message into the thread (no paired user turn,
+    /// since heat isn't user-initiated). Mirrors `injectSettingsChangeDialogue`'s
+    /// Hal half: appended to `messages` and stored as a `systemEvent` artifact so
+    /// it persists like anything else Hal says.
+    private func injectThermalNotice(_ halResponse: String) {
+        Task { @MainActor in
+            let currentTurn = memoryStore.getCurrentTurnNumber(conversationId: conversationId) + 1
+            let halMsg = ChatMessage(
+                content: halResponse,
+                isFromUser: false,
+                timestamp: Date(),
+                recordedByModel: selectedModel.id,
+                turnNumber: currentTurn
+            )
+            self.messages.append(halMsg)
+            self.memoryStore.storeConversationArtifact(
+                conversationId: self.conversationId,
+                artifactType: "systemEvent",
+                turnNumber: currentTurn,
+                deliberationRound: 1,
+                seatNumber: nil,
+                content: halResponse,
+                modelId: self.selectedModel.id
+            )
+            print("HALDEBUG-THERMAL: injected in-thread notice: \(halResponse)")
+        }
+    }
+
     /// Processes all pending settings changes and injects consolidated dialogue
     func processAllSettingsChanges() {
         guard !pendingSettingsChanges.isEmpty else {

@@ -644,6 +644,21 @@ class HalTestConsole: ObservableObject {
             }
             return "{\"status\":\"error\",\"message\":\"SET_TOP_K: must be 0–500 or default\"}"
 
+        } else if trimmed.hasPrefix("SET_MAX_OUTPUT_TOKENS:") {
+            // Tuning: override the generation output-token budget (the hammer's
+            // cap). "default" clears it (back to 4096). A small value bounds a
+            // reasoning phase so a runaway stops at the budget and always leaves
+            // a capturable partial. Applied to every MLX turn.
+            let val = String(trimmed.dropFirst("SET_MAX_OUTPUT_TOKENS:".count)).trimmingCharacters(in: .whitespaces).lowercased()
+            if val == "default" || val == "nil" {
+                ReasoningTuning.shared.maxOutputTokensOverride = nil
+                return "{\"status\":\"ok\",\"maxOutputTokens\":null}"
+            }
+            if let i = Int(val), i >= 16, i <= 8192 {
+                ReasoningTuning.shared.maxOutputTokensOverride = i
+                return "{\"status\":\"ok\",\"maxOutputTokens\":\(i)}"
+            }
+            return "{\"status\":\"error\",\"message\":\"SET_MAX_OUTPUT_TOKENS: must be 16-8192 or default\"}"
         } else if trimmed.hasPrefix("SET_PRESENCE_PENALTY:") {
             // Tuning: override reasoning presence penalty (Qwen's anti-loop lever,
             // 0–2). "default" clears it.
@@ -676,6 +691,37 @@ class HalTestConsole: ObservableObject {
             // fully inspectable. Readable mid-generation.
             let raw = ReasoningTuning.shared.rawStream
             return "{\"status\":\"ok\",\"chars\":\(raw.count),\"stream\":\"\(jsonStringEscape(raw))\"}"
+
+        } else if trimmed == "GET_THERMAL_STATE" {
+            // Diagnostic: the device's current thermal pressure, straight from
+            // ProcessInfo. Lets an external sweep pace itself off the REAL
+            // thermal state instead of a wall clock, and is the same reading
+            // the user-facing "I'm running hot, let me slow down" behavior
+            // will draw on later. nominal → fair → serious → critical.
+            let state = ProcessInfo.processInfo.thermalState
+            let name: String
+            switch state {
+            case .nominal:  name = "nominal"
+            case .fair:     name = "fair"
+            case .serious:  name = "serious"
+            case .critical: name = "critical"
+            @unknown default: name = "unknown"
+            }
+            return "{\"status\":\"ok\",\"thermalState\":\"\(name)\",\"level\":\(state.rawValue)}"
+
+        } else if trimmed.hasPrefix("SET_THERMAL_PACING:") {
+            // Experiment/DEBUG: turn the proactive ThermalGovernor (Block 61) on or
+            // off so a run can capture a true NO-pacing thermal baseline. Production
+            // leaves it on. Mirrors SET_MEMORY_ISOLATION's on/off parsing.
+            let val = String(trimmed.dropFirst("SET_THERMAL_PACING:".count)).trimmingCharacters(in: .whitespaces).lowercased()
+            if val == "on" || val == "true" || val == "1" {
+                ReasoningTuning.shared.thermalPacingEnabled = true
+                return "{\"status\":\"ok\",\"thermalPacing\":true}"
+            } else if val == "off" || val == "false" || val == "0" {
+                ReasoningTuning.shared.thermalPacingEnabled = false
+                return "{\"status\":\"ok\",\"thermalPacing\":false}"
+            }
+            return "{\"status\":\"error\",\"message\":\"SET_THERMAL_PACING: must be on/off\"}"
 
         } else if trimmed.hasPrefix("SET_SELF_KNOWLEDGE:") {
             let valStr = String(trimmed.dropFirst("SET_SELF_KNOWLEDGE:".count)).trimmingCharacters(in: .whitespaces).lowercased()
@@ -2174,7 +2220,8 @@ class HalTestConsole: ObservableObject {
 //                     SET_SIMILARITY_THRESHOLD:<f>, SET_MAX_RAG_CHARS:<n>, SET_RAG_DEDUP:<f>,
 //                     SET_SYSTEM_PROMPT:<text>, SET_SYSTEM_PROMPT_STORED:<text>,
 //                     CLEAR_SYSTEM_PROMPT, RESET_SETTINGS
-//   Info:             GET_STATE, CURRENT_MODEL, LIST_MODELS, MODEL_STATUS:<id>
+//   Info:             GET_STATE, CURRENT_MODEL, LIST_MODELS, MODEL_STATUS:<id>,
+//                     GET_THERMAL_STATE (nominal/fair/serious/critical + level)
 //
 // Enable: Settings → Power User → Developer API toggle (default OFF).
 // Setup:  python3 tests/hal_test.py setup <ip> 8766 <token>
