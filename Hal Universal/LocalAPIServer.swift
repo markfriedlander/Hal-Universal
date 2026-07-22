@@ -2020,10 +2020,21 @@ class HalTestConsole: ObservableObject {
                 truncated = false
             }
             let content = jsonStringEscape(rawContent)
+            // Phase-1 reasoning (the collapsible "Thinking" panel). Never persisted
+            // to memory/RAG, so it lives only on the in-memory message — expose it
+            // here so an API consumer can read BOTH phases of a two-phase turn.
+            // Honors the same truncation cap as content; null when absent.
+            let thinkingJSON: String
+            if let t = m.thinking, !t.isEmpty {
+                let rawT = truncateChars.map { String(t.prefix($0)) } ?? t
+                thinkingJSON = "\"\(jsonStringEscape(rawT))\""
+            } else {
+                thinkingJSON = "null"
+            }
             let ts = Int(m.timestamp.timeIntervalSince1970)
             let recBy = jsonStringEscape(m.recordedByModel)
             return """
-            {"id":"\(m.id.uuidString)","role":"\(role)","content":"\(content)","truncated":\(truncated),"timestamp":\(ts),"isPartial":\(m.isPartial),"recordedByModel":"\(recBy)","turnNumber":\(m.turnNumber)}
+            {"id":"\(m.id.uuidString)","role":"\(role)","content":"\(content)","thinking":\(thinkingJSON),"truncated":\(truncated),"timestamp":\(ts),"isPartial":\(m.isPartial),"recordedByModel":"\(recBy)","turnNumber":\(m.turnNumber)}
             """
         }.joined(separator: ",")
         return """
