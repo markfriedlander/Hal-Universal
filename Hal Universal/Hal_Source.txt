@@ -5470,7 +5470,7 @@ class MLXWrapper: ObservableObject {
     /// model chunk, so callers can update UI in real time. The final yield
     /// is the complete trimmed response; stream then finishes. Errors are
     /// thrown via the stream's failure path.
-    func generateChatStream(messages: [HalChatMessage], temperature: Double = 0.7, reasoningActive: Bool = false) -> AsyncThrowingStream<String, Error> {
+    func generateChatStream(messages: [HalChatMessage], temperature: Double = 0.7, maxTokens: Int? = nil) -> AsyncThrowingStream<String, Error> {
         AsyncThrowingStream { continuation in
             Task {
                 guard isModelLoaded, let container = self.modelContainer else {
@@ -5492,31 +5492,20 @@ class MLXWrapper: ObservableObject {
                         }
                     }
 
-                    // additionalContext matches Apple's LLMEval reference pattern.
-                    // Some chat templates (Qwen3, possibly Gemma 4) consult
-                    // enable_thinking in the template's Jinja logic; when missing,
-                    // the template can take a branch that produces only internal
-                    // reasoning and no visible output.
                     MLX.seed(UInt64(Date.timeIntervalSinceReferenceDate * 1000))
 
-                    // Reasoning models (chat template honors enable_thinking and
-                    // emits <think>…</think>, e.g. Qwen 3.5 2B) get the thinking
-                    // branch turned ON; the streamed output is split on the closing
-                    // </think> downstream into the thinking panel vs the visible
-                    // answer. Non-reasoning models leave the flag false (no-op for
-                    // their templates). Gated on the model's isReasoningModel flag.
-                    // See Docs/Think_Tokens_Reasoning_Transparency.md.
-                    // Gated on BOTH the user's per-turn reasoning toggle
-                    // (reasoningActive, threaded from the ViewModel) AND the
-                    // model's intrinsic capability, so a reasoning model only
-                    // thinks when the user has actually asked to see it.
-                    let enableThinking = reasoningActive && (self.currentModelConfig?.isReasoningModel == true)
-                    if enableThinking {
-                        halLog("HALDEBUG-THINK: enable_thinking=true for \(self.currentModelConfig?.displayName ?? "?")")
-                    }
+                    // Native <think> mode was removed 2026-07-22 in favor of the
+                    // model-agnostic two-phase reasoning orchestrated in the ViewModel
+                    // (see HalReasoning). We now ALWAYS ask the chat template for its
+                    // non-thinking branch: enable_thinking=false so a Qwen-style
+                    // template emits plain text (no <think>…</think>) for BOTH the
+                    // reason pass and the answer pass. The visible "thinking" is phase
+                    // 1's normal output, streamed into the panel by the ViewModel.
+                    // Passing the key still matters: some templates (Qwen3, possibly
+                    // Gemma 4) take a no-visible-output branch when it's absent.
                     let userInput = UserInput(
                         chat: chatMessages,
-                        additionalContext: ["enable_thinking": enableThinking]
+                        additionalContext: ["enable_thinking": false]
                     )
                     let lmInput = try await container.prepare(input: userInput)
                     let promptTokenCount = lmInput.text.tokens.size
@@ -5564,45 +5553,40 @@ class MLXWrapper: ObservableObject {
                     // Phi-4 baseline investigation. A subsequent increment will
                     // route through ModelSettingsStore.effectiveSettings(for:) to
                     // honor any user override; for now we read defaults directly.
-                    // Effective per-model settings. Reasoning turns merge the
-                    // model's reasoningSettings OVER defaultSettings (thinking and
-                    // non-thinking want different samplers — Qwen ships separate
-                    // recipes); non-reasoning turns use defaultSettings as-is. The
-                    // new sampler fields are nil until a model is seeded, so this
-                    // is a no-op for un-seeded models. See the reasoning memo.
-                    let baseSettings = self.currentModelConfig?.defaultSettings ?? ModelSettings()
-                    let settings: ModelSettings = enableThinking
-                        ? (self.currentModelConfig?.reasoningSettings.map { baseSettings.merged(with: $0) } ?? baseSettings)
-                        : baseSettings
-                    // The live tuning overrides (ReasoningTuning) reach NORMAL
-                    // (non-reasoning) turns only in DEBUG, so the harness can sweep
-                    // regular chat. RELEASE builds keep the pristine reasoning-only
-                    // path: overrides can never touch a normal user's chat, even with
-                    // the Developer API on. (Overrides are nil in production anyway;
-                    // the DEBUG gate makes that guarantee structural, not incidental.)
+                    // Effective per-model settings. One sampler per model for BOTH
+                    // phases (Mark's 2026-07-21 decision: one temperature per model,
+                    // no phase split; stop chasing per-model reasoning recipes). The
+                    // model's reasoningSettings are intentionally NOT merged in here.
+                    let settings = self.currentModelConfig?.defaultSettings ?? ModelSettings()
+                    // The live tuning overrides (ReasoningTuning) exist only for the
+                    // test harness and apply ONLY in DEBUG builds — computed directly
+                    // per build config so there is no constant-condition ternary (and
+                    // thus no dead-branch warning). In RELEASE every override is nil,
+                    // so the per-model `settings` are the sole source: no override can
+                    // touch a real user's chat, even with the Developer API on.
                     #if DEBUG
-                    let overridesApplyHere = true
+                    let penaltyOverride = ReasoningTuning.shared.repetitionPenalty.map { Float($0) }
+                    let tempOverride = ReasoningTuning.shared.temperatureOverride
+                    let topPOverride = ReasoningTuning.shared.topPOverride
+                    let topKOverride = ReasoningTuning.shared.topKOverride
+                    let presenceOverride = ReasoningTuning.shared.presencePenaltyOverride
                     #else
-                    let overridesApplyHere = enableThinking
+                    let penaltyOverride: Float? = nil
+                    let tempOverride: Double? = nil
+                    let topPOverride: Float? = nil
+                    let topKOverride: Int? = nil
+                    let presenceOverride: Float? = nil
                     #endif
-                    // Repetition penalty: override (when it applies here) else the
-                    // effective per-model setting.
-                    let penaltyOverride: Float? = overridesApplyHere ? ReasoningTuning.shared.repetitionPenalty.map { Float($0) } : nil
                     let modelPenalty = penaltyOverride ?? settings.repetitionPenalty
                     let modelPenaltyCtx = settings.repetitionContextSize ?? 20
-                    // Sampler resolution for every knob: live tuning override (only
-                    // when `overridesApplyHere` — always in DEBUG, reasoning-turns-only
-                    // in RELEASE) → per-model effective setting → mlx default. Reasoning
-                    // turns use the effective reasoning temperature (reasoningSettings
-                    // merged over defaults); normal turns use the caller's temperature.
-                    // The old hardcoded 0.6 reasoning temperature override is removed.
-                    let effectiveTemperature = (overridesApplyHere ? ReasoningTuning.shared.temperatureOverride : nil)
-                        ?? (enableThinking ? (settings.temperature ?? temperature) : temperature)
-                    let modelTopP = (overridesApplyHere ? ReasoningTuning.shared.topPOverride : nil) ?? settings.topP ?? 1.0
-                    let modelTopK = (overridesApplyHere ? ReasoningTuning.shared.topKOverride : nil) ?? settings.topK ?? 0
+                    // One temperature per model for both phases; the model's setting
+                    // wins over the caller's default when present.
+                    let effectiveTemperature = tempOverride ?? settings.temperature ?? temperature
+                    let modelTopP = topPOverride ?? settings.topP ?? 1.0
+                    let modelTopK = topKOverride ?? settings.topK ?? 0
                     let modelMinP = settings.minP ?? 0.0
-                    let modelPresencePenalty = (overridesApplyHere ? ReasoningTuning.shared.presencePenaltyOverride : nil) ?? settings.presencePenalty
-                    halLog("HALDEBUG-MLX-CHAT: Sampler for \(self.currentModelConfig?.displayName ?? "unknown") [\(enableThinking ? "reasoning" : "normal")]: temp=\(String(format: "%.2f", effectiveTemperature)) topP=\(modelTopP) topK=\(modelTopK) minP=\(modelMinP) repPen=\(modelPenalty.map { String($0) } ?? "nil") presPen=\(modelPresencePenalty.map { String($0) } ?? "nil")")
+                    let modelPresencePenalty = presenceOverride ?? settings.presencePenalty
+                    halLog("HALDEBUG-MLX-CHAT: Sampler for \(self.currentModelConfig?.displayName ?? "unknown"): temp=\(String(format: "%.2f", effectiveTemperature)) topP=\(modelTopP) topK=\(modelTopK) minP=\(modelMinP) repPen=\(modelPenalty.map { String($0) } ?? "nil") presPen=\(modelPresencePenalty.map { String($0) } ?? "nil") maxTok=\(maxTokens.map(String.init) ?? "default")")
                     // Token budget. Per Mark's clarification (May 13 evening):
                     // this is a *runaway* safeguard, not a normal-response
                     // ceiling. Models should be free to complete their thought
@@ -5631,10 +5615,11 @@ class MLXWrapper: ObservableObject {
                     // levers (temperature / rep-penalty / Layer-0 directive) are
                     // what stop the loop, not a bigger budget.
                     //
-                    // The two-phase synthetic-reasoning harness (and, ultimately,
-                    // the production hammer) sets a SMALL override here to bound
-                    // the thinking phase deterministically. nil = the 4096 default.
-                    let maxOutputTokens = ReasoningTuning.shared.maxOutputTokensOverride ?? 4096
+                    // Explicit per-call cap wins (the two-phase REASON pass passes a
+                    // depth budget here); else the DEBUG harness override; else 4096
+                    // as the runaway ceiling. The hammer was cancelled — this token
+                    // cap plus the two-phase structure replaced it.
+                    let maxOutputTokens = maxTokens ?? ReasoningTuning.shared.maxOutputTokensOverride ?? 4096
                     // Per-model KV cache quantization (Item 11 follow-up,
                     // 2026-05-18 evening). When the model config sets
                     // `kvCacheQuantizationBits` (e.g. 4 for Gemma 4 E2B),
@@ -5673,7 +5658,9 @@ class MLXWrapper: ObservableObject {
                     // buffer is appended per-chunk below and stays readable
                     // mid-flight (GET_THINK_STREAM), so a looping turn that
                     // never finishes still leaves a complete trace to diagnose.
-                    if enableThinking { ReasoningTuning.shared.resetRawStream() }
+                    #if DEBUG
+                    ReasoningTuning.shared.resetRawStream()
+                    #endif
 
                     streamLoop: while let event = await iterator.next() {
                         switch event {
@@ -5688,7 +5675,9 @@ class MLXWrapper: ObservableObject {
                             // (reasoning turns only) so the complete stream is
                             // inspectable even if this turn loops and never
                             // completes. Cheap lock-guarded append.
-                            if enableThinking { ReasoningTuning.shared.appendRawStream(text) }
+                            #if DEBUG
+                            ReasoningTuning.shared.appendRawStream(text)
+                            #endif
                             // Yield the cumulative text so the caller's UI can
                             // render the partial response as it grows.
                             continuation.yield(fullText)
@@ -5753,17 +5742,17 @@ class MLXWrapper: ObservableObject {
                         halLog("HALDEBUG-MLX-CHAT: Truncation safeguard trimmed \(whitespaceTrimmed.count - finalText.count) chars from a mid-word cut")
                     }
                     halLog("HALDEBUG-MLX-CHAT: Returning fullText (\(finalText.count) chars): \(finalText.prefix(150))")
-                    if enableThinking {
-                        // Log the RAW reasoning trace so it's queryable via
-                        // GET_LOGS — the ViewModel splits it out of the stored
-                        // message, so this is the only place to inspect what the
-                        // model actually thought (essential for tuning). Two
-                        // chunks so a loop is visible near its start.
+                    #if DEBUG
+                    do {
+                        // DEBUG only: log the RAW generation trace so it's queryable
+                        // via GET_LOGS for the test harness. Two chunks so a loop is
+                        // visible near its start.
                         halLog("HALDEBUG-THINK-RAW (\(finalText.count) chars): \(finalText.prefix(1200))")
                         if finalText.count > 1200 {
                             halLog("HALDEBUG-THINK-RAW-cont: …\(finalText.dropFirst(1200).prefix(1200))")
                         }
                     }
+                    #endif
                     // Final yield with the cleaned version so callers settle on a
                     // string with no mid-word truncation. Then finish the stream.
                     if finalText != fullText {
@@ -6185,7 +6174,7 @@ class LLMService: ObservableObject {
     /// `session.streamResponse` already produces snapshots whose
     /// `.content` is the cumulative text; MLX via `MLXWrapper.generateChatStream`
     /// produces incremental chunks that we accumulate inside the wrapper.
-    func generateChatResponseStream(messages: [HalChatMessage], temperature: Double = 0.7, reasoningActive: Bool = false) -> AsyncThrowingStream<String, Error> {
+    func generateChatResponseStream(messages: [HalChatMessage], temperature: Double = 0.7, maxTokens: Int? = nil) -> AsyncThrowingStream<String, Error> {
         halLog("HALDEBUG-RESPONSE: \(currentModel.displayName) (\(currentModel.source)) is responding [chat-path, streaming]")
         halLog("HALDEBUG-LLM: generateChatResponseStream called - \(messages.count) messages, currentModel: \(currentModel.displayName)")
 
@@ -6214,7 +6203,7 @@ class LLMService: ObservableObject {
                         let repetitionCheckEvery = 50  // chars between checks
                         var stoppedForRepetition = false
 
-                        let stream = session.streamResponse(options: GenerationOptions(temperature: temperature)) { Prompt(lastUser) }
+                        let stream = session.streamResponse(options: GenerationOptions(temperature: temperature, maximumResponseTokens: maxTokens)) { Prompt(lastUser) }
                         streamLoop: for try await snapshot in stream {
                             accumulatedText = snapshot.content
                             // snapshot.content IS the cumulative text per
@@ -6266,7 +6255,7 @@ class LLMService: ObservableObject {
         case .mlx:
             // Fast path: model resident → generate directly.
             if mlxWrapper.isModelLoaded {
-                return mlxWrapper.generateChatStream(messages: messages, temperature: temperature, reasoningActive: reasoningActive)
+                return mlxWrapper.generateChatStream(messages: messages, temperature: temperature, maxTokens: maxTokens)
             }
             // RELOAD-ON-DEMAND. The MLX model may not be resident for two reasons,
             // and neither should dead-end a chat with "model could not be loaded":
@@ -6303,7 +6292,7 @@ class LLMService: ObservableObject {
                     }
                     // 4. Bridge the inner generation stream through to the caller.
                     do {
-                        for try await chunk in self.mlxWrapper.generateChatStream(messages: messages, temperature: temperature, reasoningActive: reasoningActive) {
+                        for try await chunk in self.mlxWrapper.generateChatStream(messages: messages, temperature: temperature, maxTokens: maxTokens) {
                             continuation.yield(chunk)
                         }
                         continuation.finish()
@@ -8979,6 +8968,85 @@ nonisolated struct HalChatMessage: Sendable {
     nonisolated static func assistant(_ s: String) -> HalChatMessage { .init(role: .assistant, content: s) }
 }
 
+// ---- Model-agnostic two-phase reasoning (2026-07-22) --------------------------
+// Hal's "show me your reasoning" mode works on EVERY model, not just the ones
+// with native <think> tokens. When the brain toggle is on, the ViewModel runs a
+// user turn as two passes: (1) a REASON pass with full context that streams into
+// the collapsible thinking panel, bounded to a depth budget; (2) a CONCLUDE pass
+// with only persona + the bounded reasoning (no RAG) that writes the answer. This
+// replaced the old native-<think>-only path entirely. Prompts + budget are ported
+// verbatim from the proven sampler-recipe / synthetic-reasoning harness (tests/,
+// 2026-07-21), where this two-phase flow ran clean across Gemma/Dolphin/Bonsai/Qwen.
+enum HalReasoning {
+    /// Reasoning "depth" = how much room the thinking pass gets. ONE level today,
+    /// behind a per-model hook so depth can later scale with model capability
+    /// (Mark, 2026-07-22: "should be a function of the model's capabilities … for
+    /// now make it simple"). Only the REASON pass is bounded; the answer pass runs
+    /// at the model's normal length so real answers are never clipped.
+    struct Depth {
+        let reasonTokenBudget: Int
+        static let standard = Depth(reasonTokenBudget: 600)
+    }
+
+    /// The single extension seam for capability-scaled depth. Returns `.standard`
+    /// for every model now; branch here when we want deeper reasoning on larger
+    /// or reasoning-tuned models.
+    static func depth(for model: ModelConfiguration) -> Depth { .standard }
+
+    /// ~4 chars/token — the ratio the harness used to convert the token budget to
+    /// a character bound for the captured reasoning.
+    static let charsPerToken = 4
+
+    /// Phase 1 — elicit visible reasoning without a final answer. Verbatim from
+    /// the proven harness REASON_PROMPT.
+    static func reasonPrompt(for question: String) -> String {
+        "Work through this carefully, step by step, showing your full reasoning as you go. Do not state a final answer yet. Question: \(question)"
+    }
+
+    /// Phase 2 — answer in Hal's own voice from the (private) reasoning, without
+    /// narrating or quoting it. Verbatim from the harness CONCLUDE_PROMPT; this
+    /// framing is what fixed the phase-2 voice bug (Hal answers AS himself instead
+    /// of commenting on "the reasoning").
+    static func concludePrompt(question: String, reasoning: String) -> String {
+        """
+        A user asked you: "\(question)"
+
+        You have already thought it through. These are your PRIVATE thoughts — the user cannot see them, and you must not quote, mention, or describe them:
+        \"\"\"
+        \(reasoning)
+        \"\"\"
+
+        Now reply to the user directly and concisely, in your own voice, as Hal — the answer itself, as if speaking to them. Do not talk about your reasoning, your notes, or your process.
+        """
+    }
+
+    /// Bound the captured reasoning to the depth budget before it goes into the
+    /// conclude prompt, cutting on a sentence/line boundary when possible (ports
+    /// the harness `truncate_clean`). Keeps a runaway reason pass from blowing the
+    /// phase-2 prompt budget.
+    static func bound(_ text: String, budget tokenBudget: Int) -> String {
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        let charBudget = tokenBudget * charsPerToken
+        guard trimmed.count > charBudget else { return trimmed }
+        let cut = String(trimmed.prefix(charBudget))
+        for sep in ["\n", ". ", "! ", "? ", "; "] {
+            if let r = cut.range(of: sep, options: .backwards),
+               cut.distance(from: cut.startIndex, to: r.lowerBound) > charBudget / 2 {
+                return String(cut[..<r.upperBound]).trimmingCharacters(in: .whitespacesAndNewlines)
+            }
+        }
+        return cut.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    /// Defensive: strip any stray <think>/</think> tags a natively-reasoning model
+    /// might still emit in the reason pass even with enable_thinking=false, so the
+    /// thinking panel shows clean prose.
+    static func stripThinkTags(_ text: String) -> String {
+        text.replacingOccurrences(of: "<think>", with: "")
+            .replacingOccurrences(of: "</think>", with: "")
+    }
+}
+
 @MainActor
 class ChatViewModel: ObservableObject {
     // Shared singleton so the whole app binds to one VM instance. Pattern
@@ -9315,19 +9383,16 @@ class ChatViewModel: ObservableObject {
         let layerOneRaw = layerOneEnabled ? (model.layerOnePrompt ?? "") : ""
         let layerOne = layerOneRaw.trimmingCharacters(in: .whitespacesAndNewlines)
 
-        var base: String
+        let base: String
         if layerOne.isEmpty { base = layerTwo }
         else if layerTwo.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty { base = layerOne }
         else { base = layerOne + "\n\n" + layerTwo }
 
-        // Layer 0: when reasoning is active, PREPEND the reasoning directive so
-        // the identity layers (Layer 1 + Layer 2) still have the last word and
-        // personality is preserved. Overridable for tuning via ReasoningTuning.
-        if reasoningActive {
-            let override = ReasoningTuning.shared.promptOverride
-            let directive = (override?.isEmpty == false ? override! : Self.reasoningLayerPrompt)
-            base = base.isEmpty ? directive : directive + "\n\n" + base
-        }
+        // NOTE (2026-07-22): the old Layer-0 "<think> … </think>" directive was
+        // removed here. Reasoning is now the model-agnostic two-phase flow (see
+        // HalReasoning + the send path): the reason instruction rides on the phase-1
+        // USER turn, and phase 2 gets this clean persona plus the bounded reasoning.
+        // Injecting a <think> directive into the system prompt would poison both.
         return base
     }
     @Published var injectedSummary: String = ""
@@ -9339,26 +9404,19 @@ class ChatViewModel: ObservableObject {
     // NEW: Temperature control (0.0 = deterministic, 1.0 = creative)
     @AppStorage("temperature") var temperature: Double = 0.7
 
-    // MARK: - Reasoning / think-token toggle (2026-07)
+    // MARK: - Reasoning toggle (brain glyph) — model-agnostic two-phase (2026-07)
     //
-    // User-facing, sticky (persists across launches). Only meaningful when the
-    // active model can reason (ModelConfiguration.isReasoningModel). When the
-    // toggle is on AND the model is a reasoning model (see `reasoningActive`),
-    // Hal passes enable_thinking=true, drops the turn temperature to 0.6,
-    // appends `reasoningLayerPrompt` to keep it from rambling, and splits
-    // <think>…</think> into the collapsible "Thinking" panel. Surfaced as a
-    // brain toggle beside the lock. See Docs/Think_Tokens_Reasoning_Transparency.md.
+    // User-facing, sticky (persists across launches). Works on EVERY model now
+    // (the old isReasoningModel gate is gone, 2026-07-22). When on, a user turn
+    // runs as the two-phase HalReasoning flow: a bounded REASON pass streams into
+    // the collapsible "Thinking" panel, then a CONCLUDE pass writes the answer
+    // from that reasoning. Surfaced as a brain toggle beside the lock. See
+    // Docs/Think_Tokens_Reasoning_Transparency.md and HalReasoning above.
     @AppStorage("reasoningEnabled") var reasoningEnabled: Bool = false
 
-    /// True only when the active model can reason AND the user has reasoning on.
-    var reasoningActive: Bool { (selectedModel.isReasoningModel == true) && reasoningEnabled }
-
-    /// Default Layer-0 reasoning directive — PREPENDED to the effective system
-    /// prompt when reasoning is active (so the identity layers keep the last
-    /// word and personality is preserved). Targets repetition/looping, NOT
-    /// thinking depth, and explicitly preserves the answer voice. Overridable
-    /// for tuning via ReasoningTuning.shared.promptOverride.
-    static let reasoningLayerPrompt = "Before you answer, you may reason inside <think> and </think>. Reason as thoroughly as the question needs, but do not repeat yourself or restate points you have already made. When you reach a conclusion, close </think> and answer. This governs only your thinking; it does not change your voice, your identity, or how you write your final answer. Answer exactly as you otherwise would."
+    /// True when the user has reasoning on. Any model — the two-phase flow is
+    /// model-agnostic (no native <think> required).
+    var reasoningActive: Bool { reasoningEnabled }
 
     /// Toggle reasoning on/off and narrate the change into the chat, mirroring
     /// the model-switch narration pattern. Sticky until toggled again.
@@ -11706,8 +11764,16 @@ class ChatViewModel: ObservableObject {
                                                                         }
                                                                         try? await Task.sleep(nanoseconds: 200_000_000)
 
+                                                                        // Two-phase reasoning (model-agnostic). When the brain is on,
+                                                                        // phase 1 builds FULL context around a REASON instruction and
+                                                                        // streams into the thinking panel; phase 2 answers from the
+                                                                        // bounded reasoning with persona only (no RAG). Brain off = the
+                                                                        // single normal pass, unchanged. See HalReasoning.
+                                                                        let isReasoning = self.reasoningActive
+                                                                        let reasoningDepth = HalReasoning.depth(for: selectedModel)
+                                                                        let phase1Input = isReasoning ? HalReasoning.reasonPrompt(for: userInput) : userInput
                                                                         let chatBuildResult = await buildChatMessages(
-                                                                            currentInput: userInput,
+                                                                            currentInput: phase1Input,
                                                                             historyOverride: historyMessagesOverride
                                                                         )
                                                                         let chatMessages = chatBuildResult.messages
@@ -11740,20 +11806,51 @@ class ChatViewModel: ObservableObject {
                                                                         // first token. Generation timing (modelTime) is captured
                                                                         // around the whole stream so thinkingDuration stays meaningful.
                                                                         finalText = ""
-                                                                        // Reasoning models emit <think>…</think> before the answer; split
-                                                                        // it out live so the reasoning streams into the collapsible panel
-                                                                        // (message.thinking) and only the answer fills the bubble
-                                                                        // (message.content). See splitThinkTokens.
-                                                                        let isReasoning = self.reasoningActive
-                                                                        let turnTemp = temperature  // reasoning temp now comes from the model's reasoningSettings (was a hardcoded 0.6)
+                                                                        // Captured phase-1 reasoning for the thinking panel; nil when the
+                                                                        // brain is off. Set inside the two-phase branch below.
+                                                                        var capturedThinking: String? = nil
+                                                                        let turnTemp = temperature  // one temperature per model (from the model's settings); this is the caller default
                                                                         do {
-                                                                            let stream = llmService.generateChatResponseStream(messages: chatMessages, temperature: turnTemp, reasoningActive: isReasoning)
-                                                                            for try await chunk in stream {
-                                                                                finalText = chunk
+                                                                            if isReasoning {
+                                                                                // ===== PHASE 1 — REASON (full context, bounded to depth) =====
+                                                                                // Streams live into the collapsible thinking panel. The depth
+                                                                                // budget caps it so a runaway reason pass can't overheat the
+                                                                                // device or blow the phase-2 prompt.
+                                                                                var reasoningRaw = ""
+                                                                                let reasonStream = llmService.generateChatResponseStream(messages: chatMessages, temperature: turnTemp, maxTokens: reasoningDepth.reasonTokenBudget)
+                                                                                for try await chunk in reasonStream {
+                                                                                    reasoningRaw = chunk
+                                                                                    if let i = messages.firstIndex(where: { $0.id == pid }) {
+                                                                                        messages[i].thinking = HalReasoning.stripThinkTags(chunk)
+                                                                                    }
+                                                                                }
+                                                                                let boundedReasoning = HalReasoning.bound(HalReasoning.stripThinkTags(reasoningRaw), budget: reasoningDepth.reasonTokenBudget)
+                                                                                capturedThinking = boundedReasoning
                                                                                 if let i = messages.firstIndex(where: { $0.id == pid }) {
-                                                                                    let split = splitThinkTokens(chunk, isReasoning: isReasoning)
-                                                                                    messages[i].thinking = split.thinking
-                                                                                    messages[i].content = split.answer
+                                                                                    messages[i].thinking = boundedReasoning
+                                                                                }
+                                                                                // ===== PHASE 2 — CONCLUDE (persona + reasoning only, no RAG) =====
+                                                                                // Minimal messages: clean persona + the private reasoning. The
+                                                                                // answer streams into the bubble in Hal's own voice.
+                                                                                let concludeMessages: [HalChatMessage] = [
+                                                                                    .system(self.effectiveSystemPrompt),
+                                                                                    .user(HalReasoning.concludePrompt(question: userInput, reasoning: boundedReasoning))
+                                                                                ]
+                                                                                let answerStream = llmService.generateChatResponseStream(messages: concludeMessages, temperature: turnTemp)
+                                                                                for try await chunk in answerStream {
+                                                                                    finalText = chunk
+                                                                                    if let i = messages.firstIndex(where: { $0.id == pid }) {
+                                                                                        messages[i].content = chunk
+                                                                                    }
+                                                                                }
+                                                                            } else {
+                                                                                // ===== SINGLE PASS (brain off) — the normal path =====
+                                                                                let stream = llmService.generateChatResponseStream(messages: chatMessages, temperature: turnTemp)
+                                                                                for try await chunk in stream {
+                                                                                    finalText = chunk
+                                                                                    if let i = messages.firstIndex(where: { $0.id == pid }) {
+                                                                                        messages[i].content = chunk
+                                                                                    }
                                                                                 }
                                                                             }
                                                                         } catch let memError as LLMService.LLMError {
@@ -11788,14 +11885,11 @@ class ChatViewModel: ObservableObject {
                                                                         }
 
                                                                         let cleanedFull = removeRepetitivePatterns(from: finalText).trimmingCharacters(in: .whitespacesAndNewlines)
-                                                                        // Separate reasoning from answer. Only `text` (the answer) flows
-                                                                        // into message content, memory, and RAG; the reasoning goes to
-                                                                        // the collapsible panel and is never stored. Fallback: if a
-                                                                        // reasoning model never closed </think>, keep the full text as
-                                                                        // the answer so the bubble isn't blank.
-                                                                        let finalSplit = splitThinkTokens(cleanedFull, isReasoning: isReasoning)
-                                                                        let thinkingText: String? = finalSplit.answer.isEmpty ? nil : finalSplit.thinking
-                                                                        let text = finalSplit.answer.isEmpty ? cleanedFull : finalSplit.answer
+                                                                        // The answer (phase 2, or the single pass) is what flows into the
+                                                                        // message, memory, and RAG. The reasoning (phase 1, captured above)
+                                                                        // goes only to the collapsible panel and is never stored.
+                                                                        let text = cleanedFull
+                                                                        let thinkingText: String? = capturedThinking
 
                                                                         // Calculate token breakdown for this response
                                                                         let tokenBreakdown = calculateTokenBreakdown(
@@ -12261,13 +12355,14 @@ class ChatViewModel: ObservableObject {
                                                                         // perspectives; the visual rhythm matches the underlying
                                                                         // sequential thinking.
                                                                         finalText = ""
-                                                                        // Same reasoning-model split as the single-LLM path. The final
-                                                                        // store below (settle) splits by </think> content, so a reasoning
-                                                                        // seat's <think> trace never reaches memory/RAG regardless.
+                                                                        // Salon still uses the defensive <think> split (harmless: with
+                                                                        // native thinking removed, plain output has no tags to split).
+                                                                        // Two-phase reasoning for salon seats is deferred (2026-07-22) —
+                                                                        // tracked in NEXT; salon runs the normal single pass for now.
                                                                         let isReasoning = self.reasoningActive
-                                                                        let turnTemp = temperature  // reasoning temp now comes from the model's reasoningSettings (was a hardcoded 0.6)
+                                                                        let turnTemp = temperature  // one temperature per model (from the model's settings); this is the caller default
                                                                         do {
-                                                                            let stream = llmService.generateChatResponseStream(messages: chatMessages, temperature: turnTemp, reasoningActive: isReasoning)
+                                                                            let stream = llmService.generateChatResponseStream(messages: chatMessages, temperature: turnTemp)
                                                                             for try await chunk in stream {
                                                                                 finalText = chunk
                                                                                 if let i = messages.firstIndex(where: { $0.id == pid }) {
@@ -28800,27 +28895,25 @@ struct iOSChatView: View {
                         Image(systemName: "line.3.horizontal")
                     }
                 }
-                // Reasoning toggle — brain, shown only when the active model can
-                // reason (isReasoningModel). Tap flips reasoning on/off (sticky),
-                // narrates the change into chat, and pops a plain-language
-                // explanation of the new state. See
-                // Docs/Think_Tokens_Reasoning_Transparency.md.
-                if chatViewModel.selectedModel.isReasoningModel == true {
-                    ToolbarItem(placement: .navigationBarTrailing) {
-                        Button {
-                            chatViewModel.setReasoning(!chatViewModel.reasoningEnabled)
-                            showingReasoningPopover = true
-                        } label: {
-                            Image(systemName: "brain")
-                                .foregroundStyle(chatViewModel.reasoningEnabled ? Color.accentColor : Color.secondary)
-                        }
-                        .popover(isPresented: $showingReasoningPopover) {
-                            ReasoningPopover(
-                                isOn: chatViewModel.reasoningEnabled,
-                                modelName: chatViewModel.selectedModel.displayName
-                            )
-                            .presentationCompactAdaptation(.popover)
-                        }
+                // Reasoning toggle — brain, shown for EVERY model (2026-07-22): the
+                // two-phase reasoning flow is model-agnostic, no native <think>
+                // required. Tap flips reasoning on/off (sticky), narrates the change
+                // into chat, and pops a plain-language explanation of the new state.
+                // See Docs/Think_Tokens_Reasoning_Transparency.md.
+                ToolbarItem(placement: .navigationBarTrailing) {
+                    Button {
+                        chatViewModel.setReasoning(!chatViewModel.reasoningEnabled)
+                        showingReasoningPopover = true
+                    } label: {
+                        Image(systemName: "brain")
+                            .foregroundStyle(chatViewModel.reasoningEnabled ? Color.accentColor : Color.secondary)
+                    }
+                    .popover(isPresented: $showingReasoningPopover) {
+                        ReasoningPopover(
+                            isOn: chatViewModel.reasoningEnabled,
+                            modelName: chatViewModel.selectedModel.displayName
+                        )
+                        .presentationCompactAdaptation(.popover)
                     }
                 }
                 // Privacy lock — sits just left of the gear (declared first in

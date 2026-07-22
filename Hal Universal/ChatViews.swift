@@ -289,27 +289,25 @@ struct iOSChatView: View {
                         Image(systemName: "line.3.horizontal")
                     }
                 }
-                // Reasoning toggle — brain, shown only when the active model can
-                // reason (isReasoningModel). Tap flips reasoning on/off (sticky),
-                // narrates the change into chat, and pops a plain-language
-                // explanation of the new state. See
-                // Docs/Think_Tokens_Reasoning_Transparency.md.
-                if chatViewModel.selectedModel.isReasoningModel == true {
-                    ToolbarItem(placement: .navigationBarTrailing) {
-                        Button {
-                            chatViewModel.setReasoning(!chatViewModel.reasoningEnabled)
-                            showingReasoningPopover = true
-                        } label: {
-                            Image(systemName: "brain")
-                                .foregroundStyle(chatViewModel.reasoningEnabled ? Color.accentColor : Color.secondary)
-                        }
-                        .popover(isPresented: $showingReasoningPopover) {
-                            ReasoningPopover(
-                                isOn: chatViewModel.reasoningEnabled,
-                                modelName: chatViewModel.selectedModel.displayName
-                            )
-                            .presentationCompactAdaptation(.popover)
-                        }
+                // Reasoning toggle — brain, shown for EVERY model (2026-07-22): the
+                // two-phase reasoning flow is model-agnostic, no native <think>
+                // required. Tap flips reasoning on/off (sticky), narrates the change
+                // into chat, and pops a plain-language explanation of the new state.
+                // See Docs/Think_Tokens_Reasoning_Transparency.md.
+                ToolbarItem(placement: .navigationBarTrailing) {
+                    Button {
+                        chatViewModel.setReasoning(!chatViewModel.reasoningEnabled)
+                        showingReasoningPopover = true
+                    } label: {
+                        Image(systemName: "brain")
+                            .foregroundStyle(chatViewModel.reasoningEnabled ? Color.accentColor : Color.secondary)
+                    }
+                    .popover(isPresented: $showingReasoningPopover) {
+                        ReasoningPopover(
+                            isOn: chatViewModel.reasoningEnabled,
+                            modelName: chatViewModel.selectedModel.displayName
+                        )
+                        .presentationCompactAdaptation(.popover)
                     }
                 }
                 // Privacy lock — sits just left of the gear (declared first in
