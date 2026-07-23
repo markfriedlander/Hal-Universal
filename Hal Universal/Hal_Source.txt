@@ -116,6 +116,9 @@
 //  ThermalGovernor.swift
 //   61  ThermalGovernor (Proactive Thermal Pacing)
 //
+//  RoboRunner.swift
+//   62  RoboRunner (On-Device Reasoning/Thermal Script Runner)
+//
 import SwiftUI
 import Foundation
 import Combine
@@ -251,7 +254,11 @@ nonisolated func halLog(_ message: String) {
 /// See Docs/Think_Tokens_Reasoning_Transparency.md.
 final class ReasoningTuning: @unchecked Sendable {
     nonisolated static let shared = ReasoningTuning()
-    /// Overrides the default Layer-0 reasoning directive. nil/empty = default.
+    /// Overrides the phase-1 REASON instruction (see HalReasoning.reasonPrompt).
+    /// nil/empty = the built-in default. Set live via the SET_REASONING_PROMPT
+    /// antenna verb / RoboRunner so the reasoning directive can be A/B-tested
+    /// without a rebuild. (Pre-two-phase this drove the removed Layer-0 <think>
+    /// directive; it now feeds the phase-1 reason prompt.)
     var promptOverride: String? = nil
     /// Overrides the repetition penalty on reasoning turns. nil = model default.
     var repetitionPenalty: Double? = nil
@@ -270,6 +277,13 @@ final class ReasoningTuning: @unchecked Sendable {
     /// MLX turn (not only reasoning turns) so the model-agnostic two-phase
     /// synthetic-reasoning harness can bound any model. See the reasoning memo.
     var maxOutputTokensOverride: Int? = nil
+    /// Overrides the phase-1 REASONING token budget (HalReasoning depth). nil =
+    /// the model's depth default. This is the "how much room does thinking get"
+    /// dial, distinct from maxOutputTokensOverride (a hard ceiling on ANY single
+    /// generation): phase-1 budget = reasonBudgetOverride ?? depthDefault, then
+    /// clamped down to maxOutputTokensOverride if that ceiling is set. Set via the
+    /// SET_REASON_BUDGET antenna verb / RoboRunner. See the reasoning memo.
+    var reasonBudgetOverride: Int? = nil
     /// Skip ALL memory / RAG / self-knowledge injection for a clean footprint.
     var memoryIsolation: Bool = false
 
@@ -8997,10 +9011,21 @@ enum HalReasoning {
     /// a character bound for the captured reasoning.
     static let charsPerToken = 4
 
-    /// Phase 1 — elicit visible reasoning without a final answer. Verbatim from
-    /// the proven harness REASON_PROMPT.
+    /// Phase 1 — elicit visible reasoning without a final answer. Default is
+    /// verbatim from the proven harness REASON_PROMPT. A live override
+    /// (ReasoningTuning.promptOverride, set via SET_REASONING_PROMPT / RoboRunner)
+    /// replaces the instruction so the directive can be A/B-tested without a
+    /// rebuild: `{question}` is substituted with the user's question, and if the
+    /// override contains no placeholder the question is appended as in the default.
     static func reasonPrompt(for question: String) -> String {
-        "Work through this carefully, step by step, showing your full reasoning as you go. Do not state a final answer yet. Question: \(question)"
+        if let override = ReasoningTuning.shared.promptOverride,
+           !override.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            if override.contains("{question}") {
+                return override.replacingOccurrences(of: "{question}", with: question)
+            }
+            return "\(override) Question: \(question)"
+        }
+        return "Work through this carefully, step by step, showing your full reasoning as you go. Do not state a final answer yet. Question: \(question)"
     }
 
     /// Phase 2 — answer in Hal's own voice from the (private) reasoning, without
@@ -9888,45 +9913,33 @@ class ChatViewModel: ObservableObject {
         let previous = lastThermalLevel
         lastThermalLevel = level
         guard level != previous else { return }
+        // Thermal notices reuse the SAME paired-dialogue mechanism as settings
+        // changes (a user lead-in + Hal's reply), so they render in the identical
+        // format instead of as a lone unprompted Hal remark (Mark, 2026-07-23,
+        // Option A). NOTE: heat is NOT user-initiated, so the user lead-in here is
+        // a stopgap fabrication for visual consistency; the honest long-term fix is
+        // a dedicated system-event message style (see NEXT.md).
         if level >= 2 && previous < 2 {
             // Crossed from cool/warm straight into serious (or critical).
-            injectThermalNotice(level >= 3
-                ? "I'm getting quite hot right now, so I'm going to pause for a moment to cool down."
-                : "I'm running a little warm, so I'm going to slow down for a moment.")
+            if level >= 3 {
+                injectSettingsChangeDialogue(
+                    userMessage: "Hal, you're getting quite hot.",
+                    halResponse: "I'm getting quite hot right now, so I'm going to pause for a moment to cool down.")
+            } else {
+                injectSettingsChangeDialogue(
+                    userMessage: "Hal, you're starting to run warm.",
+                    halResponse: "I'm running a little warm, so I'm going to slow down for a moment.")
+            }
         } else if level >= 3 && previous == 2 {
             // Serious escalated to critical.
-            injectThermalNotice("I'm getting quite hot now, so I'm pausing for a moment to cool down.")
+            injectSettingsChangeDialogue(
+                userMessage: "Hal, you're heating up more.",
+                halResponse: "I'm getting quite hot now, so I'm pausing for a moment to cool down.")
         } else if level < 2 && previous >= 2 {
             // Cooled back below serious.
-            injectThermalNotice("Cooled back down. I'm at full speed again.")
-        }
-    }
-
-    /// Inject a single Hal-voiced message into the thread (no paired user turn,
-    /// since heat isn't user-initiated). Mirrors `injectSettingsChangeDialogue`'s
-    /// Hal half: appended to `messages` and stored as a `systemEvent` artifact so
-    /// it persists like anything else Hal says.
-    private func injectThermalNotice(_ halResponse: String) {
-        Task { @MainActor in
-            let currentTurn = memoryStore.getCurrentTurnNumber(conversationId: conversationId) + 1
-            let halMsg = ChatMessage(
-                content: halResponse,
-                isFromUser: false,
-                timestamp: Date(),
-                recordedByModel: selectedModel.id,
-                turnNumber: currentTurn
-            )
-            self.messages.append(halMsg)
-            self.memoryStore.storeConversationArtifact(
-                conversationId: self.conversationId,
-                artifactType: "systemEvent",
-                turnNumber: currentTurn,
-                deliberationRound: 1,
-                seatNumber: nil,
-                content: halResponse,
-                modelId: self.selectedModel.id
-            )
-            print("HALDEBUG-THERMAL: injected in-thread notice: \(halResponse)")
+            injectSettingsChangeDialogue(
+                userMessage: "Hal, you've cooled back down.",
+                halResponse: "Cooled back down. I'm at full speed again.")
         }
     }
 
@@ -11817,14 +11830,32 @@ class ChatViewModel: ObservableObject {
                                                                                 // budget caps it so a runaway reason pass can't overheat the
                                                                                 // device or blow the phase-2 prompt.
                                                                                 var reasoningRaw = ""
-                                                                                let reasonStream = llmService.generateChatResponseStream(messages: chatMessages, temperature: turnTemp, maxTokens: reasoningDepth.reasonTokenBudget)
+                                                                                // Effective phase-1 budget: the model's depth default, or a
+                                                                                // live override (SET_REASON_BUDGET / RoboRunner), then clamped
+                                                                                // down to the generic output ceiling (SET_MAX_OUTPUT_TOKENS)
+                                                                                // if one is set. One resolved value drives both the stream cap
+                                                                                // and the post-hoc bound() so they never disagree.
+                                                                                let reasonBudget = min(
+                                                                                    ReasoningTuning.shared.reasonBudgetOverride ?? reasoningDepth.reasonTokenBudget,
+                                                                                    ReasoningTuning.shared.maxOutputTokensOverride ?? Int.max
+                                                                                )
+                                                                                #if DEBUG
+                                                                                let p1Start = Date()   // RoboRunner per-phase probe (DEBUG only)
+                                                                                #endif
+                                                                                let reasonStream = llmService.generateChatResponseStream(messages: chatMessages, temperature: turnTemp, maxTokens: reasonBudget)
                                                                                 for try await chunk in reasonStream {
                                                                                     reasoningRaw = chunk
                                                                                     if let i = messages.firstIndex(where: { $0.id == pid }) {
                                                                                         messages[i].thinking = HalReasoning.stripThinkTags(chunk)
                                                                                     }
                                                                                 }
-                                                                                let boundedReasoning = HalReasoning.bound(HalReasoning.stripThinkTags(reasoningRaw), budget: reasoningDepth.reasonTokenBudget)
+                                                                                #if DEBUG
+                                                                                // Stamp the phase-1 duration + the thermalState at the phase
+                                                                                // boundary so RoboRunner can attribute heat to thinking vs answering.
+                                                                                ReasoningTurnProbe.shared.phase1Seconds = Date().timeIntervalSince(p1Start)
+                                                                                ReasoningTurnProbe.shared.thermalMid = ReasoningTurnProbe.thermalNow()
+                                                                                #endif
+                                                                                let boundedReasoning = HalReasoning.bound(HalReasoning.stripThinkTags(reasoningRaw), budget: reasonBudget)
                                                                                 capturedThinking = boundedReasoning
                                                                                 if let i = messages.firstIndex(where: { $0.id == pid }) {
                                                                                     messages[i].thinking = boundedReasoning
@@ -11836,6 +11867,9 @@ class ChatViewModel: ObservableObject {
                                                                                     .system(self.effectiveSystemPrompt),
                                                                                     .user(HalReasoning.concludePrompt(question: userInput, reasoning: boundedReasoning))
                                                                                 ]
+                                                                                #if DEBUG
+                                                                                let p2Start = Date()   // RoboRunner per-phase probe (DEBUG only)
+                                                                                #endif
                                                                                 let answerStream = llmService.generateChatResponseStream(messages: concludeMessages, temperature: turnTemp)
                                                                                 for try await chunk in answerStream {
                                                                                     finalText = chunk
@@ -11843,6 +11877,9 @@ class ChatViewModel: ObservableObject {
                                                                                         messages[i].content = chunk
                                                                                     }
                                                                                 }
+                                                                                #if DEBUG
+                                                                                ReasoningTurnProbe.shared.phase2Seconds = Date().timeIntervalSince(p2Start)
+                                                                                #endif
                                                                             } else {
                                                                                 // ===== SINGLE PASS (brain off) — the normal path =====
                                                                                 let stream = llmService.generateChatResponseStream(messages: chatMessages, temperature: turnTemp)
@@ -24089,6 +24126,40 @@ class HalTestConsole: ObservableObject {
             writeStateJSON(vm: vm)
             return "{\"status\":\"ok\",\"command\":\"NEW_THREAD\",\"conversationId\":\"\(vm.conversationId)\"}"
 
+        } else if trimmed.hasPrefix("ROBO_RUN:") {
+            // Kick off an on-device RoboRunner script (DEBUG only). Returns
+            // immediately; the run executes autonomously on the device and paces
+            // itself against the real thermalState. Poll ROBO_STATUS; read the
+            // captured turns with ROBO_RESULTS when done. See RoboRunner.swift.
+            // The arm is always present so the verb is recognised; only the body
+            // is DEBUG-gated (RoboRunner itself compiles out of release builds).
+#if DEBUG
+            let script = String(trimmed.dropFirst("ROBO_RUN:".count))
+            if RoboRunner.shared.busy {
+                return "{\"status\":\"error\",\"message\":\"RoboRunner busy (\(RoboRunner.shared.progress))\"}"
+            }
+            let console = self
+            Task { @MainActor in _ = await RoboRunner.shared.run(script: script, vm: vm, console: console) }
+            return "{\"status\":\"ok\",\"command\":\"ROBO_RUN\",\"started\":true}"
+#else
+            return "{\"status\":\"error\",\"message\":\"ROBO_RUN is a DEBUG-only command\"}"
+#endif
+
+        } else if trimmed == "ROBO_STATUS" {
+#if DEBUG
+            let r = RoboRunner.shared
+            return "{\"status\":\"ok\",\"running\":\(r.busy),\"progress\":\"\(r.progress)\",\"resultsPath\":\"\(r.lastResultsPath ?? "")\",\"error\":\"\(r.lastError ?? "")\"}"
+#else
+            return "{\"status\":\"error\",\"message\":\"ROBO_STATUS is a DEBUG-only command\"}"
+#endif
+
+        } else if trimmed == "ROBO_RESULTS" {
+#if DEBUG
+            return RoboRunner.shared.resultsJSON()
+#else
+            return "{\"status\":\"error\",\"message\":\"ROBO_RESULTS is a DEBUG-only command\"}"
+#endif
+
         } else if trimmed == "RESET_THREAD" {
             vm.memoryStore.deleteThread(id: vm.conversationId)
             vm.startNewConversation()
@@ -24238,6 +24309,24 @@ class HalTestConsole: ObservableObject {
                 return "{\"status\":\"ok\",\"maxOutputTokens\":\(i)}"
             }
             return "{\"status\":\"error\",\"message\":\"SET_MAX_OUTPUT_TOKENS: must be 16-8192 or default\"}"
+
+        } else if trimmed.hasPrefix("SET_REASON_BUDGET:") {
+            // Tuning: override the phase-1 REASONING token budget (how much room
+            // thinking gets), distinct from SET_MAX_OUTPUT_TOKENS (a hard ceiling
+            // on any single generation). "default" clears it, back to the model's
+            // depth default. The effective phase-1 budget is this value clamped
+            // down by SET_MAX_OUTPUT_TOKENS if that ceiling is also set.
+            let val = String(trimmed.dropFirst("SET_REASON_BUDGET:".count)).trimmingCharacters(in: .whitespaces).lowercased()
+            if val == "default" || val == "nil" {
+                ReasoningTuning.shared.reasonBudgetOverride = nil
+                return "{\"status\":\"ok\",\"reasonBudget\":null}"
+            }
+            if let i = Int(val), i >= 16, i <= 8192 {
+                ReasoningTuning.shared.reasonBudgetOverride = i
+                return "{\"status\":\"ok\",\"reasonBudget\":\(i)}"
+            }
+            return "{\"status\":\"error\",\"message\":\"SET_REASON_BUDGET: must be 16-8192 or default\"}"
+
         } else if trimmed.hasPrefix("SET_PRESENCE_PENALTY:") {
             // Tuning: override reasoning presence penalty (Qwen's anti-loop lever,
             // 0–2). "default" clears it.
@@ -29240,15 +29329,21 @@ private struct BubbleContainerWidthKey: PreferenceKey {
 
 // MARK: - ThinkingDisclosure
 //
-// Collapsible panel that shows a reasoning model's <think> trace
-// (message.thinking), separated from the visible answer. Auto-expands while the
-// model is still reasoning (streaming, no answer yet) so the user can watch it
-// think live, then collapses once the answer begins. Tappable to re-open.
-// See Docs/Think_Tokens_Reasoning_Transparency.md.
+// Collapsible panel that shows a reasoning model's thinking trace
+// (message.thinking), separated from the visible answer. EXPOSED BY DEFAULT and
+// STICKY across relaunch (Mark, 2026-07-23): on a transparency project the
+// reasoning is often the part most worth reading, so it should be visible without
+// a tap and it should NOT auto-collapse the instant the answer arrives. The
+// expanded state is one shared, persisted preference — expanding or collapsing any
+// panel sets the app-wide default, and that choice survives relaunch. Tappable to
+// toggle. See Docs/Think_Tokens_Reasoning_Transparency.md.
 private struct ThinkingDisclosure: View {
     let text: String
     let isStreaming: Bool
-    @State private var expanded: Bool = false
+    // One shared, persisted preference (@AppStorage), defaulting to true so
+    // thinking is shown by default. Replaces the old per-view @State that started
+    // collapsed and force-collapsed the panel the moment streaming ended.
+    @AppStorage("reasoningPanelExpanded") private var expanded: Bool = true
 
     var body: some View {
         DisclosureGroup(isExpanded: $expanded) {
@@ -29272,10 +29367,6 @@ private struct ThinkingDisclosure: View {
         .tint(.secondary)
         .padding(.vertical, 6)
         .padding(.horizontal, 14)
-        .onAppear { expanded = isStreaming }
-        .onChange(of: isStreaming) { _, streaming in
-            if !streaming { withAnimation { expanded = false } }
-        }
     }
 }
 
@@ -30854,4 +30945,277 @@ actor ThermalGovernor {
 }
 
 // ==== LEGO END: 61 ThermalGovernor (Proactive Thermal Pacing) ====
+
+// ==== FILE: RoboRunner.swift ====
+//
+//  RoboRunner.swift
+//  Hal Universal
+//
+//  On-device script runner for reasoning/thermal experiments. DEBUG-only.
+//
+//  WHY THIS EXISTS
+//  The Python harness (tests/) drives Hal over the network antenna, one command
+//  per HTTP round-trip. That is fine for single commands, but for a reasoning
+//  sweep it has three problems the test plan called out: it cannot read the
+//  device's own thermalState, it ties up the phone's composer with continuous
+//  remote-driven turns, and (for Apple Foundation Models) it forces Wi-Fi to be
+//  ON, so an AFM answer might be Private Cloud Compute rather than on-device.
+//
+//  RoboRunner moves the LOOP onto the device. A script (a plain list of steps)
+//  is handed to it once; it then runs autonomously ON the phone, pacing itself
+//  against the real thermalState, reading the real two-phase reasoning path, and
+//  writing results to a local JSON file. The antenna (or a DEBUG Settings button)
+//  only STARTS it; nothing streams per-turn over the network while it runs.
+//
+//  THE GRAMMAR IS TINY ON PURPOSE
+//  Almost every step is just an existing antenna verb, passed straight through to
+//  HalTestConsole.executeCommand (the same dispatcher the antenna uses). So
+//  SWITCH_MODEL:, SET_REASONING:true, SET_REASON_BUDGET:80, SET_REASONING_PROMPT:…,
+//  NEW_THREAD all work for free. Only two steps are special because the flat verb
+//  model cannot express them: ASK (run one real turn and capture BOTH phases plus
+//  thermal), and WAIT (pause, holding longer if the phone is hot). Comments start
+//  with '#'. That is the whole language.
+//
+//  See Docs/Reasoning_Quality_Thermal_Test_Plan_2026-07-22.md.
+//
+
+#if DEBUG
+
+import Foundation
+import Combine
+
+// ==== LEGO START: 62 RoboRunner (On-Device Reasoning/Thermal Script Runner) ====
+
+/// DEBUG-only side channel for GRANULAR per-phase data a single turn cannot expose
+/// over the atomic send path. The live two-phase reasoning path (Hal.swift) stamps
+/// each phase's duration and the thermalState AT THE PHASE-1→PHASE-2 BOUNDARY here;
+/// RoboRunner resets it before each ask and reads it after. This is how we see WHERE
+/// in a turn the heat enters (thinking vs answering) instead of only before/after.
+/// `@unchecked Sendable` + sequential main-actor access, same pattern as ReasoningTuning.
+final class ReasoningTurnProbe: @unchecked Sendable {
+    static let shared = ReasoningTurnProbe()
+    var phase1Seconds: Double = 0
+    var phase2Seconds: Double = 0
+    var thermalMid: String = "unknown"   // thermalState at the phase-1→phase-2 boundary
+    func reset() { phase1Seconds = 0; phase2Seconds = 0; thermalMid = "unknown" }
+
+    /// The current device thermalState as a lowercase string. Shared by the probe
+    /// stamp sites and RoboRunner so the mapping lives in one place.
+    static func thermalNow() -> String {
+        switch ProcessInfo.processInfo.thermalState {
+        case .nominal:  return "nominal"
+        case .fair:     return "fair"
+        case .serious:  return "serious"
+        case .critical: return "critical"
+        @unknown default: return "unknown"
+        }
+    }
+}
+
+/// One captured turn: the settings in force, both phases, timing, and the thermal
+/// state before / at the phase boundary / after. `Codable` so a run serialises
+/// straight to JSON.
+struct RoboStepResult: Codable {
+    let index: Int
+    let model: String
+    let reasonBudget: String        // "default" or a number, as set at ask time
+    let promptOverrideChars: Int    // 0 = built-in default reason prompt
+    let question: String
+    let thinking: String
+    let answer: String
+    let thinkingChars: Int
+    let answerChars: Int
+    let seconds: Double              // whole-turn wall time
+    let phase1Seconds: Double        // reasoning pass (0 if brain off)
+    let phase2Seconds: Double        // answer pass (0 if brain off)
+    let thermalBefore: String
+    let thermalMid: String           // at the phase-1→phase-2 boundary ("unknown" if brain off)
+    let thermalAfter: String
+}
+
+/// DEBUG-only. Runs a RoboRunner script on-device. `@MainActor` because every step
+/// touches the ChatViewModel and the shared HalTestConsole dispatcher, both of
+/// which are main-actor bound.
+@MainActor
+final class RoboRunner: ObservableObject {
+    static let shared = RoboRunner()
+    private init() {}
+
+    @Published private(set) var isRunning = false
+    @Published private(set) var progress = ""          // e.g. "3/18"
+    @Published private(set) var lastResultsPath: String?
+    @Published private(set) var lastError: String?
+
+    private var results: [RoboStepResult] = []
+    private var currentModel = "unknown"
+
+    /// True while a script is executing, so callers can refuse to start a second.
+    var busy: Bool { isRunning }
+
+    // MARK: - Entry point
+
+    /// Parse and run `script`. Returns a short human-readable summary. Dispatches
+    /// non-ASK/WAIT lines through the shared `console` so the full antenna verb
+    /// vocabulary is available with no duplication.
+    func run(script: String, vm: ChatViewModel, console: HalTestConsole) async -> String {
+        if isRunning { return "RoboRunner already running (\(progress))" }
+        isRunning = true
+        lastError = nil
+        results = []
+        currentModel = "unknown"
+
+        let steps = script
+            .split(separator: "\n", omittingEmptySubsequences: false)
+            .map { $0.trimmingCharacters(in: .whitespaces) }
+            .filter { !$0.isEmpty && !$0.hasPrefix("#") }
+
+        let askTotal = steps.filter { $0.uppercased().hasPrefix("ASK ") }.count
+        var askDone = 0
+        progress = "0/\(askTotal)"
+        halLog("HALDEBUG-ROBO: run start — \(steps.count) steps, \(askTotal) asks")
+
+        for step in steps {
+            let upper = step.uppercased()
+            if upper.hasPrefix("ASK ") {
+                let question = String(step.dropFirst(4)).trimmingCharacters(in: .whitespaces)
+                await runAsk(question, index: askDone, vm: vm)
+                askDone += 1
+                progress = "\(askDone)/\(askTotal)"
+                writeResults()   // persist incrementally so a crash keeps partial data
+            } else if upper.hasPrefix("WAIT ") {
+                let secs = Double(step.dropFirst(5).trimmingCharacters(in: .whitespaces)) ?? 0
+                await pace(seconds: secs)
+            } else {
+                // Any other line is a raw antenna verb. Track the model as it
+                // changes so each result is self-describing.
+                if upper.hasPrefix("SWITCH_MODEL:") {
+                    currentModel = String(step.dropFirst("SWITCH_MODEL:".count)).trimmingCharacters(in: .whitespaces)
+                }
+                _ = await console.executeCommand(step, vm: vm)
+            }
+        }
+
+        writeResults()
+        isRunning = false
+        let summary = "RoboRunner done — \(results.count) turns captured → \(lastResultsPath ?? "(write failed)")"
+        halLog("HALDEBUG-ROBO: \(summary)")
+        return summary
+    }
+
+    // MARK: - The two special steps
+
+    /// Run one real turn through the live two-phase path and capture both phases.
+    /// Thermal is stamped either side of the turn; between-phase stamping is a
+    /// later refinement (a turn is atomic here, as it is over the antenna).
+    private func runAsk(_ question: String, index: Int, vm: ChatViewModel) async {
+        // Don't start a heavy turn while the phone is already hot.
+        await coolIfHot()
+
+        let before = ReasoningTurnProbe.thermalNow()
+        let budget = ReasoningTuning.shared.reasonBudgetOverride.map(String.init) ?? "default"
+        let overrideChars = ReasoningTuning.shared.promptOverride?.count ?? 0
+
+        // Wait out any in-flight turn (mirrors the antenna's TURN guard).
+        var waited = 0
+        while vm.isAIResponding && waited < 120 {
+            try? await Task.sleep(nanoseconds: 1_000_000_000)
+            waited += 1
+        }
+
+        // Clear the probe so we read THIS turn's per-phase stamps, not a prior turn's.
+        ReasoningTurnProbe.shared.reset()
+        let t0 = Date()
+        vm.currentMessage = question
+        await vm.sendMessage()
+        let seconds = Date().timeIntervalSince(t0)
+        let after = ReasoningTurnProbe.thermalNow()
+        let probe = ReasoningTurnProbe.shared
+
+        let ai = vm.messages.last { !$0.isFromUser && !$0.isPartial }
+        let thinking = ai?.thinking ?? ""
+        let answer = ai?.content ?? ""
+
+        results.append(RoboStepResult(
+            index: index,
+            model: currentModel,
+            reasonBudget: budget,
+            promptOverrideChars: overrideChars,
+            question: question,
+            thinking: thinking,
+            answer: answer,
+            thinkingChars: thinking.count,
+            answerChars: answer.count,
+            seconds: seconds,
+            phase1Seconds: probe.phase1Seconds,
+            phase2Seconds: probe.phase2Seconds,
+            thermalBefore: before,
+            thermalMid: probe.thermalMid,
+            thermalAfter: after
+        ))
+        halLog("HALDEBUG-ROBO: ask \(index) [\(currentModel)] \(String(format: "%.1f", seconds))s (p1=\(String(format: "%.1f", probe.phase1Seconds)) p2=\(String(format: "%.1f", probe.phase2Seconds))) think=\(thinking.count) ans=\(answer.count) thermal \(before)/\(probe.thermalMid)/\(after)")
+    }
+
+    /// Fixed pause, but never resume while the die is hot: if we are at serious or
+    /// critical, keep waiting (beyond the requested seconds) until it drops or a
+    /// safety cap is hit.
+    private func pace(seconds: Double) async {
+        if seconds > 0 {
+            try? await Task.sleep(nanoseconds: UInt64(seconds * 1_000_000_000))
+        }
+        await coolIfHot()
+    }
+
+    /// Block until thermalState is nominal/fair, or a safety cap (5 min) elapses.
+    private func coolIfHot() async {
+        var capped = 0
+        while capped < 300 {
+            switch ProcessInfo.processInfo.thermalState {
+            case .serious, .critical:
+                try? await Task.sleep(nanoseconds: 5_000_000_000)
+                capped += 5
+                progress += " (cooling)"
+            default:
+                return
+            }
+        }
+    }
+
+    // MARK: - Results
+
+    private func writeResults() {
+        guard let dir = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first else {
+            lastError = "no Documents dir"
+            return
+        }
+        // Stable filename per run (set once, on the first write of this run).
+        if lastResultsPath == nil {
+            let stamp = Int(Date().timeIntervalSince1970)
+            lastResultsPath = dir.appendingPathComponent("robo_results_\(stamp).json").path
+        }
+        guard let path = lastResultsPath else { return }
+        do {
+            let enc = JSONEncoder()
+            enc.outputFormatting = [.prettyPrinted, .sortedKeys]
+            let data = try enc.encode(results)
+            try data.write(to: URL(fileURLWithPath: path), options: .atomic)
+        } catch {
+            lastError = "write failed: \(error.localizedDescription)"
+        }
+    }
+
+    /// The most recent run's results as a JSON string (for reading back over the
+    /// antenna once the run is done and Wi-Fi is back).
+    func resultsJSON() -> String {
+        guard let path = lastResultsPath,
+              let data = FileManager.default.contents(atPath: path),
+              let s = String(data: data, encoding: .utf8) else {
+            return "{\"status\":\"error\",\"message\":\"no results yet\"}"
+        }
+        return s
+    }
+}
+
+// ==== LEGO END: 62 RoboRunner (On-Device Reasoning/Thermal Script Runner) ====
+
+#endif
 

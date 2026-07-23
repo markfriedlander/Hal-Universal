@@ -510,6 +510,40 @@ class HalTestConsole: ObservableObject {
             writeStateJSON(vm: vm)
             return "{\"status\":\"ok\",\"command\":\"NEW_THREAD\",\"conversationId\":\"\(vm.conversationId)\"}"
 
+        } else if trimmed.hasPrefix("ROBO_RUN:") {
+            // Kick off an on-device RoboRunner script (DEBUG only). Returns
+            // immediately; the run executes autonomously on the device and paces
+            // itself against the real thermalState. Poll ROBO_STATUS; read the
+            // captured turns with ROBO_RESULTS when done. See RoboRunner.swift.
+            // The arm is always present so the verb is recognised; only the body
+            // is DEBUG-gated (RoboRunner itself compiles out of release builds).
+#if DEBUG
+            let script = String(trimmed.dropFirst("ROBO_RUN:".count))
+            if RoboRunner.shared.busy {
+                return "{\"status\":\"error\",\"message\":\"RoboRunner busy (\(RoboRunner.shared.progress))\"}"
+            }
+            let console = self
+            Task { @MainActor in _ = await RoboRunner.shared.run(script: script, vm: vm, console: console) }
+            return "{\"status\":\"ok\",\"command\":\"ROBO_RUN\",\"started\":true}"
+#else
+            return "{\"status\":\"error\",\"message\":\"ROBO_RUN is a DEBUG-only command\"}"
+#endif
+
+        } else if trimmed == "ROBO_STATUS" {
+#if DEBUG
+            let r = RoboRunner.shared
+            return "{\"status\":\"ok\",\"running\":\(r.busy),\"progress\":\"\(r.progress)\",\"resultsPath\":\"\(r.lastResultsPath ?? "")\",\"error\":\"\(r.lastError ?? "")\"}"
+#else
+            return "{\"status\":\"error\",\"message\":\"ROBO_STATUS is a DEBUG-only command\"}"
+#endif
+
+        } else if trimmed == "ROBO_RESULTS" {
+#if DEBUG
+            return RoboRunner.shared.resultsJSON()
+#else
+            return "{\"status\":\"error\",\"message\":\"ROBO_RESULTS is a DEBUG-only command\"}"
+#endif
+
         } else if trimmed == "RESET_THREAD" {
             vm.memoryStore.deleteThread(id: vm.conversationId)
             vm.startNewConversation()
@@ -659,6 +693,24 @@ class HalTestConsole: ObservableObject {
                 return "{\"status\":\"ok\",\"maxOutputTokens\":\(i)}"
             }
             return "{\"status\":\"error\",\"message\":\"SET_MAX_OUTPUT_TOKENS: must be 16-8192 or default\"}"
+
+        } else if trimmed.hasPrefix("SET_REASON_BUDGET:") {
+            // Tuning: override the phase-1 REASONING token budget (how much room
+            // thinking gets), distinct from SET_MAX_OUTPUT_TOKENS (a hard ceiling
+            // on any single generation). "default" clears it, back to the model's
+            // depth default. The effective phase-1 budget is this value clamped
+            // down by SET_MAX_OUTPUT_TOKENS if that ceiling is also set.
+            let val = String(trimmed.dropFirst("SET_REASON_BUDGET:".count)).trimmingCharacters(in: .whitespaces).lowercased()
+            if val == "default" || val == "nil" {
+                ReasoningTuning.shared.reasonBudgetOverride = nil
+                return "{\"status\":\"ok\",\"reasonBudget\":null}"
+            }
+            if let i = Int(val), i >= 16, i <= 8192 {
+                ReasoningTuning.shared.reasonBudgetOverride = i
+                return "{\"status\":\"ok\",\"reasonBudget\":\(i)}"
+            }
+            return "{\"status\":\"error\",\"message\":\"SET_REASON_BUDGET: must be 16-8192 or default\"}"
+
         } else if trimmed.hasPrefix("SET_PRESENCE_PENALTY:") {
             // Tuning: override reasoning presence penalty (Qwen's anti-loop lever,
             // 0–2). "default" clears it.

@@ -41,6 +41,7 @@ FILES=(
   "Hal Universal/ChatViews.swift"
   "Hal Universal/About.swift"
   "Hal Universal/ThermalGovernor.swift"
+  "Hal Universal/RoboRunner.swift"
 )
 
 OUT="Hal Universal/Hal_Source.txt"

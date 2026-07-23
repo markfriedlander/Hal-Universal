@@ -623,15 +623,21 @@ private struct BubbleContainerWidthKey: PreferenceKey {
 
 // MARK: - ThinkingDisclosure
 //
-// Collapsible panel that shows a reasoning model's <think> trace
-// (message.thinking), separated from the visible answer. Auto-expands while the
-// model is still reasoning (streaming, no answer yet) so the user can watch it
-// think live, then collapses once the answer begins. Tappable to re-open.
-// See Docs/Think_Tokens_Reasoning_Transparency.md.
+// Collapsible panel that shows a reasoning model's thinking trace
+// (message.thinking), separated from the visible answer. EXPOSED BY DEFAULT and
+// STICKY across relaunch (Mark, 2026-07-23): on a transparency project the
+// reasoning is often the part most worth reading, so it should be visible without
+// a tap and it should NOT auto-collapse the instant the answer arrives. The
+// expanded state is one shared, persisted preference — expanding or collapsing any
+// panel sets the app-wide default, and that choice survives relaunch. Tappable to
+// toggle. See Docs/Think_Tokens_Reasoning_Transparency.md.
 private struct ThinkingDisclosure: View {
     let text: String
     let isStreaming: Bool
-    @State private var expanded: Bool = false
+    // One shared, persisted preference (@AppStorage), defaulting to true so
+    // thinking is shown by default. Replaces the old per-view @State that started
+    // collapsed and force-collapsed the panel the moment streaming ended.
+    @AppStorage("reasoningPanelExpanded") private var expanded: Bool = true
 
     var body: some View {
         DisclosureGroup(isExpanded: $expanded) {
@@ -655,10 +661,6 @@ private struct ThinkingDisclosure: View {
         .tint(.secondary)
         .padding(.vertical, 6)
         .padding(.horizontal, 14)
-        .onAppear { expanded = isStreaming }
-        .onChange(of: isStreaming) { _, streaming in
-            if !streaming { withAnimation { expanded = false } }
-        }
     }
 }
 
