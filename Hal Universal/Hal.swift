@@ -9030,20 +9030,20 @@ nonisolated struct HalChatMessage: Sendable {
 // verbatim from the proven sampler-recipe / synthetic-reasoning harness (tests/,
 // 2026-07-21), where this two-phase flow ran clean across Gemma/Dolphin/Bonsai/Qwen.
 enum HalReasoning {
-    /// Reasoning "depth" = how much room the thinking pass gets. ONE level today,
-    /// behind a per-model hook so depth can later scale with model capability
-    /// (Mark, 2026-07-22: "should be a function of the model's capabilities … for
-    /// now make it simple"). Only the REASON pass is bounded; the answer pass runs
-    /// at the model's normal length so real answers are never clipped.
-    struct Depth {
-        let reasonTokenBudget: Int
-        static let standard = Depth(reasonTokenBudget: 600)
-    }
-
-    /// The single extension seam for capability-scaled depth. Returns `.standard`
-    /// for every model now; branch here when we want deeper reasoning on larger
-    /// or reasoning-tuned models.
-    static func depth(for model: ModelConfiguration) -> Depth { .standard }
+    /// Reasoning "depth" = how many tokens the phase-1 REASON pass may spend
+    /// before phase 2 answers. This is now a PER-MODEL user setting (Mark,
+    /// 2026-07-24): the Thinking slider in Single LLM settings writes it into
+    /// ModelSettings.reasoningCapTokens (surfaced live on the ChatViewModel as
+    /// `reasoningCapTokens`), so the user owns the heat/depth tradeoff instead
+    /// of us picking one number. Only the REASON pass is bounded; the answer
+    /// pass runs at the model's normal length so real answers are never clipped.
+    /// Uniform default; the earlier flat 600 is retired (slider tops out at 500).
+    /// (Superseded the old capability-scaled `depth(for:)` hook — the user's
+    /// choice is a better lever than a guess about model capability.)
+    static let defaultReasonCapTokens = 300
+    static let minReasonCapTokens = 100
+    static let maxReasonCapTokens = 500
+    static let reasonCapStep = 50
 
     /// ~4 chars/token — the ratio the harness used to convert the token budget to
     /// a character bound for the captured reasoning.
@@ -9243,7 +9243,10 @@ class ChatViewModel: ObservableObject {
             if let v = effective.ragDedupThreshold        { self.ragDedupSimilarityThreshold = v }
             if let v = effective.recencyWeight            { self.memoryStore.recencyWeight = v }
             if let v = effective.recencyHalfLifeDays      { self.memoryStore.recencyHalfLifeDays = v }
-            halLog("HALDEBUG-SETTINGS: Applied effective settings for \(newModel.displayName) via VM props: temp=\(effective.temperature.map { "\($0)" } ?? "—"), depth=\(effective.effectiveMemoryDepth.map { "\($0)" } ?? "—"), maxRag=\(effective.maxRagSnippetsCharacters.map { "\($0)" } ?? "—")")
+            // Always set (not `if let`): a model with no override must RESET the
+            // cap to the default, not inherit the previous model's value.
+            self.reasoningCapTokens = effective.reasoningCapTokens ?? HalReasoning.defaultReasonCapTokens
+            halLog("HALDEBUG-SETTINGS: Applied effective settings for \(newModel.displayName) via VM props: temp=\(effective.temperature.map { "\($0)" } ?? "—"), depth=\(effective.effectiveMemoryDepth.map { "\($0)" } ?? "—"), maxRag=\(effective.maxRagSnippetsCharacters.map { "\($0)" } ?? "—"), thinkCap=\(self.reasoningCapTokens)")
         }
 
         // Setup LLM with new model. For MLX this dispatches a detached
@@ -9466,6 +9469,12 @@ class ChatViewModel: ObservableObject {
     
     // NEW: Temperature control (0.0 = deterministic, 1.0 = creative)
     @AppStorage("temperature") var temperature: Double = 0.7
+
+    // Per-model thinking cap (2026-07-24): max tokens the phase-1 REASON pass
+    // may spend before phase 2 answers. Synced per model via ModelSettingsStore
+    // (same machinery as temperature); the Thinking slider in Single LLM
+    // settings edits it. More thinking = more heat, so the user owns it.
+    @AppStorage("reasoningCapTokens") var reasoningCapTokens: Int = HalReasoning.defaultReasonCapTokens
 
     // MARK: - Reasoning toggle (brain glyph) — model-agnostic two-phase (2026-07)
     //
@@ -9892,6 +9901,7 @@ class ChatViewModel: ObservableObject {
         static let recencyWeight: Double = 0.30
         static let recencyHalfLifeDays: Double = 90
         static let enableSelfKnowledge: Bool = true
+        static let reasoningCapTokens: Int = HalReasoning.defaultReasonCapTokens
     }
     
     /// Injects a bilateral settings change dialogue into the chat
@@ -10009,6 +10019,7 @@ class ChatViewModel: ObservableObject {
         if let v = effective.ragDedupThreshold        { self.ragDedupSimilarityThreshold = v }
         if let v = effective.recencyWeight            { self.memoryStore.recencyWeight = v }
         if let v = effective.recencyHalfLifeDays      { self.memoryStore.recencyHalfLifeDays = v }
+        self.reasoningCapTokens = effective.reasoningCapTokens ?? HalReasoning.defaultReasonCapTokens
     }
 
     /// Resets all user-configurable settings to factory defaults
@@ -10021,6 +10032,7 @@ class ChatViewModel: ObservableObject {
         // Reset Personality
         systemPrompt = DefaultSettings.systemPrompt
         temperature = DefaultSettings.temperature
+        reasoningCapTokens = DefaultSettings.reasoningCapTokens
         
         // Reset Short-Term Memory
         memoryDepth = DefaultSettings.memoryDepth
@@ -11814,7 +11826,6 @@ class ChatViewModel: ObservableObject {
                                                                         // switching into Bonsai mid-thinking is still paced.
                                                                         llmService.activeReasoningPacingMs = isReasoning ? selectedModel.reasoningThermalPacingMs : nil
                                                                         defer { llmService.activeReasoningPacingMs = nil }
-                                                                        let reasoningDepth = HalReasoning.depth(for: selectedModel)
                                                                         let phase1Input = isReasoning ? HalReasoning.reasonPrompt(for: userInput) : userInput
                                                                         let chatBuildResult = await buildChatMessages(
                                                                             currentInput: phase1Input,
@@ -11866,8 +11877,12 @@ class ChatViewModel: ObservableObject {
                                                                                 // down to the generic output ceiling (SET_MAX_OUTPUT_TOKENS)
                                                                                 // if one is set. One resolved value drives both the stream cap
                                                                                 // and the post-hoc bound() so they never disagree.
+                                                                                // Base = the user's per-model Thinking cap (live VM prop,
+                                                                                // synced per model like temperature). A DEBUG override
+                                                                                // (SET_REASON_BUDGET) still wins for testing, then the
+                                                                                // generic output ceiling (SET_MAX_OUTPUT_TOKENS) clamps.
                                                                                 let reasonBudget = min(
-                                                                                    ReasoningTuning.shared.reasonBudgetOverride ?? reasoningDepth.reasonTokenBudget,
+                                                                                    ReasoningTuning.shared.reasonBudgetOverride ?? self.reasoningCapTokens,
                                                                                     ReasoningTuning.shared.maxOutputTokensOverride ?? Int.max
                                                                                 )
                                                                                 #if DEBUG

@@ -669,6 +669,7 @@ struct PowerUserView: View {
         NavigationView {
             Form {
                 memorySection
+                thinkingSection
                 settingsResetSection
                 cacheManagementSection
                 dataManagementSection
@@ -756,6 +757,47 @@ struct PowerUserView: View {
     // Short-term: How many recent turns to keep verbatim
     // Long-term: RAG search parameters (similarity, recency weighting, retrieval limits)
     
+    // MARK: - Thinking Section
+    //
+    // Per-model cap on how much the phase-1 reason pass may spend before Hal
+    // answers. Thinking only runs in Single LLM mode (gated off in Salon), so
+    // during Salon the control is noted as inactive but still shown, since the
+    // cap is remembered per model and the user may be setting it up ahead of time.
+    private var thinkingSection: some View {
+        Section {
+            VStack(alignment: .leading, spacing: 16) {
+                SectionHeaderText(text: "THINKING")
+
+                if isSalonActive {
+                    HStack(alignment: .top, spacing: 6) {
+                        Image(systemName: "person.3.fill")
+                            .foregroundColor(.orange)
+                            .imageScale(.small)
+                        Text("Thinking runs in Single LLM mode only. This cap is remembered per model and takes effect when you leave Salon Mode.")
+                            .font(.caption)
+                            .foregroundColor(.secondary)
+                    }
+                }
+
+                LabeledSliderControl(
+                    label: "Thinking Cap",
+                    value: Binding(
+                        get: { Double(chatViewModel.reasoningCapTokens) },
+                        set: { chatViewModel.reasoningCapTokens = Int($0) }
+                    ),
+                    range: Double(HalReasoning.minReasonCapTokens)...Double(HalReasoning.maxReasonCapTokens),
+                    step: Double(HalReasoning.reasonCapStep),
+                    valueFormatter: { "\(Int($0)) tokens" },
+                    minLabel: "\(HalReasoning.minReasonCapTokens)",
+                    maxLabel: "\(HalReasoning.maxReasonCapTokens)",
+                    helperText: "The more Hal thinks, the more heat the phone makes. A lower cap runs cooler; a higher cap lets Hal reason longer before answering.",
+                    onEditingChanged: nil,
+                    isModified: chatViewModel.reasoningCapTokens != HalReasoning.defaultReasonCapTokens
+                )
+            }
+        }
+    }
+
     private var memorySection: some View {
         Section {
             VStack(alignment: .leading, spacing: 16) {

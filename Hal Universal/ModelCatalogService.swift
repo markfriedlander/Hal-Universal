@@ -102,6 +102,11 @@ struct ModelSettings: Codable, Equatable {
     var ragDedupThreshold: Double?
     var repetitionPenalty: Float?
     var repetitionContextSize: Int?
+    /// Per-model thinking cap (2026-07-24): max tokens the phase-1 REASON pass
+    /// may spend. User-set via the Thinking slider in Single LLM settings. nil =
+    /// the uniform default (HalReasoning.defaultReasonCapTokens). Only bounds the
+    /// reasoning pass; the answer is never clipped.
+    var reasoningCapTokens: Int?
     /// Full sampler knobs (2026-07-14). Qwen — and most curated models —
     /// publish recommended `top_p`/`top_k`/`min_p`/`presence_penalty`; we had
     /// been passing only temperature + repetitionPenalty, running every model
@@ -128,12 +133,14 @@ struct ModelSettings: Codable, Equatable {
         ragDedupThreshold: Double? = nil,
         repetitionPenalty: Float? = nil,
         repetitionContextSize: Int? = nil,
+        reasoningCapTokens: Int? = nil,
         topP: Float? = nil,
         topK: Int? = nil,
         minP: Float? = nil,
         presencePenalty: Float? = nil,
         layerOnePromptEnabled: Bool? = nil
     ) {
+        self.reasoningCapTokens = reasoningCapTokens
         self.temperature = temperature
         self.effectiveMemoryDepth = effectiveMemoryDepth
         self.recencyWeight = recencyWeight
@@ -162,6 +169,7 @@ struct ModelSettings: Codable, Equatable {
             ragDedupThreshold: overrides.ragDedupThreshold ?? self.ragDedupThreshold,
             repetitionPenalty: overrides.repetitionPenalty ?? self.repetitionPenalty,
             repetitionContextSize: overrides.repetitionContextSize ?? self.repetitionContextSize,
+            reasoningCapTokens: overrides.reasoningCapTokens ?? self.reasoningCapTokens,
             topP: overrides.topP ?? self.topP,
             topK: overrides.topK ?? self.topK,
             minP: overrides.minP ?? self.minP,
@@ -218,6 +226,7 @@ final class ModelSettingsStore {
         static let recencyHalfLifeDays = "recencyHalfLifeDays"
         static let maxRagSnippetsCharacters = "maxRagSnippetsCharacters"
         static let ragDedupThreshold = "ragDedupSimilarityThreshold"
+        static let reasoningCap = "reasoningCapTokens"
     }
 
     private init() {}
@@ -319,6 +328,11 @@ final class ModelSettingsStore {
         delta.recencyHalfLifeDays      = differs(live.recencyHalfLifeDays, defaults.recencyHalfLifeDays) ? live.recencyHalfLifeDays : nil
         delta.maxRagSnippetsCharacters = (live.maxRagSnippetsCharacters != defaults.maxRagSnippetsCharacters) ? live.maxRagSnippetsCharacters : nil
         delta.ragDedupThreshold        = differs(live.ragDedupThreshold, defaults.ragDedupThreshold) ? live.ragDedupThreshold : nil
+        // Thinking cap: compare against the uniform default (no model sets its
+        // own), so setting it back to the default drops the delta = a reset.
+        let liveCap = live.reasoningCapTokens ?? HalReasoning.defaultReasonCapTokens
+        let defCap  = defaults.reasoningCapTokens ?? HalReasoning.defaultReasonCapTokens
+        delta.reasoningCapTokens       = (liveCap != defCap) ? live.reasoningCapTokens : nil
 
         var dict = loadOverrides()
         // Preserve a separately-managed layerOnePromptEnabled override — it is
@@ -359,6 +373,7 @@ final class ModelSettingsStore {
         if let v = effective.recencyHalfLifeDays        { d.set(v, forKey: K.recencyHalfLifeDays) }
         if let v = effective.maxRagSnippetsCharacters   { d.set(Double(v), forKey: K.maxRagSnippetsCharacters) }
         if let v = effective.ragDedupThreshold          { d.set(v, forKey: K.ragDedupThreshold) }
+        if let v = effective.reasoningCapTokens          { d.set(v, forKey: K.reasoningCap) }
         // Force any @AppStorage observers watching these keys to re-read.
         NotificationCenter.default.post(name: UserDefaults.didChangeNotification, object: nil)
         halLog("HALDEBUG-SETTINGS: Applied effective settings for \(model.displayName): temp=\(effective.temperature.map { "\($0)" } ?? "—"), depth=\(effective.effectiveMemoryDepth.map { "\($0)" } ?? "—"), maxRag=\(effective.maxRagSnippetsCharacters.map { "\($0)" } ?? "—")")
@@ -413,7 +428,8 @@ final class ModelSettingsStore {
             maxRagSnippetsCharacters: dbl(K.maxRagSnippetsCharacters).map { Int($0) },
             ragDedupThreshold: dbl(K.ragDedupThreshold),
             repetitionPenalty: nil,            // Not user-tunable today
-            repetitionContextSize: nil         // Not user-tunable today
+            repetitionContextSize: nil,        // Not user-tunable today
+            reasoningCapTokens: int(K.reasoningCap)
         )
     }
 }
