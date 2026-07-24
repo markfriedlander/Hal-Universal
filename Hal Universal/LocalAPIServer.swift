@@ -775,6 +775,33 @@ class HalTestConsole: ObservableObject {
             }
             return "{\"status\":\"error\",\"message\":\"SET_THERMAL_PACING: must be on/off\"}"
 
+        } else if trimmed.hasPrefix("SET_THERMAL_LEVEL:") {
+            // DEBUG-only: inject a fake thermal level (0 nominal / 1 fair / 2 serious
+            // / 3 critical) so the toolbar thermal indicator AND the governor's
+            // pacing paths can be exercised WITHOUT heating real hardware (you must
+            // never deliberately overheat the phone — HANDOFF/ThermalGovernor). Drives
+            // BOTH the published `thermalLevel` (the glyph + tap-popover) and the
+            // ThermalGovernor's DEBUG state (so pace() behaves consistently). A real
+            // OS thermal notification will overwrite the glyph afterward; "default"
+            // (or "off") clears the governor override and re-reads the OS level.
+            #if DEBUG
+            let raw = String(trimmed.dropFirst("SET_THERMAL_LEVEL:".count)).trimmingCharacters(in: .whitespaces).lowercased()
+            if raw == "default" || raw == "off" {
+                await ThermalGovernor.shared.setDebugThermalState(nil)
+                vm.thermalLevel = ProcessInfo.processInfo.thermalState.rawValue
+                return "{\"status\":\"ok\",\"thermalLevel\":\(vm.thermalLevel),\"injected\":false}"
+            }
+            if let lvl = Int(raw), (0...3).contains(lvl) {
+                let states: [ProcessInfo.ThermalState] = [.nominal, .fair, .serious, .critical]
+                await ThermalGovernor.shared.setDebugThermalState(states[lvl])
+                vm.thermalLevel = lvl
+                return "{\"status\":\"ok\",\"thermalLevel\":\(lvl),\"injected\":true}"
+            }
+            return "{\"status\":\"error\",\"message\":\"SET_THERMAL_LEVEL: must be 0-3, or default\"}"
+            #else
+            return "{\"status\":\"error\",\"message\":\"SET_THERMAL_LEVEL is DEBUG-only\"}"
+            #endif
+
         } else if trimmed.hasPrefix("SET_PACING_DELAY:") {
             // Calibration/DEBUG: set the PROACTIVE per-chunk pacing delay (ms),
             // applied to every generation chunk regardless of thermal state (the

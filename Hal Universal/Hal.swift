@@ -9511,14 +9511,18 @@ class ChatViewModel: ObservableObject {
     
     // Model state observer for download completions
     private var modelStateObserver: AnyCancellable?
-    /// Watches the device thermal state so Hal can note it IN THE THREAD, in his
-    /// own voice (the way he narrates any other change), when he is genuinely hot,
-    /// and again when he cools. `lastThermalLevel` de-dupes to crossings, so he
-    /// speaks once per transition, not on every OS thermal tick. Same reading the
-    /// ThermalGovernor (Block 61) paces on. Toast chrome was rejected: Hal talks
-    /// in the thread, so this does too.
+    /// Watches the device thermal state and drives the always-available (but only
+    /// shown when warm) toolbar thermal indicator (2026-07-23). `thermalLevel` is
+    /// the OS `ProcessInfo.ThermalState.rawValue` (0 nominal / 1 fair / 2 serious /
+    /// 3 critical), the same reading the ThermalGovernor (Block 61) paces on; the
+    /// glyph fills and the tap-popover explains what the governor is doing at that
+    /// level. Published so the toolbar updates live on every crossing. Supersedes
+    /// the interim in-thread notice (an injected user+Hal pair, Option A) that used
+    /// to fire here; that fabricated the user's line, so it was replaced by this
+    /// honest chrome glyph. Hal narrating heat in his own real voice remains a
+    /// future option (see NEXT), not run alongside the glyph.
     private var thermalObserver: AnyCancellable?
-    private var lastThermalLevel: Int = ProcessInfo.processInfo.thermalState.rawValue
+    @Published var thermalLevel: Int = ProcessInfo.processInfo.thermalState.rawValue
 
     // NEW: Full RAG context for metadata storage (populated during buildPromptHistory)
     @Published var fullRAGContext: [UnifiedSearchResult] = []
@@ -9948,38 +9952,14 @@ class ChatViewModel: ObservableObject {
     /// back to cool), so Hal speaks once per transition rather than on every tick.
     /// Runs on the main thread (the observer is `.receive(on: .main)`).
     private func handleThermalStateChange() {
+        // Publish the new OS thermal level so the toolbar indicator updates live.
+        // De-dupe to crossings (the OS can re-post at the same level). The old
+        // in-thread notice that used to fire here was removed 2026-07-23 in favor
+        // of the toolbar thermal glyph (it fabricated the user's lead-in line; the
+        // glyph is honest chrome). See `thermalLevel` above and ThermalGovernor.
         let level = ProcessInfo.processInfo.thermalState.rawValue
-        let previous = lastThermalLevel
-        lastThermalLevel = level
-        guard level != previous else { return }
-        // Thermal notices reuse the SAME paired-dialogue mechanism as settings
-        // changes (a user lead-in + Hal's reply), so they render in the identical
-        // format instead of as a lone unprompted Hal remark (Mark, 2026-07-23,
-        // Option A). NOTE: heat is NOT user-initiated, so the user lead-in here is
-        // a stopgap fabrication for visual consistency; the honest long-term fix is
-        // a dedicated system-event message style (see NEXT.md).
-        if level >= 2 && previous < 2 {
-            // Crossed from cool/warm straight into serious (or critical).
-            if level >= 3 {
-                injectSettingsChangeDialogue(
-                    userMessage: "Hal, you're getting quite hot.",
-                    halResponse: "I'm getting quite hot right now, so I'm going to pause for a moment to cool down.")
-            } else {
-                injectSettingsChangeDialogue(
-                    userMessage: "Hal, you're starting to run warm.",
-                    halResponse: "I'm running a little warm, so I'm going to slow down for a moment.")
-            }
-        } else if level >= 3 && previous == 2 {
-            // Serious escalated to critical.
-            injectSettingsChangeDialogue(
-                userMessage: "Hal, you're heating up more.",
-                halResponse: "I'm getting quite hot now, so I'm pausing for a moment to cool down.")
-        } else if level < 2 && previous >= 2 {
-            // Cooled back below serious.
-            injectSettingsChangeDialogue(
-                userMessage: "Hal, you've cooled back down.",
-                halResponse: "Cooled back down. I'm at full speed again.")
-        }
+        guard level != thermalLevel else { return }
+        thermalLevel = level
     }
 
     /// Processes all pending settings changes and injects consolidated dialogue

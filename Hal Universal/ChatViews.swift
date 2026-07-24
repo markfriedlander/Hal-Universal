@@ -177,6 +177,10 @@ struct iOSChatView: View {
     // choices (turn on / not now  vs  keep on / turn off). See needsThermalConsent.
     @State private var showingThermalConsentToggle = false
     @State private var showingThermalConsentSwitch = false
+    // Tap-popover for the thermal indicator (the filling thermometer glyph, shown
+    // only above nominal). Explains the current thermal state + what the governor
+    // is doing. See ThermalIndicatorPopover.
+    @State private var showingThermalIndicatorPopover = false
     // Set when the user taps "Model Library" in the privacy popover; consumed
     // in the popover's onDisappear so the sheet presents only AFTER the popover
     // is fully gone (a popover + sheet can't present at once — same race as the
@@ -297,6 +301,28 @@ struct iOSChatView: View {
                         Image(systemName: "line.3.horizontal")
                     }
                 }
+                // Thermal indicator — a filling thermometer, shown ONLY when the
+                // phone is above nominal (Mark, 2026-07-23: appear-when-necessary,
+                // not always-on). Monochrome to match the lock/gear chrome (no
+                // color). Tap explains the current thermal state and what the
+                // ThermalGovernor (Block 61) is doing at that level. Replaces the
+                // interim in-thread notice. Driven by chatViewModel.thermalLevel.
+                // Declared FIRST in the trailing group so it sits LEFTMOST: since
+                // trailing items anchor to the right edge, the transient glyph then
+                // eats only title space when it appears, never nudging brain/lock/gear.
+                ToolbarItem(placement: .navigationBarTrailing) {
+                    if chatViewModel.thermalLevel >= 1 {
+                        Button {
+                            showingThermalIndicatorPopover = true
+                        } label: {
+                            Image(systemName: thermalGlyphName(chatViewModel.thermalLevel))
+                        }
+                        .popover(isPresented: $showingThermalIndicatorPopover) {
+                            ThermalIndicatorPopover(level: chatViewModel.thermalLevel)
+                                .presentationCompactAdaptation(.popover)
+                        }
+                    }
+                }
                 // Reasoning toggle — brain, shown for EVERY model (2026-07-22): the
                 // two-phase reasoning flow is model-agnostic, no native <think>
                 // required. Tap flips reasoning on/off (sticky), narrates the change
@@ -319,7 +345,10 @@ struct iOSChatView: View {
                         }
                     } label: {
                         Image(systemName: "brain")
-                            .foregroundStyle(chatViewModel.reasoningEnabled ? Color.accentColor : Color.secondary)
+                            // Monochrome to match the lock/gear chrome (Mark, 2026-07-23):
+                            // bright (primary) when thinking is on, dim (secondary) when off.
+                            // No accent/blue tint.
+                            .foregroundStyle(chatViewModel.reasoningEnabled ? Color.primary : Color.secondary)
                     }
                     .popover(isPresented: $showingReasoningPopover) {
                         ReasoningPopover(
@@ -458,6 +487,18 @@ struct iOSChatView: View {
     // (nothing is damaged). See ModelConfiguration.needsThermalConsent.
     private func thermalConsentTitle(for model: ModelConfiguration) -> String {
         "\(model.displayName) runs warm in thinking mode"
+    }
+
+    /// Filling-thermometer glyph for the thermal indicator, by OS thermal level
+    /// (1 fair / 2 serious / 3 critical). Level 0 (nominal) hides the glyph, so it
+    /// isn't mapped here. Monochrome; the fill level carries the meaning.
+    private func thermalGlyphName(_ level: Int) -> String {
+        switch level {
+        case 1:  return "thermometer.low"
+        case 2:  return "thermometer.medium"
+        case 3:  return "thermometer.high"
+        default: return "thermometer.medium"
+        }
     }
 
     private func thermalConsentMessage(for model: ModelConfiguration) -> String {
@@ -765,6 +806,53 @@ struct ReasoningPopover: View {
             return "\(modelName) will think each answer through first. You'll see its reasoning stream into a panel above the reply, then the answer beneath. It's slower and more deliberate. Tap the brain again to switch back to direct replies."
         } else {
             return "\(modelName) answers directly, with no visible reasoning. Tap the brain whenever you want to watch it think a question through before it replies."
+        }
+    }
+}
+
+// MARK: - ThermalIndicatorPopover
+//
+// Plain-language explanation shown when the user taps the thermal glyph, mirroring
+// PrivacyLockPopover. Only shown above nominal (the glyph hides at level 0), so the
+// text describes fair/serious/critical; a nominal fallback is kept for safety. Each
+// line states what the ThermalGovernor (Block 61) actually does at that level, so
+// the explanation is honest, not decorative. Copy approved by Mark 2026-07-23.
+struct ThermalIndicatorPopover: View {
+    let level: Int
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            Image(systemName: glyph)
+                .font(.headline)
+
+            Text(explanation)
+                .font(.subheadline)
+                .foregroundColor(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+        }
+        .padding(16)
+        .frame(width: 280)
+    }
+
+    private var glyph: String {
+        switch level {
+        case 1:  return "thermometer.low"
+        case 2:  return "thermometer.medium"
+        case 3:  return "thermometer.high"
+        default: return "thermometer.low"
+        }
+    }
+
+    private var explanation: String {
+        switch level {
+        case 1:
+            return "Your phone is warming up. Hal is easing off slightly to slow the climb."
+        case 2:
+            return "Your phone is hot. Hal is slowing down to let it cool."
+        case 3:
+            return "Your phone is very hot. Hal is pausing until it cools."
+        default:
+            return "Your phone is running cool."
         }
     }
 }
