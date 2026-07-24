@@ -607,6 +607,22 @@ class HalTestConsole: ObservableObject {
             }
             return "{\"status\":\"error\",\"message\":\"SET_TEMPERATURE: must be 0.0–1.0\"}"
 
+        } else if trimmed.hasPrefix("SET_THINKING_CAP:") {
+            // Per-model thinking cap (phase-1 reason budget). Mirrors the UI
+            // slider: clamp to [min,max] and snap to the step so the antenna
+            // and the slider set identical values. Persists per model like
+            // temperature.
+            let valStr = String(trimmed.dropFirst("SET_THINKING_CAP:".count)).trimmingCharacters(in: .whitespaces)
+            if let raw = Int(valStr) {
+                let clamped = max(HalReasoning.minReasonCapTokens, min(HalReasoning.maxReasonCapTokens, raw))
+                let snapped = Int((Double(clamped) / Double(HalReasoning.reasonCapStep)).rounded()) * HalReasoning.reasonCapStep
+                vm.reasoningCapTokens = snapped
+                ModelSettingsStore.shared.persistCurrentOverrides(for: vm.selectedModel)
+                writeStateJSON(vm: vm)
+                return "{\"status\":\"ok\",\"reasoningCapTokens\":\(snapped)}"
+            }
+            return "{\"status\":\"error\",\"message\":\"SET_THINKING_CAP: must be an integer \(HalReasoning.minReasonCapTokens)-\(HalReasoning.maxReasonCapTokens)\"}"
+
         } else if trimmed.hasPrefix("SET_REASONING:") {
             // Test hook for the reasoning / think-token toggle. Sets the sticky
             // flag directly; the in-chat narration is exercised by the actual
@@ -1850,6 +1866,10 @@ class HalTestConsole: ObservableObject {
             if let v = effective.ragDedupThreshold        { vm.ragDedupSimilarityThreshold = v }
             if let v = effective.recencyWeight            { vm.memoryStore.recencyWeight = v }
             if let v = effective.recencyHalfLifeDays      { vm.memoryStore.recencyHalfLifeDays = v }
+            // Always set (not `if let`): a model with no override must RESET the
+            // cap to the default, not inherit the previous model's value —
+            // matches the ChatViewModel switch path.
+            vm.reasoningCapTokens = effective.reasoningCapTokens ?? HalReasoning.defaultReasonCapTokens
             // Defense in depth: even if effective.effectiveMemoryDepth
             // was nil (leaving memoryDepth untouched from the previous
             // model's value), the previous value may exceed the new
@@ -1961,6 +1981,7 @@ class HalTestConsole: ObservableObject {
           "memoryDepth": \(vm.memoryDepth),
           "maxMemoryDepth": \(vm.maxMemoryDepth),
           "temperature": \(String(format: "%.2f", vm.temperature)),
+          "reasoningCapTokens": \(vm.reasoningCapTokens),
           "selfKnowledgeEnabled": \(vm.enableSelfKnowledge),
           "recencyWeight": \(String(format: "%.2f", ms.recencyWeight)),
           "recencyHalfLifeDays": \(String(format: "%.1f", ms.recencyHalfLifeDays)),
