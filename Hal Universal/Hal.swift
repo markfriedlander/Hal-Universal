@@ -9477,9 +9477,14 @@ class ChatViewModel: ObservableObject {
     // Docs/Think_Tokens_Reasoning_Transparency.md and HalReasoning above.
     @AppStorage("reasoningEnabled") var reasoningEnabled: Bool = false
 
-    /// True when the user has reasoning on. Any model — the two-phase flow is
-    /// model-agnostic (no native <think> required).
-    var reasoningActive: Bool { reasoningEnabled }
+    /// True when the user has reasoning on AND we're in single-LLM mode. Any
+    /// model — the two-phase flow is model-agnostic (no native <think> required).
+    /// Gated off in Salon Mode: watching one model reason-then-answer doesn't fit
+    /// a multi-voice round, so thinking is single-LLM only (2026-07-24). This is
+    /// the single chokepoint both salon paths read (independent via
+    /// runSingleModelTurn, context-aware inline), so it also covers the API
+    /// (SALON_SET_ENABLED) without touching the enable/disable setters.
+    var reasoningActive: Bool { reasoningEnabled && !salonConfig.isEnabled }
 
     /// Toggle reasoning on/off and narrate the change into the chat, mirroring
     /// the model-switch narration pattern. Sticky until toggled again.

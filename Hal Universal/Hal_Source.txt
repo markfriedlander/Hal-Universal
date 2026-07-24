@@ -9478,9 +9478,14 @@ class ChatViewModel: ObservableObject {
     // Docs/Think_Tokens_Reasoning_Transparency.md and HalReasoning above.
     @AppStorage("reasoningEnabled") var reasoningEnabled: Bool = false
 
-    /// True when the user has reasoning on. Any model — the two-phase flow is
-    /// model-agnostic (no native <think> required).
-    var reasoningActive: Bool { reasoningEnabled }
+    /// True when the user has reasoning on AND we're in single-LLM mode. Any
+    /// model — the two-phase flow is model-agnostic (no native <think> required).
+    /// Gated off in Salon Mode: watching one model reason-then-answer doesn't fit
+    /// a multi-voice round, so thinking is single-LLM only (2026-07-24). This is
+    /// the single chokepoint both salon paths read (independent via
+    /// runSingleModelTurn, context-aware inline), so it also covers the API
+    /// (SALON_SET_ENABLED) without touching the enable/disable setters.
+    var reasoningActive: Bool { reasoningEnabled && !salonConfig.isEnabled }
 
     /// Toggle reasoning on/off and narrate the change into the chat, mirroring
     /// the model-switch narration pattern. Sticky until toggled again.
@@ -28846,8 +28851,15 @@ struct iOSChatView: View {
                 }
             }
             // Reasoning / thinking toggle — monochrome (bright on / dim off).
+            // In Salon Mode thinking is unavailable (single-LLM only): the button
+            // stays tappable but dims and, instead of toggling, opens the popover
+            // to explain why. A dead disabled control would explain nothing —
+            // off-brand for a transparency app.
             Button {
-                if chatViewModel.reasoningEnabled {
+                if chatViewModel.salonConfig.isEnabled {
+                    // Salon Mode: thinking is gated off. Explain, don't toggle.
+                    showingReasoningPopover = true
+                } else if chatViewModel.reasoningEnabled {
                     // Turning thinking OFF — never gated.
                     chatViewModel.setReasoning(false)
                     showingReasoningPopover = true
@@ -28860,12 +28872,17 @@ struct iOSChatView: View {
                 }
             } label: {
                 Image(systemName: "brain")
-                    .foregroundStyle(chatViewModel.reasoningEnabled ? Color.primary : Color.secondary)
+                    // Colour tracks the EFFECTIVE state (reasoningActive), so the
+                    // glyph reads dim in Salon even if reasoningEnabled is still
+                    // stored true. Extra dim signals "unavailable but tappable".
+                    .foregroundStyle(chatViewModel.reasoningActive ? Color.primary : Color.secondary)
+                    .opacity(chatViewModel.salonConfig.isEnabled ? 0.45 : 1.0)
             }
             .popover(isPresented: $showingReasoningPopover) {
                 ReasoningPopover(
                     isOn: chatViewModel.reasoningEnabled,
-                    modelName: chatViewModel.selectedModel.displayName
+                    modelName: chatViewModel.selectedModel.displayName,
+                    unavailableInSalon: chatViewModel.salonConfig.isEnabled
                 )
                 .presentationCompactAdaptation(.popover)
             }
@@ -29213,12 +29230,16 @@ private struct ThinkingDisclosure: View {
 struct ReasoningPopover: View {
     let isOn: Bool
     let modelName: String
+    // When true, thinking is gated off because Salon Mode is active. Overrides
+    // the on/off copy with an explanation of why the control is unavailable.
+    // Defaults false so existing call sites are unchanged.
+    var unavailableInSalon: Bool = false
 
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
             HStack(spacing: 8) {
                 Image(systemName: "brain")
-                Text(isOn ? "Reasoning on" : "Reasoning off")
+                Text(title)
                     .fontWeight(.semibold)
             }
             .font(.headline)
@@ -29232,7 +29253,15 @@ struct ReasoningPopover: View {
         .frame(width: 280)
     }
 
+    private var title: String {
+        if unavailableInSalon { return "Thinking off in Salon Mode" }
+        return isOn ? "Reasoning on" : "Reasoning off"
+    }
+
     private var explanation: String {
+        if unavailableInSalon {
+            return "Watching Hal think runs one model through a reason-then-answer pass. Thinking is only available in single LLM mode. Switch back to a single model to turn it on."
+        }
         if isOn {
             return "\(modelName) will think each answer through first. You'll see its reasoning stream into a panel above the reply, then the answer beneath. It's slower and more deliberate. Tap the brain again to switch back to direct replies."
         } else {
