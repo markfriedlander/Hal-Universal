@@ -775,6 +775,23 @@ class HalTestConsole: ObservableObject {
             }
             return "{\"status\":\"error\",\"message\":\"SET_THERMAL_PACING: must be on/off\"}"
 
+        } else if trimmed.hasPrefix("SET_PACING_DELAY:") {
+            // Calibration/DEBUG: set the PROACTIVE per-chunk pacing delay (ms),
+            // applied to every generation chunk regardless of thermal state (the
+            // leading-indicator control). "default"/"0" clears it (off). Sweep this
+            // on a heavy model to find the largest rate that stays out of `.serious`
+            // while completing. See the proactive-pacing memo.
+            let val = String(trimmed.dropFirst("SET_PACING_DELAY:".count)).trimmingCharacters(in: .whitespaces).lowercased()
+            if val == "default" || val == "nil" || val == "0" {
+                ReasoningTuning.shared.proactivePacingDelayMs = nil
+                return "{\"status\":\"ok\",\"pacingDelayMs\":null}"
+            }
+            if let i = Int(val), i >= 1, i <= 5000 {
+                ReasoningTuning.shared.proactivePacingDelayMs = i
+                return "{\"status\":\"ok\",\"pacingDelayMs\":\(i)}"
+            }
+            return "{\"status\":\"error\",\"message\":\"SET_PACING_DELAY: must be 1-5000 (ms) or default\"}"
+
         } else if trimmed.hasPrefix("SET_SELF_KNOWLEDGE:") {
             let valStr = String(trimmed.dropFirst("SET_SELF_KNOWLEDGE:".count)).trimmingCharacters(in: .whitespaces).lowercased()
             if valStr == "true" || valStr == "false" {

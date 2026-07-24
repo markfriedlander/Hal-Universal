@@ -293,6 +293,16 @@ final class ReasoningTuning: @unchecked Sendable {
     /// turns it off to measure what pacing buys.
     var thermalPacingEnabled: Bool = true
 
+    /// PROACTIVE per-chunk pacing delay (milliseconds), applied to EVERY generation
+    /// chunk regardless of thermal state — the leading-indicator control that lets a
+    /// heavy model self-limit its token rate BEFORE it heats, instead of the reactive
+    /// governor catching it after. nil/0 = off (light models pay nothing). This is the
+    /// calibration knob: set via SET_PACING_DELAY, sweep values to find the largest
+    /// rate that keeps a heavy model (Bonsai) out of `.serious` while completing. The
+    /// shipped feature will compute this per-model from active-parameter compute
+    /// weight; the knob is how we measure the numbers. See the proactive-pacing memo.
+    var proactivePacingDelayMs: Int? = nil
+
     // Raw reasoning capture buffer. The generator appends EVERY streamed
     // chunk here as it arrives (generateChatStream), so the complete raw
     // reasoning is retained and readable *mid-flight* via the
@@ -5724,6 +5734,16 @@ class MLXWrapper: ObservableObject {
                             // never reach across into ReasoningTuning cross-actor.
                             if ReasoningTuning.shared.thermalPacingEnabled {
                                 await ThermalGovernor.shared.pace()
+                            }
+                            // PROACTIVE per-chunk pacing (leading-indicator control):
+                            // a fixed delay applied EVERY chunk regardless of thermal
+                            // state, so a heavy model self-limits its token rate before
+                            // it heats. nil/0 = off (light models untouched). This is
+                            // the calibration knob (SET_PACING_DELAY); the shipped
+                            // feature derives it per-model from compute weight.
+                            if let pacingMs = ReasoningTuning.shared.proactivePacingDelayMs,
+                               pacingMs > 0, !Task.isCancelled {
+                                try? await Task.sleep(nanoseconds: UInt64(pacingMs) * 1_000_000)
                             }
                         case .info(let info):
                             halLog("HALDEBUG-MLX-CHAT: Generation complete: \(info.generationTokenCount) tokens at \(String(format: "%.1f", info.tokensPerSecond)) tok/s")
