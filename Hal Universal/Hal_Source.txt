@@ -29025,6 +29025,8 @@ struct iOSChatView: View {
     var body: some View {
         NavigationStack {
             VStack(spacing: 0) {
+                // Top chrome — two rows: full-width thread title, then the icon row.
+                chromeHeader
                 // Messages
                 ScrollViewReader { proxy in
                     List {
@@ -29058,6 +29060,27 @@ struct iOSChatView: View {
                             .listRowSeparator(.hidden)
                     }
                     .listStyle(.plain)
+                    // Soft fades so messages dissolve into the chrome instead of
+                    // ending on a hard edge (Mark, 2026-07-23): fade DOWN into the
+                    // top chrome, and UP into the composer at the bottom. Fades to
+                    // the app background (matches the dark chrome); non-interactive
+                    // so scrolling and taps pass straight through.
+                    .overlay(alignment: .top) {
+                        LinearGradient(
+                            colors: [Color(.systemBackground), Color(.systemBackground).opacity(0)],
+                            startPoint: .top, endPoint: .bottom
+                        )
+                        .frame(height: 28)
+                        .allowsHitTesting(false)
+                    }
+                    .overlay(alignment: .bottom) {
+                        LinearGradient(
+                            colors: [Color(.systemBackground).opacity(0), Color(.systemBackground)],
+                            startPoint: .top, endPoint: .bottom
+                        )
+                        .frame(height: 28)
+                        .allowsHitTesting(false)
+                    }
                     .id(chatViewModel.messagesVersion)
                     .onTapGesture {
                         // Dismiss keyboard when tapping message area.
@@ -29108,106 +29131,10 @@ struct iOSChatView: View {
                 // Composer
                 composer
             }
-            .navigationTitle(conversationTitle)
-            .toolbar {
-                ToolbarItem(placement: .navigationBarLeading) {
-                    Button {
-                        chatViewModel.showingThreadPanel = true
-                    } label: {
-                        Image(systemName: "line.3.horizontal")
-                    }
-                }
-                // Reasoning toggle — brain, shown for EVERY model (2026-07-22): the
-                // two-phase reasoning flow is model-agnostic, no native <think>
-                // required. Tap flips reasoning on/off (sticky), narrates the change
-                // into chat, and pops a plain-language explanation of the new state.
-                // See Docs/Think_Tokens_Reasoning_Transparency.md.
-                ToolbarItem(placement: .navigationBarTrailing) {
-                    Button {
-                        if chatViewModel.reasoningEnabled {
-                            // Turning thinking OFF — never gated.
-                            chatViewModel.setReasoning(false)
-                            showingReasoningPopover = true
-                        } else if chatViewModel.selectedModel.needsThermalConsent {
-                            // Turning thinking ON with a heavy/unprofiled model: the
-                            // toll first. On accept, the alert already explained the
-                            // state, so we skip the usual ReasoningPopover.
-                            showingThermalConsentToggle = true
-                        } else {
-                            chatViewModel.setReasoning(true)
-                            showingReasoningPopover = true
-                        }
-                    } label: {
-                        Image(systemName: "brain")
-                            // Monochrome to match the lock/gear chrome (Mark, 2026-07-23):
-                            // bright (primary) when thinking is on, dim (secondary) when off.
-                            // No accent/blue tint.
-                            .foregroundStyle(chatViewModel.reasoningEnabled ? Color.primary : Color.secondary)
-                    }
-                    .popover(isPresented: $showingReasoningPopover) {
-                        ReasoningPopover(
-                            isOn: chatViewModel.reasoningEnabled,
-                            modelName: chatViewModel.selectedModel.displayName
-                        )
-                        .presentationCompactAdaptation(.popover)
-                    }
-                }
-                // Thermal indicator — a filling thermometer, shown ONLY when the
-                // phone is above nominal (Mark, 2026-07-23: appear-when-necessary,
-                // not always-on). Monochrome to match the lock/gear chrome (no
-                // color). Tap explains the current thermal state and what the
-                // ThermalGovernor (Block 61) is doing at that level. Replaces the
-                // interim in-thread notice. Driven by chatViewModel.thermalLevel.
-                ToolbarItem(placement: .navigationBarTrailing) {
-                    if chatViewModel.thermalLevel >= 1 {
-                        Button {
-                            showingThermalIndicatorPopover = true
-                        } label: {
-                            Image(systemName: thermalGlyphName(chatViewModel.thermalLevel))
-                        }
-                        .popover(isPresented: $showingThermalIndicatorPopover) {
-                            ThermalIndicatorPopover(level: chatViewModel.thermalLevel)
-                                .presentationCompactAdaptation(.popover)
-                        }
-                    }
-                }
-                // Privacy lock — sits just left of the gear (declared first in
-                // the trailing group). Monochrome outline glyph to match the
-                // gearshape. Tap opens a plain-language explanation of the
-                // current state. See PrivacyMonitor.swift.
-                ToolbarItem(placement: .navigationBarTrailing) {
-                    Button {
-                        showingPrivacyPopover = true
-                    } label: {
-                        Image(systemName: isPrivacyLocked ? "lock" : "lock.open")
-                    }
-                    .popover(isPresented: $showingPrivacyPopover) {
-                        PrivacyLockPopover(
-                            isLocked: isPrivacyLocked
-                        ) {
-                            // Record intent + dismiss the popover; the actual
-                            // Model Library sheet is presented from onDisappear
-                            // below, once the popover is fully gone.
-                            pendingModelLibraryNav = true
-                            showingPrivacyPopover = false
-                        }
-                        .presentationCompactAdaptation(.popover)
-                        .onDisappear {
-                            if pendingModelLibraryNav {
-                                pendingModelLibraryNav = false
-                                chatViewModel.apiNavModelLibrary = true
-                            }
-                        }
-                    }
-                }
-                ToolbarItem(placement: .navigationBarTrailing) {
-                    Button {
-                        chatViewModel.showingSettings = true
-                    } label: {
-                        Image(systemName: "gearshape")
-                    }
-                }
-            }
+            // Native nav bar hidden — the two-row `chromeHeader` above replaces it
+            // (2026-07-23) so the thread title gets a full-width line of its own
+            // instead of fighting the icons for space and truncating to "Wha...".
+            .toolbar(.hidden, for: .navigationBar)
             .sheet(isPresented: $chatViewModel.showingThreadPanel) {
                 ThreadPanelView(isPresented: $chatViewModel.showingThreadPanel)
                     .environmentObject(chatViewModel)
@@ -29290,6 +29217,113 @@ struct iOSChatView: View {
                 }
             }
         }
+    }
+
+    // MARK: - Top chrome (two-row: full-width title + icon row)
+    //
+    // Replaces the native nav bar (2026-07-23). Row 1 is the full-width thread
+    // name on its own line (no more truncating to "Wha..." against the icons);
+    // row 2 is the control + status icons. FIXED — no collapse-on-scroll (Mark:
+    // the one line of height isn't worth the scroll-tracking + jank; revisit only
+    // if the fixed row proves annoying in use). The icons are the same buttons and
+    // popovers that used to live in `.toolbar`, moved verbatim into an HStack.
+    private var chromeHeader: some View {
+        VStack(spacing: 2) {
+            Text(conversationTitle)
+                .font(.headline)
+                .lineLimit(1)
+                .truncationMode(.tail)
+                .frame(maxWidth: .infinity, alignment: .center)
+                .padding(.horizontal, 16)
+                .padding(.top, 6)
+            chromeIconRow
+                .padding(.horizontal, 14)
+                .padding(.top, 2)
+                .padding(.bottom, 8)
+        }
+        .background(.bar)
+        .overlay(alignment: .bottom) { Divider() }
+    }
+
+    private var chromeIconRow: some View {
+        HStack(spacing: 22) {
+            // Threads / conversation list — leftmost (as in the old nav bar).
+            Button {
+                chatViewModel.showingThreadPanel = true
+            } label: {
+                Image(systemName: "line.3.horizontal")
+            }
+            Spacer(minLength: 12)
+            // Thermal indicator — appear-when-warm (see ThermalIndicatorPopover).
+            if chatViewModel.thermalLevel >= 1 {
+                Button {
+                    showingThermalIndicatorPopover = true
+                } label: {
+                    Image(systemName: thermalGlyphName(chatViewModel.thermalLevel))
+                }
+                .popover(isPresented: $showingThermalIndicatorPopover) {
+                    ThermalIndicatorPopover(level: chatViewModel.thermalLevel)
+                        .presentationCompactAdaptation(.popover)
+                }
+            }
+            // Reasoning / thinking toggle — monochrome (bright on / dim off).
+            Button {
+                if chatViewModel.reasoningEnabled {
+                    // Turning thinking OFF — never gated.
+                    chatViewModel.setReasoning(false)
+                    showingReasoningPopover = true
+                } else if chatViewModel.selectedModel.needsThermalConsent {
+                    // Turning thinking ON with a heavy/unprofiled model: toll first.
+                    showingThermalConsentToggle = true
+                } else {
+                    chatViewModel.setReasoning(true)
+                    showingReasoningPopover = true
+                }
+            } label: {
+                Image(systemName: "brain")
+                    .foregroundStyle(chatViewModel.reasoningEnabled ? Color.primary : Color.secondary)
+            }
+            .popover(isPresented: $showingReasoningPopover) {
+                ReasoningPopover(
+                    isOn: chatViewModel.reasoningEnabled,
+                    modelName: chatViewModel.selectedModel.displayName
+                )
+                .presentationCompactAdaptation(.popover)
+            }
+            // Privacy lock.
+            Button {
+                showingPrivacyPopover = true
+            } label: {
+                Image(systemName: isPrivacyLocked ? "lock" : "lock.open")
+            }
+            .popover(isPresented: $showingPrivacyPopover) {
+                PrivacyLockPopover(
+                    isLocked: isPrivacyLocked
+                ) {
+                    // Record intent + dismiss the popover; the Model Library sheet
+                    // presents from onDisappear once the popover is fully gone.
+                    pendingModelLibraryNav = true
+                    showingPrivacyPopover = false
+                }
+                .presentationCompactAdaptation(.popover)
+                .onDisappear {
+                    if pendingModelLibraryNav {
+                        pendingModelLibraryNav = false
+                        chatViewModel.apiNavModelLibrary = true
+                    }
+                }
+            }
+            // Settings.
+            Button {
+                chatViewModel.showingSettings = true
+            } label: {
+                Image(systemName: "gearshape")
+            }
+        }
+        .font(.title3)
+        // Monochrome/white icons to match the stark chrome; the brain sets its own
+        // foreground (bright on / dim off) which overrides this tint.
+        .tint(.primary)
     }
 
     // MARK: - Thermal-consent copy
@@ -29384,6 +29418,11 @@ struct iOSChatView: View {
         }
         .padding(.horizontal, 12)
         .padding(.vertical, 10)
+        // Composer uses the lighter `.ultraThinMaterial` (its original). We tried
+        // matching it to the darker top chrome, but the composer sits against the
+        // KEYBOARD (a system element we can't recolor), and a dark composer clashed
+        // with the light keyboard. The lighter material blends with the keyboard, so
+        // it stays. Top/bottom chrome intentionally differ for this reason. (2026-07-24.)
         .background(.ultraThinMaterial)
     }
     
