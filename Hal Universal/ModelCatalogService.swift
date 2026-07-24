@@ -1159,6 +1159,44 @@ struct ModelConfiguration: Identifiable, Codable, Equatable, Hashable {
         .dolphin3Llama32_3B4bit,
         .bonsai8B2bit          // CANDIDATE — under calibration (item 6); remove if it fails
     ]
+
+    // MARK: - Thermal / thinking-mode policy (2026-07-23)
+    //
+    // Thinking mode runs a model twice per turn (reason, then answer), a sustained
+    // GPU/ANE burst. Heat per token tracks a model's ACTIVE parameters, not its file
+    // size (Bonsai's 2.3 GB download hides ~8B dense params active every token). Some
+    // models overheat in that mode; the user is warned first (a repeating toll) and
+    // the heavy ones are paced down. These small policy hooks keep that logic in one
+    // place instead of scattering model-id checks through the UI and the send path.
+
+    /// True for Apple Foundation + the curated seed models Hal ships and has profiled;
+    /// false for anything the user side-loaded (an "experimental" model we haven't
+    /// characterized for heat or quality).
+    var isCurated: Bool {
+        id == ModelConfiguration.appleFoundation.id
+            || ModelConfiguration.curatedSeeds.contains { $0.id == id }
+    }
+
+    /// Whether entering thinking mode with this model should warn the user first.
+    /// Two cases: Bonsai (calibrated to overheat in two-phase thinking, 2026-07-23),
+    /// and any experimental (non-curated) model (unprofiled — could be heavy). The
+    /// warning is a deliberate, repeating toll: a potentially degraded, slower
+    /// experience the user opts into each time, like using a beta.
+    var needsThermalConsent: Bool {
+        id == ModelConfiguration.bonsai8B2bit.id || !isCurated
+    }
+
+    /// Proactive per-token pacing (ms) applied while THINKING mode is active, so a
+    /// heavy model self-limits its token rate BEFORE it heats (a leading-indicator
+    /// control, unlike the reactive governor which reacts to heat already made).
+    /// Bonsai's ~8B active params/token make two-phase thinking overheat; 300ms was
+    /// calibrated on device (2026-07-23). Other curated models stay at full speed
+    /// (the reactive governor is their floor). `nil` = no proactive throttle. A future
+    /// step returns an estimate here for experimental models from their parameter
+    /// count; for now they lean on the governor floor + the consent warning.
+    var reasoningThermalPacingMs: Int? {
+        id == ModelConfiguration.bonsai8B2bit.id ? 300 : nil
+    }
 }
 
 // MARK: - Hugging Face API Response Models

@@ -169,6 +169,14 @@ struct iOSChatView: View {
     @StateObject private var privacyMonitor = PrivacyMonitor.shared
     @State private var showingPrivacyPopover = false
     @State private var showingReasoningPopover = false
+    // Thermal-consent toll (2026-07-23). Turning thinking ON with a heavy model
+    // (Bonsai) or an unprofiled experimental model shows a repeating warning first;
+    // switching INTO such a model while thinking is already on warns after the fact
+    // (the 300ms throttle is enforced at the generation path either way — this is the
+    // heads-up, not the protection). Two flags because the two paths offer different
+    // choices (turn on / not now  vs  keep on / turn off). See needsThermalConsent.
+    @State private var showingThermalConsentToggle = false
+    @State private var showingThermalConsentSwitch = false
     // Set when the user taps "Model Library" in the privacy popover; consumed
     // in the popover's onDisappear so the sheet presents only AFTER the popover
     // is fully gone (a popover + sheet can't present at once — same race as the
@@ -296,8 +304,19 @@ struct iOSChatView: View {
                 // See Docs/Think_Tokens_Reasoning_Transparency.md.
                 ToolbarItem(placement: .navigationBarTrailing) {
                     Button {
-                        chatViewModel.setReasoning(!chatViewModel.reasoningEnabled)
-                        showingReasoningPopover = true
+                        if chatViewModel.reasoningEnabled {
+                            // Turning thinking OFF — never gated.
+                            chatViewModel.setReasoning(false)
+                            showingReasoningPopover = true
+                        } else if chatViewModel.selectedModel.needsThermalConsent {
+                            // Turning thinking ON with a heavy/unprofiled model: the
+                            // toll first. On accept, the alert already explained the
+                            // state, so we skip the usual ReasoningPopover.
+                            showingThermalConsentToggle = true
+                        } else {
+                            chatViewModel.setReasoning(true)
+                            showingReasoningPopover = true
+                        }
                     } label: {
                         Image(systemName: "brain")
                             .foregroundStyle(chatViewModel.reasoningEnabled ? Color.accentColor : Color.secondary)
@@ -397,6 +416,56 @@ struct iOSChatView: View {
                         .environmentObject(MLXModelDownloader.shared)
                 }
             }
+            // Thermal-consent toll — path 1: the user tapped the brain to turn
+            // thinking ON with a heavy/unprofiled model. Gate before enabling.
+            .alert(thermalConsentTitle(for: chatViewModel.selectedModel),
+                   isPresented: $showingThermalConsentToggle) {
+                Button("Not now", role: .cancel) { }
+                Button("Turn on thinking") {
+                    chatViewModel.setReasoning(true)
+                }
+            } message: {
+                Text(thermalConsentMessage(for: chatViewModel.selectedModel))
+            }
+            // Thermal-consent toll — path 2: thinking is already on and the user
+            // switched INTO a heavy/unprofiled model (fired by the onChange below).
+            // The switch already happened, so the choice is about thinking state.
+            .alert(thermalConsentTitle(for: chatViewModel.selectedModel),
+                   isPresented: $showingThermalConsentSwitch) {
+                Button("Turn thinking off") {
+                    chatViewModel.setReasoning(false)
+                }
+                Button("Keep thinking on", role: .cancel) { }
+            } message: {
+                Text(thermalConsentMessage(for: chatViewModel.selectedModel))
+            }
+            // Warn when switching INTO a consent model while thinking is already on;
+            // the brain-toggle gate can't catch this path. Safety (the 300ms throttle)
+            // is enforced at the generation path regardless — this is the heads-up.
+            .onChange(of: chatViewModel.selectedModelID) { _, _ in
+                if chatViewModel.reasoningEnabled && chatViewModel.selectedModel.needsThermalConsent {
+                    showingThermalConsentSwitch = true
+                }
+            }
+        }
+    }
+
+    // MARK: - Thermal-consent copy
+    // Honest wording for the thinking-mode toll. Heat tracks a model's ACTIVE
+    // parameters per token, so Bonsai (8B dense) is the calibrated-hot case and any
+    // experimental (non-curated) model is the unprofiled case. The escalation is
+    // stated plainly: throttled → answer may cut off → iOS protects the hardware
+    // (nothing is damaged). See ModelConfiguration.needsThermalConsent.
+    private func thermalConsentTitle(for model: ModelConfiguration) -> String {
+        "\(model.displayName) runs warm in thinking mode"
+    }
+
+    private func thermalConsentMessage(for model: ModelConfiguration) -> String {
+        let name = model.displayName
+        if model.id == ModelConfiguration.bonsai8B2bit.id {
+            return "\(name) is an 8-billion-parameter model. In thinking mode it thinks and then answers, which is a lot of sustained work for the phone. To keep it cool, Hal slows \(name) down while it thinks, so replies come slowly. If the phone still gets too warm an answer can come out short or cut off, and if it gets warmer still iOS steps in to protect the phone. Nothing is damaged. You can turn thinking off anytime with the brain button."
+        } else {
+            return "\(name) isn't a model Hal has tuned for heat. In thinking mode it thinks and then answers, which is sustained work for the phone. Hal will slow it down if it starts running warm, but a reply can still come out short or cut off, and if the phone gets hot enough iOS steps in to protect it. Nothing is damaged. You can turn thinking off anytime with the brain button."
         }
     }
 

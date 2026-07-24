@@ -5145,6 +5145,14 @@ class MLXWrapper: ObservableObject {
     private var modelContainer: ModelContainer?
     internal var currentModelConfig: ModelConfiguration?  // Changed to internal so LLMService can check which model is loaded
 
+    /// Production proactive per-token pacing (ms) for the CURRENT turn, set by the
+    /// send path from the model's `reasoningThermalPacingMs` when thinking mode is on
+    /// (Bonsai overheats in two-phase thinking; 300ms calibrated 2026-07-23). `nil`
+    /// on non-thinking turns and for models that don't need it. Read on the generation
+    /// loop; the DEBUG `SET_PACING_DELAY` knob overrides it for calibration. This is
+    /// the shipped counterpart to that DEBUG-only knob — it runs in RELEASE.
+    var activeReasoningPacingMs: Int? = nil
+
     /// Held to keep the lifecycle observer alive for the wrapper's lifetime.
     /// Released automatically when the wrapper deinits (which is "never" in
     /// practice because the wrapper is held by the app's singleton chain).
@@ -5740,8 +5748,10 @@ class MLXWrapper: ObservableObject {
                             // state, so a heavy model self-limits its token rate before
                             // it heats. nil/0 = off (light models untouched). This is
                             // the calibration knob (SET_PACING_DELAY); the shipped
-                            // feature derives it per-model from compute weight.
-                            if let pacingMs = ReasoningTuning.shared.proactivePacingDelayMs,
+                            // per-model throttle is `activeReasoningPacingMs`, set by
+                            // the send path (300ms for Bonsai in thinking mode). The
+                            // DEBUG knob wins when set, so calibration still overrides.
+                            if let pacingMs = ReasoningTuning.shared.proactivePacingDelayMs ?? self.activeReasoningPacingMs,
                                pacingMs > 0, !Task.isCancelled {
                                 try? await Task.sleep(nanoseconds: UInt64(pacingMs) * 1_000_000)
                             }
@@ -5918,6 +5928,16 @@ class LLMService: ObservableObject {
     /// when compressing a segment whose raw size approaches or exceeds the
     /// active model's limit (notably AFM's 4K window).
     var activeContextWindow: Int { currentModel.contextWindow }
+
+    /// Proxy to the MLX wrapper's per-turn proactive thermal throttle. The send path
+    /// sets this from the model's `reasoningThermalPacingMs` when thinking mode is on
+    /// (300ms for Bonsai); the generation loop inside the wrapper reads it. Lives on
+    /// the wrapper because that's where generation happens; proxied here because the
+    /// send path holds an `LLMService`, not the wrapper. `nil` = no throttle.
+    var activeReasoningPacingMs: Int? {
+        get { mlxWrapper.activeReasoningPacingMs }
+        set { mlxWrapper.activeReasoningPacingMs = newValue }
+    }
 
     // MARK: - AFM-only structured generation
     //
@@ -11802,6 +11822,14 @@ class ChatViewModel: ObservableObject {
                                                                         // bounded reasoning with persona only (no RAG). Brain off = the
                                                                         // single normal pass, unchanged. See HalReasoning.
                                                                         let isReasoning = self.reasoningActive
+                                                                        // Per-model proactive thermal throttle for THIS turn: 300ms/token
+                                                                        // for Bonsai in thinking mode (its ~8B active params overheat the
+                                                                        // two-phase pass), nil otherwise. Read on the generation loop.
+                                                                        // Reset on scope exit so it never leaks into the next turn or a
+                                                                        // non-thinking model. Enforced here (not at the consent popup) so
+                                                                        // switching into Bonsai mid-thinking is still paced.
+                                                                        llmService.activeReasoningPacingMs = isReasoning ? selectedModel.reasoningThermalPacingMs : nil
+                                                                        defer { llmService.activeReasoningPacingMs = nil }
                                                                         let reasoningDepth = HalReasoning.depth(for: selectedModel)
                                                                         let phase1Input = isReasoning ? HalReasoning.reasonPrompt(for: userInput) : userInput
                                                                         let chatBuildResult = await buildChatMessages(

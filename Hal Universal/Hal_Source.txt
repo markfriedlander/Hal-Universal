@@ -5146,6 +5146,14 @@ class MLXWrapper: ObservableObject {
     private var modelContainer: ModelContainer?
     internal var currentModelConfig: ModelConfiguration?  // Changed to internal so LLMService can check which model is loaded
 
+    /// Production proactive per-token pacing (ms) for the CURRENT turn, set by the
+    /// send path from the model's `reasoningThermalPacingMs` when thinking mode is on
+    /// (Bonsai overheats in two-phase thinking; 300ms calibrated 2026-07-23). `nil`
+    /// on non-thinking turns and for models that don't need it. Read on the generation
+    /// loop; the DEBUG `SET_PACING_DELAY` knob overrides it for calibration. This is
+    /// the shipped counterpart to that DEBUG-only knob — it runs in RELEASE.
+    var activeReasoningPacingMs: Int? = nil
+
     /// Held to keep the lifecycle observer alive for the wrapper's lifetime.
     /// Released automatically when the wrapper deinits (which is "never" in
     /// practice because the wrapper is held by the app's singleton chain).
@@ -5741,8 +5749,10 @@ class MLXWrapper: ObservableObject {
                             // state, so a heavy model self-limits its token rate before
                             // it heats. nil/0 = off (light models untouched). This is
                             // the calibration knob (SET_PACING_DELAY); the shipped
-                            // feature derives it per-model from compute weight.
-                            if let pacingMs = ReasoningTuning.shared.proactivePacingDelayMs,
+                            // per-model throttle is `activeReasoningPacingMs`, set by
+                            // the send path (300ms for Bonsai in thinking mode). The
+                            // DEBUG knob wins when set, so calibration still overrides.
+                            if let pacingMs = ReasoningTuning.shared.proactivePacingDelayMs ?? self.activeReasoningPacingMs,
                                pacingMs > 0, !Task.isCancelled {
                                 try? await Task.sleep(nanoseconds: UInt64(pacingMs) * 1_000_000)
                             }
@@ -5919,6 +5929,16 @@ class LLMService: ObservableObject {
     /// when compressing a segment whose raw size approaches or exceeds the
     /// active model's limit (notably AFM's 4K window).
     var activeContextWindow: Int { currentModel.contextWindow }
+
+    /// Proxy to the MLX wrapper's per-turn proactive thermal throttle. The send path
+    /// sets this from the model's `reasoningThermalPacingMs` when thinking mode is on
+    /// (300ms for Bonsai); the generation loop inside the wrapper reads it. Lives on
+    /// the wrapper because that's where generation happens; proxied here because the
+    /// send path holds an `LLMService`, not the wrapper. `nil` = no throttle.
+    var activeReasoningPacingMs: Int? {
+        get { mlxWrapper.activeReasoningPacingMs }
+        set { mlxWrapper.activeReasoningPacingMs = newValue }
+    }
 
     // MARK: - AFM-only structured generation
     //
@@ -11803,6 +11823,14 @@ class ChatViewModel: ObservableObject {
                                                                         // bounded reasoning with persona only (no RAG). Brain off = the
                                                                         // single normal pass, unchanged. See HalReasoning.
                                                                         let isReasoning = self.reasoningActive
+                                                                        // Per-model proactive thermal throttle for THIS turn: 300ms/token
+                                                                        // for Bonsai in thinking mode (its ~8B active params overheat the
+                                                                        // two-phase pass), nil otherwise. Read on the generation loop.
+                                                                        // Reset on scope exit so it never leaks into the next turn or a
+                                                                        // non-thinking model. Enforced here (not at the consent popup) so
+                                                                        // switching into Bonsai mid-thinking is still paced.
+                                                                        llmService.activeReasoningPacingMs = isReasoning ? selectedModel.reasoningThermalPacingMs : nil
+                                                                        defer { llmService.activeReasoningPacingMs = nil }
                                                                         let reasoningDepth = HalReasoning.depth(for: selectedModel)
                                                                         let phase1Input = isReasoning ? HalReasoning.reasonPrompt(for: userInput) : userInput
                                                                         let chatBuildResult = await buildChatMessages(
@@ -23124,6 +23152,44 @@ struct ModelConfiguration: Identifiable, Codable, Equatable, Hashable {
         .dolphin3Llama32_3B4bit,
         .bonsai8B2bit          // CANDIDATE — under calibration (item 6); remove if it fails
     ]
+
+    // MARK: - Thermal / thinking-mode policy (2026-07-23)
+    //
+    // Thinking mode runs a model twice per turn (reason, then answer), a sustained
+    // GPU/ANE burst. Heat per token tracks a model's ACTIVE parameters, not its file
+    // size (Bonsai's 2.3 GB download hides ~8B dense params active every token). Some
+    // models overheat in that mode; the user is warned first (a repeating toll) and
+    // the heavy ones are paced down. These small policy hooks keep that logic in one
+    // place instead of scattering model-id checks through the UI and the send path.
+
+    /// True for Apple Foundation + the curated seed models Hal ships and has profiled;
+    /// false for anything the user side-loaded (an "experimental" model we haven't
+    /// characterized for heat or quality).
+    var isCurated: Bool {
+        id == ModelConfiguration.appleFoundation.id
+            || ModelConfiguration.curatedSeeds.contains { $0.id == id }
+    }
+
+    /// Whether entering thinking mode with this model should warn the user first.
+    /// Two cases: Bonsai (calibrated to overheat in two-phase thinking, 2026-07-23),
+    /// and any experimental (non-curated) model (unprofiled — could be heavy). The
+    /// warning is a deliberate, repeating toll: a potentially degraded, slower
+    /// experience the user opts into each time, like using a beta.
+    var needsThermalConsent: Bool {
+        id == ModelConfiguration.bonsai8B2bit.id || !isCurated
+    }
+
+    /// Proactive per-token pacing (ms) applied while THINKING mode is active, so a
+    /// heavy model self-limits its token rate BEFORE it heats (a leading-indicator
+    /// control, unlike the reactive governor which reacts to heat already made).
+    /// Bonsai's ~8B active params/token make two-phase thinking overheat; 300ms was
+    /// calibrated on device (2026-07-23). Other curated models stay at full speed
+    /// (the reactive governor is their floor). `nil` = no proactive throttle. A future
+    /// step returns an estimate here for experimental models from their parameter
+    /// count; for now they lean on the governor floor + the consent warning.
+    var reasoningThermalPacingMs: Int? {
+        id == ModelConfiguration.bonsai8B2bit.id ? 300 : nil
+    }
 }
 
 // MARK: - Hugging Face API Response Models
@@ -28912,6 +28978,14 @@ struct iOSChatView: View {
     @StateObject private var privacyMonitor = PrivacyMonitor.shared
     @State private var showingPrivacyPopover = false
     @State private var showingReasoningPopover = false
+    // Thermal-consent toll (2026-07-23). Turning thinking ON with a heavy model
+    // (Bonsai) or an unprofiled experimental model shows a repeating warning first;
+    // switching INTO such a model while thinking is already on warns after the fact
+    // (the 300ms throttle is enforced at the generation path either way — this is the
+    // heads-up, not the protection). Two flags because the two paths offer different
+    // choices (turn on / not now  vs  keep on / turn off). See needsThermalConsent.
+    @State private var showingThermalConsentToggle = false
+    @State private var showingThermalConsentSwitch = false
     // Set when the user taps "Model Library" in the privacy popover; consumed
     // in the popover's onDisappear so the sheet presents only AFTER the popover
     // is fully gone (a popover + sheet can't present at once — same race as the
@@ -29039,8 +29113,19 @@ struct iOSChatView: View {
                 // See Docs/Think_Tokens_Reasoning_Transparency.md.
                 ToolbarItem(placement: .navigationBarTrailing) {
                     Button {
-                        chatViewModel.setReasoning(!chatViewModel.reasoningEnabled)
-                        showingReasoningPopover = true
+                        if chatViewModel.reasoningEnabled {
+                            // Turning thinking OFF — never gated.
+                            chatViewModel.setReasoning(false)
+                            showingReasoningPopover = true
+                        } else if chatViewModel.selectedModel.needsThermalConsent {
+                            // Turning thinking ON with a heavy/unprofiled model: the
+                            // toll first. On accept, the alert already explained the
+                            // state, so we skip the usual ReasoningPopover.
+                            showingThermalConsentToggle = true
+                        } else {
+                            chatViewModel.setReasoning(true)
+                            showingReasoningPopover = true
+                        }
                     } label: {
                         Image(systemName: "brain")
                             .foregroundStyle(chatViewModel.reasoningEnabled ? Color.accentColor : Color.secondary)
@@ -29140,6 +29225,56 @@ struct iOSChatView: View {
                         .environmentObject(MLXModelDownloader.shared)
                 }
             }
+            // Thermal-consent toll — path 1: the user tapped the brain to turn
+            // thinking ON with a heavy/unprofiled model. Gate before enabling.
+            .alert(thermalConsentTitle(for: chatViewModel.selectedModel),
+                   isPresented: $showingThermalConsentToggle) {
+                Button("Not now", role: .cancel) { }
+                Button("Turn on thinking") {
+                    chatViewModel.setReasoning(true)
+                }
+            } message: {
+                Text(thermalConsentMessage(for: chatViewModel.selectedModel))
+            }
+            // Thermal-consent toll — path 2: thinking is already on and the user
+            // switched INTO a heavy/unprofiled model (fired by the onChange below).
+            // The switch already happened, so the choice is about thinking state.
+            .alert(thermalConsentTitle(for: chatViewModel.selectedModel),
+                   isPresented: $showingThermalConsentSwitch) {
+                Button("Turn thinking off") {
+                    chatViewModel.setReasoning(false)
+                }
+                Button("Keep thinking on", role: .cancel) { }
+            } message: {
+                Text(thermalConsentMessage(for: chatViewModel.selectedModel))
+            }
+            // Warn when switching INTO a consent model while thinking is already on;
+            // the brain-toggle gate can't catch this path. Safety (the 300ms throttle)
+            // is enforced at the generation path regardless — this is the heads-up.
+            .onChange(of: chatViewModel.selectedModelID) { _, _ in
+                if chatViewModel.reasoningEnabled && chatViewModel.selectedModel.needsThermalConsent {
+                    showingThermalConsentSwitch = true
+                }
+            }
+        }
+    }
+
+    // MARK: - Thermal-consent copy
+    // Honest wording for the thinking-mode toll. Heat tracks a model's ACTIVE
+    // parameters per token, so Bonsai (8B dense) is the calibrated-hot case and any
+    // experimental (non-curated) model is the unprofiled case. The escalation is
+    // stated plainly: throttled → answer may cut off → iOS protects the hardware
+    // (nothing is damaged). See ModelConfiguration.needsThermalConsent.
+    private func thermalConsentTitle(for model: ModelConfiguration) -> String {
+        "\(model.displayName) runs warm in thinking mode"
+    }
+
+    private func thermalConsentMessage(for model: ModelConfiguration) -> String {
+        let name = model.displayName
+        if model.id == ModelConfiguration.bonsai8B2bit.id {
+            return "\(name) is an 8-billion-parameter model. In thinking mode it thinks and then answers, which is a lot of sustained work for the phone. To keep it cool, Hal slows \(name) down while it thinks, so replies come slowly. If the phone still gets too warm an answer can come out short or cut off, and if it gets warmer still iOS steps in to protect the phone. Nothing is damaged. You can turn thinking off anytime with the brain button."
+        } else {
+            return "\(name) isn't a model Hal has tuned for heat. In thinking mode it thinks and then answers, which is sustained work for the phone. Hal will slow it down if it starts running warm, but a reply can still come out short or cut off, and if the phone gets hot enough iOS steps in to protect it. Nothing is damaged. You can turn thinking off anytime with the brain button."
         }
     }
 
