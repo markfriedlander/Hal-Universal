@@ -7,6 +7,7 @@
 	objects = {
 
 /* Begin PBXBuildFile section */
+		851C6E363013F00400362DA9 /* SharedModelStoreKit in Frameworks */ = {isa = PBXBuildFile; productRef = 851C6E353013F00400362DA9 /* SharedModelStoreKit */; };
 		855E38602EA94A620029C420 /* FoundationModels.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 855E385F2EA94A620029C420 /* FoundationModels.framework */; };
 		855E38622EA94A730029C420 /* NaturalLanguage.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 855E38612EA94A730029C420 /* NaturalLanguage.framework */; };
 		855E38642EA94AF40029C420 /* libsqlite3.tbd in Frameworks */ = {isa = PBXBuildFile; fileRef = 855E38632EA94AE60029C420 /* libsqlite3.tbd */; };
@@ -58,6 +59,7 @@
 				855E38662EA94C630029C420 /* libcompression.tbd in Frameworks */,
 				855E38642EA94AF40029C420 /* libsqlite3.tbd in Frameworks */,
 				855E38622EA94A730029C420 /* NaturalLanguage.framework in Frameworks */,
+				851C6E363013F00400362DA9 /* SharedModelStoreKit in Frameworks */,
 				855E38692EA94F460029C420 /* MLX in Frameworks */,
 				855E38602EA94A620029C420 /* FoundationModels.framework in Frameworks */,
 				858DA32C2EA956AC00A44B2F /* Hub in Frameworks */,
@@ -135,6 +137,7 @@
 				85ED7E192EA956AC00B40000 /* MLXEmbedders */,
 				85ED7E222EA956AC00B40000 /* Embeddings */,
 				85ED7E242EA956AC00B40000 /* MLTensorUtils */,
+				851C6E353013F00400362DA9 /* SharedModelStoreKit */,
 			);
 			productName = "Hal Universal";
 			productReference = 85B3C57D2EA943560060BCEC /* Hal Universal.app */;
@@ -170,6 +173,7 @@
 				858DA3242EA956AC00A44B2F /* XCRemoteSwiftPackageReference "mlx-swift-lm" */,
 				858DA3292EA956AC00A44B2F /* XCRemoteSwiftPackageReference "swift-transformers" */,
 				85ED7E202EA956AC00B40000 /* XCRemoteSwiftPackageReference "swift-embeddings" */,
+				851C6E343013F00400362DA9 /* XCRemoteSwiftPackageReference "SharedModelStoreKit" */,
 			);
 			preferredProjectObjectVersion = 77;
 			productRefGroup = 85B3C57E2EA943560060BCEC /* Products */;
@@ -421,6 +425,14 @@
 /* End XCConfigurationList section */
 
 /* Begin XCRemoteSwiftPackageReference section */
+		851C6E343013F00400362DA9 /* XCRemoteSwiftPackageReference "SharedModelStoreKit" */ = {
+			isa = XCRemoteSwiftPackageReference;
+			repositoryURL = "https://github.com/markfriedlander/SharedModelStoreKit";
+			requirement = {
+				kind = exactVersion;
+				version = 1.0.0;
+			};
+		};
 		855E38672EA94F460029C420 /* XCRemoteSwiftPackageReference "mlx-swift" */ = {
 			isa = XCRemoteSwiftPackageReference;
 			repositoryURL = "https://github.com/ml-explore/mlx-swift";
@@ -456,6 +468,11 @@
 /* End XCRemoteSwiftPackageReference section */
 
 /* Begin XCSwiftPackageProductDependency section */
+		851C6E353013F00400362DA9 /* SharedModelStoreKit */ = {
+			isa = XCSwiftPackageProductDependency;
+			package = 851C6E343013F00400362DA9 /* XCRemoteSwiftPackageReference "SharedModelStoreKit" */;
+			productName = SharedModelStoreKit;
+		};
 		855E38682EA94F460029C420 /* MLX */ = {
 			isa = XCSwiftPackageProductDependency;
 			package = 855E38672EA94F460029C420 /* XCRemoteSwiftPackageReference "mlx-swift" */;

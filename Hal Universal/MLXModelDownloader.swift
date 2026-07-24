@@ -29,12 +29,13 @@
 // coordinator's `backgroundCompletionHandler`.
 
 import Foundation
+import SharedModelStoreKit
 import SwiftUI
 import Combine
 import UIKit
 
 
-// ==== LEGO START: 45 BackgroundDownloadCoordinator + MLXModelDownloader ====
+// ==== LEGO START: 42 BackgroundDownloadCoordinator + MLXModelDownloader ====
 
 // MARK: - Background Download Coordinator
 //
@@ -244,31 +245,14 @@ class BackgroundDownloadCoordinator: NSObject, URLSessionDownloadDelegate, Obser
 
     // MARK: - Pinned revisions
     //
-    // Curated models pinned to a specific HF revision (a commit SHA) so an
-    // upstream re-conversion can never silently break a shipped build. Any repo
-    // not listed here tracks `main` (HEAD), unchanged from before.
-    //
-    // Why this exists: on 2026-07-06 `mlx-community/gemma-4-e2b-it-4bit` was
-    // re-converted upstream; the new conversion quantizes a layer that
-    // mlx-swift-lm's Gemma4Text builds as a non-quantizable `ScaledLinear`, so
-    // the model fails to load ("Mismatched parameter per_layer_model_projection…
-    // Actual [8960,192], expected [8960,1536]"). Nothing in Hal's download code
-    // broke — HEAD simply moved. Pinning to the last-good revision immunizes us.
-    // Full story: HISTORY 2026-07-20 (Gemma revision-pin). The lookup is applied
-    // at BOTH the tree-listing and file-resolve URLs below, so every download
-    // path (first-time, resume, adopt) honors the pin without touching callers.
-    static let pinnedRevisions: [String: String] = [
-        // Last revision before the 2026-07-06 re-conversion (2026-05-19): original
-        // working weights + the latest chat-template fix. Verified via the repo's
-        // HF commit history.
-        "mlx-community/gemma-4-e2b-it-4bit": "2c3e507453b4f218d05fe3cc97bea5c5a654257e"
-    ]
-
-    /// The HF revision to download `repoID` at: a pinned commit SHA if the repo
-    /// is pinned, otherwise `"main"` (HEAD, the prior behavior for everything).
-    static func revision(forRepoID repoID: String) -> String {
-        pinnedRevisions[repoID] ?? "main"
-    }
+    // The pinned-revision registry MOVED to the shared SharedModelStoreKit package
+    // (2026-07-24) so every family app agrees on the same revision — no sibling can
+    // download a broken HEAD that another app then adopts. The Gemma pin (and the
+    // full "why" — the 2026-07-06 re-conversion that broke loading) now lives there.
+    // Hal, as a family member, relies on the package's baked-in baseline. The lookup
+    // `SharedModelStore.revision(forRepoID:)` is applied at BOTH the tree-listing and
+    // file-resolve URLs below, so every download path (first-time, resume, adopt)
+    // honors the pin. See Docs/Shared_Store_Package_Design_2026-07-24.md.
 
     // MARK: - Public API
 
@@ -347,7 +331,7 @@ class BackgroundDownloadCoordinator: NSObject, URLSessionDownloadDelegate, Obser
                 continue
             }
 
-            guard let url = URL(string: "https://huggingface.co/\(repoID)/resolve/\(Self.revision(forRepoID: repoID))/\(filename)") else {
+            guard let url = URL(string: "https://huggingface.co/\(repoID)/resolve/\(SharedModelStore.revision(forRepoID: repoID))/\(filename)") else {
                 halLog("HALDEBUG-BGDL: Could not build URL for \(filename); skipping")
                 continue
             }
@@ -399,7 +383,7 @@ class BackgroundDownloadCoordinator: NSObject, URLSessionDownloadDelegate, Obser
         // invisible, and the model downloads "successfully" while silently missing
         // its nested files. Flat repos (all of Hal's Picks today) are unaffected;
         // this matters for the Community browser, which points at arbitrary repos.
-        guard let url = URL(string: "https://huggingface.co/api/models/\(repoID)/tree/\(Self.revision(forRepoID: repoID))?recursive=1") else {
+        guard let url = URL(string: "https://huggingface.co/api/models/\(repoID)/tree/\(SharedModelStore.revision(forRepoID: repoID))?recursive=1") else {
             throw NSError(domain: "BackgroundDownloadCoordinator", code: 2, userInfo: [
                 NSLocalizedDescriptionKey: "Bad repo ID: \(repoID)"
             ])
@@ -2150,4 +2134,4 @@ extension Notification.Name {
     nonisolated static let mlxModelDownloadFailed = Notification.Name("mlxModelDownloadFailed")
 }
 
-// ==== LEGO END: 45 BackgroundDownloadCoordinator + MLXModelDownloader ====
+// ==== LEGO END: 42 BackgroundDownloadCoordinator + MLXModelDownloader ====

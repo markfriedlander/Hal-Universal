@@ -35,7 +35,7 @@
 import Foundation
 import Combine
 
-// ==== LEGO START: 62 RoboRunner (On-Device Reasoning/Thermal Script Runner) ====
+// ==== LEGO START: 59 RoboRunner (On-Device Reasoning/Thermal Script Runner) ====
 
 /// DEBUG-only side channel for GRANULAR per-phase data a single turn cannot expose
 /// over the atomic send path. The live two-phase reasoning path (Hal.swift) stamps
@@ -266,6 +266,6 @@ final class RoboRunner: ObservableObject {
     }
 }
 
-// ==== LEGO END: 62 RoboRunner (On-Device Reasoning/Thermal Script Runner) ====
+// ==== LEGO END: 59 RoboRunner (On-Device Reasoning/Thermal Script Runner) ====
 
 #endif

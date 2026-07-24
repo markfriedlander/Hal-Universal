@@ -26,7 +26,7 @@
 //  model-license sheet in ModelCatalogService / the download flow).
 //
 
-// ==== LEGO START: 60 About (Open-Source Licenses & Acknowledgements) ====
+// ==== LEGO START: 57 About (Open-Source Licenses & Acknowledgements) ====
 
 import SwiftUI
 
@@ -623,4 +623,4 @@ private let halAcknowledgements: [Acknowledgement] = [
                     url: "https://github.com/swiftlang/swift-syntax"),
 ]
 
-// ==== LEGO END: 60 About (Open-Source Licenses & Acknowledgements) ====
+// ==== LEGO END: 57 About (Open-Source Licenses & Acknowledgements) ====

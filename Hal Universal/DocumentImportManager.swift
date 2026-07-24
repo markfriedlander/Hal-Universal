@@ -37,7 +37,7 @@ import PDFKit
 import UniformTypeIdentifiers
 import Compression  // libcompression — raw-deflate used by DocxParser/MiniZip
 
-// ==== LEGO START: 48 DocumentImportManager (Ingest & Entities) ====
+// ==== LEGO START: 45 DocumentImportManager (Ingest & Entities) ====
 // MARK: - DocumentImportManager (MODIFIED FOR iOS - Aligned with Hal10000App.swift)
 @MainActor
 class DocumentImportManager: ObservableObject {
@@ -632,10 +632,10 @@ class DocumentImportManager: ObservableObject {
         print("HALDEBUG-IMPORT: Generated enhanced import conversation messages with entity context")
     }
 }
-// ==== LEGO END: 48 DocumentImportManager (Ingest & Entities) ====
+// ==== LEGO END: 45 DocumentImportManager (Ingest & Entities) ====
 
 
-// ==== LEGO START: 49 DOCX Parser (MiniZip + XML Text Extraction) ====
+// ==== LEGO START: 46 DOCX Parser (MiniZip + XML Text Extraction) ====
 //
 // iOS-native .docx text extractor. A .docx file is an OPC zip archive
 // containing word/document.xml; that XML's <w:t> elements hold the
@@ -905,11 +905,11 @@ final class DocxTextExtractor: NSObject, XMLParserDelegate {
     }
 }
 
-// ==== LEGO END: 49 DOCX Parser (MiniZip + XML Text Extraction) ====
+// ==== LEGO END: 46 DOCX Parser (MiniZip + XML Text Extraction) ====
 
 
 
-// ==== LEGO START: 50 Import Models (ProcessedDocument & Summary) ====
+// ==== LEGO START: 47 Import Models (ProcessedDocument & Summary) ====
 // MARK: - Supporting Data Models (from Hal10000App.swift)
 struct ProcessedDocument {
     let url: URL
@@ -928,4 +928,4 @@ struct DocumentImportSummary {
     let totalEntitiesFound: Int
     let processingTime: TimeInterval
 }
-// ==== LEGO END: 50 Import Models (ProcessedDocument & Summary) ====
+// ==== LEGO END: 47 Import Models (ProcessedDocument & Summary) ====

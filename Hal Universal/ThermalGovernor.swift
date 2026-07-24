@@ -1,4 +1,4 @@
-// ==== LEGO START: 61 ThermalGovernor (Proactive Thermal Pacing) ====
+// ==== LEGO START: 58 ThermalGovernor (Proactive Thermal Pacing) ====
 // ThermalGovernor.swift
 // Hal Universal
 //
@@ -124,4 +124,4 @@ actor ThermalGovernor {
     }
 }
 
-// ==== LEGO END: 61 ThermalGovernor (Proactive Thermal Pacing) ====
+// ==== LEGO END: 58 ThermalGovernor (Proactive Thermal Pacing) ====

@@ -77,48 +77,47 @@
 //  PrivacyMonitor.swift
 //   41  Privacy Lock (Network Monitor, Lock Truth Table, Popover)
 //
-//  SharedModelStore.swift
-//   42  Shared Model Store (App-Group Paths)
-//   43  Shared Model Store (Refcount Manifest)
-//   44  Shared Model Store (Cross-App Download Lock)
+//  (SharedModelStore extracted 2026-07-24 to the SharedModelStoreKit SPM package —
+//   the cross-app contract now lives there, imported by Hal, Posey, and AI Camera.)
 //
 //  MLXModelDownloader.swift
-//   45  BackgroundDownloadCoordinator + MLXModelDownloader
+//   42  BackgroundDownloadCoordinator + MLXModelDownloader
 //
 //  ModelCatalogService.swift
-//   46  Model Catalog Service (Hugging Face Integration)
+//   43  Model Catalog Service (Hugging Face Integration)
 //
 //  LocalAPIServer.swift
-//   47  Developer API (HTTP Server + File-Channel Test Console)
+//   44  Developer API (HTTP Server + File-Channel Test Console)
 //
 //  DocumentImportManager.swift
-//   48  DocumentImportManager (Ingest & Entities)
-//   49  DOCX Parser (MiniZip + XML Text Extraction)
-//   50  Import Models (ProcessedDocument & Summary)
+//   45  DocumentImportManager (Ingest & Entities)
+//   46  DOCX Parser (MiniZip + XML Text Extraction)
+//   47  Import Models (ProcessedDocument & Summary)
 //
 //  SettingsViews.swift
-//   51  Main Settings (ActionsView)
-//   52  PowerUserView
-//   53  SystemPromptEditorView
-//   54  ModelFramingDetailView
-//   55  SalonModeView (Multi-LLM Configuration)
+//   48  Main Settings (ActionsView)
+//   49  PowerUserView
+//   50  SystemPromptEditorView
+//   51  ModelFramingDetailView
+//   52  SalonModeView (Multi-LLM Configuration)
 //
 //  ChatViews.swift
-//   56  App Entry & iOSChatView (UI Shell)
-//   57  ThreadPanelView
-//   58  ChatBubbleView & TimerView (Message UI Components)
-//   59  MarkdownView (Block-Level Markdown Renderer)
+//   53  App Entry & iOSChatView (UI Shell)
+//   54  ThreadPanelView
+//   55  ChatBubbleView & TimerView (Message UI Components)
+//   56  MarkdownView (Block-Level Markdown Renderer)
 //
 //  About.swift
-//   60  About (Open-Source Licenses & Acknowledgements)
+//   57  About (Open-Source Licenses & Acknowledgements)
 //
 //  ThermalGovernor.swift
-//   61  ThermalGovernor (Proactive Thermal Pacing)
+//   58  ThermalGovernor (Proactive Thermal Pacing)
 //
 //  RoboRunner.swift
-//   62  RoboRunner (On-Device Reasoning/Thermal Script Runner)
+//   59  RoboRunner (On-Device Reasoning/Thermal Script Runner)
 //
 import SwiftUI
+import SharedModelStoreKit
 import Foundation
 import Combine
 import Observation

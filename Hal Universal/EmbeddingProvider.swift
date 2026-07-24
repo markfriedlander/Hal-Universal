@@ -20,6 +20,7 @@
 // is async.
 
 import Foundation
+import SharedModelStoreKit
 import CoreML
 import NaturalLanguage
 import Embeddings

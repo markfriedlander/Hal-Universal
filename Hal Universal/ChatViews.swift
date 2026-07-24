@@ -13,11 +13,12 @@
 // and one ChatBubbleView writer.
 
 import Foundation
+import SharedModelStoreKit
 import SwiftUI
 import Combine
 import UIKit
 
-// ==== LEGO START: 56 App Entry & iOSChatView (UI Shell) ====
+// ==== LEGO START: 53 App Entry & iOSChatView (UI Shell) ====
 
 
 // MARK: - HistoricalContext (from Hal10000App.swift)
@@ -122,6 +123,12 @@ struct Hal10000App: App {
     @Environment(\.scenePhase) private var scenePhase
 
     init() {
+        // Configure the shared model store with the family App-Group id BEFORE any
+        // store access (the download coordinator constructed just below touches it),
+        // then stamp this launch so Hal's model claims stay fresh (the 30-day lease).
+        // See the SharedModelStoreKit package.
+        SharedModelStore.configure(appGroupID: "group.com.MarkFriedlander.aifamily")
+        SharedModelStore.touchHeartbeat()
         // Eagerly construct the background download coordinator so its URLSession
         // is wired up before iOS dispatches any pending completion events on
         // app launch (e.g. when iOS wakes us to deliver a finished download).
@@ -621,10 +628,10 @@ struct iOSChatView: View {
 }
 
 
-// ==== LEGO END: 56 App Entry & iOSChatView (UI Shell) ====
+// ==== LEGO END: 53 App Entry & iOSChatView (UI Shell) ====
 
 
-// ==== LEGO START: 57 ThreadPanelView ====
+// ==== LEGO START: 54 ThreadPanelView ====
 
 // MARK: - Thread Panel
 /// Slide-out panel accessed via hamburger icon. Lists all conversation threads, most recent first.
@@ -747,10 +754,10 @@ struct ThreadPanelView: View {
     }
 }
 
-// ==== LEGO END: 57 ThreadPanelView ====
+// ==== LEGO END: 54 ThreadPanelView ====
 
 
-// ==== LEGO START: 58 ChatBubbleView & TimerView (Message UI Components) ====
+// ==== LEGO START: 55 ChatBubbleView & TimerView (Message UI Components) ====
 
 // PreferenceKey used by ChatBubbleView to read the bubble's actual
 // container width via GeometryReader. This is what fixes rotation
@@ -1497,9 +1504,9 @@ struct TimerView: View {
         }
     }
 }
-// ==== LEGO END: 58 ChatBubbleView & TimerView (Message UI Components) ====
+// ==== LEGO END: 55 ChatBubbleView & TimerView (Message UI Components) ====
 
-// ==== LEGO START: 59 MarkdownView (Block-Level Markdown Renderer) ====
+// ==== LEGO START: 56 MarkdownView (Block-Level Markdown Renderer) ====
 
 // MARK: - Markdown Block Renderer
 // Parses markdown into typed blocks and renders each as a distinct SwiftUI view.
@@ -1674,4 +1681,4 @@ struct MarkdownView: View {
     }
 }
 
-// ==== LEGO END: 59 MarkdownView (Block-Level Markdown Renderer) ====
+// ==== LEGO END: 56 MarkdownView (Block-Level Markdown Renderer) ====

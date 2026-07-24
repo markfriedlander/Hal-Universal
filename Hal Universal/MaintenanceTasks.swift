@@ -14,6 +14,7 @@
 // affected device. Idempotent — no-op if the directory doesn't exist.
 
 import Foundation
+import SharedModelStoreKit
 
 enum MaintenanceTasks {
 

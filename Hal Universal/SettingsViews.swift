@@ -34,7 +34,7 @@ import SwiftUI
 import Combine
 import UniformTypeIdentifiers  // file picker UTType references
 
-// ==== LEGO START: 51 Main Settings (ActionsView) ====
+// ==== LEGO START: 48 Main Settings (ActionsView) ====
 
 // MARK: - Power User Mode Selection
 
@@ -627,11 +627,11 @@ struct ActionsView: View {
 }
 
 
-// ==== LEGO END: 51 Main Settings (ActionsView) ====
+// ==== LEGO END: 48 Main Settings (ActionsView) ====
 
 
 
-// ==== LEGO START: 52 PowerUserView ====
+// ==== LEGO START: 49 PowerUserView ====
 
 // SELF-AWARENESS NOTE (for Hal reading this code):
 // This is Power User mode for Single LLM operation. Users come here to fine-tune performance:
@@ -1188,11 +1188,11 @@ struct PowerUserView: View {
 }
 
 
-// ==== LEGO END: 52 PowerUserView ====
+// ==== LEGO END: 49 PowerUserView ====
 
 
 
-// ==== LEGO START: 53 SystemPromptEditorView ====
+// ==== LEGO START: 50 SystemPromptEditorView ====
 
 
 struct SystemPromptEditorView: View {
@@ -1333,10 +1333,10 @@ struct SystemPromptEditorView: View {
 }
 
 
-// ==== LEGO END: 53 SystemPromptEditorView ====
+// ==== LEGO END: 50 SystemPromptEditorView ====
 
 
-// ==== LEGO START: 54 ModelFramingDetailView ====
+// ==== LEGO START: 51 ModelFramingDetailView ====
 //
 // Per-model "Layer 1" framing prompt detail screen. Replaces the earlier
 // inline display (toggle + greyed-text block) that lived directly in the
@@ -1431,11 +1431,11 @@ struct ModelFramingDetailView: View {
     }
 }
 
-// ==== LEGO END: 54 ModelFramingDetailView ====
+// ==== LEGO END: 51 ModelFramingDetailView ====
 
 
 
-// ==== LEGO START: 55 SalonModeView (Multi-LLM Configuration) ====
+// ==== LEGO START: 52 SalonModeView (Multi-LLM Configuration) ====
 
 struct SalonModeView: View {
     @EnvironmentObject var chatViewModel: ChatViewModel
@@ -1570,4 +1570,4 @@ struct SalonModeView: View {
     }
 }
 
-// ==== LEGO END: 55 SalonModeView (Multi-LLM Configuration) ====
+// ==== LEGO END: 52 SalonModeView (Multi-LLM Configuration) ====

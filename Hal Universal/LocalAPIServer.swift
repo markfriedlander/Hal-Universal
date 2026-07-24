@@ -49,6 +49,7 @@
 //     never directly here
 
 import Foundation
+import SharedModelStoreKit
 import SwiftUI
 import Combine
 import Network
@@ -154,7 +155,7 @@ extension DocumentImportManager {
 }
 
 
-// ==== LEGO START: 47 Developer API (HTTP Server + File-Channel Test Console) ====
+// ==== LEGO START: 44 Developer API (HTTP Server + File-Channel Test Console) ====
 //
 // SELF-AWARENESS NOTE (for Hal reading this code):
 // This is a development tool that lets Claude Code converse with your pipeline directly,
@@ -383,6 +384,10 @@ class HalTestConsole: ObservableObject {
             return "{\"status\":\"ok\",\"command\":\"SHARED_MODELS\",\"appGroupResolved\":\(containerResolved),\"root\":\"\(jsonStringEscape(root.path))\",\"presentCount\":\(entries.count),\"present\":[\(entries.joined(separator: ","))]}"
 
         } else if trimmed.hasPrefix("DOWNLOAD_LOCK") {
+            // The lock DIAGNOSTIC verb uses the store's DEBUG-only test helpers
+            // (plant/clear/enumerate), which don't exist in release builds of the
+            // shared package. Gate the whole verb to DEBUG; release returns a stub.
+            #if DEBUG
             // v2.1 diagnostic + TEST harness for the cross-app download lock
             // (SharedModelStore BLOCK SMS.4). Lets the device test suite exercise
             // Hal's wait/adopt/take-over path without a second real app running in
@@ -430,6 +435,9 @@ class HalTestConsole: ObservableObject {
             default: // QUERY
                 return "{\"status\":\"ok\",\"command\":\"DOWNLOAD_LOCK\",\"action\":\"QUERY\",\"staleSeconds\":\(Int(SharedModelStore.downloadLockStaleSeconds)),\"lockCount\":\(SharedModelStore.debugAllDownloadLocks().count),\"locks\":\(locksJSON())}"
             }
+            #else
+            return "{\"status\":\"error\",\"command\":\"DOWNLOAD_LOCK\",\"message\":\"DOWNLOAD_LOCK is DEBUG-only\"}"
+            #endif
 
         } else if trimmed.hasPrefix("LEGACY_MIGRATION") {
             // v2.1 diagnostic + TEST harness for the launch-time legacy→shared
@@ -2621,4 +2629,4 @@ class LocalAPIServer {
     }
 }
 
-// ==== LEGO END: 47 Developer API (HTTP Server + File-Channel Test Console) ====
+// ==== LEGO END: 44 Developer API (HTTP Server + File-Channel Test Console) ====
