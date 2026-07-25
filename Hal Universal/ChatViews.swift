@@ -1214,7 +1214,10 @@ struct ChatBubbleView: View {
     // MARK: - Footer View (Updated with Processing/Inference labels)
     @ViewBuilder
     var footerView: some View {
-        VStack(alignment: .trailing, spacing: 2) {
+        // Follow the speaker: the user's footer aligns right (under their right-flush
+        // bubble); Hal's aligns left (under his left-flush text). See the Hal-branch
+        // placement, which also insets it to match the text's left edge.
+        VStack(alignment: message.isFromUser ? .trailing : .leading, spacing: 2) {
             if message.isPartial {
                 // Show the model that's currently generating, alongside the
                 // spinner and timer, so the user knows which engine is
@@ -1544,7 +1547,11 @@ struct ChatBubbleView: View {
                             showingPromptDetail = true
                         }
                     }
+                    // Match Hal's text: same left inset (assistantHInset) and same width
+                    // frame, so the footer lines up flush under the start of his reply.
                     footerView
+                        .padding(.horizontal, chatDensity.assistantHInset)
+                        .frame(maxWidth: assistantMaxWidth, alignment: .leading)
                 }
                 Spacer()
             }
