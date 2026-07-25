@@ -400,6 +400,15 @@ final class EmbeddingProvider: @unchecked Sendable {
         lock.lock()
         self.nomicBundle = bundle
         lock.unlock()
+        // Claim-on-adopt (v2.5 version-safety): the embedder loads by plain name
+        // via swift-embeddings, which writes files to the shared store but never
+        // files a claim — so nomic/mxbai sat in the ledger as orphans (claimedBy
+        // []), deletable by any sibling's refcount pass. Record Hal's claim on a
+        // successful load (plain-keyed: embedders are `plainFolderRepos`, so their
+        // required identity is the bare id) and exclude from iCloud backup (2.5.1).
+        // Idempotent. Mirrors Posey. Heals an existing orphan on next load.
+        SharedModelStore.claim(modelID: modelID, repo: modelID, sizeBytes: SharedModelStore.sizeOnDisk(modelID))
+        SharedModelStore.excludeFromBackup(modelID)
         halLog("HALDEBUG-EMBEDDING: Nomic Embed Text v1.5 loaded (\(modelID)) — dimension=\(EmbeddingBackend.nomicSwift.dimension)")
     }
 
@@ -508,6 +517,12 @@ final class EmbeddingProvider: @unchecked Sendable {
         lock.lock()
         self.mxbaiBundle = bundle
         lock.unlock()
+        // Claim-on-adopt (v2.5 version-safety) — same as the Nomic path: the
+        // embedder loads by plain name and never filed a claim, so it sat orphaned
+        // in the ledger. Record Hal's claim (plain-keyed) + exclude from backup on
+        // a successful load. Idempotent. Mirrors Posey. Heals the orphan on load.
+        SharedModelStore.claim(modelID: modelID, repo: modelID, sizeBytes: SharedModelStore.sizeOnDisk(modelID))
+        SharedModelStore.excludeFromBackup(modelID)
         halLog("HALDEBUG-EMBEDDING: mxbai-embed-large-v1 loaded (\(modelID)) — dimension=\(EmbeddingBackend.mxbai.dimension)")
     }
 

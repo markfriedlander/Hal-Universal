@@ -419,8 +419,11 @@ class BackgroundDownloadCoordinator: NSObject, URLSessionDownloadDelegate, Obser
 
     private func modelDirectory(for modelID: String) -> URL {
         // v2.1: models live in the App-Group shared store, not per-app Caches,
-        // so Hal and Posey share one copy. See SharedModelStore.swift.
-        SharedModelStore.mlxModelDir(modelID)
+        // so Hal and Posey share one copy. Keyed by the shared-store key (the
+        // version-stamped identity for a curated model) so a pinned copy lands
+        // in its own `repo@<sha>` folder, never confused with a legacy or
+        // other-version copy. See sharedStoreKey / SharedModelStore.swift.
+        SharedModelStore.mlxModelDir(sharedStoreKey(forRepoID: modelID))
     }
 
     // MARK: - Completion Notification
@@ -431,18 +434,31 @@ class BackgroundDownloadCoordinator: NSObject, URLSessionDownloadDelegate, Obser
         // Mark in MLXModelDownloader's downloaded set so future model-status
         // queries report it as downloaded.
         MLXModelDownloader.shared.markModelAsDownloadedFromBackground(modelID: modelID)
-        // v2.1 shared store: record Hal's claim on the freshly-downloaded model
-        // (so Posey's delete can't pull it out from under Hal) and exclude it
-        // from iCloud backup — App Group containers aren't auto-excluded the way
-        // Library/Caches is (App Review 2.5.1).
-        SharedModelStore.claim(modelID: modelID, repo: modelID)
-        SharedModelStore.excludeFromBackup(modelID)
+        // v2.1 shared store, keyed by the shared-store key (the version-stamped
+        // identity for a curated model): record Hal's claim on the freshly-
+        // downloaded copy (so Posey's delete can't pull it out from under Hal)
+        // and exclude it from iCloud backup — App Group containers aren't auto-
+        // excluded the way Library/Caches is (App Review 2.5.1).
+        let key = sharedStoreKey(forRepoID: modelID)
+        SharedModelStore.claim(modelID: key, repo: modelID)
+        SharedModelStore.excludeFromBackup(key)
         // Release the cross-app download lock now the model is whole. This is the
         // success release site (claim first, then release) — placing it here
         // rather than in performLockedDownload means a completion delivered after
         // a background relaunch, when that Task is gone, still clears the lock. A
         // waiting sibling sees "no lock + a claim" and adopts.
-        SharedModelStore.releaseDownloadLock(modelID: modelID)
+        SharedModelStore.releaseDownloadLock(modelID: key)
+        // Reap the superseded plain-name copy (from before versions were part of
+        // identity): drop Hal's claim on the OLD bare id and, only if no app in
+        // the family still claims it, delete the stale folder. Runs for a stamped
+        // repo only (key != bare id); a no-op otherwise. This is what stops a
+        // migrated model from leaving its old copy behind as an orphan.
+        if key != modelID,
+           SharedModelStore.releaseClaim(modelID: modelID),
+           SharedModelStore.isRepoDownloaded(modelID) {
+            try? FileManager.default.removeItem(at: SharedModelStore.mlxModelDir(modelID))
+            halLog("HALDEBUG-BGDL: reaped superseded plain copy of \(modelID) after locking to its pinned commit")
+        }
         NotificationCenter.default.post(name: .mlxModelDidDownload, object: nil, userInfo: ["modelID": modelID])
     }
 
@@ -465,8 +481,9 @@ class BackgroundDownloadCoordinator: NSObject, URLSessionDownloadDelegate, Obser
         let summary = failures.map { "\($0.key): \($0.value)" }.joined(separator: "; ")
         halLog("HALDEBUG-BGDL: ❌ Model \(modelID) FAILED — \(failures.count) file(s) did not save. Not claiming, not marking downloaded. [\(summary)]")
 
-        // Release the lock; do NOT claim, do NOT mark downloaded.
-        SharedModelStore.releaseDownloadLock(modelID: modelID)
+        // Release the lock (keyed by the shared-store key, matching acquire); do
+        // NOT claim, do NOT mark downloaded.
+        SharedModelStore.releaseDownloadLock(modelID: sharedStoreKey(forRepoID: modelID))
 
         // Remove the partial model directory so a retry starts clean and no
         // half-model masquerades as present. Model-scoped (the coordinator's own
@@ -876,8 +893,10 @@ class MLXModelDownloader: ObservableObject {
     }
     
     // Helper: Construct runtime path for a model ID (App-Group shared store).
+    // Keyed by the shared-store key so a curated model resolves to its
+    // version-stamped `repo@<sha>` folder. See sharedStoreKey.
     private func modelPath(for modelID: String) -> URL {
-        SharedModelStore.mlxModelDir(modelID)
+        SharedModelStore.mlxModelDir(sharedStoreKey(forRepoID: modelID))
     }
     
     // MARK: - Download Queue Management
@@ -972,7 +991,7 @@ class MLXModelDownloader: ObservableObject {
             // Partial models now fall through to the branches below, which either
             // let recovered background tasks keep running or re-fetch and download
             // only the missing files.
-            if SharedModelStore.isRepoComplete(modelID) {
+            if SharedModelStore.isRepoComplete(sharedStoreKey(forRepoID: modelID)) {
                 clearInFlight(modelID)
                 halLog("HALDEBUG-DOWNLOAD: \(modelID) is verified complete (sentinel); clearing in-flight marker")
                 continue
@@ -1377,9 +1396,13 @@ class MLXModelDownloader: ObservableObject {
         // container, don't start a second copy — wait for theirs to land and
         // adopt it (zero re-download), taking over only if their download dies.
         // See SharedModelStore BLOCK SMS.4 and awaitSharedDownloadThenAdopt.
-        let gotLock = SharedModelStore.acquireDownloadLock(modelID: modelID)
+        // Lock keyed by the shared-store key so Hal and a sibling contend on the
+        // SAME identity for a curated model (acquire / refresh / release below all
+        // use this key).
+        let lockID = sharedStoreKey(forRepoID: modelID)
+        let gotLock = SharedModelStore.acquireDownloadLock(modelID: lockID)
         if !gotLock {
-            let holder = SharedModelStore.downloadLock(modelID: modelID)?.holder
+            let holder = SharedModelStore.downloadLock(modelID: lockID)?.holder
             halLog("HALDEBUG-DOWNLOAD: \(modelID) already being downloaded by \(SharedModelStore.appDisplayName(holder)); waiting to adopt instead of duplicating")
             await MainActor.run {
                 self.currentDownloadModelID = modelID
@@ -1454,7 +1477,7 @@ class MLXModelDownloader: ObservableObject {
                 // waiting on this model doesn't judge our live download stale
                 // and start a redundant copy. (Only fires while we're in the
                 // foreground; the staleness window covers backgrounded holders.)
-                SharedModelStore.refreshDownloadLock(modelID: modelID)
+                SharedModelStore.refreshDownloadLock(modelID: sharedStoreKey(forRepoID: modelID))
                 await MainActor.run {
                     let bgdlFraction = BackgroundDownloadCoordinator.shared.progress(for: modelID)
                     // Fallback to legacy directorySize if BGDL hasn't yet
@@ -1547,7 +1570,7 @@ class MLXModelDownloader: ObservableObject {
                 await BackgroundDownloadCoordinator.shared.cancelDownload(modelID: modelID)
                 progressPollingTask?.cancel()
                 // Release the cross-app lock so a sibling app can proceed.
-                SharedModelStore.releaseDownloadLock(modelID: modelID)
+                SharedModelStore.releaseDownloadLock(modelID: sharedStoreKey(forRepoID: modelID))
                 await MainActor.run {
                     if var state = self.downloadStates[modelID] {
                         state.isDownloading = false
@@ -1570,7 +1593,7 @@ class MLXModelDownloader: ObservableObject {
                 progressPollingTask?.cancel()
                 // Release the cross-app lock so a sibling app (or our own
                 // next-launch resume) can retry this model.
-                SharedModelStore.releaseDownloadLock(modelID: modelID)
+                SharedModelStore.releaseDownloadLock(modelID: sharedStoreKey(forRepoID: modelID))
                 await MainActor.run {
                     if var state = self.downloadStates[modelID] {
                         state.isDownloading = false
@@ -1605,7 +1628,12 @@ class MLXModelDownloader: ObservableObject {
     /// force-quit), we take over and download it ourselves. Runs inside
     /// `currentDownloadTask`, so a user cancel (which cancels that task) ends it.
     private func awaitSharedDownloadThenAdopt(modelID: String, repoID: String, sizeGB: Double?) async {
-        let modelDir = SharedModelStore.mlxModelDir(modelID)
+        // Every store check here (lock / claim / disk presence) keys on the
+        // shared-store key so we're watching the SAME identity the sibling writes
+        // for a curated model. The internal state dictionaries stay keyed by the
+        // bare modelID.
+        let key = sharedStoreKey(forRepoID: modelID)
+        let modelDir = SharedModelStore.mlxModelDir(key)
         let expectedBytes = sizeGB.map { Int64($0 * 1_073_741_824) } ?? 0
         halLog("HALDEBUG-DOWNLOAD: awaiting sibling download of \(modelID) to adopt")
 
@@ -1616,9 +1644,9 @@ class MLXModelDownloader: ObservableObject {
             // Did it finish elsewhere? Completion = lock released AND a claim
             // recorded AND files on disk (the sibling's notifyModelDownloadComplete
             // does claim-then-release, so seeing no lock + a claim means whole).
-            if SharedModelStore.downloadLock(modelID: modelID) == nil,
-               !SharedModelStore.claimants(modelID: modelID).isEmpty,
-               SharedModelStore.isRepoDownloaded(modelID) {
+            if SharedModelStore.downloadLock(modelID: key) == nil,
+               !SharedModelStore.claimants(modelID: key).isEmpty,
+               SharedModelStore.isRepoDownloaded(key) {
                 halLog("HALDEBUG-DOWNLOAD: sibling finished \(modelID); adopting with zero re-download")
                 adoptSharedModel(modelID: modelID)
                 return
@@ -1627,11 +1655,11 @@ class MLXModelDownloader: ObservableObject {
             // Try to (re)acquire. Succeeds once the holder releases (gave up
             // without finishing) or its lock ages past the staleness backstop
             // (presumed dead). Either way, we now own the slot and download.
-            if SharedModelStore.acquireDownloadLock(modelID: modelID) {
+            if SharedModelStore.acquireDownloadLock(modelID: key) {
                 // Race guard: it may have completed in the same tick we grabbed.
-                if !SharedModelStore.claimants(modelID: modelID).isEmpty,
-                   SharedModelStore.isRepoDownloaded(modelID) {
-                    SharedModelStore.releaseDownloadLock(modelID: modelID)
+                if !SharedModelStore.claimants(modelID: key).isEmpty,
+                   SharedModelStore.isRepoDownloaded(key) {
+                    SharedModelStore.releaseDownloadLock(modelID: key)
                     adoptSharedModel(modelID: modelID)
                     return
                 }
@@ -1643,7 +1671,7 @@ class MLXModelDownloader: ObservableObject {
             // Still held by the sibling — reflect their progress from the shared
             // dir's completed bytes so the user sees movement, not a dead bar.
             let size = directorySize(modelDir)
-            let holder = SharedModelStore.downloadLock(modelID: modelID)?.holder
+            let holder = SharedModelStore.downloadLock(modelID: key)?.holder
             await MainActor.run {
                 guard var state = self.downloadStates[modelID], state.isDownloading else { return }
                 if expectedBytes > 0 {
@@ -1665,9 +1693,22 @@ class MLXModelDownloader: ObservableObject {
     /// MainActor-isolated by the project default, so no explicit annotation is
     /// needed here.)
     private func adoptSharedModel(modelID: String) {
-        SharedModelStore.claim(modelID: modelID, repo: modelID)
-        SharedModelStore.excludeFromBackup(modelID)
+        // Keyed by the shared-store key (the version-stamped identity for a
+        // curated model): claim the sibling's finished copy so their delete can't
+        // pull it out from under us, and exclude it from iCloud backup.
+        let key = sharedStoreKey(forRepoID: modelID)
+        SharedModelStore.claim(modelID: key, repo: modelID)
+        SharedModelStore.excludeFromBackup(key)
         halLog("HALDEBUG-DOWNLOAD: ✅ Adopted shared model \(modelID) (fetched by another app; zero re-download)")
+        // Reap the superseded plain-name copy, same as the real-download path:
+        // drop our claim on the OLD bare id and delete it once no app in the
+        // family still claims it. Runs for a stamped repo only (key != bare id).
+        if key != modelID,
+           SharedModelStore.releaseClaim(modelID: modelID),
+           SharedModelStore.isRepoDownloaded(modelID) {
+            try? FileManager.default.removeItem(at: SharedModelStore.mlxModelDir(modelID))
+            halLog("HALDEBUG-DOWNLOAD: reaped superseded plain copy of \(modelID) on adopt")
+        }
         markModelAsDownloadedFromBackground(modelID: modelID)
         NotificationCenter.default.post(name: .mlxModelDidDownload, object: nil, userInfo: ["modelID": modelID])
     }
@@ -1712,7 +1753,7 @@ class MLXModelDownloader: ObservableObject {
 
         // Release the cross-app download lock if we held it (harmless no-op if we
         // didn't, or if we were only waiting to adopt a sibling's download).
-        SharedModelStore.releaseDownloadLock(modelID: modelID)
+        SharedModelStore.releaseDownloadLock(modelID: sharedStoreKey(forRepoID: modelID))
         
         // Update state
         if var state = downloadStates[modelID] {
@@ -1740,7 +1781,7 @@ class MLXModelDownloader: ObservableObject {
         //   3. The in-flight resume marker — otherwise the next launch's resume path
         //      would try to re-download a model the user deliberately deleted.
         await BackgroundDownloadCoordinator.shared.cancelDownload(modelID: modelID)
-        SharedModelStore.releaseDownloadLock(modelID: modelID)
+        SharedModelStore.releaseDownloadLock(modelID: sharedStoreKey(forRepoID: modelID))
         clearInFlight(modelID)
 
         // v2.1 shared store: release Hal's claim FIRST. The files are removed
@@ -1748,7 +1789,7 @@ class MLXModelDownloader: ObservableObject {
         // shared model in Hal drops Hal's claim and leaves Posey's copy on disk;
         // deleting a Hal-only model (no remaining claimant) removes the files as
         // before. This is what makes "delete in one app can't break the other."
-        let safeToDelete = SharedModelStore.releaseClaim(modelID: modelID)
+        let safeToDelete = SharedModelStore.releaseClaim(modelID: sharedStoreKey(forRepoID: modelID))
         let fileExists = FileManager.default.fileExists(atPath: expectedPath.path)
 
         if safeToDelete && fileExists {
@@ -1826,7 +1867,7 @@ class MLXModelDownloader: ObservableObject {
         // having its own record of the download. Matches Posey's
         // `SharedModelStore.isRepoDownloaded`. Mid-download a partial dir reads
         // present, so callers that care also check `isDownloading`.
-        return SharedModelStore.isRepoDownloaded(modelID)
+        return SharedModelStore.isRepoDownloaded(sharedStoreKey(forRepoID: modelID))
     }
 
     /// Waits asynchronously for the `.mlxModelDidDownload` notification that
@@ -1880,7 +1921,7 @@ class MLXModelDownloader: ObservableObject {
         // sentinel and correctly treats the model as done. Without it, resume fell
         // back to "dir has any files," so a half-downloaded model read as complete,
         // its marker got cleared, and it was left permanently partial-but-"done".
-        SharedModelStore.markRepoComplete(modelID)
+        SharedModelStore.markRepoComplete(sharedStoreKey(forRepoID: modelID))
 
         var modelIDs = self.downloadedModelIDs
         modelIDs.insert(modelID)
@@ -2038,7 +2079,10 @@ class MLXModelDownloader: ObservableObject {
                 continue
             }
 
-            let dir = modelPath(for: modelID)
+            // `modelID` here is already a ledger key (modelsClaimedByThisApp returns
+            // stored identities), so resolve the dir directly rather than through
+            // modelPath(for:), which would re-apply sharedStoreKey to an already-keyed id.
+            let dir = SharedModelStore.mlxModelDir(modelID)
             guard FileManager.default.fileExists(atPath: dir.path) else {
                 // Claimed in the ledger but already gone from disk. The release
                 // above is the useful half; nothing to remove.

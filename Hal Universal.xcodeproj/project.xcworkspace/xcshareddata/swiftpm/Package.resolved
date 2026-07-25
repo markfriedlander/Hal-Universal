@@ -1,5 +1,5 @@
 {
-  "originHash" : "5fcd833c0fc513bf54602892a7125f56b7b492b227c4a3f7a763bbb6aec08072",
+  "originHash" : "a0ac1e8ba7799f697e8367b73d74c1df1d09975cba67de907d5ce3aac777895a",
   "pins" : [
     {
       "identity" : "eventsource",
@@ -33,8 +33,8 @@
       "kind" : "remoteSourceControl",
       "location" : "https://github.com/markfriedlander/SharedModelStoreKit",
       "state" : {
-        "revision" : "b4065777fe92123b7da8b301df5f6868b7951272",
-        "version" : "1.0.0"
+        "revision" : "43595bfa7bdf2d41379602ecb622c34c6b98a6c4",
+        "version" : "1.0.2"
       }
     },
     {

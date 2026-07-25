@@ -5998,8 +5998,13 @@ class LLMService: ObservableObject {
         // ledger no matter how the model was selected, so another app's (Posey's)
         // delete can't remove the shared files while Hal is using them.
         // Idempotent; only for models actually present in the shared store.
-        if model.source == .mlx && SharedModelStore.isRepoDownloaded(model.id) {
-            SharedModelStore.claim(modelID: model.id, repo: model.id)
+        // Keyed by the shared-store key (the version-stamped identity for a
+        // curated model) so the claim lands on the exact copy Hal is loading.
+        if model.source == .mlx {
+            let key = sharedStoreKey(forRepoID: model.id)
+            if SharedModelStore.isRepoDownloaded(key) {
+                SharedModelStore.claim(modelID: key, repo: model.id)
+            }
         }
         // If the LLM is actually changing identity (not a same-model
         // re-setup), invalidate the query expansion cache — different

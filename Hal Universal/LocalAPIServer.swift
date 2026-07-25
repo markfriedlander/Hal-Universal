@@ -376,8 +376,12 @@ class HalTestConsole: ObservableObject {
             // just the models whose files are actually in the shared store.
             var entries: [String] = []
             for model in ModelCatalogService.shared.availableModels where model.source == .mlx {
-                guard SharedModelStore.isRepoDownloaded(model.id) else { continue }
-                let claimants = SharedModelStore.claimants(modelID: model.id)
+                // Keyed by the shared-store key so presence + claimants reflect the
+                // version-stamped identity actually on disk (a migrated model no
+                // longer claims its bare id). The reported `id` stays the lay name.
+                let key = sharedStoreKey(forRepoID: model.id)
+                guard SharedModelStore.isRepoDownloaded(key) else { continue }
+                let claimants = SharedModelStore.claimants(modelID: key)
                 let claimantsJSON = "[" + claimants.map { "\"\(jsonStringEscape($0))\"" }.joined(separator: ",") + "]"
                 entries.append("{\"id\":\"\(jsonStringEscape(model.id))\",\"claimants\":\(claimantsJSON)}")
             }

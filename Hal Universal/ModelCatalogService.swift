@@ -34,8 +34,25 @@
 import Foundation
 import SwiftUI
 import Combine
+import SharedModelStoreKit
 
 // ==== LEGO START: 43 Model Catalog Service (Hugging Face Integration) ====
+
+// MARK: - Shared-store key
+//
+// The one identity every SharedModelStore call in Hal routes through. For a
+// curated, version-pinned model it returns the version-stamped identity
+// `repo@<sha>` so a specific commit gets its own folder and is never confused
+// with a legacy or other-version copy on disk. For an unpinned repo, or a
+// `plainFolderRepos` model (the embedders + sd-turbo, which a library loads by
+// plain name), it returns the bare repo id. The stamped-vs-plain decision lives
+// in the PACKAGE (`SharedModelStore.plainFolderRepos`, honored by
+// `requiredIdentity`), so this just forwards to it — keeping every shared-store
+// call in the app on one consistent key with no local special-casing. This is
+// the single change that makes Hal version-safe. See ADOPTION_SPEC.md.
+nonisolated func sharedStoreKey(forRepoID repoID: String) -> String {
+    SharedModelStore.requiredIdentity(forRepoID: repoID)
+}
 
 // MARK: - Model Source Enum
 enum ModelSource: String, Codable {

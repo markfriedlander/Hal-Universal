@@ -38,7 +38,14 @@ enum MaintenanceTasks {
         // refreshes the catalog, so it runs on the main actor. Cheap: on iOS the
         // Caches→App-Group move is a same-volume rename (re-links the directory,
         // never copies the GBs inside), so this doesn't block launch on file size.
-        Task { @MainActor in migrateLegacyCachesModelsToSharedStore() }
+        // The superseded-plain-copy sweep runs right after, on the same hop, so a
+        // model the legacy migration just parked under its bare id (now a
+        // superseded plain copy under version-safe identity) is reaped in the same
+        // launch rather than lingering a cycle.
+        Task { @MainActor in
+            migrateLegacyCachesModelsToSharedStore()
+            sweepSupersededPlainCopies()
+        }
     }
 
     /// Iterate the removed-backend list and delete each one's cache dir
@@ -205,6 +212,51 @@ enum MaintenanceTasks {
 
         if actions.isEmpty { actions.append("no legacy repos found") }
         return actions
+    }
+
+    // MARK: - v2.5 superseded-plain-copy sweep (version-safety, no-orphans)
+    //
+    // Before model identity carried a version, a curated model lived in its PLAIN
+    // `repo` folder. Now each curated (pinned, non-`plainFolderRepos`) model lives
+    // under its version-stamped identity `repo@<sha>`, and the plain copy is never
+    // trusted. The per-download / per-adopt reap (MLXModelDownloader) removes a
+    // plain copy the moment its stamped replacement lands — but a user who never
+    // re-triggers that model would keep the stale plain copy forever. This launch-
+    // time sweep closes that gap: for every pinned non-plain repo with a plain copy
+    // still on disk, it drops Hal's claim on the bare id and, once no app in the
+    // family still claims it, deletes the folder.
+    //
+    // Idempotent (a swept model leaves no plain copy to find next launch); a true
+    // no-op on a device that never had a pre-version copy. `plainFolderRepos` (the
+    // embedders + sd-turbo) are skipped, because their required identity IS the
+    // bare id — their plain folder is the real copy, not a superseded one. The
+    // store's refcount is what makes this safe across the family: a sibling still
+    // mid-migration keeps its claim, so `releaseClaim` returns false and we leave
+    // the files for it.
+    @MainActor
+    static func sweepSupersededPlainCopies() {
+        let fm = FileManager.default
+        for repoID in SharedModelStore.pinnedRevisions.keys {
+            // Only stamped repos have a superseded plain form. For a plainFolderRepo
+            // requiredIdentity(repo) == repo, so this guard skips them.
+            guard SharedModelStore.requiredIdentity(forRepoID: repoID) != repoID else { continue }
+            // Is a plain (bare-id) copy actually on disk? Skip the common case fast.
+            guard SharedModelStore.isRepoDownloaded(repoID) else { continue }
+            // Drop Hal's claim on the bare id; the store deletes files only when no
+            // app in the family still claims it. Re-check presence before removing
+            // (a concurrent reap on the same launch may have taken it already).
+            let safeToDelete = SharedModelStore.releaseClaim(modelID: repoID)
+            guard safeToDelete, SharedModelStore.isRepoDownloaded(repoID) else {
+                halLog("HALDEBUG-SWEEP: kept plain copy of \(repoID) — another app still claims it")
+                continue
+            }
+            do {
+                try fm.removeItem(at: SharedModelStore.mlxModelDir(repoID))
+                halLog("HALDEBUG-SWEEP: reaped superseded plain copy of \(repoID) (now version-stamped)")
+            } catch {
+                halLog("HALDEBUG-SWEEP: failed to reap plain \(repoID): \(error.localizedDescription)")
+            }
+        }
     }
 
     // MARK: - TEST-ONLY helpers (drive the LEGACY_MIGRATION verb)
