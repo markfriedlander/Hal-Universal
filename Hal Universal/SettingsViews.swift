@@ -73,6 +73,10 @@ struct ActionsView: View {
     // Both refreshed in onAppear and after a tap. See MaintenanceTasks.freeOldModelFiles.
     @State private var reclaimableOldBytes: Int64 = 0
     @State private var lastFreedBytes: Int64 = 0
+    // Chat display appearance (opt-in). Defaults reproduce today's look. Read live by
+    // ChatBubbleView / MarkdownView, so the conversation updates the moment these change.
+    @AppStorage(ChatTextSize.storageKey) private var chatTextSizePt: Int = ChatTextSize.defaultValue.rawValue
+    @AppStorage(ChatDensity.storageKey) private var chatDensityRaw: String = ChatDensity.defaultValue.rawValue
 
     /// One-line status under the "Free up old model files" row: what's reclaimable, or
     /// what a just-run cleanup freed, or that there's nothing to do.
@@ -96,6 +100,8 @@ struct ActionsView: View {
             Form {
                 personalitySection
                     .id("personality")
+                chatDisplaySection
+                    .id("chatdisplay")
                 importExportSection
                     .id("importexport")
                 modelSection
@@ -414,6 +420,34 @@ struct ActionsView: View {
     
     // MARK: - Import/Export Section
     
+    // Chat Display — user-facing, opt-in control over how the conversation reads.
+    // Text Size sets the message font; Density adjusts spacing and margins. The defaults
+    // (Large + Comfortable) reproduce Hal's historical look exactly, so nothing changes
+    // for anyone who doesn't touch this. ChatBubbleView / MarkdownView read these live.
+    private var chatDisplaySection: some View {
+        Section {
+            Picker(selection: $chatTextSizePt) {
+                ForEach(ChatTextSize.allCases) { size in
+                    Text(size.label).tag(size.rawValue)
+                }
+            } label: {
+                Label("Text Size", systemImage: "textformat.size")
+            }
+            Picker(selection: $chatDensityRaw) {
+                ForEach(ChatDensity.allCases) { d in
+                    Text(d.label).tag(d.rawValue)
+                }
+            } label: {
+                Label("Density", systemImage: "arrow.up.and.down.text.horizontal")
+            }
+        } header: {
+            Label("Chat Display", systemImage: "textformat")
+        } footer: {
+            Text("How the conversation reads. The defaults match Hal's classic look; change either anytime, and the chat updates as you go.")
+                .font(.caption2)
+        }
+    }
+
     private var importExportSection: some View {
         Section {
             Button("Upload Document to Memory") {

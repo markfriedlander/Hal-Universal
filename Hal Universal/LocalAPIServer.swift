@@ -420,6 +420,27 @@ class HalTestConsole: ObservableObject {
             return "{\"status\":\"error\",\"command\":\"MIGRATION_DEBUG\",\"message\":\"MIGRATION_DEBUG is DEBUG-only\"}"
             #endif
 
+        } else if trimmed.hasPrefix("SET_CHAT_DISPLAY") {
+            // DEBUG-only: set the chat display appearance so the harness can screenshot a
+            // given text-size + density combo without tapping the Settings pickers.
+            // SET_CHAT_DISPLAY:<pointSize>:<comfortable|cozy|compact>
+            #if DEBUG
+            let arg = String(trimmed.dropFirst("SET_CHAT_DISPLAY".count))
+                .trimmingCharacters(in: CharacterSet(charactersIn: ": "))
+            let parts = arg.split(separator: ":", omittingEmptySubsequences: false).map(String.init)
+            if parts.count >= 1, let pt = Int(parts[0]) {
+                UserDefaults.standard.set(pt, forKey: "chatTextSizePt")
+            }
+            if parts.count >= 2, !parts[1].isEmpty {
+                UserDefaults.standard.set(parts[1].lowercased(), forKey: "chatDensity")
+            }
+            let pt = UserDefaults.standard.integer(forKey: "chatTextSizePt")
+            let den = UserDefaults.standard.string(forKey: "chatDensity") ?? "comfortable"
+            return "{\"status\":\"ok\",\"command\":\"SET_CHAT_DISPLAY\",\"textSizePt\":\(pt),\"density\":\"\(jsonStringEscape(den))\"}"
+            #else
+            return "{\"status\":\"error\",\"command\":\"SET_CHAT_DISPLAY\",\"message\":\"DEBUG-only\"}"
+            #endif
+
         } else if trimmed.hasPrefix("DOWNLOAD_LOCK") {
             // The lock DIAGNOSTIC verb uses the store's DEBUG-only test helpers
             // (plant/clear/enumerate), which don't exist in release builds of the

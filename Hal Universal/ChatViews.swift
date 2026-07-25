@@ -1005,11 +1005,88 @@ struct ThermalIndicatorPopover: View {
     }
 }
 
+// MARK: - Chat display appearance (user-facing, opt-in)
+//
+// Two independent, opt-in controls over how the conversation reads. Their DEFAULTS
+// reproduce the pre-2026-07-25 look exactly (body text at ~20pt, generous margins),
+// so no existing user's chat changes unless they choose to change it. Text size is an
+// explicit base point size; a `@ScaledMetric(relativeTo: .body)` multiplier is layered
+// on at the render site so the system Dynamic Type / accessibility setting still scales
+// it. Density controls only spacing (margins, line spacing, bubble padding), never font.
+// Read via `@AppStorage` in ChatBubbleView (and passed into MarkdownView).
+
+enum ChatTextSize: Int, CaseIterable, Identifiable {
+    case small = 15, medium = 17, large = 20, xLarge = 24
+    var id: Int { rawValue }
+    var pointSize: CGFloat { CGFloat(rawValue) }
+    var label: String {
+        switch self {
+        case .small:  return "Small"
+        case .medium: return "Medium"
+        case .large:  return "Large"
+        case .xLarge: return "Extra Large"
+        }
+    }
+    /// The default equals the historical body size (`.title3` ≈ 20pt).
+    static let defaultValue: ChatTextSize = .large
+    static let storageKey = "chatTextSizePt"
+}
+
+enum ChatDensity: String, CaseIterable, Identifiable {
+    case comfortable, cozy, compact
+    var id: String { rawValue }
+    var label: String { rawValue.prefix(1).uppercased() + rawValue.dropFirst() }
+    /// Outer margin from the screen edge to the message row.
+    var edgePadding: CGFloat {
+        switch self { case .comfortable: return 16; case .cozy: return 11; case .compact: return 8 }
+    }
+    /// Horizontal padding inside a message bubble.
+    var bubbleHPadding: CGFloat {
+        switch self { case .comfortable: return 14; case .cozy: return 12; case .compact: return 10 }
+    }
+    /// Vertical padding inside a message bubble.
+    var bubbleVPadding: CGFloat {
+        switch self { case .comfortable: return 10; case .cozy: return 8; case .compact: return 7 }
+    }
+    /// Line spacing on body text.
+    var lineSpacing: CGFloat {
+        switch self { case .comfortable: return 6; case .cozy: return 4; case .compact: return 3 }
+    }
+    /// Vertical padding between message rows.
+    var rowVPadding: CGFloat {
+        switch self { case .comfortable: return 4; case .cozy: return 3; case .compact: return 2 }
+    }
+    /// Horizontal inset for HAL's flat (background-less) replies. Unlike the user's gray
+    /// bubble, Hal's text has no background, so bubble padding just wastes space; tighter
+    /// levels shed it so the text flows toward the edge.
+    var assistantHInset: CGFloat {
+        switch self { case .comfortable: return 14; case .cozy: return 8; case .compact: return 2 }
+    }
+    /// Fraction of the container width Hal's replies may use. Comfortable keeps the classic
+    /// 0.90 cap; tighter levels let the text run essentially edge-to-edge (the Claude/Gemini
+    /// look). The user's own bubbles are unaffected — they stay bubbles.
+    var assistantWidthFraction: CGFloat {
+        switch self { case .comfortable: return 0.90; case .cozy: return 0.97; case .compact: return 1.0 }
+    }
+    /// The default reproduces the historical spacing exactly.
+    static let defaultValue: ChatDensity = .comfortable
+    static let storageKey = "chatDensity"
+}
+
 // MARK: - ChatBubbleView (from Hal10000App.swift for consistent UI)
 struct ChatBubbleView: View {
     let message: ChatMessage
     let messageIndex: Int
     @EnvironmentObject var chatViewModel: ChatViewModel
+
+    // Chat display appearance (opt-in). Defaults reproduce today's look exactly.
+    @AppStorage(ChatTextSize.storageKey) private var chatTextSizePt: Int = ChatTextSize.defaultValue.rawValue
+    @AppStorage(ChatDensity.storageKey) private var chatDensityRaw: String = ChatDensity.defaultValue.rawValue
+    // System Dynamic Type multiplier (1.0 at default) layered on the chosen base size so
+    // accessibility text scaling still works. See ChatTextSize.
+    @ScaledMetric(relativeTo: .body) private var dynamicTypeScale: CGFloat = 1.0
+    private var chatDensity: ChatDensity { ChatDensity(rawValue: chatDensityRaw) ?? .comfortable }
+    private var chatBodyPt: CGFloat { CGFloat(chatTextSizePt) * dynamicTypeScale }
     @State private var showingDetails: Bool = false
     @State private var showingCompressionExplanation: Bool = false
     // Item 4 (2026-05-17): "View Prompt Details" sheet state. Presents
@@ -1100,6 +1177,14 @@ struct ChatBubbleView: View {
     private var bubbleMaxWidth: CGFloat {
         let base = measuredContainerWidth > 0 ? measuredContainerWidth : screenWidth
         return base * 0.90
+    }
+
+    /// Max width for HAL's flat replies — density-aware. Comfortable equals the classic
+    /// `bubbleMaxWidth` (0.90); Compact lets Hal's text run full-width. User bubbles keep
+    /// using `bubbleMaxWidth`. See ChatDensity.assistantWidthFraction.
+    private var assistantMaxWidth: CGFloat {
+        let base = measuredContainerWidth > 0 ? measuredContainerWidth : screenWidth
+        return base * chatDensity.assistantWidthFraction
     }
 
     // SALON MODE FIX: Use stored turnNumber from database instead of calculating from array position
@@ -1313,10 +1398,10 @@ struct ChatBubbleView: View {
                 Spacer()
                 VStack(alignment: .trailing, spacing: 0) {
                     Text(.init(message.content))
-                        .font(.title3)
+                        .font(.system(size: chatBodyPt))
                         .textSelection(.enabled)
-                        .padding(.vertical, 10)
-                        .padding(.horizontal, 14)
+                        .padding(.vertical, chatDensity.bubbleVPadding)
+                        .padding(.horizontal, chatDensity.bubbleHPadding)
                         .frame(maxWidth: bubbleMaxWidth, alignment: .trailing)
                         .background(Color.gray.opacity(0.8))
                         .foregroundColor(.white)
@@ -1355,20 +1440,22 @@ struct ChatBubbleView: View {
                         }
                         if isStatusMessage {
                             Text(message.content)
-                                .font(.title3)
-                                .lineSpacing(6)
+                                .font(.system(size: chatBodyPt))
+                                .lineSpacing(chatDensity.lineSpacing)
                                 .italic()
                                 .foregroundColor(.secondary)
                                 .textSelection(.enabled)
-                                .padding(.vertical, 10)
-                                .padding(.horizontal, 14)
-                                .frame(maxWidth: bubbleMaxWidth, alignment: .leading)
+                                .padding(.vertical, chatDensity.bubbleVPadding)
+                                .padding(.horizontal, chatDensity.assistantHInset)
+                                .frame(maxWidth: assistantMaxWidth, alignment: .leading)
                         } else {
-                            MarkdownView(text: message.content)
+                            MarkdownView(text: message.content,
+                                         bodyPointSize: chatBodyPt,
+                                         lineSpacing: chatDensity.lineSpacing)
                                 .textSelection(.enabled)
-                                .padding(.vertical, 10)
-                                .padding(.horizontal, 14)
-                                .frame(maxWidth: bubbleMaxWidth, alignment: .leading)
+                                .padding(.vertical, chatDensity.bubbleVPadding)
+                                .padding(.horizontal, chatDensity.assistantHInset)
+                                .frame(maxWidth: assistantMaxWidth, alignment: .leading)
                         }
                         if chatViewModel.showInlineDetails {
                             let segments = inlinePromptSegments
@@ -1462,8 +1549,8 @@ struct ChatBubbleView: View {
                 Spacer()
             }
         }
-        .padding(.horizontal)
-        .padding(.vertical, 4)
+        .padding(.horizontal, chatDensity.edgePadding)
+        .padding(.vertical, chatDensity.rowVPadding)
         // No `.animation(value: message.content)` here on purpose: animating on
         // per-token content changes made every streaming line-wrap / markdown
         // reflow ANIMATE (0.1s) instead of snapping, which read as a visible
@@ -1629,6 +1716,12 @@ private enum MDBlock {
 
 struct MarkdownView: View {
     let text: String
+    // Chat display appearance, passed down from ChatBubbleView. Defaults reproduce the
+    // historical look (body ≈ .title3 at 20pt, line spacing 6). Headings scale with the
+    // body via `sizeRatio` so their proportions hold at any chosen text size.
+    var bodyPointSize: CGFloat = 20
+    var lineSpacing: CGFloat = 6
+    private var sizeRatio: CGFloat { bodyPointSize / 20.0 }
 
     var body: some View {
         let blocks = parseBlocks(text)
@@ -1639,8 +1732,8 @@ struct MarkdownView: View {
                 // so the user sees SOMETHING rather than empty space with just a footer.
                 // This addresses the "footer visible but text missing after reload" report.
                 Text(text)
-                    .font(.title3)
-                    .lineSpacing(6)
+                    .font(.system(size: bodyPointSize))
+                    .lineSpacing(lineSpacing)
                     .foregroundColor(.primary)
             } else {
                 ForEach(Array(blocks.enumerated()), id: \.offset) { _, block in
@@ -1658,28 +1751,28 @@ struct MarkdownView: View {
             headingView(s, level: level)
         case .paragraph(let s):
             inlineText(s)
-                .font(.title3)
-                .lineSpacing(6)
+                .font(.system(size: bodyPointSize))
+                .lineSpacing(lineSpacing)
                 .foregroundColor(.primary)
         case .unorderedItem(let s):
             HStack(alignment: .top, spacing: 8) {
                 Text("\u{2022}")
-                    .font(.title3)
+                    .font(.system(size: bodyPointSize))
                     .foregroundColor(.secondary)
                 inlineText(s)
-                    .font(.title3)
-                    .lineSpacing(5)
+                    .font(.system(size: bodyPointSize))
+                    .lineSpacing(lineSpacing)
                     .foregroundColor(.primary)
             }
         case .orderedItem(let s, let number):
             HStack(alignment: .top, spacing: 6) {
                 Text("\(number).")
-                    .font(.title3)
+                    .font(.system(size: bodyPointSize))
                     .foregroundColor(.secondary)
                     .frame(minWidth: 24, alignment: .trailing)
                 inlineText(s)
-                    .font(.title3)
-                    .lineSpacing(5)
+                    .font(.system(size: bodyPointSize))
+                    .lineSpacing(lineSpacing)
                     .foregroundColor(.primary)
             }
         case .codeBlock(let code):
@@ -1697,11 +1790,11 @@ struct MarkdownView: View {
     private func headingView(_ s: String, level: Int) -> some View {
         switch level {
         case 1:
-            inlineText(s).font(.title2.bold()).foregroundColor(.primary).padding(.top, 4)
+            inlineText(s).font(.system(size: 22 * sizeRatio, weight: .bold)).foregroundColor(.primary).padding(.top, 4)
         case 2:
-            inlineText(s).font(.title3.bold()).foregroundColor(.primary).padding(.top, 4)
+            inlineText(s).font(.system(size: 20 * sizeRatio, weight: .bold)).foregroundColor(.primary).padding(.top, 4)
         case 3:
-            inlineText(s).font(.headline).foregroundColor(.primary).padding(.top, 2)
+            inlineText(s).font(.system(size: 17 * sizeRatio, weight: .semibold)).foregroundColor(.primary).padding(.top, 2)
         default:
             inlineText(s).font(.footnote.bold()).foregroundColor(.secondary)
         }
