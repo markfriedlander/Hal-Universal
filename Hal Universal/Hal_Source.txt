@@ -6965,6 +6965,11 @@ struct ModelLibraryView: View {
     // modifier for why the resume must happen in onDismiss, not onContinue.
     @State private var disclosureAcknowledged = false
     @State private var librarySearchText: String = ""
+    // Layer 3 of the model-storage migration consent flow: set when the user asks to
+    // download a model they had under the OLD scheme (a replacement). Drives a
+    // confirmation that lets them decline, with the truth that they can't use the model
+    // until the fresh copy is downloaded. Nil for a genuinely new download.
+    @State private var replacementDownloadModel: ModelConfiguration?
 
     // Surfaces a one-time hardware-compatibility warning the first time the
     // user attempts to download or switch to any MLX model.
@@ -7174,6 +7179,26 @@ struct ModelLibraryView: View {
                     Text("This will permanently delete \(model.displayName).")
                 }
             }
+            // Layer 3: replacement-download confirmation for a model the user had under
+            // the old storage scheme. Lets them decline, and tells them plainly that the
+            // model can't be used until the fresh, verified copy is downloaded.
+            .alert("Download a fresh copy?",
+                   isPresented: Binding(
+                    get: { replacementDownloadModel != nil },
+                    set: { if !$0 { replacementDownloadModel = nil } }),
+                   presenting: replacementDownloadModel) { model in
+                Button("Download") {
+                    let m = model
+                    replacementDownloadModel = nil
+                    beginDownload(m)
+                }
+                Button("Not now", role: .cancel) {
+                    replacementDownloadModel = nil
+                }
+            } message: { model in
+                let size = model.sizeGB.map { String(format: "%.1f GB", $0) } ?? "a fresh download"
+                Text("The copy of \(model.displayName) you had can't be verified, so using it means downloading a fresh version (\(size)). You won't be able to use \(model.displayName) until it's downloaded.")
+            }
     }
 
     // MARK: - Model partitioning
@@ -7248,10 +7273,27 @@ struct ModelLibraryView: View {
 
         if !ModelCatalogService.shared.hasAcceptedLicense(for: model.id) {
             selectedModelForLicense = model
-        } else {
-            Task {
-                await mlxDownloader.startDownload(modelID: model.id, repoID: model.id, sizeGB: model.sizeGB)
-            }
+            return
+        }
+
+        // Layer 3: if this is a model the user had under the old storage scheme (its
+        // verified copy isn't present yet), confirm the replacement download and let
+        // them decline. A genuinely new model has no such history and downloads
+        // straight away. (A previously-had model already accepted its license above,
+        // so this is where its flow lands.)
+        if MaintenanceTasks.isPreVersionModel(model.id) {
+            replacementDownloadModel = model
+            return
+        }
+
+        beginDownload(model)
+    }
+
+    /// Kick off the actual download. The single place the download starts once every
+    /// gate (hardware disclosure, license, replacement confirmation) has passed.
+    private func beginDownload(_ model: ModelConfiguration) {
+        Task {
+            await mlxDownloader.startDownload(modelID: model.id, repoID: model.id, sizeGB: model.sizeGB)
         }
     }
 
@@ -19041,17 +19083,21 @@ enum MaintenanceTasks {
     /// actually had orphaned files.
     nonisolated static func runAtLaunch() {
         cleanupOrphanedEmbeddingCaches()
-        // The migration touches the App-Group store (MainActor-isolated) and
-        // refreshes the catalog, so it runs on the main actor. Cheap: on iOS the
-        // Caches→App-Group move is a same-volume rename (re-links the directory,
-        // never copies the GBs inside), so this doesn't block launch on file size.
-        // The superseded-plain-copy sweep runs right after, on the same hop, so a
-        // model the legacy migration just parked under its bare id (now a
-        // superseded plain copy under version-safe identity) is reaped in the same
-        // launch rather than lingering a cycle.
+        // Detect (synchronously, before any UI can appear) which models this device
+        // carried under the OLD pre-version scheme, and record them durably. This
+        // drives the one-time launch consent notice and the download flow's
+        // "this is a replacement" wording. Cheap: a handful of directory-existence
+        // checks. It RECORDS but never deletes — under the consent design, removing a
+        // superseded copy happens only on a user action (the launch notice's "Remove
+        // old copies", or Settings' "Free up old model files"), never automatically.
+        recordPreVersionModelsAtLaunch()
+        // The legacy Caches→App-Group migration still runs (a dead one-shot on shipped
+        // devices, guarded by its own flag). It touches the MainActor-isolated store,
+        // so it hops to the main actor. No automatic sweep follows it anymore; anything
+        // it parks under a bare id is folded into the record (still no deletion).
         Task { @MainActor in
             migrateLegacyCachesModelsToSharedStore()
-            sweepSupersededPlainCopies()
+            recordPreVersionModelsAtLaunch()
         }
     }
 
@@ -19221,37 +19267,126 @@ enum MaintenanceTasks {
         return actions
     }
 
-    // MARK: - v2.5 superseded-plain-copy sweep (version-safety, no-orphans)
+    // MARK: - v2.5 model-storage migration: detection, consent, cleanup
     //
-    // Before model identity carried a version, a curated model lived in its PLAIN
-    // `repo` folder. Now each curated (pinned, non-`plainFolderRepos`) model lives
-    // under its version-stamped identity `repo@<sha>`, and the plain copy is never
-    // trusted. The per-download / per-adopt reap (MLXModelDownloader) removes a
-    // plain copy the moment its stamped replacement lands — but a user who never
-    // re-triggers that model would keep the stale plain copy forever. This launch-
-    // time sweep closes that gap: for every pinned non-plain repo with a plain copy
-    // still on disk, it drops Hal's claim on the bare id and, once no app in the
-    // family still claims it, deletes the folder.
+    // Version-safety moved every curated model from its PLAIN `repo` folder to a
+    // version-stamped `repo@<sha>` folder, and the plain copy is never trusted again,
+    // so the old plain copies are dead weight. We could delete them automatically, but
+    // that removes files from a user's device (and forces a re-download) without
+    // asking. So in HAL (which has real users) this is CONSENT-GATED:
     //
-    // Idempotent (a swept model leaves no plain copy to find next launch); a true
-    // no-op on a device that never had a pre-version copy. `plainFolderRepos` (the
-    // embedders + sd-turbo) are skipped, because their required identity IS the
-    // bare id — their plain folder is the real copy, not a superseded one. The
-    // store's refcount is what makes this safe across the family: a sibling still
-    // mid-migration keeps its claim, so `releaseClaim` returns false and we leave
-    // the files for it.
+    //   - Detection (recordPreVersionModelsAtLaunch) runs automatically at launch and
+    //     only RECORDS which models were affected. It never deletes.
+    //   - Deletion (freeOldModelFiles) runs only on an explicit user action: the
+    //     one-time launch notice's "Remove old copies", or the always-available
+    //     "Free up old model files" button in Settings.
+    //   - Per-model, the download flow uses `isPreVersionModel` to explain that a model
+    //     you already had needs a fresh, verified copy.
+    //
+    // The two companion apps (unreleased, no users to ask) still sweep automatically.
+    // Only Hal gates deletion behind consent. Safe by construction everywhere: the
+    // cleanup only ever removes a superseded PLAIN copy of a pinned repo, never a
+    // version-stamped copy, and never any conversation or memory data. `plainFolderRepos`
+    // (the embedders + sd-turbo) are skipped — their bare id IS their real identity.
+
+    private nonisolated static let hadOldModelsKey      = "modelMigration.hadOldModels.v1"
+    private nonisolated static let preVersionRepoIDsKey = "modelMigration.preVersionRepoIDs.v1"
+    private nonisolated static let noticeHandledKey     = "modelMigration.launchNoticeHandled.v1"
+
+    /// The set of repo IDs that had a pre-version (plain) copy on this device. Durable:
+    /// it outlives the plain files (so "you previously had this" survives the cleanup),
+    /// and an entry is dropped only once its version-stamped replacement lands.
+    nonisolated static func preVersionModelIDs() -> Set<String> {
+        guard let data = UserDefaults.standard.data(forKey: preVersionRepoIDsKey),
+              let ids = try? JSONDecoder().decode(Set<String>.self, from: data) else { return [] }
+        return ids
+    }
+    private nonisolated static func setPreVersionModelIDs(_ ids: Set<String>) {
+        UserDefaults.standard.set((try? JSONEncoder().encode(ids)) ?? Data(), forKey: preVersionRepoIDsKey)
+    }
+
+    /// Did this device carry any pre-version model copies? Drives whether the one-time
+    /// launch notice ever shows. Set once during detection; never auto-cleared.
+    nonisolated static func deviceHadPreVersionModels() -> Bool {
+        UserDefaults.standard.bool(forKey: hadOldModelsKey)
+    }
+
+    /// True while the one-time launch notice still needs showing: the device had old
+    /// models AND the user hasn't dismissed the notice yet.
     @MainActor
-    static func sweepSupersededPlainCopies() {
-        let fm = FileManager.default
+    static var migrationNoticeShouldShow: Bool {
+        deviceHadPreVersionModels() && !UserDefaults.standard.bool(forKey: noticeHandledKey)
+    }
+
+    /// Record that the user has seen and dismissed the one-time launch notice (via
+    /// either button). It never shows again; the Settings button is the ongoing door.
+    @MainActor
+    static func markMigrationNoticeHandled() {
+        UserDefaults.standard.set(true, forKey: noticeHandledKey)
+    }
+
+    /// Is `repoID` a model this device had under the old scheme and hasn't yet replaced
+    /// with a verified copy? Drives the download flow's "this is a replacement" wording.
+    nonisolated static func isPreVersionModel(_ repoID: String) -> Bool {
+        preVersionModelIDs().contains(repoID)
+    }
+
+    /// Called when a version-stamped copy of `repoID` lands (download complete or
+    /// adopt): the pre-version copy has now been replaced, so drop it from the record.
+    nonisolated static func notePreVersionModelReplaced(_ repoID: String) {
+        var ids = preVersionModelIDs()
+        if ids.remove(repoID) != nil { setPreVersionModelIDs(ids) }
+    }
+
+    /// Detection (synchronous, at launch). For every pinned non-plainFolder repo with a
+    /// plain copy on disk, record it as a pre-version model. Records only, never
+    /// deletes. Idempotent (unions into the durable set).
+    nonisolated static func recordPreVersionModelsAtLaunch() {
+        var ids = preVersionModelIDs()
+        var found = false
         for repoID in SharedModelStore.pinnedRevisions.keys {
-            // Only stamped repos have a superseded plain form. For a plainFolderRepo
-            // requiredIdentity(repo) == repo, so this guard skips them.
             guard SharedModelStore.requiredIdentity(forRepoID: repoID) != repoID else { continue }
-            // Is a plain (bare-id) copy actually on disk? Skip the common case fast.
             guard SharedModelStore.isRepoDownloaded(repoID) else { continue }
-            // Drop Hal's claim on the bare id; the store deletes files only when no
-            // app in the family still claims it. Re-check presence before removing
-            // (a concurrent reap on the same launch may have taken it already).
+            found = true
+            ids.insert(repoID)
+        }
+        if found {
+            setPreVersionModelIDs(ids)
+            UserDefaults.standard.set(true, forKey: hadOldModelsKey)
+            halLog("HALDEBUG-MIGRATE: recorded \(ids.count) pre-version model(s) present on device")
+        }
+    }
+
+    /// Total bytes reclaimable by removing this device's superseded plain copies. Lets
+    /// the Settings button show a size and disable itself when there's nothing to do.
+    @MainActor
+    static func reclaimableOldModelBytes() -> Int64 {
+        var total: Int64 = 0
+        for repoID in SharedModelStore.pinnedRevisions.keys {
+            guard SharedModelStore.requiredIdentity(forRepoID: repoID) != repoID else { continue }
+            guard SharedModelStore.isRepoDownloaded(repoID) else { continue }
+            total += SharedModelStore.sizeOnDisk(repoID)
+        }
+        return total
+    }
+
+    /// The single cleanup engine behind all three doors (launch notice, Settings button,
+    /// and the companion apps' automatic sweep). Removes this device's superseded plain
+    /// copies and returns the bytes actually freed. For each pinned non-plain repo with a
+    /// plain copy, drop Hal's claim on the bare id and, once no app in the family still
+    /// claims it, delete the folder (the store's refcount keeps a sibling's copy safe).
+    /// Also clears each removed repo from the pre-version record. Idempotent.
+    @MainActor
+    @discardableResult
+    static func freeOldModelFiles() -> Int64 {
+        let fm = FileManager.default
+        var freed: Int64 = 0
+        for repoID in SharedModelStore.pinnedRevisions.keys {
+            guard SharedModelStore.requiredIdentity(forRepoID: repoID) != repoID else { continue }
+            guard SharedModelStore.isRepoDownloaded(repoID) else { continue }
+            let size = SharedModelStore.sizeOnDisk(repoID)
+            // Drop Hal's claim on the bare id; the store deletes files only when no app
+            // in the family still claims it. Re-check presence before removing.
             let safeToDelete = SharedModelStore.releaseClaim(modelID: repoID)
             guard safeToDelete, SharedModelStore.isRepoDownloaded(repoID) else {
                 halLog("HALDEBUG-SWEEP: kept plain copy of \(repoID) — another app still claims it")
@@ -19259,11 +19394,13 @@ enum MaintenanceTasks {
             }
             do {
                 try fm.removeItem(at: SharedModelStore.mlxModelDir(repoID))
-                halLog("HALDEBUG-SWEEP: reaped superseded plain copy of \(repoID) (now version-stamped)")
+                freed += size
+                halLog("HALDEBUG-SWEEP: reaped superseded plain copy of \(repoID) (\(size) bytes)")
             } catch {
                 halLog("HALDEBUG-SWEEP: failed to reap plain \(repoID): \(error.localizedDescription)")
             }
         }
+        return freed
     }
 
     // MARK: - TEST-ONLY helpers (drive the LEGACY_MIGRATION verb)
@@ -19311,6 +19448,44 @@ enum MaintenanceTasks {
         }
         try? fm.removeItem(at: SharedModelStore.mlxModelDir(repoID))
         _ = SharedModelStore.releaseClaim(modelID: repoID)
+    }
+
+    // MARK: - TEST-ONLY: migration-consent state (drive the MIGRATION_DEBUG verb)
+    //
+    // The dev device's real pre-version copies were already reaped, so the launch
+    // notice won't arm naturally. These let the harness force the "affected user"
+    // state to screenshot the notice + Settings button, inspect the flags, and reset.
+    // Never used by production.
+
+    /// Arm the one-time launch notice for the next launch (device "had old models",
+    /// notice not yet handled).
+    nonisolated static func debugForceShowNotice() {
+        UserDefaults.standard.set(true, forKey: hadOldModelsKey)
+        UserDefaults.standard.removeObject(forKey: noticeHandledKey)
+    }
+
+    /// Mark a repo as a pre-version model (drives Layer 3's replacement wording).
+    nonisolated static func debugAddPreVersionModel(_ repoID: String) {
+        var ids = preVersionModelIDs(); ids.insert(repoID); setPreVersionModelIDs(ids)
+        UserDefaults.standard.set(true, forKey: hadOldModelsKey)
+    }
+
+    /// Clear all migration-consent state (arm flag, handled flag, pre-version set).
+    nonisolated static func debugResetMigrationConsent() {
+        UserDefaults.standard.removeObject(forKey: hadOldModelsKey)
+        UserDefaults.standard.removeObject(forKey: noticeHandledKey)
+        UserDefaults.standard.removeObject(forKey: preVersionRepoIDsKey)
+    }
+
+    @MainActor
+    static func debugMigrationStateJSON() -> String {
+        let pre = preVersionModelIDs().sorted()
+        let preJSON = "[" + pre.map { "\"\($0)\"" }.joined(separator: ",") + "]"
+        return "{\"hadOldModels\":\(deviceHadPreVersionModels()),"
+            + "\"noticeHandled\":\(UserDefaults.standard.bool(forKey: noticeHandledKey)),"
+            + "\"shouldShow\":\(migrationNoticeShouldShow),"
+            + "\"preVersion\":\(preJSON),"
+            + "\"reclaimableBytes\":\(reclaimableOldModelBytes())}"
     }
 }
 // ==== LEGO END: 40 MaintenanceTasks (Launch Housekeeping) ====
@@ -19949,6 +20124,9 @@ class BackgroundDownloadCoordinator: NSObject, URLSessionDownloadDelegate, Obser
             try? FileManager.default.removeItem(at: SharedModelStore.mlxModelDir(modelID))
             halLog("HALDEBUG-BGDL: reaped superseded plain copy of \(modelID) after locking to its pinned commit")
         }
+        // The version-stamped copy is now present, so this model is no longer a
+        // pre-version "replacement" in the download flow (Layer 3 messaging).
+        MaintenanceTasks.notePreVersionModelReplaced(modelID)
         NotificationCenter.default.post(name: .mlxModelDidDownload, object: nil, userInfo: ["modelID": modelID])
     }
 
@@ -21199,6 +21377,9 @@ class MLXModelDownloader: ObservableObject {
             try? FileManager.default.removeItem(at: SharedModelStore.mlxModelDir(modelID))
             halLog("HALDEBUG-DOWNLOAD: reaped superseded plain copy of \(modelID) on adopt")
         }
+        // The version-stamped copy is now present (adopted from a sibling), so this
+        // model is no longer a pre-version "replacement" in the download flow.
+        MaintenanceTasks.notePreVersionModelReplaced(modelID)
         markModelAsDownloadedFromBackground(modelID: modelID)
         NotificationCenter.default.post(name: .mlxModelDidDownload, object: nil, userInfo: ["modelID": modelID])
     }
@@ -23801,6 +23982,39 @@ class HalTestConsole: ObservableObject {
                 entries.append("{\"id\":\"\(jsonStringEscape(model.id))\",\"claimants\":\(claimantsJSON)}")
             }
             return "{\"status\":\"ok\",\"command\":\"SHARED_MODELS\",\"appGroupResolved\":\(containerResolved),\"root\":\"\(jsonStringEscape(root.path))\",\"presentCount\":\(entries.count),\"present\":[\(entries.joined(separator: ","))]}"
+
+        } else if trimmed.hasPrefix("MIGRATION_DEBUG") {
+            // DEBUG-only harness for the model-storage migration consent flow. The dev
+            // device's real pre-version copies were already reaped, so the launch notice
+            // won't arm on its own; this lets the harness force the "affected user" state
+            // to screenshot the notice + Settings button, then reset. Sub-commands:
+            //   MIGRATION_DEBUG STATE                 — flags + pre-version set + reclaimable
+            //   MIGRATION_DEBUG SHOW                  — arm the launch notice for next launch
+            //   MIGRATION_DEBUG PREVERSION:<repoID>   — mark a repo as a pre-version model
+            //   MIGRATION_DEBUG RESET                 — clear all migration-consent state
+            #if DEBUG
+            let arg = String(trimmed.dropFirst("MIGRATION_DEBUG".count)).trimmingCharacters(in: .whitespaces)
+            let parts = arg.split(separator: ":", maxSplits: 1, omittingEmptySubsequences: false).map(String.init)
+            let sub = (parts.first?.isEmpty == false ? parts[0] : "STATE").uppercased()
+            switch sub {
+            case "SHOW":
+                MaintenanceTasks.debugForceShowNotice()
+                return "{\"status\":\"ok\",\"command\":\"MIGRATION_DEBUG\",\"action\":\"SHOW\",\"note\":\"relaunch to see the notice\",\"state\":\(MaintenanceTasks.debugMigrationStateJSON())}"
+            case "PREVERSION":
+                guard parts.count >= 2, !parts[1].isEmpty else {
+                    return "{\"status\":\"error\",\"command\":\"MIGRATION_DEBUG\",\"detail\":\"usage PREVERSION:<repoID>\"}"
+                }
+                MaintenanceTasks.debugAddPreVersionModel(parts[1])
+                return "{\"status\":\"ok\",\"command\":\"MIGRATION_DEBUG\",\"action\":\"PREVERSION\",\"repoID\":\"\(jsonStringEscape(parts[1]))\",\"state\":\(MaintenanceTasks.debugMigrationStateJSON())}"
+            case "RESET":
+                MaintenanceTasks.debugResetMigrationConsent()
+                return "{\"status\":\"ok\",\"command\":\"MIGRATION_DEBUG\",\"action\":\"RESET\",\"state\":\(MaintenanceTasks.debugMigrationStateJSON())}"
+            default: // STATE
+                return "{\"status\":\"ok\",\"command\":\"MIGRATION_DEBUG\",\"action\":\"STATE\",\"state\":\(MaintenanceTasks.debugMigrationStateJSON())}"
+            }
+            #else
+            return "{\"status\":\"error\",\"command\":\"MIGRATION_DEBUG\",\"message\":\"MIGRATION_DEBUG is DEBUG-only\"}"
+            #endif
 
         } else if trimmed.hasPrefix("DOWNLOAD_LOCK") {
             // The lock DIAGNOSTIC verb uses the store's DEBUG-only test helpers
@@ -27074,6 +27288,28 @@ struct ActionsView: View {
     @State private var showingSelfReflectionViewer = false
     @State private var initialSettingsSnapshot: [String: Any] = [:]
     @State private var skipComparisonOnDismiss = false
+    // "Free up old model files" — the always-available door to the version-safety
+    // cleanup engine. `reclaimableOldBytes` is the space a cleanup would recover
+    // (0 = nothing to do); `lastFreedBytes` shows what a just-run cleanup recovered.
+    // Both refreshed in onAppear and after a tap. See MaintenanceTasks.freeOldModelFiles.
+    @State private var reclaimableOldBytes: Int64 = 0
+    @State private var lastFreedBytes: Int64 = 0
+
+    /// One-line status under the "Free up old model files" row: what's reclaimable, or
+    /// what a just-run cleanup freed, or that there's nothing to do.
+    private var freeOldModelsSubtitle: String {
+        if reclaimableOldBytes > 0 {
+            return "\(Self.formatBytes(reclaimableOldBytes)) of old-version copies to remove"
+        }
+        if lastFreedBytes > 0 {
+            return "Freed \(Self.formatBytes(lastFreedBytes)). You're all clean."
+        }
+        return "Nothing to clean up."
+    }
+
+    private static func formatBytes(_ bytes: Int64) -> String {
+        ByteCountFormatter.string(fromByteCount: bytes, countStyle: .file)
+    }
 
     var body: some View {
         NavigationView {
@@ -27123,6 +27359,9 @@ struct ActionsView: View {
             } // ScrollViewReader
         }
         .onAppear {
+            // Refresh the "Free up old model files" reclaimable size each time
+            // Settings opens (cheap: a few directory checks).
+            reclaimableOldBytes = MaintenanceTasks.reclaimableOldModelBytes()
             // v1.x release: force Salon Mode off in the live ChatViewModel state
             // so any persisted `salonConfig.isEnabled = true` from prior builds
             // (where the toggle existed) doesn't route chat through the salon
@@ -27483,6 +27722,32 @@ struct ActionsView: View {
                 }
             }
             .foregroundColor(.primary)
+
+            // Free up old model files — the always-available catch-all for the
+            // version-safety migration. Removes leftover copies of models from before
+            // the storage update; safe (never touches a model you're using, or your
+            // conversations and memory). Tappable only when there's something to
+            // reclaim; otherwise it stays visible but disabled so the door is always
+            // findable. See MaintenanceTasks.freeOldModelFiles.
+            Button {
+                lastFreedBytes = MaintenanceTasks.freeOldModelFiles()
+                reclaimableOldBytes = MaintenanceTasks.reclaimableOldModelBytes()
+                mlxDownloader.objectWillChange.send()
+                ModelCatalogService.shared.refreshDownloadStates()
+            } label: {
+                HStack(alignment: .top) {
+                    Image(systemName: "trash.slash")
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text("Free up old model files")
+                        Text(freeOldModelsSubtitle)
+                            .font(.caption2)
+                            .foregroundColor(.secondary)
+                    }
+                    Spacer()
+                }
+            }
+            .foregroundColor(.primary)
+            .disabled(reclaimableOldBytes == 0)
         } header: {
             Label("AI Model", systemImage: "cpu")
         } footer: {
@@ -28799,6 +29064,10 @@ struct iOSChatView: View {
     // only above nominal). Explains the current thermal state + what the governor
     // is doing. See ThermalIndicatorPopover.
     @State private var showingThermalIndicatorPopover = false
+    // One-time model-storage migration notice (Layer 2 of the consent flow): shown at
+    // launch to users who had models under the old pre-version scheme, gating the
+    // cleanup behind their choice. See ModelStorageMigrationNotice + MaintenanceTasks.
+    @State private var showingModelStorageNotice = false
     // Set when the user taps "Model Library" in the privacy popover; consumed
     // in the popover's onDisappear so the sheet presents only AFTER the popover
     // is fully gone (a popover + sheet can't present at once — same race as the
@@ -28985,6 +29254,20 @@ struct iOSChatView: View {
                     ModelLibraryView()
                         .environmentObject(chatViewModel)
                         .environmentObject(MLXModelDownloader.shared)
+                }
+            }
+            // One-time model-storage migration notice (Layer 2). Shown once at launch
+            // to users who had pre-version model copies; both buttons mark it handled
+            // so it never returns. See ModelStorageMigrationNotice.
+            .sheet(isPresented: $showingModelStorageNotice) {
+                ModelStorageMigrationNotice()
+            }
+            .task {
+                // Present after the shell settles. `migrationNoticeShouldShow` is set by
+                // the synchronous launch detection (MaintenanceTasks.runAtLaunch) and
+                // goes false the moment either button is tapped, so this fires at most once.
+                if MaintenanceTasks.migrationNoticeShouldShow {
+                    showingModelStorageNotice = true
                 }
             }
             // Thermal-consent toll — path 1: the user tapped the brain to turn
@@ -29250,6 +29533,69 @@ struct iOSChatView: View {
     }
 }
 
+// MARK: - Model-storage migration notice (Layer 2 of the consent flow)
+//
+// A one-time launch screen shown to users who had models under the OLD pre-version
+// storage scheme. It explains the change in Hal's own voice (the project's
+// "access to reflection" maxim, pointed at the user) and, crucially, GATES the
+// cleanup: nothing is deleted until the user chooses. "Remove old copies" runs the
+// cleanup engine; "Not now" leaves the files untouched. Either choice marks the
+// notice handled so it never shows again; the Settings "Free up old model files"
+// button remains the ongoing door. Interactive dismissal is disabled so the choice
+// is deliberate (both options are gentle). See MaintenanceTasks for the engine.
+private struct ModelStorageMigrationNotice: View {
+    @Environment(\.dismiss) private var dismiss
+
+    var body: some View {
+        VStack(spacing: 0) {
+            ScrollView {
+                VStack(alignment: .leading, spacing: 18) {
+                    Image(systemName: "internaldrive")
+                        .font(.system(size: 40, weight: .regular))
+                        .foregroundStyle(.tint)
+                        .padding(.top, 8)
+
+                    Text("I changed how I keep my models")
+                        .font(.title2).bold()
+                        .fixedSize(horizontal: false, vertical: true)
+
+                    Text("I now store each model under its exact version, so one can never be quietly replaced by a different or untested build, and so I can safely share a single copy with companion apps coming soon.")
+
+                    Text("The models you downloaded before this change can't be verified that way, so I won't reuse them. Nothing you made is affected: your conversations and my memory are untouched. The next time you reach for one of these models, I'll download a fresh, verified copy, once.")
+
+                    Text("Want me to clear the old, unusable copies now to free up the space?")
+                        .fontWeight(.medium)
+                }
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .padding(24)
+            }
+
+            VStack(spacing: 12) {
+                Button {
+                    MaintenanceTasks.freeOldModelFiles()
+                    MaintenanceTasks.markMigrationNoticeHandled()
+                    ModelCatalogService.shared.refreshDownloadStates()
+                    dismiss()
+                } label: {
+                    Text("Remove old copies").frame(maxWidth: .infinity)
+                }
+                .buttonStyle(.borderedProminent)
+                .controlSize(.large)
+
+                Button {
+                    MaintenanceTasks.markMigrationNoticeHandled()
+                    dismiss()
+                } label: {
+                    Text("Not now").frame(maxWidth: .infinity)
+                }
+                .controlSize(.large)
+            }
+            .padding([.horizontal, .bottom], 24)
+            .padding(.top, 8)
+        }
+        .interactiveDismissDisabled(true)
+    }
+}
 
 // ==== LEGO END: 53 App Entry & iOSChatView (UI Shell) ====
 

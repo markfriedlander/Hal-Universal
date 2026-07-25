@@ -188,6 +188,10 @@ struct iOSChatView: View {
     // only above nominal). Explains the current thermal state + what the governor
     // is doing. See ThermalIndicatorPopover.
     @State private var showingThermalIndicatorPopover = false
+    // One-time model-storage migration notice (Layer 2 of the consent flow): shown at
+    // launch to users who had models under the old pre-version scheme, gating the
+    // cleanup behind their choice. See ModelStorageMigrationNotice + MaintenanceTasks.
+    @State private var showingModelStorageNotice = false
     // Set when the user taps "Model Library" in the privacy popover; consumed
     // in the popover's onDisappear so the sheet presents only AFTER the popover
     // is fully gone (a popover + sheet can't present at once — same race as the
@@ -374,6 +378,20 @@ struct iOSChatView: View {
                     ModelLibraryView()
                         .environmentObject(chatViewModel)
                         .environmentObject(MLXModelDownloader.shared)
+                }
+            }
+            // One-time model-storage migration notice (Layer 2). Shown once at launch
+            // to users who had pre-version model copies; both buttons mark it handled
+            // so it never returns. See ModelStorageMigrationNotice.
+            .sheet(isPresented: $showingModelStorageNotice) {
+                ModelStorageMigrationNotice()
+            }
+            .task {
+                // Present after the shell settles. `migrationNoticeShouldShow` is set by
+                // the synchronous launch detection (MaintenanceTasks.runAtLaunch) and
+                // goes false the moment either button is tapped, so this fires at most once.
+                if MaintenanceTasks.migrationNoticeShouldShow {
+                    showingModelStorageNotice = true
                 }
             }
             // Thermal-consent toll — path 1: the user tapped the brain to turn
@@ -639,6 +657,69 @@ struct iOSChatView: View {
     }
 }
 
+// MARK: - Model-storage migration notice (Layer 2 of the consent flow)
+//
+// A one-time launch screen shown to users who had models under the OLD pre-version
+// storage scheme. It explains the change in Hal's own voice (the project's
+// "access to reflection" maxim, pointed at the user) and, crucially, GATES the
+// cleanup: nothing is deleted until the user chooses. "Remove old copies" runs the
+// cleanup engine; "Not now" leaves the files untouched. Either choice marks the
+// notice handled so it never shows again; the Settings "Free up old model files"
+// button remains the ongoing door. Interactive dismissal is disabled so the choice
+// is deliberate (both options are gentle). See MaintenanceTasks for the engine.
+private struct ModelStorageMigrationNotice: View {
+    @Environment(\.dismiss) private var dismiss
+
+    var body: some View {
+        VStack(spacing: 0) {
+            ScrollView {
+                VStack(alignment: .leading, spacing: 18) {
+                    Image(systemName: "internaldrive")
+                        .font(.system(size: 40, weight: .regular))
+                        .foregroundStyle(.tint)
+                        .padding(.top, 8)
+
+                    Text("I changed how I keep my models")
+                        .font(.title2).bold()
+                        .fixedSize(horizontal: false, vertical: true)
+
+                    Text("I now store each model under its exact version, so one can never be quietly replaced by a different or untested build, and so I can safely share a single copy with companion apps coming soon.")
+
+                    Text("The models you downloaded before this change can't be verified that way, so I won't reuse them. Nothing you made is affected: your conversations and my memory are untouched. The next time you reach for one of these models, I'll download a fresh, verified copy, once.")
+
+                    Text("Want me to clear the old, unusable copies now to free up the space?")
+                        .fontWeight(.medium)
+                }
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .padding(24)
+            }
+
+            VStack(spacing: 12) {
+                Button {
+                    MaintenanceTasks.freeOldModelFiles()
+                    MaintenanceTasks.markMigrationNoticeHandled()
+                    ModelCatalogService.shared.refreshDownloadStates()
+                    dismiss()
+                } label: {
+                    Text("Remove old copies").frame(maxWidth: .infinity)
+                }
+                .buttonStyle(.borderedProminent)
+                .controlSize(.large)
+
+                Button {
+                    MaintenanceTasks.markMigrationNoticeHandled()
+                    dismiss()
+                } label: {
+                    Text("Not now").frame(maxWidth: .infinity)
+                }
+                .controlSize(.large)
+            }
+            .padding([.horizontal, .bottom], 24)
+            .padding(.top, 8)
+        }
+        .interactiveDismissDisabled(true)
+    }
+}
 
 // ==== LEGO END: 53 App Entry & iOSChatView (UI Shell) ====
 

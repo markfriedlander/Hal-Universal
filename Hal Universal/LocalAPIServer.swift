@@ -387,6 +387,39 @@ class HalTestConsole: ObservableObject {
             }
             return "{\"status\":\"ok\",\"command\":\"SHARED_MODELS\",\"appGroupResolved\":\(containerResolved),\"root\":\"\(jsonStringEscape(root.path))\",\"presentCount\":\(entries.count),\"present\":[\(entries.joined(separator: ","))]}"
 
+        } else if trimmed.hasPrefix("MIGRATION_DEBUG") {
+            // DEBUG-only harness for the model-storage migration consent flow. The dev
+            // device's real pre-version copies were already reaped, so the launch notice
+            // won't arm on its own; this lets the harness force the "affected user" state
+            // to screenshot the notice + Settings button, then reset. Sub-commands:
+            //   MIGRATION_DEBUG STATE                 — flags + pre-version set + reclaimable
+            //   MIGRATION_DEBUG SHOW                  — arm the launch notice for next launch
+            //   MIGRATION_DEBUG PREVERSION:<repoID>   — mark a repo as a pre-version model
+            //   MIGRATION_DEBUG RESET                 — clear all migration-consent state
+            #if DEBUG
+            let arg = String(trimmed.dropFirst("MIGRATION_DEBUG".count)).trimmingCharacters(in: .whitespaces)
+            let parts = arg.split(separator: ":", maxSplits: 1, omittingEmptySubsequences: false).map(String.init)
+            let sub = (parts.first?.isEmpty == false ? parts[0] : "STATE").uppercased()
+            switch sub {
+            case "SHOW":
+                MaintenanceTasks.debugForceShowNotice()
+                return "{\"status\":\"ok\",\"command\":\"MIGRATION_DEBUG\",\"action\":\"SHOW\",\"note\":\"relaunch to see the notice\",\"state\":\(MaintenanceTasks.debugMigrationStateJSON())}"
+            case "PREVERSION":
+                guard parts.count >= 2, !parts[1].isEmpty else {
+                    return "{\"status\":\"error\",\"command\":\"MIGRATION_DEBUG\",\"detail\":\"usage PREVERSION:<repoID>\"}"
+                }
+                MaintenanceTasks.debugAddPreVersionModel(parts[1])
+                return "{\"status\":\"ok\",\"command\":\"MIGRATION_DEBUG\",\"action\":\"PREVERSION\",\"repoID\":\"\(jsonStringEscape(parts[1]))\",\"state\":\(MaintenanceTasks.debugMigrationStateJSON())}"
+            case "RESET":
+                MaintenanceTasks.debugResetMigrationConsent()
+                return "{\"status\":\"ok\",\"command\":\"MIGRATION_DEBUG\",\"action\":\"RESET\",\"state\":\(MaintenanceTasks.debugMigrationStateJSON())}"
+            default: // STATE
+                return "{\"status\":\"ok\",\"command\":\"MIGRATION_DEBUG\",\"action\":\"STATE\",\"state\":\(MaintenanceTasks.debugMigrationStateJSON())}"
+            }
+            #else
+            return "{\"status\":\"error\",\"command\":\"MIGRATION_DEBUG\",\"message\":\"MIGRATION_DEBUG is DEBUG-only\"}"
+            #endif
+
         } else if trimmed.hasPrefix("DOWNLOAD_LOCK") {
             // The lock DIAGNOSTIC verb uses the store's DEBUG-only test helpers
             // (plant/clear/enumerate), which don't exist in release builds of the

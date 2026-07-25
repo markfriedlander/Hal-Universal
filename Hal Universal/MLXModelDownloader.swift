@@ -459,6 +459,9 @@ class BackgroundDownloadCoordinator: NSObject, URLSessionDownloadDelegate, Obser
             try? FileManager.default.removeItem(at: SharedModelStore.mlxModelDir(modelID))
             halLog("HALDEBUG-BGDL: reaped superseded plain copy of \(modelID) after locking to its pinned commit")
         }
+        // The version-stamped copy is now present, so this model is no longer a
+        // pre-version "replacement" in the download flow (Layer 3 messaging).
+        MaintenanceTasks.notePreVersionModelReplaced(modelID)
         NotificationCenter.default.post(name: .mlxModelDidDownload, object: nil, userInfo: ["modelID": modelID])
     }
 
@@ -1709,6 +1712,9 @@ class MLXModelDownloader: ObservableObject {
             try? FileManager.default.removeItem(at: SharedModelStore.mlxModelDir(modelID))
             halLog("HALDEBUG-DOWNLOAD: reaped superseded plain copy of \(modelID) on adopt")
         }
+        // The version-stamped copy is now present (adopted from a sibling), so this
+        // model is no longer a pre-version "replacement" in the download flow.
+        MaintenanceTasks.notePreVersionModelReplaced(modelID)
         markModelAsDownloadedFromBackground(modelID: modelID)
         NotificationCenter.default.post(name: .mlxModelDidDownload, object: nil, userInfo: ["modelID": modelID])
     }

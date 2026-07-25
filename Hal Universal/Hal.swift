@@ -6964,6 +6964,11 @@ struct ModelLibraryView: View {
     // modifier for why the resume must happen in onDismiss, not onContinue.
     @State private var disclosureAcknowledged = false
     @State private var librarySearchText: String = ""
+    // Layer 3 of the model-storage migration consent flow: set when the user asks to
+    // download a model they had under the OLD scheme (a replacement). Drives a
+    // confirmation that lets them decline, with the truth that they can't use the model
+    // until the fresh copy is downloaded. Nil for a genuinely new download.
+    @State private var replacementDownloadModel: ModelConfiguration?
 
     // Surfaces a one-time hardware-compatibility warning the first time the
     // user attempts to download or switch to any MLX model.
@@ -7173,6 +7178,26 @@ struct ModelLibraryView: View {
                     Text("This will permanently delete \(model.displayName).")
                 }
             }
+            // Layer 3: replacement-download confirmation for a model the user had under
+            // the old storage scheme. Lets them decline, and tells them plainly that the
+            // model can't be used until the fresh, verified copy is downloaded.
+            .alert("Download a fresh copy?",
+                   isPresented: Binding(
+                    get: { replacementDownloadModel != nil },
+                    set: { if !$0 { replacementDownloadModel = nil } }),
+                   presenting: replacementDownloadModel) { model in
+                Button("Download") {
+                    let m = model
+                    replacementDownloadModel = nil
+                    beginDownload(m)
+                }
+                Button("Not now", role: .cancel) {
+                    replacementDownloadModel = nil
+                }
+            } message: { model in
+                let size = model.sizeGB.map { String(format: "%.1f GB", $0) } ?? "a fresh download"
+                Text("The copy of \(model.displayName) you had can't be verified, so using it means downloading a fresh version (\(size)). You won't be able to use \(model.displayName) until it's downloaded.")
+            }
     }
 
     // MARK: - Model partitioning
@@ -7247,10 +7272,27 @@ struct ModelLibraryView: View {
 
         if !ModelCatalogService.shared.hasAcceptedLicense(for: model.id) {
             selectedModelForLicense = model
-        } else {
-            Task {
-                await mlxDownloader.startDownload(modelID: model.id, repoID: model.id, sizeGB: model.sizeGB)
-            }
+            return
+        }
+
+        // Layer 3: if this is a model the user had under the old storage scheme (its
+        // verified copy isn't present yet), confirm the replacement download and let
+        // them decline. A genuinely new model has no such history and downloads
+        // straight away. (A previously-had model already accepted its license above,
+        // so this is where its flow lands.)
+        if MaintenanceTasks.isPreVersionModel(model.id) {
+            replacementDownloadModel = model
+            return
+        }
+
+        beginDownload(model)
+    }
+
+    /// Kick off the actual download. The single place the download starts once every
+    /// gate (hardware disclosure, license, replacement confirmation) has passed.
+    private func beginDownload(_ model: ModelConfiguration) {
+        Task {
+            await mlxDownloader.startDownload(modelID: model.id, repoID: model.id, sizeGB: model.sizeGB)
         }
     }
 

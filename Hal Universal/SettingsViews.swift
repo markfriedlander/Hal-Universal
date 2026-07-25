@@ -67,6 +67,28 @@ struct ActionsView: View {
     @State private var showingSelfReflectionViewer = false
     @State private var initialSettingsSnapshot: [String: Any] = [:]
     @State private var skipComparisonOnDismiss = false
+    // "Free up old model files" — the always-available door to the version-safety
+    // cleanup engine. `reclaimableOldBytes` is the space a cleanup would recover
+    // (0 = nothing to do); `lastFreedBytes` shows what a just-run cleanup recovered.
+    // Both refreshed in onAppear and after a tap. See MaintenanceTasks.freeOldModelFiles.
+    @State private var reclaimableOldBytes: Int64 = 0
+    @State private var lastFreedBytes: Int64 = 0
+
+    /// One-line status under the "Free up old model files" row: what's reclaimable, or
+    /// what a just-run cleanup freed, or that there's nothing to do.
+    private var freeOldModelsSubtitle: String {
+        if reclaimableOldBytes > 0 {
+            return "\(Self.formatBytes(reclaimableOldBytes)) of old-version copies to remove"
+        }
+        if lastFreedBytes > 0 {
+            return "Freed \(Self.formatBytes(lastFreedBytes)). You're all clean."
+        }
+        return "Nothing to clean up."
+    }
+
+    private static func formatBytes(_ bytes: Int64) -> String {
+        ByteCountFormatter.string(fromByteCount: bytes, countStyle: .file)
+    }
 
     var body: some View {
         NavigationView {
@@ -116,6 +138,9 @@ struct ActionsView: View {
             } // ScrollViewReader
         }
         .onAppear {
+            // Refresh the "Free up old model files" reclaimable size each time
+            // Settings opens (cheap: a few directory checks).
+            reclaimableOldBytes = MaintenanceTasks.reclaimableOldModelBytes()
             // v1.x release: force Salon Mode off in the live ChatViewModel state
             // so any persisted `salonConfig.isEnabled = true` from prior builds
             // (where the toggle existed) doesn't route chat through the salon
@@ -476,6 +501,32 @@ struct ActionsView: View {
                 }
             }
             .foregroundColor(.primary)
+
+            // Free up old model files — the always-available catch-all for the
+            // version-safety migration. Removes leftover copies of models from before
+            // the storage update; safe (never touches a model you're using, or your
+            // conversations and memory). Tappable only when there's something to
+            // reclaim; otherwise it stays visible but disabled so the door is always
+            // findable. See MaintenanceTasks.freeOldModelFiles.
+            Button {
+                lastFreedBytes = MaintenanceTasks.freeOldModelFiles()
+                reclaimableOldBytes = MaintenanceTasks.reclaimableOldModelBytes()
+                mlxDownloader.objectWillChange.send()
+                ModelCatalogService.shared.refreshDownloadStates()
+            } label: {
+                HStack(alignment: .top) {
+                    Image(systemName: "trash.slash")
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text("Free up old model files")
+                        Text(freeOldModelsSubtitle)
+                            .font(.caption2)
+                            .foregroundColor(.secondary)
+                    }
+                    Spacer()
+                }
+            }
+            .foregroundColor(.primary)
+            .disabled(reclaimableOldBytes == 0)
         } header: {
             Label("AI Model", systemImage: "cpu")
         } footer: {
