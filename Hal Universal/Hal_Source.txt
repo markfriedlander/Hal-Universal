@@ -27723,31 +27723,37 @@ struct ActionsView: View {
             }
             .foregroundColor(.primary)
 
-            // Free up old model files — the always-available catch-all for the
-            // version-safety migration. Removes leftover copies of models from before
-            // the storage update; safe (never touches a model you're using, or your
-            // conversations and memory). Tappable only when there's something to
-            // reclaim; otherwise it stays visible but disabled so the door is always
-            // findable. See MaintenanceTasks.freeOldModelFiles.
-            Button {
-                lastFreedBytes = MaintenanceTasks.freeOldModelFiles()
-                reclaimableOldBytes = MaintenanceTasks.reclaimableOldModelBytes()
-                mlxDownloader.objectWillChange.send()
-                ModelCatalogService.shared.refreshDownloadStates()
-            } label: {
-                HStack(alignment: .top) {
-                    Image(systemName: "trash.slash")
-                    VStack(alignment: .leading, spacing: 2) {
-                        Text("Free up old model files")
-                        Text(freeOldModelsSubtitle)
-                            .font(.caption2)
-                            .foregroundColor(.secondary)
+            // Free up old model files — the migration cleanup, shown ONLY when there's
+            // actually something to reclaim (or a cleanup just ran, so we can confirm
+            // it). A user with nothing to clean never sees this row, so there is no
+            // empty state and no chance of a confusing tiny/stale number: when it
+            // appears, it always shows a real, GB-scale amount. Still serves the
+            // "Not now" users, since they are exactly the ones with a leftover to
+            // reclaim. Safe: never touches a model you're using, or your conversations
+            // and memory. See MaintenanceTasks.freeOldModelFiles.
+            if reclaimableOldBytes > 0 || lastFreedBytes > 0 {
+                Button {
+                    lastFreedBytes = MaintenanceTasks.freeOldModelFiles()
+                    reclaimableOldBytes = MaintenanceTasks.reclaimableOldModelBytes()
+                    mlxDownloader.objectWillChange.send()
+                    ModelCatalogService.shared.refreshDownloadStates()
+                } label: {
+                    HStack(alignment: .top) {
+                        Image(systemName: "trash.slash")
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text("Free up old model files")
+                            Text(freeOldModelsSubtitle)
+                                .font(.caption2)
+                                .foregroundColor(.secondary)
+                        }
+                        Spacer()
                     }
-                    Spacer()
                 }
+                .foregroundColor(.primary)
+                // After a cleanup, reclaimable is 0 but the row stays (lastFreedBytes > 0)
+                // to show "Freed X"; disable it then so the confirmation isn't tappable.
+                .disabled(reclaimableOldBytes == 0)
             }
-            .foregroundColor(.primary)
-            .disabled(reclaimableOldBytes == 0)
         } header: {
             Label("AI Model", systemImage: "cpu")
         } footer: {
