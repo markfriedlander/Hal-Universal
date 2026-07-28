@@ -363,29 +363,41 @@ class HalTestConsole: ObservableObject {
             {"status":"ok","selectedModelID":"\(jsonStringEscape(selectedID))","wrapper":{"isModelLoaded":\(wrapperLoaded),"currentModelConfigID":"\(jsonStringEscape(wrapperConfigID))","currentModelConfigLocalPath":"\(jsonStringEscape(wrapperConfigPath))","mlxError":"\(jsonStringEscape(wrapperError))","loadingMessage":"\(jsonStringEscape(wrapperLoadingMessage))","loadingProgress":\(wrapperLoadingProgress)},"catalog":{"hasEntry":\(catalogModel != nil),"isDownloaded":\(catalogIsDownloaded),"localPath":"\(jsonStringEscape(catalogLocalPath))"},"disk":{"resolvedPath":"\(jsonStringEscape(diskPathStr))","fileExists":\(diskHasModel)}}
             """
 
+        } else if trimmed == "HELP" || trimmed == "COMMANDS" || trimmed.hasPrefix("HELP:") {
+#if DEBUG
+            // Lab command discovery. Single source of truth = CommandCatalog (RoboRunner.swift,
+            // LEGO block 60). Lists every verb with args, a one-line description, category, and a
+            // destructive flag. `HELP:SAFE` hides destructive verbs (Safe mode); plain HELP or
+            // `HELP:ALL` includes them. CommandCatalog is pure data (no disk I/O, no @MainActor
+            // state). Feeds the future `hal` CLI help, the RoboRunner editor Help, and Hal's own
+            // self-knowledge. DEBUG-gated for now like the rest of the Lab; un-gate when the Lab
+            // ships as a user-facing opt-in.
+            let modeArg = trimmed.hasPrefix("HELP:")
+                ? String(trimmed.dropFirst("HELP:".count)).trimmingCharacters(in: .whitespaces).uppercased()
+                : ""
+            return CommandCatalog.helpJSON(includeDestructive: modeArg != "SAFE")
+#else
+            return "{\"status\":\"error\",\"message\":\"HELP is available in developer builds only\"}"
+#endif
+
         } else if trimmed == "SHARED_MODELS" {
             // v2.1 diagnostic (READ-ONLY): the App-Group shared model store — its
             // resolved root, whether the container entitlement resolved, and for
             // each MLX catalog model whether its files are present on disk and
             // which apps claim it in manifest.json. Verifies cross-app sharing
             // (Hal seeing Posey's models) + the refcount ledger without mutating.
-            let root = SharedModelStore.root
-            let containerResolved = FileManager.default.containerURL(forSecurityApplicationGroupIdentifier: SharedModelStore.appGroupID) != nil
-            // Present-only: iterating the whole (post-HF-refresh) catalog would
-            // be huge + slow (an NSFileCoordinator read per model), so report
-            // just the models whose files are actually in the shared store.
-            var entries: [String] = []
-            for model in ModelCatalogService.shared.availableModels where model.source == .mlx {
-                // Keyed by the shared-store key so presence + claimants reflect the
-                // version-stamped identity actually on disk (a migrated model no
-                // longer claims its bare id). The reported `id` stays the lay name.
-                let key = sharedStoreKey(forRepoID: model.id)
-                guard SharedModelStore.isRepoDownloaded(key) else { continue }
-                let claimants = SharedModelStore.claimants(modelID: key)
-                let claimantsJSON = "[" + claimants.map { "\"\(jsonStringEscape($0))\"" }.joined(separator: ",") + "]"
-                entries.append("{\"id\":\"\(jsonStringEscape(model.id))\",\"claimants\":\(claimantsJSON)}")
-            }
-            return "{\"status\":\"ok\",\"command\":\"SHARED_MODELS\",\"appGroupResolved\":\(containerResolved),\"root\":\"\(jsonStringEscape(root.path))\",\"presentCount\":\(entries.count),\"present\":[\(entries.joined(separator: ","))]}"
+            //
+            // API-HARDENING (2026-07-27): the expensive part is the per-model disk
+            // I/O — an NSFileCoordinator read for isRepoDownloaded + claimants on
+            // every model — which used to run on the main actor and wedge the app
+            // under load. Now we snapshot only the cheap in-memory catalog IDs on
+            // the main actor, then hand the disk work to `sharedModelsJSON`, a
+            // nonisolated async helper that runs OFF the main actor (freeing it for
+            // the duration of the I/O). First slice of the antenna-hardening pass.
+            let mlxModelIDs = ModelCatalogService.shared.availableModels
+                .filter { $0.source == .mlx }
+                .map { $0.id }
+            return await sharedModelsJSON(mlxModelIDs: mlxModelIDs)
 
         } else if trimmed.hasPrefix("MIGRATION_DEBUG") {
             // DEBUG-only harness for the model-storage migration consent flow. The dev
@@ -608,6 +620,18 @@ class HalTestConsole: ObservableObject {
             return RoboRunner.shared.resultsJSON()
 #else
             return "{\"status\":\"error\",\"message\":\"ROBO_RESULTS is a DEBUG-only command\"}"
+#endif
+
+        } else if trimmed == "ROBO_STOP" {
+#if DEBUG
+            // Ask a running RoboRunner script to halt at the next step boundary. Does NOT
+            // interrupt a turn mid-generation (that is the separate user STOP feature); it
+            // stops cleanly between steps, keeping the partial results already captured.
+            let wasRunning = RoboRunner.shared.busy
+            RoboRunner.shared.requestStop()
+            return "{\"status\":\"ok\",\"command\":\"ROBO_STOP\",\"wasRunning\":\(wasRunning)}"
+#else
+            return "{\"status\":\"error\",\"message\":\"ROBO_STOP is a DEBUG-only command\"}"
 #endif
 
         } else if trimmed == "RESET_THREAD" {
@@ -1212,11 +1236,11 @@ class HalTestConsole: ObservableObject {
             return buildRenderedMessagesJSON(vm: vm, truncateChars: nil)
 
         } else if trimmed == "GET_LOGS" {
-            return buildLogsJSON(limit: 200)
+            return await buildLogsJSON(limit: 200)
 
         } else if trimmed.hasPrefix("GET_LOGS:") {
             let n = Int(trimmed.dropFirst("GET_LOGS:".count).trimmingCharacters(in: .whitespaces)) ?? 200
-            return buildLogsJSON(limit: max(1, min(1000, n)))
+            return await buildLogsJSON(limit: max(1, min(1000, n)))
 
         } else if trimmed == "CLEAR_LOGS" {
             RuntimeLog.shared.clear()
@@ -2174,7 +2198,12 @@ class HalTestConsole: ObservableObject {
 
     // Returns the most recent log entries captured by RuntimeLog. Useful for
     // diagnosing MLX/AFM generation behaviour without device-console access.
-    func buildLogsJSON(limit: Int) -> String {
+    // `nonisolated` + `async`: awaited from the @MainActor executeCommand so the
+    // potentially large per-entry JSON escaping/serialization runs OFF the main actor.
+    // RuntimeLog is @unchecked Sendable (guarded by its own lock), so reading it off the
+    // main actor is safe, and no @MainActor state is touched here. Second slice of the
+    // antenna API-hardening pass (2026-07-27); behavior is unchanged.
+    nonisolated func buildLogsJSON(limit: Int) async -> String {
         let entries = RuntimeLog.shared.snapshot(limit: limit)
         let json = entries.map { "\"\(jsonStringEscape($0))\"" }.joined(separator: ",")
         return "{\"status\":\"ok\",\"count\":\(entries.count),\"logs\":[\(json)]}"
@@ -2357,6 +2386,33 @@ class HalTestConsole: ObservableObject {
 
     // MARK: - JSON Helpers
 
+    /// Off-main assembly of the SHARED_MODELS diagnostic. `nonisolated` + `async` so that
+    /// awaiting it from the @MainActor `executeCommand` runs the body on a background
+    /// executor, freeing the main actor for the duration of the per-model disk I/O
+    /// (file-existence + manifest/claimant reads, all nonisolated `SharedModelStore`
+    /// statics). The caller snapshots the cheap catalog IDs on the main actor and passes
+    /// them in, so NO @MainActor state is touched here. First slice of the antenna
+    /// API-hardening pass (2026-07-27): move heavy file work off the main actor so the
+    /// antenna stops wedging under load, without changing any observable behavior.
+    private nonisolated func sharedModelsJSON(mlxModelIDs: [String]) async -> String {
+        let root = SharedModelStore.root
+        let containerResolved = FileManager.default.containerURL(forSecurityApplicationGroupIdentifier: SharedModelStore.appGroupID) != nil
+        // Present-only: iterating the whole (post-HF-refresh) catalog would be huge +
+        // slow (an NSFileCoordinator read per model), so report just the models whose
+        // files are actually in the shared store. Keyed by the shared-store identity so
+        // presence + claimants reflect the version-stamped copy actually on disk (a
+        // migrated model no longer claims its bare id); the reported `id` stays lay name.
+        var entries: [String] = []
+        for id in mlxModelIDs {
+            let key = SharedModelStore.requiredIdentity(forRepoID: id)
+            guard SharedModelStore.isRepoDownloaded(key) else { continue }
+            let claimants = SharedModelStore.claimants(modelID: key)
+            let claimantsJSON = "[" + claimants.map { "\"\(jsonStringEscape($0))\"" }.joined(separator: ",") + "]"
+            entries.append("{\"id\":\"\(jsonStringEscape(id))\",\"claimants\":\(claimantsJSON)}")
+        }
+        return "{\"status\":\"ok\",\"command\":\"SHARED_MODELS\",\"appGroupResolved\":\(containerResolved),\"root\":\"\(jsonStringEscape(root.path))\",\"presentCount\":\(entries.count),\"present\":[\(entries.joined(separator: ","))]}"
+    }
+
     private func jsonEscape(_ s: String) -> String {
         let escaped = s
             .replacingOccurrences(of: "\\", with: "\\\\")
@@ -2367,7 +2423,7 @@ class HalTestConsole: ObservableObject {
         return "\"\(escaped)\""
     }
 
-    private func jsonStringEscape(_ s: String) -> String {
+    private nonisolated func jsonStringEscape(_ s: String) -> String {
         // Fully JSON-compliant string escaping. The earlier version handled
         // only \, ", and \n — leaving tabs, carriage returns, and other
         // control chars (< 0x20) raw, which yields INVALID JSON that strict
