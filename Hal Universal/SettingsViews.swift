@@ -65,6 +65,9 @@ struct ActionsView: View {
     @State private var showingSystemPromptEditor = false
     @State private var showingModelFramingDetail = false
     @State private var showingSelfReflectionViewer = false
+#if DEBUG
+    @State private var showingRoboEditor = false   // Lab: RoboRunner script editor (DEBUG only)
+#endif
     @State private var initialSettingsSnapshot: [String: Any] = [:]
     @State private var skipComparisonOnDismiss = false
     // "Free up old model files" — the always-available door to the version-safety
@@ -108,6 +111,10 @@ struct ActionsView: View {
                     .id("ai")
                 powerUserSection
                     .id("poweruser")
+#if DEBUG
+                labSection
+                    .id("lab")
+#endif
 
                 // About — version + build at the bottom of Settings.
                 // Plain footer rather than a Section{} so it doesn't get a
@@ -177,6 +184,12 @@ struct ActionsView: View {
             SystemPromptEditorView()
                 .environmentObject(chatViewModel)
         }
+#if DEBUG
+        .sheet(isPresented: $showingRoboEditor) {
+            RoboEditorView()
+                .environmentObject(chatViewModel)
+        }
+#endif
         .sheet(isPresented: $showingModelFramingDetail) {
             ModelFramingDetailView()
                 .environmentObject(chatViewModel)
@@ -289,6 +302,31 @@ struct ActionsView: View {
     private var isSalonActive: Bool {
         chatViewModel.salonConfig.isEnabled
     }
+
+#if DEBUG
+    // MARK: - Developer / Lab (DEBUG only)
+
+    /// A single row into the Lab's RoboRunner script editor. DEBUG-only: the whole Lab
+    /// (antenna, command catalog, editor) compiles out of Release.
+    private var labSection: some View {
+        Section {
+            Button {
+                showingRoboEditor = true
+            } label: {
+                HStack {
+                    Label("RoboRunner", systemImage: "wrench.and.screwdriver")
+                    Spacer()
+                    Image(systemName: "chevron.right").font(.caption).foregroundColor(.secondary)
+                }
+            }
+            .foregroundColor(.primary)
+        } header: {
+            Text("Developer")
+        } footer: {
+            Text("Write and run on-device RoboRunner scripts. Developer builds only.")
+        }
+    }
+#endif
 
     private var personalitySection: some View {
         Section {

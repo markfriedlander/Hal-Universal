@@ -116,6 +116,7 @@
 //  RoboRunner.swift
 //   59  RoboRunner (On-Device Reasoning/Thermal Script Runner)
 //   60  CommandCatalog (Lab Command Surface, Single Source of Truth)
+//   61  RoboEditor (Lab UI, on-device RoboRunner script editor)
 //
 import SwiftUI
 import SharedModelStoreKit

@@ -34,6 +34,7 @@
 
 import Foundation
 import Combine
+import SwiftUI   // the Lab UI (RoboEditor, block 61) lives in this DEBUG-only file
 
 // ==== LEGO START: 59 RoboRunner (On-Device Reasoning/Thermal Script Runner) ====
 
@@ -605,5 +606,148 @@ enum CommandCatalog {
     }
 }
 // ==== LEGO END: 60 CommandCatalog (Lab Command Surface, Single Source of Truth) ====
+
+
+// ==== LEGO START: 61 RoboEditor (Lab UI, on-device RoboRunner script editor) ====
+//
+// The in-app face of RoboRunner: write a script, Run/Stop it, watch live status, read the
+// captured results, and browse the command catalog (Help). Modeled on SystemPromptEditorView.
+// Reached from a DEBUG-only "Developer" row in Settings (ActionsView). DEBUG-only, like the rest
+// of the Lab. v1 persists a single script via @AppStorage; multi-file save/load is a follow-up.
+
+/// The RoboRunner script editor sheet.
+struct RoboEditorView: View {
+    @Environment(\.dismiss) private var dismiss
+    @EnvironmentObject private var chatViewModel: ChatViewModel
+    @ObservedObject private var robo = RoboRunner.shared
+    @AppStorage("lab.roboScript") private var script: String = RoboEditorView.sampleScript
+    @State private var showingHelp = false
+    @State private var showingResults = false
+
+    static let sampleScript = """
+    # RoboRunner script. Most lines are antenna verbs, passed straight through.
+    # ASK <question>  runs one real two-phase turn and captures it.
+    # WAIT <seconds>  pauses (longer if the phone is hot). '#' starts a comment.
+    SWITCH_MODEL:mlx-community/Qwen3.5-2B-MLX-4bit
+    ASK What is two plus two? Answer in one word.
+    WAIT 5
+    ASK Name a primary color. One word.
+    """
+
+    private var stepCount: Int {
+        script.split(separator: "\n")
+            .map { $0.trimmingCharacters(in: .whitespaces) }
+            .filter { !$0.isEmpty && !$0.hasPrefix("#") }
+            .count
+    }
+
+    var body: some View {
+        NavigationView {
+            VStack(spacing: 0) {
+                TextEditor(text: $script)
+                    .font(.system(.callout, design: .monospaced))
+                    .padding(8)
+                    .disabled(robo.isRunning)
+                    .opacity(robo.isRunning ? 0.6 : 1.0)
+
+                statusBar
+                    .font(.caption)
+                    .padding(.horizontal, 12)
+                    .padding(.bottom, 8)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+            }
+            .navigationTitle("RoboRunner")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .cancellationAction) {
+                    Button("Done") { dismiss() }
+                }
+                ToolbarItem(placement: .confirmationAction) {
+                    if robo.isRunning {
+                        Button("Stop", role: .destructive) { robo.requestStop() }
+                    } else {
+                        Button("Run", action: runScript).fontWeight(.semibold)
+                    }
+                }
+                ToolbarItemGroup(placement: .bottomBar) {
+                    Button { showingHelp = true } label: { Label("Commands", systemImage: "list.bullet.rectangle") }
+                    Spacer()
+                    Button { showingResults = true } label: { Label("Results", systemImage: "doc.text.magnifyingglass") }
+                        .disabled(robo.lastResultsPath == nil)
+                }
+            }
+            .sheet(isPresented: $showingHelp) { RoboHelpView() }
+            .sheet(isPresented: $showingResults) { RoboResultsView() }
+        }
+    }
+
+    @ViewBuilder private var statusBar: some View {
+        if robo.isRunning {
+            HStack(spacing: 6) {
+                ProgressView().controlSize(.small)
+                Text("Running \(robo.progress)").foregroundColor(.secondary)
+            }
+        } else if let err = robo.lastError, !err.isEmpty {
+            Label(err, systemImage: "exclamationmark.triangle").foregroundColor(.orange)
+        } else {
+            Text("\(stepCount) step\(stepCount == 1 ? "" : "s") ready").foregroundColor(.secondary)
+        }
+    }
+
+    private func runScript() {
+        let vm = chatViewModel
+        let text = script
+        // MainActor Task so RoboRunner's @Published status updates land on the main thread,
+        // matching the antenna's ROBO_RUN path.
+        Task { @MainActor in _ = await RoboRunner.shared.run(script: text, vm: vm, console: vm.testConsole) }
+    }
+}
+
+/// The command catalog, shown in the editor's Help.
+struct RoboHelpView: View {
+    @Environment(\.dismiss) private var dismiss
+    var body: some View {
+        NavigationView {
+            ScrollView {
+                Text(CommandCatalog.helpText())
+                    .font(.system(.caption2, design: .monospaced))
+                    .textSelection(.enabled)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .padding()
+            }
+            .navigationTitle("Commands")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar { ToolbarItem(placement: .confirmationAction) { Button("Done") { dismiss() } } }
+        }
+    }
+}
+
+/// The captured results of the last run, pretty-printed.
+struct RoboResultsView: View {
+    @Environment(\.dismiss) private var dismiss
+    private var pretty: String {
+        let json = RoboRunner.shared.resultsJSON()
+        guard let data = json.data(using: .utf8),
+              let obj = try? JSONSerialization.jsonObject(with: data),
+              let out = try? JSONSerialization.data(withJSONObject: obj, options: [.prettyPrinted]),
+              let s = String(data: out, encoding: .utf8) else { return json }
+        return s
+    }
+    var body: some View {
+        NavigationView {
+            ScrollView {
+                Text(pretty)
+                    .font(.system(.caption2, design: .monospaced))
+                    .textSelection(.enabled)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .padding()
+            }
+            .navigationTitle("Results")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar { ToolbarItem(placement: .confirmationAction) { Button("Done") { dismiss() } } }
+        }
+    }
+}
+// ==== LEGO END: 61 RoboEditor (Lab UI, on-device RoboRunner script editor) ====
 
 #endif
