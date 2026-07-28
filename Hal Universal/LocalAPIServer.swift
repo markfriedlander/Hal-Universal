@@ -327,7 +327,26 @@ class HalTestConsole: ObservableObject {
 
     @discardableResult
     func executeCommand(_ cmd: String, vm: ChatViewModel) async -> String {
-        let trimmed = cmd.trimmingCharacters(in: .whitespacesAndNewlines)
+        let rawTrimmed = cmd.trimmingCharacters(in: .whitespacesAndNewlines)
+
+        // Lab safety gate (single source of truth = CommandCatalog.destructive). Enforced HERE at the
+        // interpreter so every door (antenna, CLI, RoboRunner) inherits it: Safe mode refuses
+        // destructive verbs; Advanced requires a trailing confirm marker (--yes / CONFIRM). On allow,
+        // the marker is stripped so each verb's own arg parsing below is unaffected. DEBUG-only like
+        // the rest of the Lab (CommandCatalog is DEBUG-only); un-gates with the Lab at productization.
+        // `trimmed` is a `let` in both configs (Release just passes rawTrimmed straight through), so no
+        // "never mutated" warning when the gate compiles out.
+#if DEBUG
+        let trimmed: String
+        switch CommandCatalog.gate(rawTrimmed) {
+        case .refuse(let reason):
+            return "{\"status\":\"error\",\"blocked\":\"safety\",\"message\":\"\(jsonStringEscape(reason))\"}"
+        case .allow(let cleaned):
+            trimmed = cleaned
+        }
+#else
+        let trimmed = rawTrimmed
+#endif
 
         if trimmed.hasPrefix("SET_MODEL:") || trimmed.hasPrefix("SWITCH_MODEL:") {
             let prefix = trimmed.hasPrefix("SET_MODEL:") ? "SET_MODEL:" : "SWITCH_MODEL:"
@@ -378,6 +397,21 @@ class HalTestConsole: ObservableObject {
             return CommandCatalog.helpJSON(includeDestructive: modeArg != "SAFE")
 #else
             return "{\"status\":\"error\",\"message\":\"HELP is available in developer builds only\"}"
+#endif
+
+        } else if trimmed.hasPrefix("SET_SAFETY:") {
+#if DEBUG
+            // Set the Lab safety mode (see CommandCatalog.gate). A non-destructive control verb, so the
+            // gate at the top lets it through. Not persisted; resets to Safe on relaunch.
+            let v = String(trimmed.dropFirst("SET_SAFETY:".count)).trimmingCharacters(in: .whitespaces).lowercased()
+            switch v {
+            case "safe":     CommandCatalog.mode = .safe
+            case "advanced": CommandCatalog.mode = .advanced
+            default: return "{\"status\":\"error\",\"message\":\"SET_SAFETY: must be safe or advanced\"}"
+            }
+            return "{\"status\":\"ok\",\"command\":\"SET_SAFETY\",\"mode\":\"\(CommandCatalog.mode.rawValue)\"}"
+#else
+            return "{\"status\":\"error\",\"message\":\"SET_SAFETY is available in developer builds only\"}"
 #endif
 
         } else if trimmed == "SHARED_MODELS" {

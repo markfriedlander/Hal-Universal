@@ -23924,7 +23924,26 @@ class HalTestConsole: ObservableObject {
 
     @discardableResult
     func executeCommand(_ cmd: String, vm: ChatViewModel) async -> String {
-        let trimmed = cmd.trimmingCharacters(in: .whitespacesAndNewlines)
+        let rawTrimmed = cmd.trimmingCharacters(in: .whitespacesAndNewlines)
+
+        // Lab safety gate (single source of truth = CommandCatalog.destructive). Enforced HERE at the
+        // interpreter so every door (antenna, CLI, RoboRunner) inherits it: Safe mode refuses
+        // destructive verbs; Advanced requires a trailing confirm marker (--yes / CONFIRM). On allow,
+        // the marker is stripped so each verb's own arg parsing below is unaffected. DEBUG-only like
+        // the rest of the Lab (CommandCatalog is DEBUG-only); un-gates with the Lab at productization.
+        // `trimmed` is a `let` in both configs (Release just passes rawTrimmed straight through), so no
+        // "never mutated" warning when the gate compiles out.
+#if DEBUG
+        let trimmed: String
+        switch CommandCatalog.gate(rawTrimmed) {
+        case .refuse(let reason):
+            return "{\"status\":\"error\",\"blocked\":\"safety\",\"message\":\"\(jsonStringEscape(reason))\"}"
+        case .allow(let cleaned):
+            trimmed = cleaned
+        }
+#else
+        let trimmed = rawTrimmed
+#endif
 
         if trimmed.hasPrefix("SET_MODEL:") || trimmed.hasPrefix("SWITCH_MODEL:") {
             let prefix = trimmed.hasPrefix("SET_MODEL:") ? "SET_MODEL:" : "SWITCH_MODEL:"
@@ -23975,6 +23994,21 @@ class HalTestConsole: ObservableObject {
             return CommandCatalog.helpJSON(includeDestructive: modeArg != "SAFE")
 #else
             return "{\"status\":\"error\",\"message\":\"HELP is available in developer builds only\"}"
+#endif
+
+        } else if trimmed.hasPrefix("SET_SAFETY:") {
+#if DEBUG
+            // Set the Lab safety mode (see CommandCatalog.gate). A non-destructive control verb, so the
+            // gate at the top lets it through. Not persisted; resets to Safe on relaunch.
+            let v = String(trimmed.dropFirst("SET_SAFETY:".count)).trimmingCharacters(in: .whitespaces).lowercased()
+            switch v {
+            case "safe":     CommandCatalog.mode = .safe
+            case "advanced": CommandCatalog.mode = .advanced
+            default: return "{\"status\":\"error\",\"message\":\"SET_SAFETY: must be safe or advanced\"}"
+            }
+            return "{\"status\":\"ok\",\"command\":\"SET_SAFETY\",\"mode\":\"\(CommandCatalog.mode.rawValue)\"}"
+#else
+            return "{\"status\":\"error\",\"message\":\"SET_SAFETY is available in developer builds only\"}"
 #endif
 
         } else if trimmed == "SHARED_MODELS" {
@@ -32126,6 +32160,7 @@ enum CommandCatalog {
         CommandDescriptor(verb: "ROBO_RESULTS", args: nil, summary: "Return the captured results of the last RoboRunner run.", category: .automation, destructive: false),
 
         // State & Logs
+        CommandDescriptor(verb: "SET_SAFETY", args: "<safe|advanced>", summary: "Set the Lab safety mode. Safe (default) refuses destructive verbs; Advanced allows them with a per-command confirmation (append --yes or CONFIRM).", category: .diagnostics, destructive: false),
         CommandDescriptor(verb: "GET_STATE", args: nil, summary: "Return a JSON snapshot of Hal's core runtime state.", category: .diagnostics, destructive: false),
         CommandDescriptor(verb: "GET_LOGS", args: "[:<n>]", summary: "Return the last n runtime log lines, default 200.", category: .diagnostics, destructive: false),
         CommandDescriptor(verb: "CLEAR_LOGS", args: nil, summary: "Clear the in-memory runtime log buffer.", category: .diagnostics, destructive: false),
@@ -32148,6 +32183,61 @@ enum CommandCatalog {
     /// should treat an UNRECOGNIZED verb as needing confirmation rather than trusting this.
     static func isDestructive(_ verb: String) -> Bool {
         descriptor(forVerb: verb)?.destructive ?? false
+    }
+
+    // MARK: - Safety gate (the Lab safety layer)
+
+    /// The Lab's safety posture. Safe (default) refuses destructive verbs outright; Advanced
+    /// allows them but still requires an explicit per-command confirmation. Process-wide; set
+    /// over any door via SET_SAFETY. Not persisted, so it resets to Safe on every launch.
+    enum SafetyMode: String { case safe, advanced }
+    nonisolated(unsafe) static var mode: SafetyMode = .safe
+
+    /// The confirm markers a caller appends to a destructive command to approve it. A door turns
+    /// "the user said yes" into one of these; scripts/automation include it explicitly. Matched
+    /// case-insensitively as the last whitespace-separated token.
+    static let confirmMarkers = ["--yes", "--force", "CONFIRM"]
+
+    /// Interpreter-level decision for a raw command. `.allow(cleaned:)` returns the command with any
+    /// confirm marker stripped (so the verb's own arg parsing is unaffected); `.refuse(reason:)` is a
+    /// human-readable block the interpreter returns WITHOUT executing.
+    enum GateDecision { case allow(cleaned: String), refuse(reason: String) }
+
+    /// The single safety chokepoint (called by LocalAPIServer.executeCommand, so every door inherits
+    /// it). Non-destructive and unknown verbs always pass (unknown ones fall through to the normal
+    /// "unknown command" path). A destructive verb is refused in Safe mode, and in Advanced mode is
+    /// refused unless the command carries a trailing confirm marker.
+    static func gate(_ raw: String) -> GateDecision {
+        let cmd = raw.trimmingCharacters(in: .whitespaces)
+        let verb = String(cmd.prefix { $0 != ":" && !$0.isWhitespace }).uppercased()
+        // Non-destructive or unknown verbs pass through UNCHANGED. Crucially we do not strip a
+        // trailing confirm marker here, so a non-destructive arg that legitimately ends in a word
+        // like "confirm" (e.g. a system prompt) is never mangled. Marker handling is destructive-only.
+        guard descriptor(forVerb: verb)?.destructive == true else {
+            return .allow(cleaned: cmd)
+        }
+        // Destructive: a confirm marker only counts as its own last whitespace-separated token, so a
+        // model id that happens to end in "confirm" is not mistaken for approval.
+        var confirmed = false
+        var cleaned = cmd
+        for marker in confirmMarkers {
+            let up = marker.uppercased()
+            if cleaned.count > up.count,
+               cleaned.uppercased().hasSuffix(up),
+               cleaned[cleaned.index(cleaned.endIndex, offsetBy: -(up.count + 1))].isWhitespace {
+                confirmed = true
+                cleaned = String(cleaned.dropLast(marker.count)).trimmingCharacters(in: .whitespaces)
+                break
+            }
+        }
+        if mode == .safe {
+            return .refuse(reason: "Safe mode: '\(verb)' is destructive and is disabled. Switch to Advanced with SET_SAFETY:advanced to use it.")
+        }
+        if !confirmed {
+            let what = descriptor(forVerb: verb)?.summary ?? "This is a destructive command."
+            return .refuse(reason: "'\(verb)' is destructive. \(what) Re-send with a trailing ' --yes' (or CONFIRM) to proceed.")
+        }
+        return .allow(cleaned: cleaned)
     }
 
     /// Human-readable, categorized help text. In Safe mode, destructive verbs are omitted.
