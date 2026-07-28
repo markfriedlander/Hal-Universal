@@ -44,3 +44,8 @@ secrets/
 __pycache__/
 *.pyc
 .DS_Store
+# Xcode builds go to the DEFAULT DerivedData (~/Library/...), NEVER a custom path.
+# This only guards against a stray in-project build dir (e.g. an accidental
+# -derivedDataPath build) so 2 GB of output can never be staged or synced.
+build/
+DerivedData/

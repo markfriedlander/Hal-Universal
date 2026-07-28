@@ -31737,10 +31737,14 @@ actor ThermalGovernor {
 //  Almost every step is just an existing antenna verb, passed straight through to
 //  HalTestConsole.executeCommand (the same dispatcher the antenna uses). So
 //  SWITCH_MODEL:, SET_REASONING:true, SET_REASON_BUDGET:80, SET_REASONING_PROMPT:…,
-//  NEW_THREAD all work for free. Only two steps are special because the flat verb
+//  NEW_THREAD all work for free. Three constructs are special because the flat verb
 //  model cannot express them: ASK (run one real turn and capture BOTH phases plus
-//  thermal), and WAIT (pause, holding longer if the phone is hot). Comments start
-//  with '#'. That is the whole language.
+//  thermal), WAIT (pause, holding longer if the phone is hot), and a bounded sweep
+//  FOR <VAR> IN a, b, c … END that repeats its block once per value, substituting
+//  {VAR} each pass (e.g. sweep temperature or model over the same question). The
+//  sweep is deliberately condition-free — it repeats a written block over a written
+//  list, it cannot branch or loop open-endedly. Comments start with '#'. That is the
+//  whole language.
 //
 //  See Docs/Reasoning_Quality_Thermal_Test_Plan_2026-07-22.md.
 //
@@ -31750,6 +31754,7 @@ actor ThermalGovernor {
 import Foundation
 import Combine
 import SwiftUI   // the Lab UI (RoboEditor, block 61) lives in this DEBUG-only file
+import UIKit     // UIActivityViewController for the results Share sheet (block 61)
 
 // ==== LEGO START: 59 RoboRunner (On-Device Reasoning/Thermal Script Runner) ====
 
@@ -31800,6 +31805,17 @@ struct RoboStepResult: Codable {
     let thermalAfter: String
 }
 
+/// A whole run's record: the script that produced it, when it started, and every captured
+/// turn. Persisted as ONE JSON object (not a bare `[RoboStepResult]` array) so each history
+/// file is a self-contained lab-notebook page, input and output together. The `script` field
+/// is Mark's "script at the top, the outputs below it" idea, expressed the way JSON expresses
+/// "these results belong to this run."
+struct RoboRunFile: Codable {
+    let script: String
+    let startedAt: String   // ISO-8601, stamped once at run start
+    let results: [RoboStepResult]
+}
+
 /// DEBUG-only. Runs a RoboRunner script on-device. `@MainActor` because every step
 /// touches the ChatViewModel and the shared HalTestConsole dispatcher, both of
 /// which are main-actor bound.
@@ -31821,6 +31837,8 @@ final class RoboRunner: ObservableObject {
 
     private var results: [RoboStepResult] = []
     private var currentModel = "unknown"
+    private var currentScript = ""     // the script that produced this run, written into the results file
+    private var runStartedAt = ""      // ISO-8601 stamp, set once at run start
 
     /// True while a script is executing, so callers can refuse to start a second.
     var busy: Bool { isRunning }
@@ -31845,11 +31863,28 @@ final class RoboRunner: ObservableObject {
         lastError = nil
         results = []
         currentModel = "unknown"
+        // Reset the results path so THIS run writes its own timestamped file. Without this, the
+        // path set on the first run of the app session would stick, and every later run would
+        // overwrite that one file (losing prior runs, and freezing the filename's timestamp at
+        // the first run). Now each run keeps its own robo_results_<time>.json, which is what the
+        // Past Runs history reads back.
+        lastResultsPath = nil
+        currentScript = script
+        runStartedAt = ISO8601DateFormatter().string(from: Date())
 
-        let steps = script
+        let rawSteps = script
             .split(separator: "\n", omittingEmptySubsequences: false)
             .map { $0.trimmingCharacters(in: .whitespaces) }
             .filter { !$0.isEmpty && !$0.hasPrefix("#") }
+
+        // Expand FOR ... IN ... / END sweeps into a flat step list before running, so the loop
+        // below is unchanged (it just gets a longer list) and the ask count is already correct.
+        var steps: [String] = []
+        expandLoops(rawSteps, into: &steps)
+        if steps.count >= RoboRunner.maxExpandedSteps {
+            lastError = "script expanded past the \(RoboRunner.maxExpandedSteps)-step cap; truncated"
+            halLog("HALDEBUG-ROBO: \(lastError ?? "")")
+        }
 
         let askTotal = steps.filter { $0.uppercased().hasPrefix("ASK ") }.count
         var askDone = 0
@@ -31888,6 +31923,70 @@ final class RoboRunner: ObservableObject {
         if wasStopped { lastError = "stopped by request" }
         halLog("HALDEBUG-ROBO: \(summary)")
         return summary
+    }
+
+    // MARK: - Loop expansion (FOR ... IN ... END)
+
+    /// Hard ceiling on expanded steps so a fat or deeply nested sweep can't blow up a run.
+    static let maxExpandedSteps = 2000
+
+    /// Expand `FOR <VAR> IN a, b, c` / `END` blocks into a flat step list, substituting `{VAR}`
+    /// with each value in turn. Bounded ON PURPOSE: it repeats a written block over a written
+    /// list, with no conditions and no open-ended looping, so a script can neither run away nor
+    /// branch (that keeps the Lab's "fixed verbs, not arbitrary code" posture). Nesting works via
+    /// recursion (an inner loop expands once per outer value). Appends into `out`, stopping at
+    /// `maxExpandedSteps`.
+    private func expandLoops(_ lines: [String], into out: inout [String]) {
+        var i = 0
+        while i < lines.count {
+            if out.count >= RoboRunner.maxExpandedSteps { return }
+            let line = lines[i]
+            if line.uppercased().hasPrefix("FOR ") {
+                guard let (varName, values) = parseForHeader(line) else {
+                    // Malformed FOR (no " IN " or empty list): pass it through so it surfaces as
+                    // an unknown verb rather than silently swallowing the block.
+                    out.append(line); i += 1; continue
+                }
+                // Collect the body up to the matching END, respecting nested FOR/END.
+                var depth = 1, j = i + 1
+                var body: [String] = []
+                while j < lines.count {
+                    let u = lines[j].uppercased()
+                    if u.hasPrefix("FOR ") { depth += 1 }
+                    else if u == "END" { depth -= 1; if depth == 0 { break } }
+                    body.append(lines[j]); j += 1
+                }
+                for value in values {
+                    var expandedBody: [String] = []
+                    expandLoops(body, into: &expandedBody)   // resolve any nested loops first
+                    for b in expandedBody {
+                        if out.count >= RoboRunner.maxExpandedSteps { return }
+                        out.append(substitute(b, varName: varName, value: value))
+                    }
+                }
+                i = j + 1   // skip past the matching END (or off the end if none was found)
+            } else if line.uppercased() == "END" {
+                i += 1       // stray END with no FOR: ignore
+            } else {
+                out.append(line); i += 1
+            }
+        }
+    }
+
+    /// Parse `FOR <VAR> IN v1, v2, v3` into (VAR, [values]). Returns nil if malformed.
+    private func parseForHeader(_ line: String) -> (String, [String])? {
+        let afterFor = String(line.dropFirst(3)).trimmingCharacters(in: .whitespaces)  // drop "FOR"
+        guard let inRange = afterFor.range(of: " IN ", options: [.caseInsensitive]) else { return nil }
+        let varName = String(afterFor[..<inRange.lowerBound]).trimmingCharacters(in: .whitespaces)
+        let values = String(afterFor[inRange.upperBound...])
+            .split(separator: ",").map { $0.trimmingCharacters(in: .whitespaces) }.filter { !$0.isEmpty }
+        guard !varName.isEmpty, !values.isEmpty else { return nil }
+        return (varName, values)
+    }
+
+    /// Replace `{VAR}` (case-insensitive on the name, braces literal) with `value`.
+    private func substitute(_ line: String, varName: String, value: String) -> String {
+        line.replacingOccurrences(of: "{\(varName)}", with: value, options: [.caseInsensitive])
     }
 
     // MARK: - The two special steps
@@ -31985,7 +32084,8 @@ final class RoboRunner: ObservableObject {
             lastError = "no Documents dir"
             return
         }
-        // Stable filename per run (set once, on the first write of this run).
+        // One file per run: the path is set on this run's first write (lastResultsPath was reset
+        // to nil in run()), so the timestamp reflects THIS run and later runs don't overwrite it.
         if lastResultsPath == nil {
             let stamp = Int(Date().timeIntervalSince1970)
             lastResultsPath = dir.appendingPathComponent("robo_results_\(stamp).json").path
@@ -31994,7 +32094,9 @@ final class RoboRunner: ObservableObject {
         do {
             let enc = JSONEncoder()
             enc.outputFormatting = [.prettyPrinted, .sortedKeys]
-            let data = try enc.encode(results)
+            // Wrap the turns with the script + start time so the file is a self-contained record.
+            let payload = RoboRunFile(script: currentScript, startedAt: runStartedAt, results: results)
+            let data = try enc.encode(payload)
             try data.write(to: URL(fileURLWithPath: path), options: .atomic)
         } catch {
             lastError = "write failed: \(error.localizedDescription)"
@@ -32010,6 +32112,59 @@ final class RoboRunner: ObservableObject {
             return "{\"status\":\"error\",\"message\":\"no results yet\"}"
         }
         return s
+    }
+
+    // MARK: - Run history
+
+    /// Every persisted run file (robo_results_*.json) in Documents, newest first. These small
+    /// files ARE the run history the Past Runs list reads. Read on demand when that sheet opens,
+    /// never during a run, so main-actor disk reads here are harmless. Files written before the
+    /// script-in-file change decode from the older bare-array shape and show "(script not
+    /// recorded)" rather than being dropped.
+    func pastRuns() -> [RoboRunSummary] {
+        guard let dir = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first else { return [] }
+        let files = (try? FileManager.default.contentsOfDirectory(
+            at: dir, includingPropertiesForKeys: [.contentModificationDateKey])) ?? []
+        let runFiles = files.filter { $0.lastPathComponent.hasPrefix("robo_results_") && $0.pathExtension == "json" }
+        var dated: [(Date, RoboRunSummary)] = []
+        for url in runFiles {
+            guard let data = try? Data(contentsOf: url) else { continue }
+            let modified = (try? url.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate) ?? Date.distantPast
+            let run: RoboRunFile
+            if let decoded = try? JSONDecoder().decode(RoboRunFile.self, from: data) {
+                run = decoded
+            } else if let legacy = try? JSONDecoder().decode([RoboStepResult].self, from: data) {
+                run = RoboRunFile(script: "(script not recorded)", startedAt: "", results: legacy)
+            } else {
+                continue
+            }
+            dated.append((modified, RoboRunSummary(path: url.path, run: run)))
+        }
+        return dated.sorted { $0.0 > $1.0 }.map { $0.1 }
+    }
+}
+
+/// One past run, for the Past Runs list. Wraps a decoded `RoboRunFile` plus its file path so a
+/// row can be shared (the file URL) or opened in detail.
+struct RoboRunSummary: Identifiable {
+    let path: String
+    let run: RoboRunFile
+    var id: String { path }
+    var askCount: Int { run.results.count }
+
+    /// A short human title: the first captured question, else the file name.
+    var title: String {
+        if let q = run.results.first?.question, !q.isEmpty {
+            return q.count > 52 ? String(q.prefix(52)) + "…" : q
+        }
+        return (path as NSString).lastPathComponent
+    }
+
+    /// A compact date/time from the ISO-8601 start stamp, empty for legacy files.
+    var dateLabel: String {
+        guard !run.startedAt.isEmpty, let d = ISO8601DateFormatter().date(from: run.startedAt) else { return "" }
+        let f = DateFormatter(); f.dateStyle = .short; f.timeStyle = .short
+        return f.string(from: d)
     }
 }
 
@@ -32347,6 +32502,13 @@ struct RoboEditorView: View {
     ASK What is two plus two? Answer in one word.
     WAIT 5
     ASK Name a primary color. One word.
+
+    # Sweep: repeat a block once per value, substituting {VAR} each pass.
+    # Uncomment to see the same question at three temperatures, compared:
+    # FOR TEMP IN 0.2, 0.6, 1.0
+    #     SET_TEMPERATURE:{TEMP}
+    #     ASK In one sentence, what is a good name for a pet fox?
+    # END
     """
 
     private var stepCount: Int {
@@ -32387,8 +32549,9 @@ struct RoboEditorView: View {
                 ToolbarItemGroup(placement: .bottomBar) {
                     Button { showingHelp = true } label: { Label("Commands", systemImage: "list.bullet.rectangle") }
                     Spacer()
+                    // Always enabled: the Results sheet is the run HISTORY, which can hold runs
+                    // from earlier sessions even before anything runs this session.
                     Button { showingResults = true } label: { Label("Results", systemImage: "doc.text.magnifyingglass") }
-                        .disabled(robo.lastResultsPath == nil)
                 }
             }
             .sheet(isPresented: $showingHelp) { RoboHelpView() }
@@ -32418,50 +32581,218 @@ struct RoboEditorView: View {
     }
 }
 
-/// The command catalog, shown in the editor's Help.
+/// The command catalog, shown in the editor's Help. A searchable, sectioned list rather than one
+/// flat blob: one collapsible-feeling Section per category, each verb its own row (verb, args,
+/// summary, and a red [!] badge for destructive). All data comes from CommandCatalog.all.
 struct RoboHelpView: View {
     @Environment(\.dismiss) private var dismiss
+    @State private var search = ""
+
+    /// Categories that have at least one matching verb, each with its filtered, sorted verbs.
+    private var sections: [(CommandCategory, [CommandDescriptor])] {
+        CommandCategory.allCases.compactMap { category in
+            let items = CommandCatalog.all
+                .filter { $0.category == category }
+                .filter { d in
+                    search.isEmpty
+                        || d.verb.localizedCaseInsensitiveContains(search)
+                        || d.summary.localizedCaseInsensitiveContains(search)
+                }
+                .sorted { $0.verb < $1.verb }
+            return items.isEmpty ? nil : (category, items)
+        }
+    }
+
     var body: some View {
         NavigationView {
-            ScrollView {
-                Text(CommandCatalog.helpText())
-                    .font(.system(.caption2, design: .monospaced))
-                    .textSelection(.enabled)
-                    .frame(maxWidth: .infinity, alignment: .leading)
-                    .padding()
+            List {
+                ForEach(sections, id: \.0) { category, items in
+                    Section(category.rawValue) {
+                        ForEach(items) { d in commandRow(d) }
+                    }
+                }
             }
+            .listStyle(.insetGrouped)
+            .searchable(text: $search, prompt: "Search commands")
             .navigationTitle("Commands")
             .navigationBarTitleDisplayMode(.inline)
             .toolbar { ToolbarItem(placement: .confirmationAction) { Button("Done") { dismiss() } } }
         }
     }
+
+    @ViewBuilder private func commandRow(_ d: CommandDescriptor) -> some View {
+        VStack(alignment: .leading, spacing: 3) {
+            HStack(spacing: 6) {
+                Text(d.verb)
+                    .font(.system(.subheadline, design: .monospaced)).fontWeight(.semibold)
+                if let args = d.args {
+                    Text(args)
+                        .font(.system(.caption, design: .monospaced)).foregroundColor(.secondary)
+                        .lineLimit(1)
+                }
+                if d.destructive {
+                    Text("!")
+                        .font(.caption2).fontWeight(.bold).foregroundColor(.white)
+                        .padding(.horizontal, 5).padding(.vertical, 1)
+                        .background(Capsule().fill(Color.red))
+                }
+            }
+            Text(d.summary).font(.caption).foregroundColor(.secondary)
+        }
+        .padding(.vertical, 2)
+        .textSelection(.enabled)
+    }
 }
 
-/// The captured results of the last run, pretty-printed.
+/// The run history: a list of past runs (newest first), each opening a detail view with a
+/// card / raw-JSON toggle and a Share button. Reads the robo_results_*.json files on appear.
 struct RoboResultsView: View {
     @Environment(\.dismiss) private var dismiss
-    private var pretty: String {
-        let json = RoboRunner.shared.resultsJSON()
-        guard let data = json.data(using: .utf8),
-              let obj = try? JSONSerialization.jsonObject(with: data),
-              let out = try? JSONSerialization.data(withJSONObject: obj, options: [.prettyPrinted]),
-              let s = String(data: out, encoding: .utf8) else { return json }
-        return s
-    }
+    @State private var runs: [RoboRunSummary] = []
+
     var body: some View {
         NavigationView {
-            ScrollView {
-                Text(pretty)
-                    .font(.system(.caption2, design: .monospaced))
-                    .textSelection(.enabled)
-                    .frame(maxWidth: .infinity, alignment: .leading)
-                    .padding()
+            Group {
+                if runs.isEmpty {
+                    ContentUnavailableView(
+                        "No runs yet",
+                        systemImage: "doc.text.magnifyingglass",
+                        description: Text("Run a script and its results are saved here."))
+                } else {
+                    List(runs) { run in
+                        NavigationLink { RoboRunDetailView(run: run) } label: {
+                            VStack(alignment: .leading, spacing: 3) {
+                                Text(run.title).font(.subheadline).fontWeight(.medium).lineLimit(2)
+                                Text(subtitle(run)).font(.caption).foregroundColor(.secondary)
+                            }
+                        }
+                    }
+                }
             }
-            .navigationTitle("Results")
+            .navigationTitle("Past Runs")
             .navigationBarTitleDisplayMode(.inline)
             .toolbar { ToolbarItem(placement: .confirmationAction) { Button("Done") { dismiss() } } }
+            .onAppear { runs = RoboRunner.shared.pastRuns() }
         }
     }
+
+    private func subtitle(_ run: RoboRunSummary) -> String {
+        let turns = "\(run.askCount) turn\(run.askCount == 1 ? "" : "s")"
+        return run.dateLabel.isEmpty ? turns : "\(turns)  ·  \(run.dateLabel)"
+    }
+}
+
+/// One run in detail: the script at the top, then a card per captured turn (question, thinking,
+/// answer, and the timing / thermal metrics), with a toggle to the raw JSON and a Share button
+/// that hands the run's .json file to the iOS share sheet.
+struct RoboRunDetailView: View {
+    let run: RoboRunSummary
+    @State private var showRawJSON = false
+    @State private var showingShare = false
+
+    var body: some View {
+        Group {
+            if showRawJSON {
+                ScrollView {
+                    Text(prettyJSON)
+                        .font(.system(.caption2, design: .monospaced))
+                        .textSelection(.enabled)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .padding()
+                }
+            } else {
+                ScrollView {
+                    VStack(alignment: .leading, spacing: 14) {
+                        if !run.run.script.isEmpty { scriptCard }
+                        ForEach(run.run.results, id: \.index) { turnCard($0) }
+                    }
+                    .padding()
+                }
+            }
+        }
+        .navigationTitle("Run")
+        .navigationBarTitleDisplayMode(.inline)
+        .toolbar {
+            ToolbarItem(placement: .primaryAction) {
+                Menu {
+                    Toggle(isOn: $showRawJSON) { Label("Raw JSON", systemImage: "curlybraces") }
+                    Button { showingShare = true } label: { Label("Share", systemImage: "square.and.arrow.up") }
+                } label: { Image(systemName: "ellipsis.circle") }
+            }
+        }
+        .sheet(isPresented: $showingShare) {
+            RoboShareSheet(activityItems: [URL(fileURLWithPath: run.path)])
+        }
+    }
+
+    private var scriptCard: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            Text("SCRIPT").font(.caption2).fontWeight(.semibold).foregroundColor(.secondary)
+            Text(run.run.script)
+                .font(.system(.caption, design: .monospaced))
+                .textSelection(.enabled)
+                .frame(maxWidth: .infinity, alignment: .leading)
+        }
+        .padding(12)
+        .background(RoundedRectangle(cornerRadius: 10).fill(Color.blue.opacity(0.08)))
+    }
+
+    @ViewBuilder private func turnCard(_ r: RoboStepResult) -> some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack {
+                Text("Turn \(r.index + 1)").font(.caption).fontWeight(.semibold)
+                Spacer()
+                Text(r.model).font(.caption2).foregroundColor(.secondary).lineLimit(1)
+            }
+            field("Question", r.question)
+            if !r.thinking.isEmpty { field("Thinking", r.thinking) }
+            field("Answer", r.answer)
+            Text(metrics(r)).font(.caption2).foregroundColor(.secondary)
+        }
+        .padding(12)
+        .background(RoundedRectangle(cornerRadius: 10).fill(Color.secondary.opacity(0.08)))
+    }
+
+    private func field(_ label: String, _ value: String) -> some View {
+        VStack(alignment: .leading, spacing: 2) {
+            Text(label.uppercased()).font(.caption2).foregroundColor(.secondary)
+            Text(value.isEmpty ? "—" : value)
+                .font(.callout)
+                .textSelection(.enabled)
+                .frame(maxWidth: .infinity, alignment: .leading)
+        }
+    }
+
+    private func metrics(_ r: RoboStepResult) -> String {
+        var parts = [String(format: "%.1fs", r.seconds)]
+        if r.phase1Seconds > 0 || r.phase2Seconds > 0 {
+            parts.append(String(format: "think %.1fs / answer %.1fs", r.phase1Seconds, r.phase2Seconds))
+        }
+        parts.append("budget \(r.reasonBudget)")
+        parts.append("thermal \(r.thermalBefore)→\(r.thermalAfter)")
+        return parts.joined(separator: "  ·  ")
+    }
+
+    /// Pretty-print the run's file for the raw-JSON view. Falls back to the file text as-is.
+    private var prettyJSON: String {
+        guard let data = try? Data(contentsOf: URL(fileURLWithPath: run.path)),
+              let obj = try? JSONSerialization.jsonObject(with: data),
+              let out = try? JSONSerialization.data(withJSONObject: obj, options: [.prettyPrinted, .sortedKeys]),
+              let s = String(data: out, encoding: .utf8) else {
+            return (try? String(contentsOfFile: run.path, encoding: .utf8)) ?? "{}"
+        }
+        return s
+    }
+}
+
+/// Minimal UIActivityViewController bridge for the results Share button. Named distinctly from
+/// the app's other (nested) ShareSheet so this DEBUG-only file stays self-contained.
+struct RoboShareSheet: UIViewControllerRepresentable {
+    let activityItems: [Any]
+    func makeUIViewController(context: Context) -> UIActivityViewController {
+        UIActivityViewController(activityItems: activityItems, applicationActivities: nil)
+    }
+    func updateUIViewController(_ controller: UIActivityViewController, context: Context) {}
 }
 // ==== LEGO END: 61 RoboEditor (Lab UI, on-device RoboRunner script editor) ====
 
