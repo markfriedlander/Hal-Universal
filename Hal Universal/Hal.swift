@@ -117,6 +117,10 @@
 //   59  RoboRunner (On-Device Reasoning/Thermal Script Runner)
 //   60  CommandCatalog (Lab Command Surface, Single Source of Truth)
 //   61  RoboEditor (Lab UI, on-device RoboRunner script editor)
+//  LabView.swift
+//   62  LabView (The Lab UI)
+//  MaintenanceView.swift
+//   63  MaintenanceView (Maintenance & Reset)
 //
 import SwiftUI
 import SharedModelStoreKit
@@ -10502,7 +10506,19 @@ class ChatViewModel: ObservableObject {
                     }
                     return names.joined(separator: " · ")
                 }
-                
+
+                /// The active salon seats' display names, in seat order. The settings UI lists
+                /// these one per line (see modelSection) so long names never truncate or jumble,
+                /// unlike the dot-joined salonSeatSummary used in compact contexts.
+                var salonSeatDisplayNames: [String] {
+                    salonConfig.activeSeats.map { (_, modelID) in
+                        if let model = ModelCatalogService.shared.getModel(byID: modelID) {
+                            return model.displayName
+                        }
+                        return modelID.split(separator: "/").last.map(String.init) ?? modelID
+                    }
+                }
+
                 /// Refreshes the model catalog from Hugging Face
                 /// - Note: This is an async operation that updates ModelCatalogService.shared.availableModels
                 func refreshModelCatalog() async {

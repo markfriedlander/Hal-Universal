@@ -65,7 +65,8 @@ struct ActionsView: View {
     @State private var showingSystemPromptEditor = false
     @State private var showingModelFramingDetail = false
     @State private var showingSelfReflectionViewer = false
-    @State private var showingRoboEditor = false   // Lab: RoboRunner script editor
+    @State private var showingLab = false   // The Lab (developer / power-user tools)
+    @State private var showingMaintenance = false   // Maintenance & Reset page
     @State private var initialSettingsSnapshot: [String: Any] = [:]
     @State private var skipComparisonOnDismiss = false
     // "Free up old model files" — the always-available door to the version-safety
@@ -111,6 +112,8 @@ struct ActionsView: View {
                     .id("poweruser")
                 labSection
                     .id("lab")
+                maintenanceSection
+                    .id("maintenance")
 
                 // About — version + build at the bottom of Settings.
                 // Plain footer rather than a Section{} so it doesn't get a
@@ -180,9 +183,14 @@ struct ActionsView: View {
             SystemPromptEditorView()
                 .environmentObject(chatViewModel)
         }
-        .sheet(isPresented: $showingRoboEditor) {
-            RoboEditorView()
+        .sheet(isPresented: $showingLab) {
+            LabView()
                 .environmentObject(chatViewModel)
+        }
+        .sheet(isPresented: $showingMaintenance) {
+            MaintenanceView()
+                .environmentObject(chatViewModel)
+                .environmentObject(mlxDownloader)
         }
         .sheet(isPresented: $showingModelFramingDetail) {
             ModelFramingDetailView()
@@ -299,24 +307,44 @@ struct ActionsView: View {
 
     // MARK: - Developer / Lab
 
-    /// A single row into the Lab's RoboRunner script editor. Ships as a user-facing opt-in
-    /// (graduated out of DEBUG 2026-07-28); the antenna and command surface graduated with it.
+    /// Entry to The Lab: Hal's developer / power-user tools (RoboRunner + the local API and
+    /// the hal-CLI installer), gathered behind one door. Opens LabView. Graduated out of DEBUG
+    /// 2026-07-28; ships as a user-facing opt-in.
     private var labSection: some View {
         Section {
             Button {
-                showingRoboEditor = true
+                showingLab = true
             } label: {
                 HStack {
-                    Label("RoboRunner", systemImage: "wrench.and.screwdriver")
+                    Label("The Lab", systemImage: "flask")
                     Spacer()
                     Image(systemName: "chevron.right").font(.caption).foregroundColor(.secondary)
                 }
             }
             .foregroundColor(.primary)
         } header: {
-            Text("Developer")
+            Text("The Lab")
         } footer: {
-            Text("Write and run on-device RoboRunner scripts.")
+            Text("Power tools: run on-device automation scripts (RoboRunner) and reach Hal from your Mac terminal (the hal command).")
+        }
+    }
+
+    /// Entry to Maintenance & Reset: housekeeping/reset actions gathered on one page
+    /// (Reset Defaults, Clear Hal's Models, Nuclear Reset). See MaintenanceView (block 63).
+    private var maintenanceSection: some View {
+        Section {
+            Button {
+                showingMaintenance = true
+            } label: {
+                HStack {
+                    Label("Maintenance & Reset", systemImage: "arrow.triangle.2.circlepath")
+                    Spacer()
+                    Image(systemName: "chevron.right").font(.caption).foregroundColor(.secondary)
+                }
+            }
+            .foregroundColor(.primary)
+        } footer: {
+            Text("Reset settings, clear model storage, or wipe all data.")
         }
     }
 
@@ -511,32 +539,37 @@ struct ActionsView: View {
             // render at slightly different heights, which propagated through
             // Form re-layout as a visible scroll/flash jump above the
             // picker. Verified on iPhone 17 Pro sim before/after.
-            HStack(alignment: .top) {
-                if chatViewModel.salonConfig.isEnabled {
-                    Text("Salon Mode")
-                        .font(.subheadline)
-                        .fontWeight(.medium)
-                    Spacer()
-                    HStack(alignment: .top, spacing: 6) {
+            if chatViewModel.salonConfig.isEnabled {
+                // Salon: list each active seat's model on its own line, in seat order, full
+                // names (no truncation). The old dot-joined trailing summary wrapped and
+                // clipped ("... Ter...") on narrow widths, which read as jumbled.
+                VStack(alignment: .leading, spacing: 6) {
+                    HStack(spacing: 6) {
+                        Text("Salon Mode")
+                            .font(.subheadline)
+                            .fontWeight(.medium)
                         Image(systemName: "person.2.fill")
                             .foregroundColor(.accentColor)
                             .imageScale(.small)
-                            .padding(.top, 2)
-                        // Show all active seat names ("Gemma · Llama · Qwen
-                        // · Dolphin"). Bug-fix 2026-05-19: previously
-                        // .lineLimit(1) truncated the summary at the first
-                        // model name on narrower widths, so a 2+ seat
-                        // configuration looked like only seat 1 was
-                        // running. Allow up to 3 lines and right-align so
-                        // long names wrap cleanly instead of disappearing.
-                        Text(chatViewModel.salonSeatSummary)
-                            .font(.subheadline)
-                            .foregroundColor(.secondary)
-                            .multilineTextAlignment(.trailing)
-                            .lineLimit(3)
-                            .fixedSize(horizontal: false, vertical: true)
+                        Spacer()
                     }
-                } else {
+                    ForEach(Array(chatViewModel.salonSeatDisplayNames.enumerated()), id: \.offset) { idx, name in
+                        HStack(alignment: .firstTextBaseline, spacing: 8) {
+                            Text("\(idx + 1)")
+                                .font(.caption)
+                                .foregroundColor(.secondary)
+                                .frame(minWidth: 14, alignment: .trailing)
+                            Text(name)
+                                .font(.subheadline)
+                                .foregroundColor(.secondary)
+                                .fixedSize(horizontal: false, vertical: true)
+                            Spacer(minLength: 0)
+                        }
+                    }
+                }
+                .frame(maxWidth: .infinity, alignment: .leading)
+            } else {
+                HStack(alignment: .top) {
                     Text("Active Model")
                         .font(.subheadline)
                         .fontWeight(.medium)
@@ -552,8 +585,8 @@ struct ActionsView: View {
                             .foregroundColor(.secondary)
                     }
                 }
+                .frame(minHeight: 28)
             }
-            .frame(minHeight: 28)
 
             NavigationLink(destination: ModelLibraryView()
                 .environmentObject(chatViewModel)
@@ -622,19 +655,19 @@ struct ActionsView: View {
     // One control does everything: activation + settings access + chat behavior.
     
     private var powerUserSection: some View {
-        // v1.x release: Salon Mode is hidden from the UI. The mode toggle
-        // and the Salon Mode settings sheet entry are gated on Self.salonModeExposedInUI.
-        // The underlying Salon Mode code (SalonModeView, salonConfig, runSalonTurn,
-        // etc.) remains intact per the standing "broken-but-precious" instruction —
-        // flipping the flag back to true restores full Salon Mode access for
-        // future releases. We also force salonConfig.isEnabled = false on appear
-        // (see .onAppear below) to guarantee chat behaviour is single-model
-        // regardless of any stale state from prior installs.
+        // Salon Mode shipped as a working feature in v2.0 and is exposed via
+        // Self.salonModeExposedInUI (currently true): the Conversation Mode toggle and
+        // the Salon Mode Settings sheet are gated on that flag, and salon runs verified
+        // (device-tested 2026-07-28, independent mode, multiple attributed voices).
+        // If the flag is ever set false to hide Salon for a release, the .onAppear above
+        // also forces salonConfig.isEnabled = false so no persisted salon state routes
+        // chat through the salon path while the UI is hidden. (Earlier v1.x builds kept
+        // Salon hidden; that is historical, not the current state.)
         Section {
             if Self.salonModeExposedInUI {
                 // Mode toggle (hidden in v1.x)
                 VStack(alignment: .leading, spacing: 8) {
-                    Text("Power User Mode")
+                    Text("Conversation Mode")
                         .font(.subheadline)
                         .fontWeight(.medium)
 
@@ -676,7 +709,7 @@ struct ActionsView: View {
                          "Advanced settings for single model operation")
                         .font(.caption)
                         .foregroundColor(.secondary)
-                        .lineLimit(1)
+                        .fixedSize(horizontal: false, vertical: true)
                         .frame(maxWidth: .infinity, alignment: .leading)
 
                     // BUG 4 v2 fix (2026-05-19): salon-mode banner moved
@@ -772,9 +805,6 @@ struct PowerUserView: View {
     @EnvironmentObject var chatViewModel: ChatViewModel
     @EnvironmentObject var mlxDownloader: MLXModelDownloader
 
-    @State private var showingNuclearResetConfirmationAlert = false
-    @State private var showingClearCacheAlert = false
-    @State private var showResetSettingsAlert = false
     @State private var sliderStartValues: [String: Double] = [:]
 
     /// Per Mark's May-15 directive — per-model controls (memory depth,
@@ -791,86 +821,24 @@ struct PowerUserView: View {
             Form {
                 memorySection
                 thinkingSection
-                settingsResetSection
-                cacheManagementSection
-                dataManagementSection
-                developerAPISection
+                #if DEBUG
+                // Pipeline Test Console: superseded dev scaffolding (a file-based input.txt/
+                // output.json harness). The antenna + hal CLI + RoboRunner replace it, so it is
+                // DEBUG-only and never ships in Release.
                 if ProcessInfo.processInfo.isiOSAppOnMac {
                     testConsoleSection
                 }
+                #endif
             }
-            .navigationTitle("Power User")
+            .navigationTitle("Single LLM Settings")
             .toolbar {
                 ToolbarItem(placement: .cancellationAction) {
                     Button("Done") { dismiss() }
                 }
             }
         }
-        .alert("Confirm Nuclear Reset", isPresented: $showingNuclearResetConfirmationAlert) {
-            Button("Nuclear Reset", role: .destructive) {
-                chatViewModel.resetAllData()
-                dismiss()
-            }
-            Button("Cancel", role: .cancel) { }
-        } message: {
-            Text("Are you sure you want to delete ALL conversations, summaries, RAG documents, and document memory from the database? This cannot be undone.")
-        }
-        .alert("Confirm Settings Reset", isPresented: $showResetSettingsAlert) {
-            Button("Reset Settings", role: .destructive) {
-                chatViewModel.resetSettingsToDefaults()
-                dismiss()
-            }
-            Button("Cancel", role: .cancel) { }
-        } message: {
-            Text("Reset all settings to factory defaults? This will reset your system prompt, memory depth, similarity threshold, recency settings, and RAG limits. Your conversation history and documents will not be affected.")
-        }
-        .alert("Clear Hal's Models", isPresented: $showingClearCacheAlert) {
-            Button("Clear Hal's Models", role: .destructive) {
-                mlxDownloader.clearHalsModels()
-            }
-            Button("Cancel", role: .cancel) { }
-        } message: {
-            Text(clearModelsMessage)
-        }
     }
 
-    /// Confirmation copy for "Clear Hal's Models", built from a dry run so it
-    /// describes what will actually happen to THIS device right now.
-    ///
-    /// The old copy — "this will delete all cached model files" — was technically
-    /// true of the old (broken) behavior and read to every user as "Hal's files."
-    /// It was deleting the whole family's. Now that the delete is claim-aware, the
-    /// alert explains the sharing rather than hiding it: a co-claimed model staying
-    /// on disk is the system working, and saying so is cheaper than a support email.
-    private var clearModelsMessage: String {
-        let plan = mlxDownloader.previewClearHalsModels()
-
-        if plan.isEmpty {
-            return "Hal isn't using any downloaded models right now, so there's nothing to clear."
-        }
-
-        var lines: [String] = []
-        if !plan.willDelete.isEmpty {
-            let n = plan.willDelete.count
-            lines.append("\(n) model\(n == 1 ? "" : "s") will be deleted from this device.")
-        }
-        if !plan.willStayForOthers.isEmpty {
-            let n = plan.willStayForOthers.count
-            // Name the siblings when we can — "also used by Posey" explains the
-            // family; "also used by another app" just raises a question.
-            let who = plan.otherClaimants.sorted()
-            let byWhom: String
-            switch who.count {
-            case 0:  byWhom = "another app in the AI family"
-            case 1:  byWhom = who[0]
-            case 2:  byWhom = "\(who[0]) and \(who[1])"
-            default: byWhom = who.dropLast().joined(separator: ", ") + ", and " + who[who.count - 1]
-            }
-            lines.append("\(n) \(n == 1 ? "is" : "are") also used by \(byWhom) and will stay on disk — Hal just stops using \(n == 1 ? "it" : "them").")
-        }
-        lines.append("Anything deleted will need to be downloaded again.")
-        return lines.joined(separator: " ")
-    }
 
     // MARK: - Memory Section
     
@@ -1059,290 +1027,6 @@ struct PowerUserView: View {
         }
     }
     
-    // MARK: - Settings Reset Section
-    
-    private var settingsResetSection: some View {
-        Section {
-            VStack(alignment: .leading, spacing: 16) {
-                // Per-model reset (Layer 3 of per-model settings profiles).
-                // Restores just the active model's settings to its empirical
-                // defaults, leaving other models' overrides untouched.
-                Button(action: {
-                    chatViewModel.resetSettingsToModelDefaults()
-                }) {
-                    HStack {
-                        Image(systemName: "arrow.uturn.backward.circle.fill")
-                            .foregroundColor(.blue)
-                        Text("Reset settings for \(chatViewModel.selectedModel.displayName)")
-                            .foregroundColor(.primary)
-                            .multilineTextAlignment(.leading)
-                        Spacer()
-                    }
-                    .padding(.vertical, 4)
-                }
-
-                Text("Restore the active model's settings (temperature, memory depth, RAG budget, etc.) to its tuned defaults. Other models' settings are untouched.")
-                    .font(.caption)
-                    .foregroundColor(.secondary)
-
-                Divider()
-
-                // Global "nuke everything" reset (existing behavior).
-                Button(action: {
-                    showResetSettingsAlert = true
-                }) {
-                    HStack {
-                        Image(systemName: "arrow.counterclockwise.circle.fill")
-                            .foregroundColor(.orange)
-                        Text("Reset All Settings to Factory Defaults")
-                            .foregroundColor(.primary)
-                            .multilineTextAlignment(.leading)
-                        Spacer()
-                    }
-                    .padding(.vertical, 4)
-                }
-
-                Text("Restore every tunable parameter — across every model — to factory defaults. This does not affect conversation history, documents, or Hal's learned self-knowledge.")
-                    .font(.caption)
-                    .foregroundColor(.secondary)
-            }
-        } header: {
-            Label("Settings Reset", systemImage: "arrow.counterclockwise")
-        }
-    }
-    
-    // MARK: - Cache Management Section
-    
-    // Allows clearing of Hugging Face model cache to free disk space
-    // This doesn't affect conversations or documents, only downloaded model files
-    
-    private var cacheManagementSection: some View {
-        Section {
-            HStack {
-                VStack(alignment: .leading, spacing: 4) {
-                    Text("Model Cache")
-                        .font(.subheadline)
-                    Text(mlxDownloader.hubCacheSize)
-                        .font(.caption)
-                        .foregroundColor(.secondary)
-                }
-                Spacer()
-                if mlxDownloader.isCacheCalculating {
-                    ProgressView()
-                        .scaleEffect(0.8)
-                } else {
-                    Button("Clear Hal's Models") {
-                        showingClearCacheAlert = true
-                    }
-                    .font(.caption)
-                    .foregroundColor(.red)
-                }
-            }
-        } header: {
-            Label("Storage", systemImage: "externaldrive")
-        } footer: {
-            Text("Clear cached Hugging Face model files to free up space")
-                .font(.caption2)
-        }
-    }
-    
-    // MARK: - Data Management Section
-    
-    // Database statistics and nuclear reset option
-    // Nuclear reset deletes ALL conversations and documents (can't be undone)
-    
-    private var dataManagementSection: some View {
-        Section {
-            HStack {
-                VStack(alignment: .leading, spacing: 4) {
-                    Text("Total Threads")
-                        .font(.subheadline)
-                    Text("\(chatViewModel.memoryStore.totalConversations)")
-                        .font(.caption)
-                        .foregroundColor(.secondary)
-                }
-                Spacer()
-            }
-            
-            HStack {
-                VStack(alignment: .leading, spacing: 4) {
-                    Text("Total Documents")
-                        .font(.subheadline)
-                    Text("\(chatViewModel.memoryStore.totalDocuments)")
-                        .font(.caption)
-                        .foregroundColor(.secondary)
-                }
-                Spacer()
-            }
-            
-            Button("Nuclear Reset (Delete All Data)") {
-                showingNuclearResetConfirmationAlert = true
-            }
-            .foregroundColor(.red)
-        } header: {
-            Label("Database", systemImage: "externaldrive.badge.questionmark")
-        } footer: {
-            Text("Database statistics and data management options")
-                .font(.caption2)
-        }
-    }
-
-    // MARK: - Developer API Section
-
-    private var developerAPISection: some View {
-        DeveloperAPISectionView(viewModel: chatViewModel)
-    }
-
-    struct DeveloperAPISectionView: View {
-        @ObservedObject var viewModel: ChatViewModel
-        @State private var copiedField: String? = nil
-
-        var body: some View {
-            Section {
-                Toggle(isOn: Binding(
-                    get: { viewModel.localAPIEnabled },
-                    set: { enabled in
-                        if enabled { viewModel.startLocalAPI() }
-                        else       { viewModel.stopLocalAPI()  }
-                    }
-                )) {
-                    Label("Local API Access", systemImage: "network")
-                }
-                if viewModel.localAPIEnabled {
-                    VStack(alignment: .leading, spacing: 8) {
-                        copyableRow(label: "Address",
-                                    value: viewModel.localAPIServer.connectionURL,
-                                    field: "address",
-                                    font: .caption)
-                        copyableRow(label: "Port",
-                                    value: "\(LocalAPIServer.apiPort)",
-                                    field: "port",
-                                    font: .caption)
-                        copyableRow(label: "Token",
-                                    value: viewModel.localAPIServer.apiToken,
-                                    field: "token",
-                                    font: .system(.caption2, design: .monospaced))
-                    }
-                    .padding(.vertical, 4)
-
-                    // The hal CLI installer only makes sense on a Mac (writes to /usr/local/bin).
-                    // On iPhone/iPad the API is still reachable; users build their own client.
-                    if ProcessInfo.processInfo.isiOSAppOnMac {
-                        halInstallerView
-                    }
-                }
-            } header: {
-                Label("Developer API", systemImage: "terminal")
-            } footer: {
-                Text(viewModel.localAPIEnabled
-                    ? "Tap any field to copy. Setup: python3 tests/hal_test.py setup 127.0.0.1 \(LocalAPIServer.apiPort) <token>"
-                    : "Enables a local HTTP API for automated testing. Off by default.")
-                    .font(.caption2)
-            }
-        }
-
-        @ViewBuilder
-        private func copyableRow(label: String, value: String, field: String, font: Font) -> some View {
-            HStack(alignment: .top) {
-                Text(label)
-                    .font(.caption)
-                    .foregroundColor(.secondary)
-                Spacer()
-                HStack(spacing: 4) {
-                    Text(copiedField == field ? "Copied!" : value)
-                        .font(font)
-                        .foregroundColor(copiedField == field ? .green : .primary)
-                        .multilineTextAlignment(.trailing)
-                        .textSelection(.enabled)
-                    Image(systemName: "doc.on.doc")
-                        .font(.caption2)
-                        .foregroundColor(copiedField == field ? .green : .secondary)
-                }
-                .onTapGesture {
-                    UIPasteboard.general.string = value
-                    withAnimation { copiedField = field }
-                    DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) {
-                        withAnimation { if copiedField == field { copiedField = nil } }
-                    }
-                }
-            }
-        }
-
-        // MARK: - hal CLI installer (Mac only)
-
-        /// Absolute path of the `hal` script bundled inside the app, or nil until it is added
-        /// to the target as a bundled resource. The install line copies FROM this path.
-        private var bundledHalPath: String? {
-            Bundle.main.path(forResource: "hal", ofType: nil)
-        }
-
-        /// A readable, scoped-sudo one-liner the user pastes into their own Mac Terminal. Only the
-        /// write into /usr/local/bin uses sudo; the ~/.config/hal file stays user-owned. Refuses if
-        /// hal already exists (uninstall first). host/port/token come straight from this running app.
-        private func installCommand(halPath: String, token: String) -> String {
-            let port = LocalAPIServer.apiPort
-            let configJSON = "{\"host\":\"127.0.0.1\",\"port\":\(port),\"token\":\"\(token)\"}"
-            return "if [ -e /usr/local/bin/hal ]; then echo \"hal already installed. Run the uninstall line first.\"; else sudo mkdir -p /usr/local/bin && sudo install -m 755 \"\(halPath)\" /usr/local/bin/hal && install -d -m 700 ~/.config/hal && printf '\(configJSON)\\n' > ~/.config/hal/config.json && chmod 600 ~/.config/hal/config.json && echo \"hal installed. Try: hal hello\"; fi"
-        }
-
-        /// Removes exactly what the installer added, nothing else. `rmdir` only removes the config
-        /// directory if it is empty, so a user's own files there are never touched.
-        private var uninstallCommand: String {
-            "sudo rm -f /usr/local/bin/hal && rm -f ~/.config/hal/config.json && rmdir ~/.config/hal 2>/dev/null; echo \"hal uninstalled.\""
-        }
-
-        @ViewBuilder
-        private var halInstallerView: some View {
-            VStack(alignment: .leading, spacing: 10) {
-                Divider()
-                Text("Install the hal command")
-                    .font(.subheadline).bold()
-                Text("Run the hal CLI in your Mac Terminal, talking to this app over the local API. Read a line, then paste it into Terminal. The install line asks for your password because it writes hal into /usr/local/bin.")
-                    .font(.caption).foregroundColor(.secondary)
-                if let halPath = bundledHalPath {
-                    commandBlock(title: "Install",
-                                 command: installCommand(halPath: halPath, token: viewModel.localAPIServer.apiToken),
-                                 field: "install")
-                    commandBlock(title: "Uninstall", command: uninstallCommand, field: "uninstall")
-                } else {
-                    Text("The hal script is not bundled in this build yet.")
-                        .font(.caption).foregroundColor(.orange)
-                }
-            }
-            .padding(.vertical, 4)
-        }
-
-        @ViewBuilder
-        private func commandBlock(title: String, command: String, field: String) -> some View {
-            VStack(alignment: .leading, spacing: 4) {
-                HStack {
-                    Text(title).font(.caption).foregroundColor(.secondary)
-                    Spacer()
-                    Button {
-                        UIPasteboard.general.string = command
-                        withAnimation { copiedField = field }
-                        DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) {
-                            withAnimation { if copiedField == field { copiedField = nil } }
-                        }
-                    } label: {
-                        Label(copiedField == field ? "Copied!" : "Copy",
-                              systemImage: copiedField == field ? "checkmark" : "doc.on.doc")
-                            .font(.caption2)
-                    }
-                    .buttonStyle(.borderless)
-                    .foregroundColor(copiedField == field ? .green : .accentColor)
-                }
-                Text(command)
-                    .font(.system(.caption2, design: .monospaced))
-                    .foregroundColor(.primary)
-                    .textSelection(.enabled)
-                    .padding(8)
-                    .frame(maxWidth: .infinity, alignment: .leading)
-                    .background(RoundedRectangle(cornerRadius: 6).fill(Color.secondary.opacity(0.12)))
-            }
-        }
-    }
-
     // MARK: - Test Console Section (shown when running as iOS app on Mac)
 
     private var testConsoleSection: some View {
@@ -1521,7 +1205,6 @@ struct SystemPromptEditorView: View {
                     .frame(maxWidth: .infinity, alignment: .trailing)
             }
             .navigationTitle("System Prompt")
-            .navigationBarTitleDisplayMode(.inline)
             .toolbar {
                 ToolbarItem(placement: .cancellationAction) {
                     Button("Cancel") {
@@ -1651,9 +1334,8 @@ struct ModelFramingDetailView: View {
                 }
             }
             .navigationTitle("Model Framing")
-            .navigationBarTitleDisplayMode(.inline)
             .toolbar {
-                ToolbarItem(placement: .confirmationAction) {
+                ToolbarItem(placement: .cancellationAction) {
                     Button("Done") { dismiss() }
                 }
             }
@@ -1787,10 +1469,9 @@ struct SalonModeView: View {
                         .font(.caption)
                 }
             }
-            .navigationTitle("Salon Mode")
-            .navigationBarTitleDisplayMode(.inline)
+            .navigationTitle("Salon Mode Settings")
             .toolbar {
-                ToolbarItem(placement: .navigationBarTrailing) {
+                ToolbarItem(placement: .cancellationAction) {
                     Button("Done") {
                         dismiss()
                     }
