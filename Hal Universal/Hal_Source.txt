@@ -23930,11 +23930,9 @@ class HalTestConsole: ObservableObject {
         // Lab safety gate (single source of truth = CommandCatalog.destructive). Enforced HERE at the
         // interpreter so every door (antenna, CLI, RoboRunner) inherits it: Safe mode refuses
         // destructive verbs; Advanced requires a trailing confirm marker (--yes / CONFIRM). On allow,
-        // the marker is stripped so each verb's own arg parsing below is unaffected. DEBUG-only like
-        // the rest of the Lab (CommandCatalog is DEBUG-only); un-gates with the Lab at productization.
-        // `trimmed` is a `let` in both configs (Release just passes rawTrimmed straight through), so no
-        // "never mutated" warning when the gate compiles out.
-#if DEBUG
+        // the marker is stripped so each verb's own arg parsing below is unaffected. Graduated out of
+        // DEBUG with the rest of the Lab (2026-07-28): the gate now runs in EVERY build, so the shipped
+        // antenna/CLI/RoboRunner are all protected by Safe mode by default.
         let trimmed: String
         switch CommandCatalog.gate(rawTrimmed) {
         case .refuse(let reason):
@@ -23942,9 +23940,6 @@ class HalTestConsole: ObservableObject {
         case .allow(let cleaned):
             trimmed = cleaned
         }
-#else
-        let trimmed = rawTrimmed
-#endif
 
         if trimmed.hasPrefix("SET_MODEL:") || trimmed.hasPrefix("SWITCH_MODEL:") {
             let prefix = trimmed.hasPrefix("SET_MODEL:") ? "SET_MODEL:" : "SWITCH_MODEL:"
@@ -23981,24 +23976,18 @@ class HalTestConsole: ObservableObject {
             """
 
         } else if trimmed == "HELP" || trimmed == "COMMANDS" || trimmed.hasPrefix("HELP:") {
-#if DEBUG
             // Lab command discovery. Single source of truth = CommandCatalog (RoboRunner.swift,
-            // LEGO block 60). Lists every verb with args, a one-line description, category, and a
-            // destructive flag. `HELP:SAFE` hides destructive verbs (Safe mode); plain HELP or
-            // `HELP:ALL` includes them. CommandCatalog is pure data (no disk I/O, no @MainActor
-            // state). Feeds the future `hal` CLI help, the RoboRunner editor Help, and Hal's own
-            // self-knowledge. DEBUG-gated for now like the rest of the Lab; un-gate when the Lab
-            // ships as a user-facing opt-in.
+            // LEGO block 60). Lists every VISIBLE verb with args, a one-line description, category,
+            // and a destructive flag (developer-only verbs are hidden in Release via debugOnly).
+            // `HELP:SAFE` hides destructive verbs (Safe mode); plain HELP or `HELP:ALL` includes them.
+            // CommandCatalog is pure data (no disk I/O, no @MainActor state). Feeds the `hal` CLI help,
+            // the RoboRunner editor Help, and Hal's own self-knowledge.
             let modeArg = trimmed.hasPrefix("HELP:")
                 ? String(trimmed.dropFirst("HELP:".count)).trimmingCharacters(in: .whitespaces).uppercased()
                 : ""
             return CommandCatalog.helpJSON(includeDestructive: modeArg != "SAFE")
-#else
-            return "{\"status\":\"error\",\"message\":\"HELP is available in developer builds only\"}"
-#endif
 
         } else if trimmed.hasPrefix("SET_SAFETY:") {
-#if DEBUG
             // Set the Lab safety mode (see CommandCatalog.gate). A non-destructive control verb, so the
             // gate at the top lets it through. Not persisted; resets to Safe on relaunch.
             let v = String(trimmed.dropFirst("SET_SAFETY:".count)).trimmingCharacters(in: .whitespaces).lowercased()
@@ -24008,9 +23997,6 @@ class HalTestConsole: ObservableObject {
             default: return "{\"status\":\"error\",\"message\":\"SET_SAFETY: must be safe or advanced\"}"
             }
             return "{\"status\":\"ok\",\"command\":\"SET_SAFETY\",\"mode\":\"\(CommandCatalog.mode.rawValue)\"}"
-#else
-            return "{\"status\":\"error\",\"message\":\"SET_SAFETY is available in developer builds only\"}"
-#endif
 
         } else if trimmed == "SHARED_MODELS" {
             // v2.1 diagnostic (READ-ONLY): the App-Group shared model store — its
@@ -24221,13 +24207,11 @@ class HalTestConsole: ObservableObject {
             return "{\"status\":\"ok\",\"command\":\"NEW_THREAD\",\"conversationId\":\"\(vm.conversationId)\"}"
 
         } else if trimmed.hasPrefix("ROBO_RUN:") {
-            // Kick off an on-device RoboRunner script (DEBUG only). Returns
-            // immediately; the run executes autonomously on the device and paces
-            // itself against the real thermalState. Poll ROBO_STATUS; read the
-            // captured turns with ROBO_RESULTS when done. See RoboRunner.swift.
-            // The arm is always present so the verb is recognised; only the body
-            // is DEBUG-gated (RoboRunner itself compiles out of release builds).
-#if DEBUG
+            // Kick off an on-device RoboRunner script. Returns immediately; the run executes
+            // autonomously on the device and paces itself against the real thermalState. Poll
+            // ROBO_STATUS; read the captured turns with ROBO_RESULTS when done. See RoboRunner.swift.
+            // ROBO_RUN is destructive in the catalog (a script can issue any verb), so the safety
+            // gate above already refused it in Safe mode / required a confirm marker in Advanced.
             let script = String(trimmed.dropFirst("ROBO_RUN:".count))
             if RoboRunner.shared.busy {
                 return "{\"status\":\"error\",\"message\":\"RoboRunner busy (\(RoboRunner.shared.progress))\"}"
@@ -24235,36 +24219,21 @@ class HalTestConsole: ObservableObject {
             let console = self
             Task { @MainActor in _ = await RoboRunner.shared.run(script: script, vm: vm, console: console) }
             return "{\"status\":\"ok\",\"command\":\"ROBO_RUN\",\"started\":true}"
-#else
-            return "{\"status\":\"error\",\"message\":\"ROBO_RUN is a DEBUG-only command\"}"
-#endif
 
         } else if trimmed == "ROBO_STATUS" {
-#if DEBUG
             let r = RoboRunner.shared
             return "{\"status\":\"ok\",\"running\":\(r.busy),\"progress\":\"\(r.progress)\",\"resultsPath\":\"\(r.lastResultsPath ?? "")\",\"error\":\"\(r.lastError ?? "")\"}"
-#else
-            return "{\"status\":\"error\",\"message\":\"ROBO_STATUS is a DEBUG-only command\"}"
-#endif
 
         } else if trimmed == "ROBO_RESULTS" {
-#if DEBUG
             return RoboRunner.shared.resultsJSON()
-#else
-            return "{\"status\":\"error\",\"message\":\"ROBO_RESULTS is a DEBUG-only command\"}"
-#endif
 
         } else if trimmed == "ROBO_STOP" {
-#if DEBUG
             // Ask a running RoboRunner script to halt at the next step boundary. Does NOT
             // interrupt a turn mid-generation (that is the separate user STOP feature); it
             // stops cleanly between steps, keeping the partial results already captured.
             let wasRunning = RoboRunner.shared.busy
             RoboRunner.shared.requestStop()
             return "{\"status\":\"ok\",\"command\":\"ROBO_STOP\",\"wasRunning\":\(wasRunning)}"
-#else
-            return "{\"status\":\"error\",\"message\":\"ROBO_STOP is a DEBUG-only command\"}"
-#endif
 
         } else if trimmed == "RESET_THREAD" {
             vm.memoryStore.deleteThread(id: vm.conversationId)
@@ -24640,6 +24609,7 @@ class HalTestConsole: ObservableObject {
             return "{\"status\":\"ok\",\"command\":\"RRF_STATUS\",\"rrfKSemantic\":\(ms.rrfKSemantic),\"rrfKBM25Distinctive\":\(ms.rrfKBM25Distinctive),\"rrfKBM25Default\":\(ms.rrfKBM25Default)}"
 
         } else if trimmed.hasPrefix("MEMORY_PLANT_AGED:") {
+            #if DEBUG
             // MEMORY_PLANT_AGED:<days_old>:<content>
             //
             // Test-only. Plants one conversation row into unified_content with
@@ -24682,8 +24652,12 @@ class HalTestConsole: ObservableObject {
                 return "{\"status\":\"error\",\"message\":\"MEMORY_PLANT_AGED: store failed\"}"
             }
             return "{\"status\":\"ok\",\"command\":\"MEMORY_PLANT_AGED\",\"id\":\"\(contentId)\",\"daysOld\":\(daysOld),\"timestamp\":\(Int(backdated.timeIntervalSince1970))}"
+            #else
+            return "{\"status\":\"error\",\"command\":\"MEMORY_PLANT_AGED\",\"message\":\"MEMORY_PLANT_AGED is a developer-only command\"}"
+            #endif
 
         } else if trimmed == "MEMORY_PLANT_AGED_CLEANUP" {
+            #if DEBUG
             // Test-only. Removes every row planted by MEMORY_PLANT_AGED by
             // deleting the "recency-regression-test" source_id via the same
             // production thread-deletion path (scoped to that id only — no
@@ -24691,6 +24665,9 @@ class HalTestConsole: ObservableObject {
             // real corpus exactly as it found it.
             vm.memoryStore.deleteThread(id: "recency-regression-test")
             return "{\"status\":\"ok\",\"command\":\"MEMORY_PLANT_AGED_CLEANUP\"}"
+            #else
+            return "{\"status\":\"error\",\"command\":\"MEMORY_PLANT_AGED_CLEANUP\",\"message\":\"MEMORY_PLANT_AGED_CLEANUP is a developer-only command\"}"
+            #endif
 
         } else if trimmed == "GET_THREADS" {
             let threads = vm.threads
@@ -25032,9 +25009,13 @@ class HalTestConsole: ObservableObject {
             return "{\"status\":\"error\",\"message\":\"Could not read state\"}"
 
         } else if trimmed == "CLEAR_TEST_DATA" {
+            #if DEBUG
             let (threads, facts, messages) = vm.memoryStore.clearAllConversationData()
             vm.startNewConversation()
             return "{\"status\":\"ok\",\"command\":\"CLEAR_TEST_DATA\",\"threadsDeleted\":\(threads),\"factsDeleted\":\(facts),\"messagesDeleted\":\(messages),\"newConversationId\":\"\(vm.conversationId)\"}"
+            #else
+            return "{\"status\":\"error\",\"command\":\"CLEAR_TEST_DATA\",\"message\":\"CLEAR_TEST_DATA is a developer-only command\"}"
+            #endif
 
         } else if trimmed.hasPrefix("EMBED_SIM_BATCH:") {
             // EMBED_SIM_BATCH:<t1a>|||<t2a>~~~<t1b>|||<t2b>~~~...
@@ -25356,12 +25337,16 @@ class HalTestConsole: ObservableObject {
             return "{\"status\":\"ok\",\"backend\":\"\(backend.rawValue)\",\"modelID\":\"\(modelID)\",\"isDownloaded\":\(isDownloaded),\"isDownloading\":\(isDownloading),\"progress\":\(progress),\"message\":\"\(message)\",\"error\":\"\(err)\"}"
 
         } else if trimmed == "INJECT_REALISTIC_TEST_CORPUS" {
+            #if DEBUG
             // Inject ~70 rows of realistic conversational content into
             // unified_content for RAG threshold evaluation. Used by the
             // 2026-05-17 threshold-tuning eval (build out a populated DB
             // so the threshold isn't tuned against a 6-row trivial case).
             let count = vm.memoryStore.injectRealisticTestCorpus()
             return "{\"status\":\"ok\",\"command\":\"INJECT_REALISTIC_TEST_CORPUS\",\"rowsInjected\":\(count)}"
+            #else
+            return "{\"status\":\"error\",\"command\":\"INJECT_REALISTIC_TEST_CORPUS\",\"message\":\"INJECT_REALISTIC_TEST_CORPUS is a developer-only command\"}"
+            #endif
 
         } else if trimmed.hasPrefix("MEMORY_DUMP:") {
             // MEMORY_DUMP:<limit>
@@ -25453,6 +25438,7 @@ class HalTestConsole: ObservableObject {
             return vm.memoryStore.debugSearchUnifiedContent(query: query, currentConversationId: vm.conversationId)
 
         } else if trimmed.hasPrefix("MEMORY_INJECT_TEST:") {
+            #if DEBUG
             // MEMORY_INJECT_TEST:<count>:<tokens_each>[:<category>]
             //
             // Inserts N synthetic self-knowledge entries of approximately
@@ -25512,6 +25498,9 @@ class HalTestConsole: ObservableObject {
             vm.memoryStore.invalidateCachedCompressions(forSegmentKind: .selfKnowledge)
             print("HALDEBUG-TESTCONSOLE: MEMORY_INJECT_TEST — injected \(count) synthetic entries of ~\(tokensEach) tokens each (category: \(category))")
             return "{\"status\":\"ok\",\"command\":\"MEMORY_INJECT_TEST\",\"injected\":\(count),\"tokensEach\":\(tokensEach),\"category\":\"\(category)\"}"
+            #else
+            return "{\"status\":\"error\",\"command\":\"MEMORY_INJECT_TEST\",\"message\":\"MEMORY_INJECT_TEST is a developer-only command\"}"
+            #endif
 
         } else {
             print("HALDEBUG-TESTCONSOLE: Unknown command: \(trimmed.prefix(60))")
@@ -27399,9 +27388,7 @@ struct ActionsView: View {
     @State private var showingSystemPromptEditor = false
     @State private var showingModelFramingDetail = false
     @State private var showingSelfReflectionViewer = false
-#if DEBUG
-    @State private var showingRoboEditor = false   // Lab: RoboRunner script editor (DEBUG only)
-#endif
+    @State private var showingRoboEditor = false   // Lab: RoboRunner script editor
     @State private var initialSettingsSnapshot: [String: Any] = [:]
     @State private var skipComparisonOnDismiss = false
     // "Free up old model files" — the always-available door to the version-safety
@@ -27445,10 +27432,8 @@ struct ActionsView: View {
                     .id("ai")
                 powerUserSection
                     .id("poweruser")
-#if DEBUG
                 labSection
                     .id("lab")
-#endif
 
                 // About — version + build at the bottom of Settings.
                 // Plain footer rather than a Section{} so it doesn't get a
@@ -27518,12 +27503,10 @@ struct ActionsView: View {
             SystemPromptEditorView()
                 .environmentObject(chatViewModel)
         }
-#if DEBUG
         .sheet(isPresented: $showingRoboEditor) {
             RoboEditorView()
                 .environmentObject(chatViewModel)
         }
-#endif
         .sheet(isPresented: $showingModelFramingDetail) {
             ModelFramingDetailView()
                 .environmentObject(chatViewModel)
@@ -27637,11 +27620,10 @@ struct ActionsView: View {
         chatViewModel.salonConfig.isEnabled
     }
 
-#if DEBUG
-    // MARK: - Developer / Lab (DEBUG only)
+    // MARK: - Developer / Lab
 
-    /// A single row into the Lab's RoboRunner script editor. DEBUG-only: the whole Lab
-    /// (antenna, command catalog, editor) compiles out of Release.
+    /// A single row into the Lab's RoboRunner script editor. Ships as a user-facing opt-in
+    /// (graduated out of DEBUG 2026-07-28); the antenna and command surface graduated with it.
     private var labSection: some View {
         Section {
             Button {
@@ -27657,10 +27639,9 @@ struct ActionsView: View {
         } header: {
             Text("Developer")
         } footer: {
-            Text("Write and run on-device RoboRunner scripts. Developer builds only.")
+            Text("Write and run on-device RoboRunner scripts.")
         }
     }
-#endif
 
     private var personalitySection: some View {
         Section {
@@ -28566,6 +28547,12 @@ struct PowerUserView: View {
                                     font: .system(.caption2, design: .monospaced))
                     }
                     .padding(.vertical, 4)
+
+                    // The hal CLI installer only makes sense on a Mac (writes to /usr/local/bin).
+                    // On iPhone/iPad the API is still reachable; users build their own client.
+                    if ProcessInfo.processInfo.isiOSAppOnMac {
+                        halInstallerView
+                    }
                 }
             } header: {
                 Label("Developer API", systemImage: "terminal")
@@ -28601,6 +28588,80 @@ struct PowerUserView: View {
                         withAnimation { if copiedField == field { copiedField = nil } }
                     }
                 }
+            }
+        }
+
+        // MARK: - hal CLI installer (Mac only)
+
+        /// Absolute path of the `hal` script bundled inside the app, or nil until it is added
+        /// to the target as a bundled resource. The install line copies FROM this path.
+        private var bundledHalPath: String? {
+            Bundle.main.path(forResource: "hal", ofType: nil)
+        }
+
+        /// A readable, scoped-sudo one-liner the user pastes into their own Mac Terminal. Only the
+        /// write into /usr/local/bin uses sudo; the ~/.config/hal file stays user-owned. Refuses if
+        /// hal already exists (uninstall first). host/port/token come straight from this running app.
+        private func installCommand(halPath: String, token: String) -> String {
+            let port = LocalAPIServer.apiPort
+            let configJSON = "{\"host\":\"127.0.0.1\",\"port\":\(port),\"token\":\"\(token)\"}"
+            return "if [ -e /usr/local/bin/hal ]; then echo \"hal already installed. Run the uninstall line first.\"; else sudo mkdir -p /usr/local/bin && sudo install -m 755 \"\(halPath)\" /usr/local/bin/hal && install -d -m 700 ~/.config/hal && printf '\(configJSON)\\n' > ~/.config/hal/config.json && chmod 600 ~/.config/hal/config.json && echo \"hal installed. Try: hal hello\"; fi"
+        }
+
+        /// Removes exactly what the installer added, nothing else. `rmdir` only removes the config
+        /// directory if it is empty, so a user's own files there are never touched.
+        private var uninstallCommand: String {
+            "sudo rm -f /usr/local/bin/hal && rm -f ~/.config/hal/config.json && rmdir ~/.config/hal 2>/dev/null; echo \"hal uninstalled.\""
+        }
+
+        @ViewBuilder
+        private var halInstallerView: some View {
+            VStack(alignment: .leading, spacing: 10) {
+                Divider()
+                Text("Install the hal command")
+                    .font(.subheadline).bold()
+                Text("Run the hal CLI in your Mac Terminal, talking to this app over the local API. Read a line, then paste it into Terminal. The install line asks for your password because it writes hal into /usr/local/bin.")
+                    .font(.caption).foregroundColor(.secondary)
+                if let halPath = bundledHalPath {
+                    commandBlock(title: "Install",
+                                 command: installCommand(halPath: halPath, token: viewModel.localAPIServer.apiToken),
+                                 field: "install")
+                    commandBlock(title: "Uninstall", command: uninstallCommand, field: "uninstall")
+                } else {
+                    Text("The hal script is not bundled in this build yet.")
+                        .font(.caption).foregroundColor(.orange)
+                }
+            }
+            .padding(.vertical, 4)
+        }
+
+        @ViewBuilder
+        private func commandBlock(title: String, command: String, field: String) -> some View {
+            VStack(alignment: .leading, spacing: 4) {
+                HStack {
+                    Text(title).font(.caption).foregroundColor(.secondary)
+                    Spacer()
+                    Button {
+                        UIPasteboard.general.string = command
+                        withAnimation { copiedField = field }
+                        DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) {
+                            withAnimation { if copiedField == field { copiedField = nil } }
+                        }
+                    } label: {
+                        Label(copiedField == field ? "Copied!" : "Copy",
+                              systemImage: copiedField == field ? "checkmark" : "doc.on.doc")
+                            .font(.caption2)
+                    }
+                    .buttonStyle(.borderless)
+                    .foregroundColor(copiedField == field ? .green : .accentColor)
+                }
+                Text(command)
+                    .font(.system(.caption2, design: .monospaced))
+                    .foregroundColor(.primary)
+                    .textSelection(.enabled)
+                    .padding(8)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .background(RoundedRectangle(cornerRadius: 6).fill(Color.secondary.opacity(0.12)))
             }
         }
     }
@@ -31717,7 +31778,9 @@ actor ThermalGovernor {
 //  RoboRunner.swift
 //  Hal Universal
 //
-//  On-device script runner for reasoning/thermal experiments. DEBUG-only.
+//  On-device script runner for reasoning/thermal experiments. Ships as a user-facing
+//  opt-in Lab tool (graduated out of DEBUG 2026-07-28); a handful of pure test-scaffolding
+//  verbs stay DEBUG-only via CommandDescriptor.debugOnly.
 //
 //  WHY THIS EXISTS
 //  The Python harness (tests/) drives Hal over the network antenna, one command
@@ -31749,16 +31812,14 @@ actor ThermalGovernor {
 //  See Docs/Reasoning_Quality_Thermal_Test_Plan_2026-07-22.md.
 //
 
-#if DEBUG
-
 import Foundation
 import Combine
-import SwiftUI   // the Lab UI (RoboEditor, block 61) lives in this DEBUG-only file
+import SwiftUI   // the Lab UI (RoboEditor, block 61)
 import UIKit     // UIActivityViewController for the results Share sheet (block 61)
 
 // ==== LEGO START: 59 RoboRunner (On-Device Reasoning/Thermal Script Runner) ====
 
-/// DEBUG-only side channel for GRANULAR per-phase data a single turn cannot expose
+/// Side channel for GRANULAR per-phase data a single turn cannot expose
 /// over the atomic send path. The live two-phase reasoning path (Hal.swift) stamps
 /// each phase's duration and the thermalState AT THE PHASE-1→PHASE-2 BOUNDARY here;
 /// RoboRunner resets it before each ask and reads it after. This is how we see WHERE
@@ -31816,7 +31877,7 @@ struct RoboRunFile: Codable {
     let results: [RoboStepResult]
 }
 
-/// DEBUG-only. Runs a RoboRunner script on-device. `@MainActor` because every step
+/// Runs a RoboRunner script on-device. `@MainActor` because every step
 /// touches the ChatViewModel and the shared HalTestConsole dispatcher, both of
 /// which are main-actor bound.
 @MainActor
@@ -32193,11 +32254,12 @@ struct RoboRunSummary: Identifiable {
 // to be tightened against each handler as the Lab is built out.
 //
 // PLACEMENT: this is pure DATA plus pure formatting (no view-model, no @MainActor state),
-// so it is usable from any actor. It lives INSIDE this file's #if DEBUG for now, so it
-// shares the file's Foundation import and matches the current dev-only state of the whole
-// Lab. When the Lab ships as a user-facing opt-in, move it OUT of #if DEBUG and into its
-// own CommandCatalog.swift (add that file to the target in Xcode). It sits here, at the end
-// of the last concatenated source file, only to avoid a mid-sequence LEGO renumber today.
+// so it is usable from any actor. It now ships in Release with the rest of the graduated
+// Lab (2026-07-28). Individual verbs that must NOT ship (pure test scaffolding, debug
+// forcing) carry `debugOnly: true` and are filtered out of `visible` in non-DEBUG builds,
+// so the shipped HELP advertises exactly what the shipped interpreter can run. It may later
+// move into its own CommandCatalog.swift (add that file to the target in Xcode); it sits
+// here, at the end of the last concatenated source file, only to avoid a LEGO renumber.
 
 /// Grouping used to organize the help output.
 enum CommandCategory: String, CaseIterable {
@@ -32225,6 +32287,9 @@ struct CommandDescriptor: Identifiable {
     let summary: String
     let category: CommandCategory
     let destructive: Bool
+    /// True for verbs that exist only in developer builds (test scaffolding, debug forcing).
+    /// Filtered out of `visible` in Release so shipped HELP matches the shipped interpreter.
+    var debugOnly: Bool = false
     var id: String { verb }
     /// Canonical usage string: "VERB:<args>" when it takes an argument, else "VERB".
     var usage: String { args.map { "\(verb):\($0)" } ?? verb }
@@ -32244,9 +32309,9 @@ enum CommandCatalog {
         CommandDescriptor(verb: "MODEL_STATUS", args: "<modelID>", summary: "Report download and disk status for one model.", category: .model, destructive: false),
         CommandDescriptor(verb: "DELETE_MODEL", args: "<modelID>", summary: "Delete a model's files. Releases this app's claim, files are removed only when no app still claims them.", category: .model, destructive: true),
         CommandDescriptor(verb: "CANCEL_DOWNLOAD", args: "<modelID>", summary: "Cancel an in-flight model download.", category: .model, destructive: false),
-        CommandDescriptor(verb: "DOWNLOAD_LOCK", args: "<QUERY|ACQUIRE|RELEASE|PLANT|CLEAR> [args]", summary: "Inspect or manipulate the cross-app download lock. Advanced, can disrupt sibling downloads.", category: .model, destructive: true),
+        CommandDescriptor(verb: "DOWNLOAD_LOCK", args: "<QUERY|ACQUIRE|RELEASE|PLANT|CLEAR> [args]", summary: "Inspect or manipulate the cross-app download lock. Advanced, can disrupt sibling downloads.", category: .model, destructive: true, debugOnly: true),
         CommandDescriptor(verb: "LEGACY_MIGRATION", args: "<subcommand>", summary: "Drive or inspect the legacy model-storage migration. Advanced, touches model files.", category: .model, destructive: true),
-        CommandDescriptor(verb: "MIGRATION_DEBUG", args: "<STATE|SHOW|PREVERSION:..|RESET>", summary: "DEBUG harness for the model-storage migration consent flow. Forces or resets migration state.", category: .model, destructive: true),
+        CommandDescriptor(verb: "MIGRATION_DEBUG", args: "<STATE|SHOW|PREVERSION:..|RESET>", summary: "DEBUG harness for the model-storage migration consent flow. Forces or resets migration state.", category: .model, destructive: true, debugOnly: true),
 
         // Threads & Messages
         CommandDescriptor(verb: "NEW_THREAD", args: nil, summary: "Start a new conversation thread.", category: .conversation, destructive: false),
@@ -32299,9 +32364,9 @@ enum CommandCatalog {
         CommandDescriptor(verb: "SET_FORCE_EXPANSION", args: "<true|false>", summary: "Force query expansion on or off, for testing.", category: .memory, destructive: false),
         CommandDescriptor(verb: "CLEAR_QUERY_EXPANSION_CACHE", args: nil, summary: "Clear the query-expansion cache.", category: .memory, destructive: false),
         CommandDescriptor(verb: "QUERY_EXPANSION_CACHE_STATUS", args: nil, summary: "Report query-expansion cache status.", category: .memory, destructive: false),
-        CommandDescriptor(verb: "MEMORY_PLANT_AGED", args: "<args>", summary: "Plant aged test memories. Contaminates the real store, testing only.", category: .memory, destructive: true),
-        CommandDescriptor(verb: "MEMORY_PLANT_AGED_CLEANUP", args: nil, summary: "Remove planted aged test memories.", category: .memory, destructive: true),
-        CommandDescriptor(verb: "MEMORY_INJECT_TEST", args: "<args>", summary: "Inject test memory rows. Contaminates the real store, testing only.", category: .memory, destructive: true),
+        CommandDescriptor(verb: "MEMORY_PLANT_AGED", args: "<args>", summary: "Plant aged test memories. Contaminates the real store, testing only.", category: .memory, destructive: true, debugOnly: true),
+        CommandDescriptor(verb: "MEMORY_PLANT_AGED_CLEANUP", args: nil, summary: "Remove planted aged test memories.", category: .memory, destructive: true, debugOnly: true),
+        CommandDescriptor(verb: "MEMORY_INJECT_TEST", args: "<args>", summary: "Inject test memory rows. Contaminates the real store, testing only.", category: .memory, destructive: true, debugOnly: true),
 
         // Embeddings & Database
         CommandDescriptor(verb: "EMBEDDING_STATUS", args: nil, summary: "Report the active embedder and its load state.", category: .embeddings, destructive: false),
@@ -32320,8 +32385,8 @@ enum CommandCatalog {
         // Thermal
         CommandDescriptor(verb: "GET_THERMAL_STATE", args: nil, summary: "Report the current thermal level and governor state.", category: .thermal, destructive: false),
         CommandDescriptor(verb: "SET_THERMAL_PACING", args: "<value>", summary: "Set the thermal governor pacing.", category: .thermal, destructive: false),
-        CommandDescriptor(verb: "SET_THERMAL_LEVEL", args: "<0-3|default>", summary: "DEBUG: force a thermal level to exercise the indicator and governor without heating the device.", category: .thermal, destructive: false),
-        CommandDescriptor(verb: "SET_PACING_DELAY", args: "<ms>", summary: "DEBUG: set the per-token pacing delay.", category: .thermal, destructive: false),
+        CommandDescriptor(verb: "SET_THERMAL_LEVEL", args: "<0-3|default>", summary: "DEBUG: force a thermal level to exercise the indicator and governor without heating the device.", category: .thermal, destructive: false, debugOnly: true),
+        CommandDescriptor(verb: "SET_PACING_DELAY", args: "<ms>", summary: "DEBUG: set the per-token pacing delay.", category: .thermal, destructive: false, debugOnly: true),
 
         // Salon Mode
         CommandDescriptor(verb: "SALON_GET_STATE", args: nil, summary: "Report the salon configuration and seats.", category: .salon, destructive: false),
@@ -32345,7 +32410,7 @@ enum CommandCatalog {
         // UI & Display
         CommandDescriptor(verb: "GET_UI_STATE", args: nil, summary: "Report the current UI and navigation state.", category: .ui, destructive: false),
         CommandDescriptor(verb: "SET_UI_STATE", args: "<state>", summary: "Drive the UI to a semantic state, for example open settings or the model library.", category: .ui, destructive: false),
-        CommandDescriptor(verb: "SET_CHAT_DISPLAY", args: "<pt>:<density>", summary: "Set the chat text size and density, for testing the display controls.", category: .ui, destructive: false),
+        CommandDescriptor(verb: "SET_CHAT_DISPLAY", args: "<pt>:<density>", summary: "Set the chat text size and density, for testing the display controls.", category: .ui, destructive: false, debugOnly: true),
         CommandDescriptor(verb: "SCREENSHOT", args: nil, summary: "Capture the current key window as a PNG. View render only, does not show live camera or video.", category: .ui, destructive: false),
 
         // RoboRunner Automation
@@ -32364,9 +32429,20 @@ enum CommandCatalog {
         CommandDescriptor(verb: "RESET_SETTINGS", args: nil, summary: "Reset all app settings to defaults.", category: .testing, destructive: true),
         CommandDescriptor(verb: "RESET_HARDWARE_DISCLOSURE", args: nil, summary: "Reset the hardware-disclosure flag so it shows again.", category: .testing, destructive: false),
         CommandDescriptor(verb: "NUCLEAR_RESET", args: nil, summary: "Wipe all state (memory, settings, self-knowledge) back to first-run.", category: .testing, destructive: true),
-        CommandDescriptor(verb: "CLEAR_TEST_DATA", args: nil, summary: "Remove test data and fixtures from the store.", category: .testing, destructive: true),
-        CommandDescriptor(verb: "INJECT_REALISTIC_TEST_CORPUS", args: nil, summary: "Inject a realistic test corpus into memory. Contaminates the store, testing only.", category: .testing, destructive: true)
+        CommandDescriptor(verb: "CLEAR_TEST_DATA", args: nil, summary: "Remove test data and fixtures from the store.", category: .testing, destructive: true, debugOnly: true),
+        CommandDescriptor(verb: "INJECT_REALISTIC_TEST_CORPUS", args: nil, summary: "Inject a realistic test corpus into memory. Contaminates the store, testing only.", category: .testing, destructive: true, debugOnly: true)
     ]
+
+    /// The verbs to ADVERTISE for this build. In Release, developer-only verbs are hidden so
+    /// HELP and the shipped interpreter never disagree. `all` stays complete so the safety
+    /// gate can still classify any verb by destructiveness.
+    static var visible: [CommandDescriptor] {
+        #if DEBUG
+        return all
+        #else
+        return all.filter { !$0.debugOnly }
+        #endif
+    }
 
     /// Look up a descriptor by exact verb name (case-insensitive).
     static func descriptor(forVerb verb: String) -> CommandDescriptor? {
@@ -32437,10 +32513,11 @@ enum CommandCatalog {
 
     /// Human-readable, categorized help text. In Safe mode, destructive verbs are omitted.
     static func helpText(includeDestructive: Bool = true) -> String {
-        let shown = includeDestructive ? all.count : all.filter { !$0.destructive }.count
-        var out = "Hal command catalog: \(shown) of \(all.count) verbs. [!] marks destructive.\n"
+        let source = visible
+        let shown = includeDestructive ? source.count : source.filter { !$0.destructive }.count
+        var out = "Hal command catalog: \(shown) of \(source.count) verbs. [!] marks destructive.\n"
         for category in CommandCategory.allCases {
-            let items = all
+            let items = source
                 .filter { $0.category == category && (includeDestructive || !$0.destructive) }
                 .sorted { $0.verb < $1.verb }
             guard !items.isEmpty else { continue }
@@ -32455,8 +32532,9 @@ enum CommandCatalog {
     /// JSON form for the antenna HELP verb and the CLI. Pure data, so it is off-main safe.
     static func helpJSON(includeDestructive: Bool = true) -> String {
         var objs: [String] = []
+        let source = visible
         for category in CommandCategory.allCases {
-            let items = all
+            let items = source
                 .filter { $0.category == category && (includeDestructive || !$0.destructive) }
                 .sorted { $0.verb < $1.verb }
             for d in items {
@@ -32464,7 +32542,7 @@ enum CommandCatalog {
                 objs.append("{\"verb\":\"\(d.verb)\",\"usage\":\"\(jsonEsc(d.usage))\",\"args\":\(argsField),\"summary\":\"\(jsonEsc(d.summary))\",\"category\":\"\(jsonEsc(category.rawValue))\",\"destructive\":\(d.destructive)}")
             }
         }
-        return "{\"status\":\"ok\",\"command\":\"HELP\",\"count\":\(objs.count),\"total\":\(all.count),\"safeModeFiltered\":\(!includeDestructive),\"commands\":[\(objs.joined(separator: ","))]}"
+        return "{\"status\":\"ok\",\"command\":\"HELP\",\"count\":\(objs.count),\"total\":\(source.count),\"safeModeFiltered\":\(!includeDestructive),\"commands\":[\(objs.joined(separator: ","))]}"
     }
 
     /// Minimal JSON string escaping for the help payload (verbs and summaries are controlled
@@ -32482,8 +32560,8 @@ enum CommandCatalog {
 //
 // The in-app face of RoboRunner: write a script, Run/Stop it, watch live status, read the
 // captured results, and browse the command catalog (Help). Modeled on SystemPromptEditorView.
-// Reached from a DEBUG-only "Developer" row in Settings (ActionsView). DEBUG-only, like the rest
-// of the Lab. v1 persists a single script via @AppStorage; multi-file save/load is a follow-up.
+// Reached from a "Developer" row in Settings (ActionsView). Ships as a user-facing opt-in.
+// v1 persists a single script via @AppStorage; multi-file save/load is a follow-up.
 
 /// The RoboRunner script editor sheet.
 struct RoboEditorView: View {
@@ -32786,7 +32864,7 @@ struct RoboRunDetailView: View {
 }
 
 /// Minimal UIActivityViewController bridge for the results Share button. Named distinctly from
-/// the app's other (nested) ShareSheet so this DEBUG-only file stays self-contained.
+/// the app's other (nested) ShareSheet so this file stays self-contained.
 struct RoboShareSheet: UIViewControllerRepresentable {
     let activityItems: [Any]
     func makeUIViewController(context: Context) -> UIActivityViewController {
@@ -32795,6 +32873,4 @@ struct RoboShareSheet: UIViewControllerRepresentable {
     func updateUIViewController(_ controller: UIActivityViewController, context: Context) {}
 }
 // ==== LEGO END: 61 RoboEditor (Lab UI, on-device RoboRunner script editor) ====
-
-#endif
 

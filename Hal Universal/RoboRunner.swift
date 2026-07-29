@@ -2,7 +2,9 @@
 //  RoboRunner.swift
 //  Hal Universal
 //
-//  On-device script runner for reasoning/thermal experiments. DEBUG-only.
+//  On-device script runner for reasoning/thermal experiments. Ships as a user-facing
+//  opt-in Lab tool (graduated out of DEBUG 2026-07-28); a handful of pure test-scaffolding
+//  verbs stay DEBUG-only via CommandDescriptor.debugOnly.
 //
 //  WHY THIS EXISTS
 //  The Python harness (tests/) drives Hal over the network antenna, one command
@@ -34,16 +36,14 @@
 //  See Docs/Reasoning_Quality_Thermal_Test_Plan_2026-07-22.md.
 //
 
-#if DEBUG
-
 import Foundation
 import Combine
-import SwiftUI   // the Lab UI (RoboEditor, block 61) lives in this DEBUG-only file
+import SwiftUI   // the Lab UI (RoboEditor, block 61)
 import UIKit     // UIActivityViewController for the results Share sheet (block 61)
 
 // ==== LEGO START: 59 RoboRunner (On-Device Reasoning/Thermal Script Runner) ====
 
-/// DEBUG-only side channel for GRANULAR per-phase data a single turn cannot expose
+/// Side channel for GRANULAR per-phase data a single turn cannot expose
 /// over the atomic send path. The live two-phase reasoning path (Hal.swift) stamps
 /// each phase's duration and the thermalState AT THE PHASE-1→PHASE-2 BOUNDARY here;
 /// RoboRunner resets it before each ask and reads it after. This is how we see WHERE
@@ -101,7 +101,7 @@ struct RoboRunFile: Codable {
     let results: [RoboStepResult]
 }
 
-/// DEBUG-only. Runs a RoboRunner script on-device. `@MainActor` because every step
+/// Runs a RoboRunner script on-device. `@MainActor` because every step
 /// touches the ChatViewModel and the shared HalTestConsole dispatcher, both of
 /// which are main-actor bound.
 @MainActor
@@ -478,11 +478,12 @@ struct RoboRunSummary: Identifiable {
 // to be tightened against each handler as the Lab is built out.
 //
 // PLACEMENT: this is pure DATA plus pure formatting (no view-model, no @MainActor state),
-// so it is usable from any actor. It lives INSIDE this file's #if DEBUG for now, so it
-// shares the file's Foundation import and matches the current dev-only state of the whole
-// Lab. When the Lab ships as a user-facing opt-in, move it OUT of #if DEBUG and into its
-// own CommandCatalog.swift (add that file to the target in Xcode). It sits here, at the end
-// of the last concatenated source file, only to avoid a mid-sequence LEGO renumber today.
+// so it is usable from any actor. It now ships in Release with the rest of the graduated
+// Lab (2026-07-28). Individual verbs that must NOT ship (pure test scaffolding, debug
+// forcing) carry `debugOnly: true` and are filtered out of `visible` in non-DEBUG builds,
+// so the shipped HELP advertises exactly what the shipped interpreter can run. It may later
+// move into its own CommandCatalog.swift (add that file to the target in Xcode); it sits
+// here, at the end of the last concatenated source file, only to avoid a LEGO renumber.
 
 /// Grouping used to organize the help output.
 enum CommandCategory: String, CaseIterable {
@@ -510,6 +511,9 @@ struct CommandDescriptor: Identifiable {
     let summary: String
     let category: CommandCategory
     let destructive: Bool
+    /// True for verbs that exist only in developer builds (test scaffolding, debug forcing).
+    /// Filtered out of `visible` in Release so shipped HELP matches the shipped interpreter.
+    var debugOnly: Bool = false
     var id: String { verb }
     /// Canonical usage string: "VERB:<args>" when it takes an argument, else "VERB".
     var usage: String { args.map { "\(verb):\($0)" } ?? verb }
@@ -529,9 +533,9 @@ enum CommandCatalog {
         CommandDescriptor(verb: "MODEL_STATUS", args: "<modelID>", summary: "Report download and disk status for one model.", category: .model, destructive: false),
         CommandDescriptor(verb: "DELETE_MODEL", args: "<modelID>", summary: "Delete a model's files. Releases this app's claim, files are removed only when no app still claims them.", category: .model, destructive: true),
         CommandDescriptor(verb: "CANCEL_DOWNLOAD", args: "<modelID>", summary: "Cancel an in-flight model download.", category: .model, destructive: false),
-        CommandDescriptor(verb: "DOWNLOAD_LOCK", args: "<QUERY|ACQUIRE|RELEASE|PLANT|CLEAR> [args]", summary: "Inspect or manipulate the cross-app download lock. Advanced, can disrupt sibling downloads.", category: .model, destructive: true),
+        CommandDescriptor(verb: "DOWNLOAD_LOCK", args: "<QUERY|ACQUIRE|RELEASE|PLANT|CLEAR> [args]", summary: "Inspect or manipulate the cross-app download lock. Advanced, can disrupt sibling downloads.", category: .model, destructive: true, debugOnly: true),
         CommandDescriptor(verb: "LEGACY_MIGRATION", args: "<subcommand>", summary: "Drive or inspect the legacy model-storage migration. Advanced, touches model files.", category: .model, destructive: true),
-        CommandDescriptor(verb: "MIGRATION_DEBUG", args: "<STATE|SHOW|PREVERSION:..|RESET>", summary: "DEBUG harness for the model-storage migration consent flow. Forces or resets migration state.", category: .model, destructive: true),
+        CommandDescriptor(verb: "MIGRATION_DEBUG", args: "<STATE|SHOW|PREVERSION:..|RESET>", summary: "DEBUG harness for the model-storage migration consent flow. Forces or resets migration state.", category: .model, destructive: true, debugOnly: true),
 
         // Threads & Messages
         CommandDescriptor(verb: "NEW_THREAD", args: nil, summary: "Start a new conversation thread.", category: .conversation, destructive: false),
@@ -584,9 +588,9 @@ enum CommandCatalog {
         CommandDescriptor(verb: "SET_FORCE_EXPANSION", args: "<true|false>", summary: "Force query expansion on or off, for testing.", category: .memory, destructive: false),
         CommandDescriptor(verb: "CLEAR_QUERY_EXPANSION_CACHE", args: nil, summary: "Clear the query-expansion cache.", category: .memory, destructive: false),
         CommandDescriptor(verb: "QUERY_EXPANSION_CACHE_STATUS", args: nil, summary: "Report query-expansion cache status.", category: .memory, destructive: false),
-        CommandDescriptor(verb: "MEMORY_PLANT_AGED", args: "<args>", summary: "Plant aged test memories. Contaminates the real store, testing only.", category: .memory, destructive: true),
-        CommandDescriptor(verb: "MEMORY_PLANT_AGED_CLEANUP", args: nil, summary: "Remove planted aged test memories.", category: .memory, destructive: true),
-        CommandDescriptor(verb: "MEMORY_INJECT_TEST", args: "<args>", summary: "Inject test memory rows. Contaminates the real store, testing only.", category: .memory, destructive: true),
+        CommandDescriptor(verb: "MEMORY_PLANT_AGED", args: "<args>", summary: "Plant aged test memories. Contaminates the real store, testing only.", category: .memory, destructive: true, debugOnly: true),
+        CommandDescriptor(verb: "MEMORY_PLANT_AGED_CLEANUP", args: nil, summary: "Remove planted aged test memories.", category: .memory, destructive: true, debugOnly: true),
+        CommandDescriptor(verb: "MEMORY_INJECT_TEST", args: "<args>", summary: "Inject test memory rows. Contaminates the real store, testing only.", category: .memory, destructive: true, debugOnly: true),
 
         // Embeddings & Database
         CommandDescriptor(verb: "EMBEDDING_STATUS", args: nil, summary: "Report the active embedder and its load state.", category: .embeddings, destructive: false),
@@ -605,8 +609,8 @@ enum CommandCatalog {
         // Thermal
         CommandDescriptor(verb: "GET_THERMAL_STATE", args: nil, summary: "Report the current thermal level and governor state.", category: .thermal, destructive: false),
         CommandDescriptor(verb: "SET_THERMAL_PACING", args: "<value>", summary: "Set the thermal governor pacing.", category: .thermal, destructive: false),
-        CommandDescriptor(verb: "SET_THERMAL_LEVEL", args: "<0-3|default>", summary: "DEBUG: force a thermal level to exercise the indicator and governor without heating the device.", category: .thermal, destructive: false),
-        CommandDescriptor(verb: "SET_PACING_DELAY", args: "<ms>", summary: "DEBUG: set the per-token pacing delay.", category: .thermal, destructive: false),
+        CommandDescriptor(verb: "SET_THERMAL_LEVEL", args: "<0-3|default>", summary: "DEBUG: force a thermal level to exercise the indicator and governor without heating the device.", category: .thermal, destructive: false, debugOnly: true),
+        CommandDescriptor(verb: "SET_PACING_DELAY", args: "<ms>", summary: "DEBUG: set the per-token pacing delay.", category: .thermal, destructive: false, debugOnly: true),
 
         // Salon Mode
         CommandDescriptor(verb: "SALON_GET_STATE", args: nil, summary: "Report the salon configuration and seats.", category: .salon, destructive: false),
@@ -630,7 +634,7 @@ enum CommandCatalog {
         // UI & Display
         CommandDescriptor(verb: "GET_UI_STATE", args: nil, summary: "Report the current UI and navigation state.", category: .ui, destructive: false),
         CommandDescriptor(verb: "SET_UI_STATE", args: "<state>", summary: "Drive the UI to a semantic state, for example open settings or the model library.", category: .ui, destructive: false),
-        CommandDescriptor(verb: "SET_CHAT_DISPLAY", args: "<pt>:<density>", summary: "Set the chat text size and density, for testing the display controls.", category: .ui, destructive: false),
+        CommandDescriptor(verb: "SET_CHAT_DISPLAY", args: "<pt>:<density>", summary: "Set the chat text size and density, for testing the display controls.", category: .ui, destructive: false, debugOnly: true),
         CommandDescriptor(verb: "SCREENSHOT", args: nil, summary: "Capture the current key window as a PNG. View render only, does not show live camera or video.", category: .ui, destructive: false),
 
         // RoboRunner Automation
@@ -649,9 +653,20 @@ enum CommandCatalog {
         CommandDescriptor(verb: "RESET_SETTINGS", args: nil, summary: "Reset all app settings to defaults.", category: .testing, destructive: true),
         CommandDescriptor(verb: "RESET_HARDWARE_DISCLOSURE", args: nil, summary: "Reset the hardware-disclosure flag so it shows again.", category: .testing, destructive: false),
         CommandDescriptor(verb: "NUCLEAR_RESET", args: nil, summary: "Wipe all state (memory, settings, self-knowledge) back to first-run.", category: .testing, destructive: true),
-        CommandDescriptor(verb: "CLEAR_TEST_DATA", args: nil, summary: "Remove test data and fixtures from the store.", category: .testing, destructive: true),
-        CommandDescriptor(verb: "INJECT_REALISTIC_TEST_CORPUS", args: nil, summary: "Inject a realistic test corpus into memory. Contaminates the store, testing only.", category: .testing, destructive: true)
+        CommandDescriptor(verb: "CLEAR_TEST_DATA", args: nil, summary: "Remove test data and fixtures from the store.", category: .testing, destructive: true, debugOnly: true),
+        CommandDescriptor(verb: "INJECT_REALISTIC_TEST_CORPUS", args: nil, summary: "Inject a realistic test corpus into memory. Contaminates the store, testing only.", category: .testing, destructive: true, debugOnly: true)
     ]
+
+    /// The verbs to ADVERTISE for this build. In Release, developer-only verbs are hidden so
+    /// HELP and the shipped interpreter never disagree. `all` stays complete so the safety
+    /// gate can still classify any verb by destructiveness.
+    static var visible: [CommandDescriptor] {
+        #if DEBUG
+        return all
+        #else
+        return all.filter { !$0.debugOnly }
+        #endif
+    }
 
     /// Look up a descriptor by exact verb name (case-insensitive).
     static func descriptor(forVerb verb: String) -> CommandDescriptor? {
@@ -722,10 +737,11 @@ enum CommandCatalog {
 
     /// Human-readable, categorized help text. In Safe mode, destructive verbs are omitted.
     static func helpText(includeDestructive: Bool = true) -> String {
-        let shown = includeDestructive ? all.count : all.filter { !$0.destructive }.count
-        var out = "Hal command catalog: \(shown) of \(all.count) verbs. [!] marks destructive.\n"
+        let source = visible
+        let shown = includeDestructive ? source.count : source.filter { !$0.destructive }.count
+        var out = "Hal command catalog: \(shown) of \(source.count) verbs. [!] marks destructive.\n"
         for category in CommandCategory.allCases {
-            let items = all
+            let items = source
                 .filter { $0.category == category && (includeDestructive || !$0.destructive) }
                 .sorted { $0.verb < $1.verb }
             guard !items.isEmpty else { continue }
@@ -740,8 +756,9 @@ enum CommandCatalog {
     /// JSON form for the antenna HELP verb and the CLI. Pure data, so it is off-main safe.
     static func helpJSON(includeDestructive: Bool = true) -> String {
         var objs: [String] = []
+        let source = visible
         for category in CommandCategory.allCases {
-            let items = all
+            let items = source
                 .filter { $0.category == category && (includeDestructive || !$0.destructive) }
                 .sorted { $0.verb < $1.verb }
             for d in items {
@@ -749,7 +766,7 @@ enum CommandCatalog {
                 objs.append("{\"verb\":\"\(d.verb)\",\"usage\":\"\(jsonEsc(d.usage))\",\"args\":\(argsField),\"summary\":\"\(jsonEsc(d.summary))\",\"category\":\"\(jsonEsc(category.rawValue))\",\"destructive\":\(d.destructive)}")
             }
         }
-        return "{\"status\":\"ok\",\"command\":\"HELP\",\"count\":\(objs.count),\"total\":\(all.count),\"safeModeFiltered\":\(!includeDestructive),\"commands\":[\(objs.joined(separator: ","))]}"
+        return "{\"status\":\"ok\",\"command\":\"HELP\",\"count\":\(objs.count),\"total\":\(source.count),\"safeModeFiltered\":\(!includeDestructive),\"commands\":[\(objs.joined(separator: ","))]}"
     }
 
     /// Minimal JSON string escaping for the help payload (verbs and summaries are controlled
@@ -767,8 +784,8 @@ enum CommandCatalog {
 //
 // The in-app face of RoboRunner: write a script, Run/Stop it, watch live status, read the
 // captured results, and browse the command catalog (Help). Modeled on SystemPromptEditorView.
-// Reached from a DEBUG-only "Developer" row in Settings (ActionsView). DEBUG-only, like the rest
-// of the Lab. v1 persists a single script via @AppStorage; multi-file save/load is a follow-up.
+// Reached from a "Developer" row in Settings (ActionsView). Ships as a user-facing opt-in.
+// v1 persists a single script via @AppStorage; multi-file save/load is a follow-up.
 
 /// The RoboRunner script editor sheet.
 struct RoboEditorView: View {
@@ -1071,7 +1088,7 @@ struct RoboRunDetailView: View {
 }
 
 /// Minimal UIActivityViewController bridge for the results Share button. Named distinctly from
-/// the app's other (nested) ShareSheet so this DEBUG-only file stays self-contained.
+/// the app's other (nested) ShareSheet so this file stays self-contained.
 struct RoboShareSheet: UIViewControllerRepresentable {
     let activityItems: [Any]
     func makeUIViewController(context: Context) -> UIActivityViewController {
@@ -1080,5 +1097,3 @@ struct RoboShareSheet: UIViewControllerRepresentable {
     func updateUIViewController(_ controller: UIActivityViewController, context: Context) {}
 }
 // ==== LEGO END: 61 RoboEditor (Lab UI, on-device RoboRunner script editor) ====
-
-#endif

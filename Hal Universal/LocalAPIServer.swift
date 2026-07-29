@@ -332,11 +332,9 @@ class HalTestConsole: ObservableObject {
         // Lab safety gate (single source of truth = CommandCatalog.destructive). Enforced HERE at the
         // interpreter so every door (antenna, CLI, RoboRunner) inherits it: Safe mode refuses
         // destructive verbs; Advanced requires a trailing confirm marker (--yes / CONFIRM). On allow,
-        // the marker is stripped so each verb's own arg parsing below is unaffected. DEBUG-only like
-        // the rest of the Lab (CommandCatalog is DEBUG-only); un-gates with the Lab at productization.
-        // `trimmed` is a `let` in both configs (Release just passes rawTrimmed straight through), so no
-        // "never mutated" warning when the gate compiles out.
-#if DEBUG
+        // the marker is stripped so each verb's own arg parsing below is unaffected. Graduated out of
+        // DEBUG with the rest of the Lab (2026-07-28): the gate now runs in EVERY build, so the shipped
+        // antenna/CLI/RoboRunner are all protected by Safe mode by default.
         let trimmed: String
         switch CommandCatalog.gate(rawTrimmed) {
         case .refuse(let reason):
@@ -344,9 +342,6 @@ class HalTestConsole: ObservableObject {
         case .allow(let cleaned):
             trimmed = cleaned
         }
-#else
-        let trimmed = rawTrimmed
-#endif
 
         if trimmed.hasPrefix("SET_MODEL:") || trimmed.hasPrefix("SWITCH_MODEL:") {
             let prefix = trimmed.hasPrefix("SET_MODEL:") ? "SET_MODEL:" : "SWITCH_MODEL:"
@@ -383,24 +378,18 @@ class HalTestConsole: ObservableObject {
             """
 
         } else if trimmed == "HELP" || trimmed == "COMMANDS" || trimmed.hasPrefix("HELP:") {
-#if DEBUG
             // Lab command discovery. Single source of truth = CommandCatalog (RoboRunner.swift,
-            // LEGO block 60). Lists every verb with args, a one-line description, category, and a
-            // destructive flag. `HELP:SAFE` hides destructive verbs (Safe mode); plain HELP or
-            // `HELP:ALL` includes them. CommandCatalog is pure data (no disk I/O, no @MainActor
-            // state). Feeds the future `hal` CLI help, the RoboRunner editor Help, and Hal's own
-            // self-knowledge. DEBUG-gated for now like the rest of the Lab; un-gate when the Lab
-            // ships as a user-facing opt-in.
+            // LEGO block 60). Lists every VISIBLE verb with args, a one-line description, category,
+            // and a destructive flag (developer-only verbs are hidden in Release via debugOnly).
+            // `HELP:SAFE` hides destructive verbs (Safe mode); plain HELP or `HELP:ALL` includes them.
+            // CommandCatalog is pure data (no disk I/O, no @MainActor state). Feeds the `hal` CLI help,
+            // the RoboRunner editor Help, and Hal's own self-knowledge.
             let modeArg = trimmed.hasPrefix("HELP:")
                 ? String(trimmed.dropFirst("HELP:".count)).trimmingCharacters(in: .whitespaces).uppercased()
                 : ""
             return CommandCatalog.helpJSON(includeDestructive: modeArg != "SAFE")
-#else
-            return "{\"status\":\"error\",\"message\":\"HELP is available in developer builds only\"}"
-#endif
 
         } else if trimmed.hasPrefix("SET_SAFETY:") {
-#if DEBUG
             // Set the Lab safety mode (see CommandCatalog.gate). A non-destructive control verb, so the
             // gate at the top lets it through. Not persisted; resets to Safe on relaunch.
             let v = String(trimmed.dropFirst("SET_SAFETY:".count)).trimmingCharacters(in: .whitespaces).lowercased()
@@ -410,9 +399,6 @@ class HalTestConsole: ObservableObject {
             default: return "{\"status\":\"error\",\"message\":\"SET_SAFETY: must be safe or advanced\"}"
             }
             return "{\"status\":\"ok\",\"command\":\"SET_SAFETY\",\"mode\":\"\(CommandCatalog.mode.rawValue)\"}"
-#else
-            return "{\"status\":\"error\",\"message\":\"SET_SAFETY is available in developer builds only\"}"
-#endif
 
         } else if trimmed == "SHARED_MODELS" {
             // v2.1 diagnostic (READ-ONLY): the App-Group shared model store — its
@@ -623,13 +609,11 @@ class HalTestConsole: ObservableObject {
             return "{\"status\":\"ok\",\"command\":\"NEW_THREAD\",\"conversationId\":\"\(vm.conversationId)\"}"
 
         } else if trimmed.hasPrefix("ROBO_RUN:") {
-            // Kick off an on-device RoboRunner script (DEBUG only). Returns
-            // immediately; the run executes autonomously on the device and paces
-            // itself against the real thermalState. Poll ROBO_STATUS; read the
-            // captured turns with ROBO_RESULTS when done. See RoboRunner.swift.
-            // The arm is always present so the verb is recognised; only the body
-            // is DEBUG-gated (RoboRunner itself compiles out of release builds).
-#if DEBUG
+            // Kick off an on-device RoboRunner script. Returns immediately; the run executes
+            // autonomously on the device and paces itself against the real thermalState. Poll
+            // ROBO_STATUS; read the captured turns with ROBO_RESULTS when done. See RoboRunner.swift.
+            // ROBO_RUN is destructive in the catalog (a script can issue any verb), so the safety
+            // gate above already refused it in Safe mode / required a confirm marker in Advanced.
             let script = String(trimmed.dropFirst("ROBO_RUN:".count))
             if RoboRunner.shared.busy {
                 return "{\"status\":\"error\",\"message\":\"RoboRunner busy (\(RoboRunner.shared.progress))\"}"
@@ -637,36 +621,21 @@ class HalTestConsole: ObservableObject {
             let console = self
             Task { @MainActor in _ = await RoboRunner.shared.run(script: script, vm: vm, console: console) }
             return "{\"status\":\"ok\",\"command\":\"ROBO_RUN\",\"started\":true}"
-#else
-            return "{\"status\":\"error\",\"message\":\"ROBO_RUN is a DEBUG-only command\"}"
-#endif
 
         } else if trimmed == "ROBO_STATUS" {
-#if DEBUG
             let r = RoboRunner.shared
             return "{\"status\":\"ok\",\"running\":\(r.busy),\"progress\":\"\(r.progress)\",\"resultsPath\":\"\(r.lastResultsPath ?? "")\",\"error\":\"\(r.lastError ?? "")\"}"
-#else
-            return "{\"status\":\"error\",\"message\":\"ROBO_STATUS is a DEBUG-only command\"}"
-#endif
 
         } else if trimmed == "ROBO_RESULTS" {
-#if DEBUG
             return RoboRunner.shared.resultsJSON()
-#else
-            return "{\"status\":\"error\",\"message\":\"ROBO_RESULTS is a DEBUG-only command\"}"
-#endif
 
         } else if trimmed == "ROBO_STOP" {
-#if DEBUG
             // Ask a running RoboRunner script to halt at the next step boundary. Does NOT
             // interrupt a turn mid-generation (that is the separate user STOP feature); it
             // stops cleanly between steps, keeping the partial results already captured.
             let wasRunning = RoboRunner.shared.busy
             RoboRunner.shared.requestStop()
             return "{\"status\":\"ok\",\"command\":\"ROBO_STOP\",\"wasRunning\":\(wasRunning)}"
-#else
-            return "{\"status\":\"error\",\"message\":\"ROBO_STOP is a DEBUG-only command\"}"
-#endif
 
         } else if trimmed == "RESET_THREAD" {
             vm.memoryStore.deleteThread(id: vm.conversationId)
@@ -1042,6 +1011,7 @@ class HalTestConsole: ObservableObject {
             return "{\"status\":\"ok\",\"command\":\"RRF_STATUS\",\"rrfKSemantic\":\(ms.rrfKSemantic),\"rrfKBM25Distinctive\":\(ms.rrfKBM25Distinctive),\"rrfKBM25Default\":\(ms.rrfKBM25Default)}"
 
         } else if trimmed.hasPrefix("MEMORY_PLANT_AGED:") {
+            #if DEBUG
             // MEMORY_PLANT_AGED:<days_old>:<content>
             //
             // Test-only. Plants one conversation row into unified_content with
@@ -1084,8 +1054,12 @@ class HalTestConsole: ObservableObject {
                 return "{\"status\":\"error\",\"message\":\"MEMORY_PLANT_AGED: store failed\"}"
             }
             return "{\"status\":\"ok\",\"command\":\"MEMORY_PLANT_AGED\",\"id\":\"\(contentId)\",\"daysOld\":\(daysOld),\"timestamp\":\(Int(backdated.timeIntervalSince1970))}"
+            #else
+            return "{\"status\":\"error\",\"command\":\"MEMORY_PLANT_AGED\",\"message\":\"MEMORY_PLANT_AGED is a developer-only command\"}"
+            #endif
 
         } else if trimmed == "MEMORY_PLANT_AGED_CLEANUP" {
+            #if DEBUG
             // Test-only. Removes every row planted by MEMORY_PLANT_AGED by
             // deleting the "recency-regression-test" source_id via the same
             // production thread-deletion path (scoped to that id only — no
@@ -1093,6 +1067,9 @@ class HalTestConsole: ObservableObject {
             // real corpus exactly as it found it.
             vm.memoryStore.deleteThread(id: "recency-regression-test")
             return "{\"status\":\"ok\",\"command\":\"MEMORY_PLANT_AGED_CLEANUP\"}"
+            #else
+            return "{\"status\":\"error\",\"command\":\"MEMORY_PLANT_AGED_CLEANUP\",\"message\":\"MEMORY_PLANT_AGED_CLEANUP is a developer-only command\"}"
+            #endif
 
         } else if trimmed == "GET_THREADS" {
             let threads = vm.threads
@@ -1434,9 +1411,13 @@ class HalTestConsole: ObservableObject {
             return "{\"status\":\"error\",\"message\":\"Could not read state\"}"
 
         } else if trimmed == "CLEAR_TEST_DATA" {
+            #if DEBUG
             let (threads, facts, messages) = vm.memoryStore.clearAllConversationData()
             vm.startNewConversation()
             return "{\"status\":\"ok\",\"command\":\"CLEAR_TEST_DATA\",\"threadsDeleted\":\(threads),\"factsDeleted\":\(facts),\"messagesDeleted\":\(messages),\"newConversationId\":\"\(vm.conversationId)\"}"
+            #else
+            return "{\"status\":\"error\",\"command\":\"CLEAR_TEST_DATA\",\"message\":\"CLEAR_TEST_DATA is a developer-only command\"}"
+            #endif
 
         } else if trimmed.hasPrefix("EMBED_SIM_BATCH:") {
             // EMBED_SIM_BATCH:<t1a>|||<t2a>~~~<t1b>|||<t2b>~~~...
@@ -1758,12 +1739,16 @@ class HalTestConsole: ObservableObject {
             return "{\"status\":\"ok\",\"backend\":\"\(backend.rawValue)\",\"modelID\":\"\(modelID)\",\"isDownloaded\":\(isDownloaded),\"isDownloading\":\(isDownloading),\"progress\":\(progress),\"message\":\"\(message)\",\"error\":\"\(err)\"}"
 
         } else if trimmed == "INJECT_REALISTIC_TEST_CORPUS" {
+            #if DEBUG
             // Inject ~70 rows of realistic conversational content into
             // unified_content for RAG threshold evaluation. Used by the
             // 2026-05-17 threshold-tuning eval (build out a populated DB
             // so the threshold isn't tuned against a 6-row trivial case).
             let count = vm.memoryStore.injectRealisticTestCorpus()
             return "{\"status\":\"ok\",\"command\":\"INJECT_REALISTIC_TEST_CORPUS\",\"rowsInjected\":\(count)}"
+            #else
+            return "{\"status\":\"error\",\"command\":\"INJECT_REALISTIC_TEST_CORPUS\",\"message\":\"INJECT_REALISTIC_TEST_CORPUS is a developer-only command\"}"
+            #endif
 
         } else if trimmed.hasPrefix("MEMORY_DUMP:") {
             // MEMORY_DUMP:<limit>
@@ -1855,6 +1840,7 @@ class HalTestConsole: ObservableObject {
             return vm.memoryStore.debugSearchUnifiedContent(query: query, currentConversationId: vm.conversationId)
 
         } else if trimmed.hasPrefix("MEMORY_INJECT_TEST:") {
+            #if DEBUG
             // MEMORY_INJECT_TEST:<count>:<tokens_each>[:<category>]
             //
             // Inserts N synthetic self-knowledge entries of approximately
@@ -1914,6 +1900,9 @@ class HalTestConsole: ObservableObject {
             vm.memoryStore.invalidateCachedCompressions(forSegmentKind: .selfKnowledge)
             print("HALDEBUG-TESTCONSOLE: MEMORY_INJECT_TEST — injected \(count) synthetic entries of ~\(tokensEach) tokens each (category: \(category))")
             return "{\"status\":\"ok\",\"command\":\"MEMORY_INJECT_TEST\",\"injected\":\(count),\"tokensEach\":\(tokensEach),\"category\":\"\(category)\"}"
+            #else
+            return "{\"status\":\"error\",\"command\":\"MEMORY_INJECT_TEST\",\"message\":\"MEMORY_INJECT_TEST is a developer-only command\"}"
+            #endif
 
         } else {
             print("HALDEBUG-TESTCONSOLE: Unknown command: \(trimmed.prefix(60))")

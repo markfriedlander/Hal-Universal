@@ -65,9 +65,7 @@ struct ActionsView: View {
     @State private var showingSystemPromptEditor = false
     @State private var showingModelFramingDetail = false
     @State private var showingSelfReflectionViewer = false
-#if DEBUG
-    @State private var showingRoboEditor = false   // Lab: RoboRunner script editor (DEBUG only)
-#endif
+    @State private var showingRoboEditor = false   // Lab: RoboRunner script editor
     @State private var initialSettingsSnapshot: [String: Any] = [:]
     @State private var skipComparisonOnDismiss = false
     // "Free up old model files" — the always-available door to the version-safety
@@ -111,10 +109,8 @@ struct ActionsView: View {
                     .id("ai")
                 powerUserSection
                     .id("poweruser")
-#if DEBUG
                 labSection
                     .id("lab")
-#endif
 
                 // About — version + build at the bottom of Settings.
                 // Plain footer rather than a Section{} so it doesn't get a
@@ -184,12 +180,10 @@ struct ActionsView: View {
             SystemPromptEditorView()
                 .environmentObject(chatViewModel)
         }
-#if DEBUG
         .sheet(isPresented: $showingRoboEditor) {
             RoboEditorView()
                 .environmentObject(chatViewModel)
         }
-#endif
         .sheet(isPresented: $showingModelFramingDetail) {
             ModelFramingDetailView()
                 .environmentObject(chatViewModel)
@@ -303,11 +297,10 @@ struct ActionsView: View {
         chatViewModel.salonConfig.isEnabled
     }
 
-#if DEBUG
-    // MARK: - Developer / Lab (DEBUG only)
+    // MARK: - Developer / Lab
 
-    /// A single row into the Lab's RoboRunner script editor. DEBUG-only: the whole Lab
-    /// (antenna, command catalog, editor) compiles out of Release.
+    /// A single row into the Lab's RoboRunner script editor. Ships as a user-facing opt-in
+    /// (graduated out of DEBUG 2026-07-28); the antenna and command surface graduated with it.
     private var labSection: some View {
         Section {
             Button {
@@ -323,10 +316,9 @@ struct ActionsView: View {
         } header: {
             Text("Developer")
         } footer: {
-            Text("Write and run on-device RoboRunner scripts. Developer builds only.")
+            Text("Write and run on-device RoboRunner scripts.")
         }
     }
-#endif
 
     private var personalitySection: some View {
         Section {
@@ -1232,6 +1224,12 @@ struct PowerUserView: View {
                                     font: .system(.caption2, design: .monospaced))
                     }
                     .padding(.vertical, 4)
+
+                    // The hal CLI installer only makes sense on a Mac (writes to /usr/local/bin).
+                    // On iPhone/iPad the API is still reachable; users build their own client.
+                    if ProcessInfo.processInfo.isiOSAppOnMac {
+                        halInstallerView
+                    }
                 }
             } header: {
                 Label("Developer API", systemImage: "terminal")
@@ -1267,6 +1265,80 @@ struct PowerUserView: View {
                         withAnimation { if copiedField == field { copiedField = nil } }
                     }
                 }
+            }
+        }
+
+        // MARK: - hal CLI installer (Mac only)
+
+        /// Absolute path of the `hal` script bundled inside the app, or nil until it is added
+        /// to the target as a bundled resource. The install line copies FROM this path.
+        private var bundledHalPath: String? {
+            Bundle.main.path(forResource: "hal", ofType: nil)
+        }
+
+        /// A readable, scoped-sudo one-liner the user pastes into their own Mac Terminal. Only the
+        /// write into /usr/local/bin uses sudo; the ~/.config/hal file stays user-owned. Refuses if
+        /// hal already exists (uninstall first). host/port/token come straight from this running app.
+        private func installCommand(halPath: String, token: String) -> String {
+            let port = LocalAPIServer.apiPort
+            let configJSON = "{\"host\":\"127.0.0.1\",\"port\":\(port),\"token\":\"\(token)\"}"
+            return "if [ -e /usr/local/bin/hal ]; then echo \"hal already installed. Run the uninstall line first.\"; else sudo mkdir -p /usr/local/bin && sudo install -m 755 \"\(halPath)\" /usr/local/bin/hal && install -d -m 700 ~/.config/hal && printf '\(configJSON)\\n' > ~/.config/hal/config.json && chmod 600 ~/.config/hal/config.json && echo \"hal installed. Try: hal hello\"; fi"
+        }
+
+        /// Removes exactly what the installer added, nothing else. `rmdir` only removes the config
+        /// directory if it is empty, so a user's own files there are never touched.
+        private var uninstallCommand: String {
+            "sudo rm -f /usr/local/bin/hal && rm -f ~/.config/hal/config.json && rmdir ~/.config/hal 2>/dev/null; echo \"hal uninstalled.\""
+        }
+
+        @ViewBuilder
+        private var halInstallerView: some View {
+            VStack(alignment: .leading, spacing: 10) {
+                Divider()
+                Text("Install the hal command")
+                    .font(.subheadline).bold()
+                Text("Run the hal CLI in your Mac Terminal, talking to this app over the local API. Read a line, then paste it into Terminal. The install line asks for your password because it writes hal into /usr/local/bin.")
+                    .font(.caption).foregroundColor(.secondary)
+                if let halPath = bundledHalPath {
+                    commandBlock(title: "Install",
+                                 command: installCommand(halPath: halPath, token: viewModel.localAPIServer.apiToken),
+                                 field: "install")
+                    commandBlock(title: "Uninstall", command: uninstallCommand, field: "uninstall")
+                } else {
+                    Text("The hal script is not bundled in this build yet.")
+                        .font(.caption).foregroundColor(.orange)
+                }
+            }
+            .padding(.vertical, 4)
+        }
+
+        @ViewBuilder
+        private func commandBlock(title: String, command: String, field: String) -> some View {
+            VStack(alignment: .leading, spacing: 4) {
+                HStack {
+                    Text(title).font(.caption).foregroundColor(.secondary)
+                    Spacer()
+                    Button {
+                        UIPasteboard.general.string = command
+                        withAnimation { copiedField = field }
+                        DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) {
+                            withAnimation { if copiedField == field { copiedField = nil } }
+                        }
+                    } label: {
+                        Label(copiedField == field ? "Copied!" : "Copy",
+                              systemImage: copiedField == field ? "checkmark" : "doc.on.doc")
+                            .font(.caption2)
+                    }
+                    .buttonStyle(.borderless)
+                    .foregroundColor(copiedField == field ? .green : .accentColor)
+                }
+                Text(command)
+                    .font(.system(.caption2, design: .monospaced))
+                    .foregroundColor(.primary)
+                    .textSelection(.enabled)
+                    .padding(8)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .background(RoundedRectangle(cornerRadius: 6).fill(Color.secondary.opacity(0.12)))
             }
         }
     }
