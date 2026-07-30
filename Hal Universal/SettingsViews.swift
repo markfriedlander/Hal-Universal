@@ -69,32 +69,10 @@ struct ActionsView: View {
     @State private var showingMaintenance = false   // Maintenance & Reset page
     @State private var initialSettingsSnapshot: [String: Any] = [:]
     @State private var skipComparisonOnDismiss = false
-    // "Free up old model files" — the always-available door to the version-safety
-    // cleanup engine. `reclaimableOldBytes` is the space a cleanup would recover
-    // (0 = nothing to do); `lastFreedBytes` shows what a just-run cleanup recovered.
-    // Both refreshed in onAppear and after a tap. See MaintenanceTasks.freeOldModelFiles.
-    @State private var reclaimableOldBytes: Int64 = 0
-    @State private var lastFreedBytes: Int64 = 0
     // Chat display appearance (opt-in). Defaults reproduce today's look. Read live by
     // ChatBubbleView / MarkdownView, so the conversation updates the moment these change.
     @AppStorage(ChatTextSize.storageKey) private var chatTextSizePt: Int = ChatTextSize.defaultValue.rawValue
     @AppStorage(ChatDensity.storageKey) private var chatDensityRaw: String = ChatDensity.defaultValue.rawValue
-
-    /// One-line status under the "Free up old model files" row: what's reclaimable, or
-    /// what a just-run cleanup freed, or that there's nothing to do.
-    private var freeOldModelsSubtitle: String {
-        if reclaimableOldBytes > 0 {
-            return "\(Self.formatBytes(reclaimableOldBytes)) of old-version copies to remove"
-        }
-        if lastFreedBytes > 0 {
-            return "Freed \(Self.formatBytes(lastFreedBytes)). You're all clean."
-        }
-        return "Nothing to clean up."
-    }
-
-    private static func formatBytes(_ bytes: Int64) -> String {
-        ByteCountFormatter.string(fromByteCount: bytes, countStyle: .file)
-    }
 
     var body: some View {
         NavigationView {
@@ -150,9 +128,6 @@ struct ActionsView: View {
             } // ScrollViewReader
         }
         .onAppear {
-            // Refresh the "Free up old model files" reclaimable size each time
-            // Settings opens (cheap: a few directory checks).
-            reclaimableOldBytes = MaintenanceTasks.reclaimableOldModelBytes()
             // v1.x release: force Salon Mode off in the live ChatViewModel state
             // so any persisted `salonConfig.isEnabled = true` from prior builds
             // (where the toggle existed) doesn't route chat through the salon
@@ -599,37 +574,10 @@ struct ActionsView: View {
             }
             .foregroundColor(.primary)
 
-            // Free up old model files — the migration cleanup, shown ONLY when there's
-            // actually something to reclaim (or a cleanup just ran, so we can confirm
-            // it). A user with nothing to clean never sees this row, so there is no
-            // empty state and no chance of a confusing tiny/stale number: when it
-            // appears, it always shows a real, GB-scale amount. Still serves the
-            // "Not now" users, since they are exactly the ones with a leftover to
-            // reclaim. Safe: never touches a model you're using, or your conversations
-            // and memory. See MaintenanceTasks.freeOldModelFiles.
-            if reclaimableOldBytes > 0 || lastFreedBytes > 0 {
-                Button {
-                    lastFreedBytes = MaintenanceTasks.freeOldModelFiles()
-                    reclaimableOldBytes = MaintenanceTasks.reclaimableOldModelBytes()
-                    mlxDownloader.objectWillChange.send()
-                    ModelCatalogService.shared.refreshDownloadStates()
-                } label: {
-                    HStack(alignment: .top) {
-                        Image(systemName: "trash.slash")
-                        VStack(alignment: .leading, spacing: 2) {
-                            Text("Free up old model files")
-                            Text(freeOldModelsSubtitle)
-                                .font(.caption2)
-                                .foregroundColor(.secondary)
-                        }
-                        Spacer()
-                    }
-                }
-                .foregroundColor(.primary)
-                // After a cleanup, reclaimable is 0 but the row stays (lastFreedBytes > 0)
-                // to show "Freed X"; disable it then so the confirmation isn't tappable.
-                .disabled(reclaimableOldBytes == 0)
-            }
+            // "Free up old model files" used to live here. It moved to Maintenance &
+            // Reset (Storage section) 2026-07-29, where it pairs with "Clear Hal's
+            // Models" as the gentle-reclaim vs full-clear mirror of the Settings-Reset
+            // section. See MaintenanceView.
         } header: {
             Label("AI Model", systemImage: "cpu")
         } footer: {

@@ -42,6 +42,12 @@ enum MaintenanceTasks {
         // superseded copy happens only on a user action (the launch notice's "Remove
         // old copies", or Settings' "Free up old model files"), never automatically.
         recordPreVersionModelsAtLaunch()
+        // Drop any stale pre-version entries whose old (plain) copy is no longer on
+        // disk (freed here, cleaned elsewhere, or the model simply removed). The record
+        // exists to flag a *present* suspect copy; once the copy is gone the entry is
+        // just drift (e.g. the Ternary-Bonsai entry seen 2026-07-29: files gone, no
+        // claim, still listed). Cheap + idempotent; runs every launch.
+        prunePreVersionRecord()
         // The legacy Caches→App-Group migration still runs (a dead one-shot on shipped
         // devices, guarded by its own flag). It touches the MainActor-isolated store,
         // so it hops to the main actor. No automatic sweep follows it anymore; anything
@@ -308,17 +314,75 @@ enum MaintenanceTasks {
         }
     }
 
-    /// Total bytes reclaimable by removing this device's superseded plain copies. Lets
-    /// the Settings button show a size and disable itself when there's nothing to do.
+    /// A read-only dry run of ``freeOldModelFiles()``: what tapping "Free up old model
+    /// files" would ACTUALLY do, split into what Hal can free versus what a sibling
+    /// still holds. Mirrors the delete loop's guards exactly, then asks the same
+    /// question the delete asks (would releasing Hal's claim leave the copy unclaimed?),
+    /// so the UI can promise only what it delivers.
+    ///
+    /// This closes a real gap. The old estimate counted every superseded plain copy on
+    /// disk with NO claim check, while the delete frees only copies no sibling claims,
+    /// so on a shared Mac the row could advertise gigabytes it would never reclaim
+    /// (measured 2026-07-29: 5.44 GB "reclaimable" that was entirely Posey's). Same
+    /// pattern as ``MLXModelDownloader.previewClearHalsModels()``, applied to the
+    /// superseded-plain-copy cleanup.
+    struct OldModelsPlan {
+        /// (repoID, bytes) Hal can actually free — no live sibling claims the plain copy.
+        var willFree: [(repoID: String, bytes: Int64)] = []
+        /// (repoID, bytes) a sibling still claims; the bytes stay on disk.
+        var willKeep: [(repoID: String, bytes: Int64)] = []
+        /// Display names of the sibling apps holding the kept copies ("in use by Posey").
+        var otherClaimants: Set<String> = []
+
+        var freeableBytes: Int64 { willFree.reduce(0) { $0 + $1.bytes } }
+        var keptBytes: Int64 { willKeep.reduce(0) { $0 + $1.bytes } }
+        var isEmpty: Bool { willFree.isEmpty && willKeep.isEmpty }
+    }
+
     @MainActor
-    static func reclaimableOldModelBytes() -> Int64 {
-        var total: Int64 = 0
+    static func previewFreeOldModelFiles() -> OldModelsPlan {
+        var plan = OldModelsPlan()
+        let thisApp = SharedModelStore.thisAppID
         for repoID in SharedModelStore.pinnedRevisions.keys {
             guard SharedModelStore.requiredIdentity(forRepoID: repoID) != repoID else { continue }
             guard SharedModelStore.isRepoDownloaded(repoID) else { continue }
-            total += SharedModelStore.sizeOnDisk(repoID)
+            let bytes = SharedModelStore.sizeOnDisk(repoID)
+            // `claimants()` already filters to LIVE claimants (stale ones reaped in a
+            // read-only pass); minus Hal itself = who would still hold it after we
+            // release. Empty ⇒ the delete would free it; non-empty ⇒ it stays for them.
+            let others = SharedModelStore.claimants(modelID: repoID).filter { $0 != thisApp }
+            if others.isEmpty {
+                plan.willFree.append((repoID, bytes))
+            } else {
+                plan.willKeep.append((repoID, bytes))
+                for appID in others { plan.otherClaimants.insert(SharedModelStore.displayName(forAppID: appID)) }
+            }
         }
-        return total
+        return plan
+    }
+
+    /// Bytes Hal can *honestly* reclaim right now (only copies no sibling claims). Thin
+    /// wrapper over ``previewFreeOldModelFiles()`` for callers that want just the number.
+    @MainActor
+    static func reclaimableOldModelBytes() -> Int64 {
+        previewFreeOldModelFiles().freeableBytes
+    }
+
+    /// Drop pre-version entries whose old (plain) copy is no longer on disk. The durable
+    /// record exists to flag a *present* suspect copy so its re-download reads as a
+    /// replacement; once the copy is gone the entry is stale. ``notePreVersionModelReplaced``
+    /// already handles the stamped-copy-landed case; this covers the copy-vanished case
+    /// (freed here, cleaned by a sibling, or the model removed outright). Read-then-write,
+    /// idempotent. Returns the ids pruned, for logging/diagnostics.
+    @discardableResult
+    nonisolated static func prunePreVersionRecord() -> [String] {
+        let ids = preVersionModelIDs()
+        let stale = ids.filter { !SharedModelStore.isRepoDownloaded($0) }
+        guard !stale.isEmpty else { return [] }
+        setPreVersionModelIDs(ids.subtracting(stale))
+        let pruned = stale.sorted()
+        halLog("HALDEBUG-MIGRATE: pruned \(pruned.count) stale pre-version entr\(pruned.count == 1 ? "y" : "ies"): \(pruned)")
+        return pruned
     }
 
     /// The single cleanup engine behind all three doors (launch notice, Settings button,
@@ -432,11 +496,22 @@ enum MaintenanceTasks {
     static func debugMigrationStateJSON() -> String {
         let pre = preVersionModelIDs().sorted()
         let preJSON = "[" + pre.map { "\"\($0)\"" }.joined(separator: ",") + "]"
+        let plan = previewFreeOldModelFiles()
+        func repoBytesJSON(_ list: [(repoID: String, bytes: Int64)]) -> String {
+            "[" + list.map { "{\"repoID\":\"\($0.repoID)\",\"bytes\":\($0.bytes)}" }.joined(separator: ",") + "]"
+        }
+        let claimantsJSON = "[" + plan.otherClaimants.sorted().map { "\"\($0)\"" }.joined(separator: ",") + "]"
         return "{\"hadOldModels\":\(deviceHadPreVersionModels()),"
             + "\"noticeHandled\":\(UserDefaults.standard.bool(forKey: noticeHandledKey)),"
             + "\"shouldShow\":\(migrationNoticeShouldShow),"
             + "\"preVersion\":\(preJSON),"
-            + "\"reclaimableBytes\":\(reclaimableOldModelBytes())}"
+            // `reclaimableBytes` is now HONEST: only what Hal can actually free (no live
+            // sibling claim). `keptBytes` + `heldBy` explain the rest that stays shared.
+            + "\"reclaimableBytes\":\(plan.freeableBytes),"
+            + "\"keptBytes\":\(plan.keptBytes),"
+            + "\"willFree\":\(repoBytesJSON(plan.willFree)),"
+            + "\"willKeep\":\(repoBytesJSON(plan.willKeep)),"
+            + "\"heldBy\":\(claimantsJSON)}"
     }
 }
 // ==== LEGO END: 40 MaintenanceTasks (Launch Housekeeping) ====

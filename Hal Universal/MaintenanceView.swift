@@ -12,6 +12,7 @@
 //
 
 import SwiftUI
+import Combine   // objectWillChange.send() on the shared downloader (Free-up-models row)
 
 // ==== LEGO START: 63 MaintenanceView (Maintenance & Reset) ====
 
@@ -23,6 +24,16 @@ struct MaintenanceView: View {
     @State private var showResetSettingsAlert = false
     @State private var showingClearCacheAlert = false
     @State private var showingNuclearResetConfirmationAlert = false
+
+    // "Free up old model files" — moved here from the AI Model section 2026-07-29 to sit
+    // beside "Clear Hal's Models" as the gentle-reclaim vs full-clear pair. `oldModelsPlan`
+    // is a read-only dry run of the cleanup (what Hal can free vs what a sibling still
+    // holds), refreshed on appear and after a tap; `lastFreedOldBytes` shows what a
+    // just-run cleanup recovered. Together they let the subtitle tell the honest truth
+    // instead of advertising space a sibling is still using. See
+    // MaintenanceTasks.previewFreeOldModelFiles / freeOldModelFiles.
+    @State private var oldModelsPlan = MaintenanceTasks.OldModelsPlan()
+    @State private var lastFreedOldBytes: Int64 = 0
 
     var body: some View {
         NavigationView {
@@ -36,6 +47,11 @@ struct MaintenanceView: View {
                 ToolbarItem(placement: .cancellationAction) {
                     Button("Done") { dismiss() }
                 }
+            }
+            .onAppear {
+                // Cheap dry run (a few directory checks + a manifest read) so the
+                // "Free up old model files" row shows an honest, up-to-date picture.
+                oldModelsPlan = MaintenanceTasks.previewFreeOldModelFiles()
             }
         }
         .alert("Confirm Nuclear Reset", isPresented: $showingNuclearResetConfirmationAlert) {
@@ -90,18 +106,50 @@ struct MaintenanceView: View {
             let n = plan.willStayForOthers.count
             // Name the siblings when we can — "also used by Posey" explains the
             // family; "also used by another app" just raises a question.
-            let who = plan.otherClaimants.sorted()
-            let byWhom: String
-            switch who.count {
-            case 0:  byWhom = "another app in the AI family"
-            case 1:  byWhom = who[0]
-            case 2:  byWhom = "\(who[0]) and \(who[1])"
-            default: byWhom = who.dropLast().joined(separator: ", ") + ", and " + who[who.count - 1]
-            }
-            lines.append("\(n) \(n == 1 ? "is" : "are") also used by \(byWhom) and will stay on disk — Hal just stops using \(n == 1 ? "it" : "them").")
+            let byWhom = claimantList(plan.otherClaimants)
+            lines.append("\(n) \(n == 1 ? "is" : "are") also used by \(byWhom) and will stay on disk, Hal just stops using \(n == 1 ? "it" : "them").")
         }
         lines.append("Anything deleted will need to be downloaded again.")
         return lines.joined(separator: " ")
+    }
+
+    /// One-line status under "Free up old model files": what Hal can actually reclaim,
+    /// what a sibling is still using (named), or that a just-run cleanup is done. Honest
+    /// by construction — it reads the same dry run the delete acts on, so the row never
+    /// promises space a sibling still holds (the bug that made this button look dead on
+    /// a shared Mac). No em dashes: user-facing string.
+    private var freeOldModelsSubtitle: String {
+        let plan = oldModelsPlan
+        let heldBy = claimantList(plan.otherClaimants)
+        if plan.freeableBytes > 0 && plan.keptBytes > 0 {
+            return "Free \(fmtBytes(plan.freeableBytes)). \(fmtBytes(plan.keptBytes)) kept, in use by \(heldBy)."
+        }
+        if plan.freeableBytes > 0 {
+            return "\(fmtBytes(plan.freeableBytes)) of old-version copies to remove."
+        }
+        if plan.keptBytes > 0 {
+            return "\(fmtBytes(plan.keptBytes)) in use by \(heldBy). Nothing for Hal to free right now."
+        }
+        if lastFreedOldBytes > 0 {
+            return "Freed \(fmtBytes(lastFreedOldBytes)). You're all clean."
+        }
+        return "Nothing to clean up."
+    }
+
+    private func fmtBytes(_ bytes: Int64) -> String {
+        ByteCountFormatter.string(fromByteCount: bytes, countStyle: .file)
+    }
+
+    /// "Posey" / "Posey and AI Camera" / "A, B, and C" from a set of display names.
+    /// Shared by the Clear-models confirmation and the Free-up subtitle.
+    private func claimantList(_ names: Set<String>) -> String {
+        let who = names.sorted()
+        switch who.count {
+        case 0:  return "another app in the AI family"
+        case 1:  return who[0]
+        case 2:  return "\(who[0]) and \(who[1])"
+        default: return who.dropLast().joined(separator: ", ") + ", and " + who[who.count - 1]
+        }
     }
 
     // MARK: - Settings Reset Section
@@ -182,6 +230,40 @@ struct MaintenanceView: View {
                     .font(.caption)
                     .foregroundColor(.red)
                 }
+            }
+
+            // Free up old model files — the gentle, targeted reclaim that mirrors
+            // "Reset settings for <model>" up in Settings Reset (versus the full
+            // "Clear Hal's Models" right above). Shown only when there's actually an
+            // old copy on disk (freeable OR held by a sibling) or a cleanup just ran,
+            // so a clean device never sees an empty row. The subtitle is honest: it
+            // reads the same dry run the delete acts on, and the button disables itself
+            // when every old copy is held by a sibling (nothing Hal alone can free),
+            // leaving the row as an informational "in use by X" line rather than a
+            // dead button. Safe: never touches a model in use, a sibling's copy, or
+            // any conversation/memory. See MaintenanceTasks.freeOldModelFiles.
+            if !oldModelsPlan.isEmpty || lastFreedOldBytes > 0 {
+                Button {
+                    lastFreedOldBytes = MaintenanceTasks.freeOldModelFiles()
+                    oldModelsPlan = MaintenanceTasks.previewFreeOldModelFiles()
+                    mlxDownloader.objectWillChange.send()
+                    ModelCatalogService.shared.refreshDownloadStates()
+                } label: {
+                    HStack(alignment: .top) {
+                        Image(systemName: "trash.slash")
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text("Free up old model files")
+                            Text(freeOldModelsSubtitle)
+                                .font(.caption2)
+                                .foregroundColor(.secondary)
+                        }
+                        Spacer()
+                    }
+                }
+                .foregroundColor(.primary)
+                // Disable when nothing is Hal's to free (all kept by siblings, or a
+                // cleanup just finished): the row stays visible + honest, but not tappable.
+                .disabled(oldModelsPlan.freeableBytes == 0)
             }
         } header: {
             Label("Storage", systemImage: "externaldrive")
