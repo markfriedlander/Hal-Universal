@@ -1465,6 +1465,9 @@ class MemoryStore: ObservableObject {
 
                                         // Enable source code access (Maxim #2)
                                         enableSourceCodeAccess()
+                                        // Curated Lab USAGE reference so Hal can actually help users operate the
+                                        // API / RoboRunner / CLI (source code alone made him confabulate; 2026-07-29).
+                                        enableLabReferenceAccess()
                                     }
 
                                     // MARK: - Schema Migration v2 (UNIQUE-constraint widening)
@@ -1963,7 +1966,111 @@ class MemoryStore: ObservableObject {
                                         }
                                         sqlite3_finalize(stmt)
                                     }
-                                    
+
+                                    // Curated USAGE guide for the Lab (API / RoboRunner / hal CLI), ingested as its
+                                    // own small `lab_reference` RAG document. Distinct from `source_code`: that gives
+                                    // Hal an implementer's view (and, asked a Lab question, he confabulated Swift, seen
+                                    // 2026-07-29); this gives him a user's guide. Built at RUNTIME from the live command
+                                    // catalog (CommandCatalog.helpText) plus a hand-written three-doors + syntax + safety
+                                    // primer, so it never drifts from the real verbs and needs no bundled file. Because
+                                    // it is small + usage-worded, RAG surfaces it over the 33k-line source blob on
+                                    // "how do I use…" questions. Hash-gated like the source ingestion.
+                                    nonisolated private func enableLabReferenceAccess() {
+                                        let primer = """
+                                        THE LAB — HOW TO USE HAL'S DEVELOPER TOOLS
+
+                                        This is a USAGE guide (how to operate the tools), not source code. When a user asks how to use \
+                                        the API, RoboRunner, or the hal CLI, answer from here, do NOT show Swift implementation.
+
+                                        Hal's Lab has three doors into ONE command interpreter, the SAME command verbs work in all three:
+
+                                        1) DEVELOPER API (the "antenna"): a local HTTP server on the device.
+                                           Turn it on in Settings > The Lab > Developer API (off by default). It shows the address, port, and a bearer token.
+                                           Send a command: POST http://<address>:<port>/command with JSON {"command":"VERB..."} and header Authorization: Bearer <token>.
+                                           Full conversation turn: POST /chat with {"message":"..."}.
+                                           It answers only while Hal is the foreground app.
+
+                                        2) ROBORUNNER: an in-app script editor (Settings > The Lab). One command per line. The grammar is tiny:
+                                           - Any command verb on its own line runs that verb (for example SWITCH_MODEL:..., SET_REASONING:true, NEW_THREAD).
+                                           - ASK <prompt>          runs one real conversation turn with that prompt.
+                                           - WAIT <seconds>        pauses (longer if the device is warm).
+                                           - FOR <VAR> IN a, b, c  repeats the block below once per value, substituting {VAR} each pass; close it with END.
+                                             ... END               It only sweeps a written list; it cannot branch or loop forever.
+                                           - # comment             a line starting with # is a comment.
+                                           Example, ask the same prompt three times, each in a fresh thread:
+                                             FOR N IN 1, 2, 3
+                                             NEW_THREAD
+                                             ASK Tell me something interesting (try {N})
+                                             END
+
+                                        3) HAL CLI (Mac only): talk to Hal from the Terminal.
+                                           Install it from Settings > The Lab > Hal CLI (shown when Hal runs on a Mac with the API on). Then:
+                                             hal "your message"               one conversation turn.
+                                             cat notes.txt | hal "summarize"   pipe input in.
+                                           Quote any message containing shell characters like ? so the shell does not expand them.
+
+                                        SAFETY: the interpreter starts in Safe mode and refuses destructive verbs. Switch with SET_SAFETY:advanced; \
+                                        in Advanced a destructive verb must end with --yes (or CONFIRM) to run.
+
+                                        COMMAND CATALOG (every verb, its usage, and what it does):
+                                        """
+                                        let labReference = primer + "\n" + CommandCatalog.helpText()
+
+                                        let currentHash = labReference.hash
+                                        let storedHash = UserDefaults.standard.integer(forKey: "hal_lab_reference_hash")
+                                        var existsStmt: OpaquePointer?
+                                        var rowCount = 0
+                                        if sqlite3_prepare_v2(db, "SELECT COUNT(*) FROM unified_content WHERE source_type = 'lab_reference'", -1, &existsStmt, nil) == SQLITE_OK {
+                                            if sqlite3_step(existsStmt) == SQLITE_ROW { rowCount = Int(sqlite3_column_int(existsStmt, 0)) }
+                                        }
+                                        sqlite3_finalize(existsStmt)
+                                        if currentHash == storedHash && storedHash != 0 && rowCount > 0 {
+                                            print("HALDEBUG-SELFKNOWLEDGE: Lab reference unchanged, current")
+                                            return
+                                        }
+                                        print("HALDEBUG-SELFKNOWLEDGE: (re)ingesting Lab usage reference...")
+
+                                        var stmt: OpaquePointer?
+                                        sqlite3_exec(db, "DELETE FROM unified_content WHERE source_type = 'lab_reference'", nil, nil, nil)
+                                        sqlite3_exec(db, "DELETE FROM sources WHERE source_type = 'lab_reference'", nil, nil, nil)
+
+                                        let sourceID = "hal-lab-reference"
+                                        let timestamp = Int(Date().timeIntervalSince1970)
+                                        let sourceInsertSQL = """
+                                        INSERT OR REPLACE INTO sources
+                                        (id, source_type, display_name, created_at, last_updated, total_chunks, file_size)
+                                        VALUES (?, 'lab_reference', 'The Lab - How To Use It', ?, ?, 1, ?)
+                                        """
+                                        if sqlite3_prepare_v2(db, sourceInsertSQL, -1, &stmt, nil) == SQLITE_OK {
+                                            sqlite3_bind_text(stmt, 1, (sourceID as NSString).utf8String, -1, nil)
+                                            sqlite3_bind_int64(stmt, 2, Int64(timestamp))
+                                            sqlite3_bind_int64(stmt, 3, Int64(timestamp))
+                                            sqlite3_bind_int64(stmt, 4, Int64(labReference.count))
+                                            sqlite3_step(stmt)
+                                        }
+                                        sqlite3_finalize(stmt)
+
+                                        let contentInsertSQL = """
+                                        INSERT OR REPLACE INTO unified_content
+                                        (id, content, timestamp, source_type, source_id, position, is_from_user)
+                                        VALUES (?, ?, ?, 'lab_reference', ?, 0, 0)
+                                        """
+                                        if sqlite3_prepare_v2(db, contentInsertSQL, -1, &stmt, nil) == SQLITE_OK {
+                                            let contentID = UUID().uuidString
+                                            sqlite3_bind_text(stmt, 1, (contentID as NSString).utf8String, -1, nil)
+                                            sqlite3_bind_text(stmt, 2, (labReference as NSString).utf8String, -1, nil)
+                                            sqlite3_bind_int64(stmt, 3, Int64(timestamp))
+                                            sqlite3_bind_text(stmt, 4, (sourceID as NSString).utf8String, -1, nil)
+                                            if sqlite3_step(stmt) == SQLITE_DONE {
+                                                print("HALDEBUG-SELFKNOWLEDGE: Lab usage reference ingested (\(labReference.count) chars)")
+                                                UserDefaults.standard.set(currentHash, forKey: "hal_lab_reference_hash")
+                                            } else {
+                                                print("HALDEBUG-SELFKNOWLEDGE: ERROR ingesting Lab reference: \(String(cString: sqlite3_errmsg(db)))")
+                                            }
+                                        }
+                                        sqlite3_finalize(stmt)
+                                    }
+
                                     // MARK: - Greeting Prefix Scrubber (Layer 3 of greeting fix)
                                     // Removes common greeting prefixes when storing assistant responses to prevent
                                     // RAG from showing greeting patterns in retrieved context
