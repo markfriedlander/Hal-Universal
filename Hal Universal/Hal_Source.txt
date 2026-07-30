@@ -28228,6 +28228,22 @@ struct PowerUserView: View {
     private var thinkingSection: some View {
         Section {
             VStack(alignment: .leading, spacing: 16) {
+                // Thinking is gated OFF in Salon Mode (reasoningActive ANDs in
+                // !salonConfig.isEnabled), so the Thinking Cap is inert there. Match the
+                // memory section: show a lock notice and gray the control out during
+                // salon, rather than presenting a live-looking slider that does nothing.
+                if isSalonActive {
+                    HStack(alignment: .top, spacing: 6) {
+                        Image(systemName: "person.3.fill")
+                            .foregroundColor(.orange)
+                            .imageScale(.small)
+                        Text("Thinking is off during Salon conversations, so the Thinking Cap doesn't apply. Exit Salon Mode to adjust it.")
+                            .font(.caption)
+                            .foregroundColor(.secondary)
+                    }
+                }
+
+                Group {
                 SectionHeaderText(text: "THINKING")
 
                 LabeledSliderControl(
@@ -28241,10 +28257,13 @@ struct PowerUserView: View {
                     valueFormatter: { "\(Int($0)) tokens" },
                     minLabel: "\(HalReasoning.minReasonCapTokens)",
                     maxLabel: "\(HalReasoning.maxReasonCapTokens)",
-                    helperText: "The more Hal thinks, the more heat the phone makes. A lower cap runs cooler; a higher cap lets Hal reason longer before answering.",
+                    helperText: "The more Hal thinks, the more heat the device makes. A lower cap runs cooler; a higher cap lets Hal reason longer before answering.",
                     onEditingChanged: nil,
                     isModified: chatViewModel.reasoningCapTokens != HalReasoning.defaultReasonCapTokens
                 )
+                }  // end Group
+                .disabled(isSalonActive)
+                .opacity(isSalonActive ? 0.45 : 1.0)
             }
         }
     }
@@ -29433,9 +29452,9 @@ struct iOSChatView: View {
     private func thermalConsentMessage(for model: ModelConfiguration) -> String {
         let name = model.displayName
         if model.id == ModelConfiguration.bonsai8B2bit.id {
-            return "\(name) is an 8-billion-parameter model. In thinking mode it thinks and then answers, which is a lot of sustained work for the phone. To keep it cool, Hal slows \(name) down while it thinks, so replies come slowly. If the phone still gets too warm an answer can come out short or cut off, and if it gets warmer still iOS steps in to protect the phone. Nothing is damaged. You can turn thinking off anytime with the brain button."
+            return "\(name) is an 8-billion-parameter model. In thinking mode it thinks and then answers, which is a lot of sustained work for the device. To keep it cool, Hal slows \(name) down while it thinks, so replies come slowly. If the device still gets too warm an answer can come out short or cut off, and if it gets warmer still the OS steps in to protect the device. Nothing is damaged. You can turn thinking off anytime with the brain button."
         } else {
-            return "\(name) isn't a model Hal has tuned for heat. In thinking mode it thinks and then answers, which is sustained work for the phone. Hal will slow it down if it starts running warm, but a reply can still come out short or cut off, and if the phone gets hot enough iOS steps in to protect it. Nothing is damaged. You can turn thinking off anytime with the brain button."
+            return "\(name) isn't a model Hal has tuned for heat. In thinking mode it thinks and then answers, which is sustained work for the device. Hal will slow it down if it starts running warm, but a reply can still come out short or cut off, and if the device gets hot enough the OS steps in to protect it. Nothing is damaged. You can turn thinking off anytime with the brain button."
         }
     }
 

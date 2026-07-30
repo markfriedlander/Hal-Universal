@@ -572,9 +572,9 @@ struct iOSChatView: View {
     private func thermalConsentMessage(for model: ModelConfiguration) -> String {
         let name = model.displayName
         if model.id == ModelConfiguration.bonsai8B2bit.id {
-            return "\(name) is an 8-billion-parameter model. In thinking mode it thinks and then answers, which is a lot of sustained work for the phone. To keep it cool, Hal slows \(name) down while it thinks, so replies come slowly. If the phone still gets too warm an answer can come out short or cut off, and if it gets warmer still iOS steps in to protect the phone. Nothing is damaged. You can turn thinking off anytime with the brain button."
+            return "\(name) is an 8-billion-parameter model. In thinking mode it thinks and then answers, which is a lot of sustained work for the device. To keep it cool, Hal slows \(name) down while it thinks, so replies come slowly. If the device still gets too warm an answer can come out short or cut off, and if it gets warmer still the OS steps in to protect the device. Nothing is damaged. You can turn thinking off anytime with the brain button."
         } else {
-            return "\(name) isn't a model Hal has tuned for heat. In thinking mode it thinks and then answers, which is sustained work for the phone. Hal will slow it down if it starts running warm, but a reply can still come out short or cut off, and if the phone gets hot enough iOS steps in to protect it. Nothing is damaged. You can turn thinking off anytime with the brain button."
+            return "\(name) isn't a model Hal has tuned for heat. In thinking mode it thinks and then answers, which is sustained work for the device. Hal will slow it down if it starts running warm, but a reply can still come out short or cut off, and if the device gets hot enough the OS steps in to protect it. Nothing is damaged. You can turn thinking off anytime with the brain button."
         }
     }
 

@@ -801,6 +801,22 @@ struct PowerUserView: View {
     private var thinkingSection: some View {
         Section {
             VStack(alignment: .leading, spacing: 16) {
+                // Thinking is gated OFF in Salon Mode (reasoningActive ANDs in
+                // !salonConfig.isEnabled), so the Thinking Cap is inert there. Match the
+                // memory section: show a lock notice and gray the control out during
+                // salon, rather than presenting a live-looking slider that does nothing.
+                if isSalonActive {
+                    HStack(alignment: .top, spacing: 6) {
+                        Image(systemName: "person.3.fill")
+                            .foregroundColor(.orange)
+                            .imageScale(.small)
+                        Text("Thinking is off during Salon conversations, so the Thinking Cap doesn't apply. Exit Salon Mode to adjust it.")
+                            .font(.caption)
+                            .foregroundColor(.secondary)
+                    }
+                }
+
+                Group {
                 SectionHeaderText(text: "THINKING")
 
                 LabeledSliderControl(
@@ -814,10 +830,13 @@ struct PowerUserView: View {
                     valueFormatter: { "\(Int($0)) tokens" },
                     minLabel: "\(HalReasoning.minReasonCapTokens)",
                     maxLabel: "\(HalReasoning.maxReasonCapTokens)",
-                    helperText: "The more Hal thinks, the more heat the phone makes. A lower cap runs cooler; a higher cap lets Hal reason longer before answering.",
+                    helperText: "The more Hal thinks, the more heat the device makes. A lower cap runs cooler; a higher cap lets Hal reason longer before answering.",
                     onEditingChanged: nil,
                     isModified: chatViewModel.reasoningCapTokens != HalReasoning.defaultReasonCapTokens
                 )
+                }  // end Group
+                .disabled(isSalonActive)
+                .opacity(isSalonActive ? 0.45 : 1.0)
             }
         }
     }
