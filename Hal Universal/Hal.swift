@@ -2139,23 +2139,63 @@ class MemoryStore: ObservableObject {
                                         halLog("HALDEBUG-SELFKNOWLEDGE: source_code embedding pass done — filled \(filled)/\(rows.count) into \(col)")
                                     }
 
-                                    /// Read the Lab usage reference back as one whole document. The
-                                    /// KnowledgeRouter injects this verbatim (it's small and hand-sized, unlike
-                                    /// the chunked source_code corpus) when a turn is about how to use Hal's
-                                    /// tools. Deterministic fetch by source_type — no ranking, so the guide can
-                                    /// never be out-ranked and buried the way it was as a general-RAG chunk.
-                                    /// Returns nil if the reference hasn't been ingested yet.
-                                    nonisolated func fetchLabReference() -> String? {
-                                        guard ensureHealthyConnection() else { return nil }
-                                        var stmt: OpaquePointer?
-                                        var result: String?
-                                        if sqlite3_prepare_v2(db, "SELECT content FROM unified_content WHERE source_type = 'lab_reference' ORDER BY position LIMIT 1;", -1, &stmt, nil) == SQLITE_OK {
-                                            if sqlite3_step(stmt) == SQLITE_ROW, let c = sqlite3_column_text(stmt, 0) {
-                                                result = String(cString: c)
+                                    /// BM25-ONLY retrieval over Hal's combined SELF-KNOWLEDGE pool: his source
+                                    /// code AND his chunked Lab/tool documentation. This is the retrieval half of
+                                    /// the collapsed router (2026-07-30): the model no longer decides "code vs
+                                    /// tools" (a distinction it drew unreliably), it only decides "is this about
+                                    /// Hal," and the LEXICAL match here does the routing — "RoboRunner syntax"
+                                    /// surfaces the guide chunk, "hybrid search" surfaces the search code, purely by
+                                    /// which words hit. Deliberately NOT the hybrid searchUnifiedContent: none of
+                                    /// our embedders were trained on code, so semantic is noise here and the hybrid
+                                    /// path's "trust BM25 only if it agrees with semantic" gate is backwards for this
+                                    /// corpus. BM25 also makes the top chunk deterministic, which matters for small-
+                                    /// window models that effectively see only the first chunk. Best first.
+                                    func searchSelfKnowledge(query: String, maxResults: Int) -> [String] {
+                                        guard ensureHealthyConnection() else { return [] }
+                                        let sanitized = sanitizeFTSQuery(query)
+                                        guard !sanitized.isEmpty, sanitized != "\"\"" else { return [] }
+
+                                        // TWO SEPARATE BM25 searches, not one pooled ranking. The Lab guide is a
+                                        // tiny curated corpus (~9 chunks) about USAGE; the source code is ~672
+                                        // chunks that also mention the tool names ("RoboRunner", "SWITCH_MODEL").
+                                        // Pooled, the code drowns the guide even on a pure "how do I use it"
+                                        // question (device-observed 2026-07-30). Searching each corpus on its own
+                                        // guarantees the guide is represented when it matches, and the answering
+                                        // model — seeing both, labelled — picks the right one with the full
+                                        // question in view (a better place to decide than up-front classification).
+                                        // Guide FIRST so it survives truncation on small-window models for the
+                                        // usage questions that need it; a pure-architecture query simply returns
+                                        // no guide hit and the code leads.
+                                        func bm25(sourceType: String, limit: Int) -> [String] {
+                                            let sql = """
+                                            SELECT u.content, -bm25(unified_content_fts) AS score
+                                            FROM unified_content_fts
+                                            JOIN unified_content u ON u.rowid = unified_content_fts.rowid
+                                            WHERE unified_content_fts MATCH ? AND u.source_type = '\(sourceType)'
+                                            ORDER BY score DESC
+                                            LIMIT ?;
+                                            """
+                                            var stmt: OpaquePointer?
+                                            var out: [String] = []
+                                            if sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK {
+                                                sqlite3_bind_text(stmt, 1, (sanitized as NSString).utf8String, -1, nil)
+                                                sqlite3_bind_int(stmt, 2, Int32(limit))
+                                                while sqlite3_step(stmt) == SQLITE_ROW {
+                                                    if let c = sqlite3_column_text(stmt, 0) {
+                                                        let content = String(cString: c)
+                                                        if !content.isEmpty { out.append(content) }
+                                                    }
+                                                }
                                             }
+                                            sqlite3_finalize(stmt)
+                                            return out
                                         }
-                                        sqlite3_finalize(stmt)
-                                        return result
+                                        let guideHits = bm25(sourceType: "lab_reference", limit: 2)
+                                        let codeHits = bm25(sourceType: "source_code", limit: max(1, maxResults - guideHits.count))
+                                        let out = guideHits + codeHits
+                                        let topHeader = out.first.map { String($0.prefix(90)).replacingOccurrences(of: "\n", with: " ") } ?? "(none)"
+                                        halLog("HALDEBUG-ROUTER: self-knowledge search '\(sanitized.prefix(40))' -> \(guideHits.count) guide + \(codeHits.count) code, top: \(topHeader)")
+                                        return out
                                     }
 
                                     // Curated USAGE guide for the Lab (API / RoboRunner / hal CLI), ingested as its
@@ -2207,7 +2247,12 @@ class MemoryStore: ObservableObject {
                                         """
                                         let labReference = primer + "\n" + CommandCatalog.helpText()
 
-                                        let currentHash = labReference.hash
+                                        // Version the hash so a change to the CHUNKING scheme (not just the guide
+                                        // text) forces a re-ingest. The guide is now SPLIT into pieces so BM25 can
+                                        // match a section — the RoboRunner part, the API part, one command — instead
+                                        // of the whole blob. This is what lets the router collapse the fragile
+                                        // architecture-vs-tools split and let lexical match do the routing (2026-07-30).
+                                        let currentHash = (labReference + "#labchunk-v1").hash
                                         let storedHash = UserDefaults.standard.integer(forKey: "hal_lab_reference_hash")
                                         var existsStmt: OpaquePointer?
                                         var rowCount = 0
@@ -2221,6 +2266,30 @@ class MemoryStore: ObservableObject {
                                         }
                                         print("HALDEBUG-SELFKNOWLEDGE: (re)ingesting Lab usage reference...")
 
+                                        // Split the guide into ~1400-char pieces on line boundaries so BM25 can
+                                        // surface the relevant SECTION. Each piece is self-labelling so a retrieved
+                                        // chunk still reads sensibly when injected into a prompt.
+                                        let labChunks: [String] = {
+                                            let maxChunkChars = 1400
+                                            var chunks: [String] = []
+                                            var buf: [String] = []
+                                            var bufLen = 0
+                                            func flush() {
+                                                let body = buf.joined(separator: "\n").trimmingCharacters(in: .whitespacesAndNewlines)
+                                                buf.removeAll(keepingCapacity: true); bufLen = 0
+                                                if !body.isEmpty { chunks.append(body) }
+                                            }
+                                            for line in labReference.components(separatedBy: "\n") {
+                                                if bufLen + line.count + 1 > maxChunkChars && !buf.isEmpty { flush() }
+                                                buf.append(line); bufLen += line.count + 1
+                                            }
+                                            flush()
+                                            let total = chunks.count
+                                            return chunks.enumerated().map { (i, c) in
+                                                "[Hal Lab usage guide | part \(i + 1)/\(total)]\n\(c)"
+                                            }
+                                        }()
+
                                         var stmt: OpaquePointer?
                                         sqlite3_exec(db, "DELETE FROM unified_content WHERE source_type = 'lab_reference'", nil, nil, nil)
                                         sqlite3_exec(db, "DELETE FROM sources WHERE source_type = 'lab_reference'", nil, nil, nil)
@@ -2230,13 +2299,14 @@ class MemoryStore: ObservableObject {
                                         let sourceInsertSQL = """
                                         INSERT OR REPLACE INTO sources
                                         (id, source_type, display_name, created_at, last_updated, total_chunks, file_size)
-                                        VALUES (?, 'lab_reference', 'The Lab - How To Use It', ?, ?, 1, ?)
+                                        VALUES (?, 'lab_reference', 'The Lab - How To Use It', ?, ?, ?, ?)
                                         """
                                         if sqlite3_prepare_v2(db, sourceInsertSQL, -1, &stmt, nil) == SQLITE_OK {
                                             sqlite3_bind_text(stmt, 1, (sourceID as NSString).utf8String, -1, nil)
                                             sqlite3_bind_int64(stmt, 2, Int64(timestamp))
                                             sqlite3_bind_int64(stmt, 3, Int64(timestamp))
-                                            sqlite3_bind_int64(stmt, 4, Int64(labReference.count))
+                                            sqlite3_bind_int(stmt, 4, Int32(labChunks.count))
+                                            sqlite3_bind_int64(stmt, 5, Int64(labReference.count))
                                             sqlite3_step(stmt)
                                         }
                                         sqlite3_finalize(stmt)
@@ -2244,22 +2314,30 @@ class MemoryStore: ObservableObject {
                                         let contentInsertSQL = """
                                         INSERT OR REPLACE INTO unified_content
                                         (id, content, timestamp, source_type, source_id, position, is_from_user)
-                                        VALUES (?, ?, ?, 'lab_reference', ?, 0, 0)
+                                        VALUES (?, ?, ?, 'lab_reference', ?, ?, 0)
                                         """
+                                        var inserted = 0
                                         if sqlite3_prepare_v2(db, contentInsertSQL, -1, &stmt, nil) == SQLITE_OK {
-                                            let contentID = UUID().uuidString
-                                            sqlite3_bind_text(stmt, 1, (contentID as NSString).utf8String, -1, nil)
-                                            sqlite3_bind_text(stmt, 2, (labReference as NSString).utf8String, -1, nil)
-                                            sqlite3_bind_int64(stmt, 3, Int64(timestamp))
-                                            sqlite3_bind_text(stmt, 4, (sourceID as NSString).utf8String, -1, nil)
-                                            if sqlite3_step(stmt) == SQLITE_DONE {
-                                                print("HALDEBUG-SELFKNOWLEDGE: Lab usage reference ingested (\(labReference.count) chars)")
-                                                UserDefaults.standard.set(currentHash, forKey: "hal_lab_reference_hash")
-                                            } else {
-                                                print("HALDEBUG-SELFKNOWLEDGE: ERROR ingesting Lab reference: \(String(cString: sqlite3_errmsg(db)))")
+                                            for (index, chunk) in labChunks.enumerated() {
+                                                sqlite3_reset(stmt)
+                                                sqlite3_clear_bindings(stmt)
+                                                let contentID = UUID().uuidString as NSString
+                                                let chunkNS = chunk as NSString
+                                                sqlite3_bind_text(stmt, 1, contentID.utf8String, -1, nil)
+                                                sqlite3_bind_text(stmt, 2, chunkNS.utf8String, -1, nil)
+                                                sqlite3_bind_int64(stmt, 3, Int64(timestamp))
+                                                sqlite3_bind_text(stmt, 4, (sourceID as NSString).utf8String, -1, nil)
+                                                sqlite3_bind_int(stmt, 5, Int32(index))
+                                                if sqlite3_step(stmt) == SQLITE_DONE { inserted += 1 }
                                             }
                                         }
                                         sqlite3_finalize(stmt)
+                                        if inserted == labChunks.count && inserted > 0 {
+                                            UserDefaults.standard.set(currentHash, forKey: "hal_lab_reference_hash")
+                                            print("HALDEBUG-SELFKNOWLEDGE: Lab usage reference ingested — \(inserted) chunks from \(labReference.count) chars")
+                                        } else {
+                                            print("HALDEBUG-SELFKNOWLEDGE: ERROR: stored \(inserted)/\(labChunks.count) lab chunks — leaving hash unset so next launch retries")
+                                        }
                                     }
 
                                     // MARK: - Greeting Prefix Scrubber (Layer 3 of greeting fix)
@@ -3066,25 +3144,13 @@ extension MemoryStore {
     // the caller asks the active LLM for related terms and re-runs with
     // those terms here. Semantic side is unchanged — embeddings don't
     // benefit from word expansion. Empty list = no behavior change.
-    /// Scoping for a unified-content search.
-    /// `.general` is normal RAG and HIDES Hal's self-knowledge corpora
-    /// (source_code + lab_reference) so they only enter a prompt via the
-    /// KnowledgeRouter's deliberate injection — the "one door" rule.
-    /// `.sourceType` flips to fetch ONLY that source_type, which is how the
-    /// router pulls Hal's own source-code chunks.
-    enum SearchScope: Equatable {
-        case general
-        case sourceType(String)
-    }
-
     func searchUnifiedContent(
         for query: String,
         currentConversationId: String,
         excludeTurns: [Int],
         maxResults: Int,
         tokenBudget: Int,
-        expansionTerms: [String] = [],
-        scope: SearchScope = .general
+        expansionTerms: [String] = []
     ) -> UnifiedSearchContext {
         print("HALDEBUG-SEARCH: Starting unified content search for query: '\(query.prefix(50))....'")
         print("HALDEBUG-SEARCH: Excluding turns: \(excludeTurns)")
@@ -3127,22 +3193,13 @@ extension MemoryStore {
 
         let exclusionClause = buildExclusionClause(conversationId: currentConversationId, excludeTurns: excludeTurns)
 
-        // Source-type scoping (see SearchScope). `.general` hides the
-        // self-knowledge corpora so they never appear as general RAG noise;
-        // `.sourceType` restricts to exactly one corpus. The source_type value
-        // is an internal enum-derived constant (never user input), so string
-        // interpolation here is safe. `semantic*` is unqualified (FROM
-        // unified_content, no alias); `bm25*` is `u.`-qualified for the FTS JOIN.
-        let semanticSourceClause: String
-        let bm25SourceClause: String
-        switch scope {
-        case .general:
-            semanticSourceClause = " AND source_type NOT IN ('source_code','lab_reference')"
-            bm25SourceClause = " AND u.source_type NOT IN ('source_code','lab_reference')"
-        case .sourceType(let t):
-            semanticSourceClause = " AND source_type = '\(t)'"
-            bm25SourceClause = " AND u.source_type = '\(t)'"
-        }
+        // Self-knowledge corpora (source_code + lab_reference) are ALWAYS hidden
+        // from general RAG so they only ever enter a prompt via the KnowledgeRouter's
+        // deliberate injection — the "one door" rule. Both are retrieved together by
+        // the router's BM25-only searchSelfKnowledge. `semantic*` is unqualified
+        // (FROM unified_content, no alias); `bm25*` is `u.`-qualified for the FTS JOIN.
+        let semanticSourceClause = " AND source_type NOT IN ('source_code','lab_reference')"
+        let bm25SourceClause = " AND u.source_type NOT IN ('source_code','lab_reference')"
 
         // Row metadata captured per id during retrieval, then reattached
         // to the RRF-fused result list. Keyed by `id` (TEXT PRIMARY KEY
@@ -6200,29 +6257,18 @@ struct AFMRAGGateDecision {
     var shouldSearchMemory: Bool
 }
 
-// KnowledgeRouter (2026-07-30) — the source decision that sits BESIDE the memory
-// gate. The memory gate (AFMRAGGateDecision / decideTools) decides whether to
-// search the user's personal memory; this decides whether the turn also needs one
-// of Hal's SELF-knowledge sources, and which. Modeled as a set + enum so a turn
-// can pull more than one and so new sources (a specific uploaded document, etc.)
-// drop in without reworking call sites — "like a tool call," where the model names
-// the source and deterministic retrieval fetches it (Stage 3). Deliberately
-// separate from the memory gate so the proven personal-recall path is untouched.
-enum KnowledgeSource: String, CaseIterable {
-    case architecture   // Hal's own source code (source_type = 'source_code')
-    case labTools       // how to use the Lab / command API / RoboRunner / CLI (source_type = 'lab_reference')
-}
-
-// AFM typed route decision. Two independent booleans so the single @Generable
-// call classifies both self-knowledge sources at once. MLX uses a text prompt at
-// the callsite (see decideKnowledgeSources).
+// KnowledgeRouter (2026-07-30, collapsed) — sits BESIDE the memory gate. The memory
+// gate (AFMRAGGateDecision / decideTools) decides whether to search the user's
+// PERSONAL memory; this decides only whether the turn is about HAL HIMSELF. The
+// earlier two-way "architecture vs tools" split was dropped: models drew that
+// distinction unreliably ("model switching in your code" -> tools). Now the model
+// answers one easy yes/no, and the LEXICAL match in searchSelfKnowledge does the
+// actual routing across the combined source-code + tool-docs pool. Kept separate
+// from the memory gate so the proven personal-recall path is untouched.
 @Generable
-struct AFMKnowledgeRouteDecision {
-    @Guide(description: "True if the user is asking how Hal works INTERNALLY or how he is built: his source code, algorithms or data structures, or the inner workings of his memory, RAG, search or retrieval (including terms like BM25, semantic search, embeddings, ranking, hybrid search), model handling, or any implementation detail. This is about how the machinery works — not how to operate a feature.")
-    var aboutHalArchitecture: Bool
-
-    @Guide(description: "True if the user is asking how to OPERATE Hal's hands-on developer features: the Lab screen, the local command API, writing or running RoboRunner scripts, or the hal command-line tool — commands, syntax, or steps to use them. This is about USING those features, not how they are implemented internally.")
-    var aboutUsingHalTools: Bool
+struct AFMSelfQueryDecision {
+    @Guide(description: "True if the user's message is about Hal himself: how he works, his architecture, his source code, his memory or retrieval or models, OR how to use his built-in tools (the Lab, the command API, RoboRunner scripts, the command-line tool). False for anything not about Hal's own workings or tools — general knowledge, the user's life, other topics, chit-chat.")
+    var aboutHalHimself: Bool
 }
 
 @Generable
@@ -11121,72 +11167,54 @@ class ChatViewModel: ObservableObject {
                                                                             }
                                                                         }
 
-                                                                        /// KnowledgeRouter source decision — companion to decideTools (the memory
-                                                                        /// gate), kept deliberately separate so the proven personal-recall path is
-                                                                        /// never touched. One model call classifies whether the current turn is
-                                                                        /// ABOUT Hal's own architecture and/or ABOUT how to use his tools, and
-                                                                        /// returns the set of self-knowledge sources to pull. Model-driven, not a
-                                                                        /// keyword heuristic (Mark 2026-07-30). Both backends fail safe to the empty
-                                                                        /// set, i.e. normal behavior with no extra injection.
-                                                                        ///
-                                                                        /// Note the prompt is the CURRENT question alone: unlike the memory gate,
-                                                                        /// source intent doesn't need the STM excerpt, which keeps the MLX call tiny.
-                                                                        private func decideKnowledgeSources(userInput: String) async -> Set<KnowledgeSource> {
+                                                                        /// KnowledgeRouter gate (collapsed 2026-07-30) — companion to decideTools
+                                                                        /// (the personal-memory gate), kept separate so that proven path is never
+                                                                        /// touched. ONE easy yes/no: is this turn about Hal himself (his workings OR
+                                                                        /// his tools)? We no longer ask the model the fragile "code vs tools"
+                                                                        /// question — it drew that line unreliably. When this is true, the lexical
+                                                                        /// match in searchSelfKnowledge does the actual routing across the combined
+                                                                        /// pool. Model-driven, not a keyword heuristic. Fails safe to false (no
+                                                                        /// injection, normal behavior). Prompt is the CURRENT question alone —
+                                                                        /// self-reference needs no STM excerpt, keeping the MLX call tiny.
+                                                                        private func isSelfReferentialQuestion(userInput: String) async -> Bool {
                                                                             let trimmed = userInput.trimmingCharacters(in: .whitespacesAndNewlines)
-                                                                            guard !trimmed.isEmpty else { return [] }
+                                                                            guard !trimmed.isEmpty else { return false }
 
                                                                             let question = """
-                                                                            Classify what the user's message is asking about. It may be about Hal himself.
+                                                                            Is the user's message asking about Hal HIMSELF — how he works, his architecture, his source code, his memory, retrieval, or models, OR how to use his built-in tools (the Lab, the command API, RoboRunner scripts, the command-line tool)?
 
                                                                             User message: "\(trimmed)"
 
-                                                                            Decide two independent things:
-                                                                            - ARCHITECTURE: is the user asking how Hal works INTERNALLY or how he is built — his source code, algorithms, or the inner workings of his memory, RAG, search or retrieval (including terms like BM25, semantic search, embeddings, ranking, hybrid search), model handling, or any implementation detail? This is about how the machinery works.
-                                                                            - TOOLS: is the user asking how to OPERATE Hal's hands-on developer features — the Lab, the local command API, writing or running RoboRunner scripts, or the command-line tool (commands, syntax, steps)? This is about USING those features, not how they are built.
+                                                                            Answer YES if it is about Hal's own workings or his tools. Answer NO for anything else — general knowledge, the user's own life, other topics, or chit-chat.
                                                                             """
 
                                                                             let routeStart = Date()
                                                                             do {
+                                                                                let aboutHal: Bool
                                                                                 if selectedModel.source == .appleFoundation {
                                                                                     let decision = try await llmService.generateStructuredOnAFM(
                                                                                         prompt: question,
-                                                                                        instructions: "You are a fast classifier deciding which of Hal's self-knowledge sources a question needs.",
-                                                                                        type: AFMKnowledgeRouteDecision.self,
+                                                                                        instructions: "You classify whether a question is about Hal himself — his workings or his tools.",
+                                                                                        type: AFMSelfQueryDecision.self,
                                                                                         temperature: 0.1
                                                                                     )
-                                                                                    var sources: Set<KnowledgeSource> = []
-                                                                                    if decision.aboutHalArchitecture { sources.insert(.architecture) }
-                                                                                    if decision.aboutUsingHalTools { sources.insert(.labTools) }
-                                                                                    halLog("HALDEBUG-ROUTER: knowledge sources (AFM) = \(sources.map { $0.rawValue }.sorted()) in \(Int(Date().timeIntervalSince(routeStart) * 1000))ms")
-                                                                                    return sources
+                                                                                    aboutHal = decision.aboutHalHimself
                                                                                 } else {
-                                                                                    let mlxPrompt = question + "\n\nReply with a comma-separated list of ALL that apply from exactly these tokens: ARCHITECTURE, TOOLS, NONE. Output only the tokens, nothing else."
+                                                                                    let mlxPrompt = mlxGatePromptAugmentation(modelID: selectedModel.id, base: question + "\n\nAnswer only YES or NO.")
                                                                                     let response = try await llmService.generateChatResponse(
                                                                                         messages: [
-                                                                                            .system("You are a fast classifier. Output only tokens from the allowed set, comma-separated, nothing else."),
+                                                                                            .system("You are a fast YES/NO classifier. Respond with only the single word YES or NO — no punctuation, no explanation."),
                                                                                             .user(mlxPrompt)
                                                                                         ],
                                                                                         temperature: 0.1
                                                                                     )
-                                                                                    // Scan only the model's LAST non-empty line for tokens, so an
-                                                                                    // echoed prompt (small models sometimes repeat the instructions,
-                                                                                    // which themselves contain the token words) can't cause a false
-                                                                                    // positive. A false positive is only a harmless extra section;
-                                                                                    // a false negative just misses the feature — both fail soft.
-                                                                                    let answerLine = response
-                                                                                        .split(separator: "\n", omittingEmptySubsequences: true)
-                                                                                        .last
-                                                                                        .map(String.init)?
-                                                                                        .uppercased() ?? ""
-                                                                                    var sources: Set<KnowledgeSource> = []
-                                                                                    if answerLine.contains("ARCHITECTURE") { sources.insert(.architecture) }
-                                                                                    if answerLine.contains("TOOLS") { sources.insert(.labTools) }
-                                                                                    halLog("HALDEBUG-ROUTER: knowledge sources (MLX) = \(sources.map { $0.rawValue }.sorted()) [answer: \(answerLine.prefix(40))] in \(Int(Date().timeIntervalSince(routeStart) * 1000))ms")
-                                                                                    return sources
+                                                                                    aboutHal = response.trimmingCharacters(in: .whitespacesAndNewlines).uppercased().hasPrefix("YES")
                                                                                 }
+                                                                                halLog("HALDEBUG-ROUTER: self-referential = \(aboutHal) in \(Int(Date().timeIntervalSince(routeStart) * 1000))ms")
+                                                                                return aboutHal
                                                                             } catch {
-                                                                                halLog("HALDEBUG-ROUTER: knowledge-source classification failed — \(error.localizedDescription); defaulting to none")
-                                                                                return []
+                                                                                halLog("HALDEBUG-ROUTER: self-reference classification failed — \(error.localizedDescription); defaulting to false")
+                                                                                return false
                                                                             }
                                                                         }
 
@@ -11638,7 +11666,15 @@ class ChatViewModel: ObservableObject {
                                                                             // for speed and stability — see decideTools comments). executeTools
                                                                             // runs the memory search and returns up to 10 snippets within the
                                                                             // model's RAG token budget.
-                                                                            if !currentInput.isEmpty && !isolated {
+                                                                            // SELF-REFERENCE HELP MODE (2026-07-30). Decide ONCE, up front, whether
+                                                                            // this turn is about Hal himself. If so we take a different path: skip
+                                                                            // the personal-memory RAG entirely (it is noise for a self-question and
+                                                                            // it was crowding the window) and dedicate the freed space to Hal's own
+                                                                            // source/docs. A mode with intent — Hal clearing the table to focus on
+                                                                            // himself — not a blind both-piles injection.
+                                                                            let helpMode = (!currentInput.isEmpty && !isolated) ? await isSelfReferentialQuestion(userInput: currentInput) : false
+
+                                                                            if !currentInput.isEmpty && !isolated && !helpMode {
                                                                                 let toolDecision = await decideTools(userInput: currentInput)
                                                                                 let shortTermTurns = getShortTermTurns(currentTurns: countCompletedTurns())
                                                                                 let toolResults = await executeTools(
@@ -11674,73 +11710,64 @@ class ChatViewModel: ObservableObject {
                                                                                 }
                                                                             }
 
-                                                                            // STEP 4b: KnowledgeRouter — inject Hal's OWN knowledge sources on
-                                                                            // demand. Separate from the memory gate above so the proven personal-
-                                                                            // recall path is untouched. decideKnowledgeSources names which of Hal's
-                                                                            // corpora the turn needs; each is then fetched DETERMINISTICALLY:
-                                                                            // source_code via a scoped hybrid search (top-K of the 672 chunks), the
-                                                                            // Lab guide as one whole small document. Both are excluded from general
-                                                                            // RAG (SearchScope.general), so this is their ONLY door into a prompt —
-                                                                            // no double injection. This is the fix for Hal confabulating his own
-                                                                            // code / Lab usage instead of reading it (2026-07-29/30, Maxim #2).
-                                                                            if !currentInput.isEmpty && !isolated {
-                                                                                let sources = await decideKnowledgeSources(userInput: currentInput)
-
-                                                                                if sources.contains(.architecture) {
-                                                                                    // Give RETRIEVAL a generous budget so it actually returns the
-                                                                                    // top chunks: a single ~750-token code chunk exceeds AFM's tiny
-                                                                                    // ~614-token RAG budget, which made the search skip every
-                                                                                    // candidate and return nothing. truncateToBudget below then does
-                                                                                    // the real model-fit cap (on AFM that's ~the single most relevant
-                                                                                    // chunk, head-kept; on big-window models, all of them).
-                                                                                    let codeCtx = memoryStore.searchUnifiedContent(
-                                                                                        for: currentInput,
-                                                                                        currentConversationId: conversationId,
-                                                                                        excludeTurns: [],
-                                                                                        maxResults: 6,
-                                                                                        tokenBudget: max(limits.maxRagTokens, 12000),
-                                                                                        scope: .sourceType("source_code")
-                                                                                    )
-                                                                                    let codeSnippets = codeCtx.snippets
-                                                                                    if !codeSnippets.isEmpty {
-                                                                                        var lines: [String] = []
-                                                                                        for (idx, s) in codeSnippets.enumerated() {
-                                                                                            lines.append("[\(idx + 1)] \(s.content)")
-                                                                                        }
-                                                                                        let raw = "Excerpts from your own source code (Hal_Source.txt), retrieved because the user is asking how you work. Explain from THIS, your real implementation — do not invent or guess code:\n\n\(lines.joined(separator: "\n\n"))"
-                                                                                        // Head-truncate to budget rather than summarize. Running code
-                                                                                        // through the LLM summarizer is both lossy (it paraphrases the
-                                                                                        // implementation into vague prose) and slow (~20s on AFM), which
-                                                                                        // defeats the point — the model must see the REAL code. Chunks are
-                                                                                        // relevance-ordered, so the head is the best material to keep.
-                                                                                        contextSections.append(truncateToBudget(raw, maxChars: limits.tokensToChars(limits.maxRagTokens)))
-                                                                                        halLog("HALDEBUG-ROUTER: injected \(codeSnippets.count) source_code chunk(s) for an architecture question")
-                                                                                    } else {
-                                                                                        halLog("HALDEBUG-ROUTER: architecture asked but scoped source_code search returned nothing")
+                                                                            // STEP 4b: KnowledgeRouter (collapsed) — inject Hal's OWN self-knowledge
+                                                                            // on demand. Separate from the memory gate above so the proven personal-
+                                                                            // recall path is untouched. The model answers ONE easy question — "is
+                                                                            // this about Hal himself?" — and if so, a single BM25 search over the
+                                                                            // combined source-code + tool-docs pool does the actual routing by
+                                                                            // lexical match (searchSelfKnowledge). Both corpora are excluded from
+                                                                            // general RAG, so this is their ONLY door into a prompt — no double
+                                                                            // injection. This is the fix for Hal confabulating his own code / Lab
+                                                                            // usage instead of reading it (2026-07-29/30, Maxim #2).
+                                                                            // STEP 4b: SELF-REFERENCE HELP MODE injection. Runs INSTEAD of the
+                                                                            // personal-memory RAG above (which was gated off for helpMode). The
+                                                                            // model already decided "this is about Hal"; a BM25 search over Hal's
+                                                                            // own source + tool docs surfaces the relevant material, and here we
+                                                                            // dedicate the window to it. This is the fix for Hal confabulating his
+                                                                            // own code / Lab usage instead of reading it (2026-07-29/30, Maxim #2).
+                                                                            var selfKnowledgeGuidance = false
+                                                                            if helpMode {
+                                                                                // Personal RAG was skipped, so its budget is free: give the
+                                                                                // self-knowledge injection a much larger cap (up to ~3/4 of the
+                                                                                // prompt allocation) so the FULL relevant section fits even on
+                                                                                // AFM's tiny 4K window, where the old maxRag-sized slice held only
+                                                                                // the guide's intro and the RoboRunner grammar fell off the end.
+                                                                                let helpBudget = max(limits.maxRagTokens, (limits.maxPromptTokens * 3) / 4)
+                                                                                let chunks = memoryStore.searchSelfKnowledge(query: currentInput, maxResults: 6)
+                                                                                if !chunks.isEmpty {
+                                                                                    var lines: [String] = []
+                                                                                    for (idx, c) in chunks.enumerated() {
+                                                                                        lines.append("[\(idx + 1)] \(c)")
                                                                                     }
+                                                                                    let raw = "Relevant material from your own source code and tool documentation, retrieved because the user is asking about you. Explain from THIS — your real implementation and docs — and do not invent code, commands, or features that are not here:\n\n\(lines.joined(separator: "\n\n"))"
+                                                                                    // Head-truncate, never summarize (lossy + slow); chunks are
+                                                                                    // BM25-ranked so the head is the best material to keep.
+                                                                                    contextSections.append(truncateToBudget(raw, maxChars: limits.tokensToChars(helpBudget)))
+                                                                                    halLog("HALDEBUG-ROUTER: help mode — injected \(chunks.count) self-knowledge chunk(s), budget \(helpBudget) tok")
+                                                                                } else {
+                                                                                    halLog("HALDEBUG-ROUTER: help mode but self-knowledge search returned nothing")
                                                                                 }
-
-                                                                                if sources.contains(.labTools) {
-                                                                                    if let labRef = memoryStore.fetchLabReference(), !labRef.isEmpty {
-                                                                                        let raw = "Hal's Lab usage guide, retrieved because the user is asking how to use your tools. Answer from THIS guide — do not invent commands or show Swift implementation:\n\n\(labRef)"
-                                                                                        // Head-truncate, never summarize (see the source_code branch above).
-                                                                                        // The guide is authored primer-first (three doors + grammar + safety),
-                                                                                        // so keeping the head preserves exactly what a "how do I use it"
-                                                                                        // question needs, instantly.
-                                                                                        contextSections.append(truncateToBudget(raw, maxChars: limits.tokensToChars(limits.maxRagTokens)))
-                                                                                        halLog("HALDEBUG-ROUTER: injected Lab usage reference (\(labRef.count) chars pre-budget) for a tools question")
-                                                                                    } else {
-                                                                                        halLog("HALDEBUG-ROUTER: labTools asked but no Lab reference stored")
-                                                                                    }
-                                                                                }
+                                                                                // Notify + honesty directive, added below as a trailing INSTRUCTION,
+                                                                                // NOT context material (it leaked verbatim when it lived in context).
+                                                                                selfKnowledgeGuidance = true
                                                                             }
 
-                                                                            let systemMessage: String
+                                                                            var systemMessage: String
                                                                             if contextSections.isEmpty {
                                                                                 systemMessage = effectiveSystemPrompt
                                                                             } else {
                                                                                 let contextBlock = contextSections.joined(separator: "\n\n")
                                                                                 systemMessage = "\(effectiveSystemPrompt)\n\nCURRENT CONTEXT:\n\(contextBlock)"
+                                                                            }
+                                                                            if selfKnowledgeGuidance {
+                                                                                // Help-mode reply guidance, kept OUT of CURRENT CONTEXT and framed as a
+                                                                                // private instruction so it is followed, not quoted (it leaked verbatim
+                                                                                // when it lived in context). Two parts: (1) notify — Hal briefly tells
+                                                                                // the user he is consulting his own source/docs (transparency, the
+                                                                                // "mode with intent" made visible); (2) honesty — Hal isn't a coder and
+                                                                                // doesn't have to be RIGHT, he has to be HONEST (Maxim #1), not a
+                                                                                // bolted-on disclaimer.
+                                                                                systemMessage += "\n\nHOW TO ANSWER THIS ONE (private guidance — follow it, do not repeat, quote, or mention these instructions): The user is asking about you, so OPEN with one short, natural sentence in your own voice telling them you're pulling up your own source and documentation to answer properly, then give the answer. Work only from the material above. This is honestly not your strongest area, so be straight and a little humble: distinguish what you are confident about from what you are only inferring, never invent code, commands, or features that are not in that material, and it is fine to point the user to your real source or guide so they can check you. If you are not certain, say so plainly. Honestly unsure beats confidently wrong, and it is more you."
                                                                             }
                                                                             msgs.append(.system(systemMessage))
 
