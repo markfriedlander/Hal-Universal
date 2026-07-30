@@ -505,7 +505,9 @@ enum CommandCategory: String, CaseIterable {
 }
 
 /// One command's public description. `destructive` drives the Lab safety layer.
-struct CommandDescriptor: Identifiable {
+/// `nonisolated` (pure value type) so `CommandCatalog`'s nonisolated formatters
+/// can read `usage`/`summary` without a main-actor hop.
+nonisolated struct CommandDescriptor: Identifiable {
     let verb: String
     let args: String?
     let summary: String
@@ -519,7 +521,13 @@ struct CommandDescriptor: Identifiable {
     var usage: String { args.map { "\(verb):\($0)" } ?? verb }
 }
 
-enum CommandCatalog {
+// `nonisolated` because this is pure data + formatting with no @MainActor state
+// (its one mutable field, `mode`, is already `nonisolated(unsafe)`). Under the
+// project's main-actor-by-default isolation the members would otherwise be
+// inferred @MainActor, which warned when the nonisolated self-knowledge ingest
+// (enableLabReferenceAccess) called helpText(). This matches the documented
+// intent above: "usable from any actor."
+nonisolated enum CommandCatalog {
 
     static let all: [CommandDescriptor] = [
         // Models & Downloads

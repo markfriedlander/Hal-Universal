@@ -1901,6 +1901,17 @@ class MemoryStore: ObservableObject {
                                         // If content unchanged AND data exists in DB, skip re-ingestion
                                         if currentHash == storedHash && storedHash != 0 && sourceDataExists {
                                             print("HALDEBUG-SELFKNOWLEDGE: Source code unchanged, Hal's self-knowledge is current")
+                                            // Chunks are already ingested — but still make sure their
+                                            // semantic vectors are filled. The embed pass is resumable and
+                                            // self-guarding, so if a PRIOR launch's pass was interrupted
+                                            // (app backgrounded mid-pass, or first-launch embedder-asset
+                                            // download), this launch finishes it. Costs one COUNT when
+                                            // there is nothing left to embed. This spawn must live OUTSIDE
+                                            // the re-ingest path so it runs on ordinary launches too.
+                                            let storeRef = self
+                                            Task.detached(priority: .utility) {
+                                                storeRef.ensureSourceCodeEmbeddings()
+                                            }
                                             return
                                         }
                                         if !sourceDataExists {
@@ -1910,61 +1921,223 @@ class MemoryStore: ObservableObject {
                                         // Content has changed - refresh Hal's self-knowledge
                                         print("HALDEBUG-SELFKNOWLEDGE: Source code updated, refreshing Hal's self-knowledge...")
                                         
-                                        // Delete old source code entries to prevent duplicates
+                                        // Delete old source-code rows to prevent duplicates. The FTS
+                                        // mirror is kept in sync by the AFTER DELETE trigger.
                                         var stmt: OpaquePointer?
                                         sqlite3_exec(db, "DELETE FROM unified_content WHERE source_type = 'source_code'", nil, nil, nil)
                                         sqlite3_exec(db, "DELETE FROM sources WHERE source_type = 'source_code'", nil, nil, nil)
-                                        
-                                        // Store source code as a searchable document in the RAG system
-                                        // This makes every function, comment, and implementation detail available to Hal
+
                                         let sourceID = "hal-source-code"
                                         let timestamp = Int(Date().timeIntervalSince1970)
-                                        
-                                        // Create source entry in the sources table (metadata about this document)
-                                        // Display name "My Architecture" - this is how Hal will see it when searching his memory
+
+                                        // Split the source into retrieval-sized, self-describing chunks.
+                                        // The old single-blob ingestion (2026-05) was inert: one ~1.9 MB
+                                        // row no embedder could represent, excluded from both retrieval
+                                        // passes — so Hal could never actually FIND his own code and
+                                        // confabulated it instead (2026-07-30). Chunking on the file's own
+                                        // FILE/LEGO boundaries makes each piece embeddable AND lexically
+                                        // searchable, finally delivering Maxim #2 (access to reflection).
+                                        let chunks = chunkSourceCode(sourceCode)
+
+                                        // sources row: total_chunks now reflects the real chunk count.
                                         let sourceInsertSQL = """
-                                        INSERT OR REPLACE INTO sources 
+                                        INSERT OR REPLACE INTO sources
                                         (id, source_type, display_name, created_at, last_updated, total_chunks, file_size)
-                                        VALUES (?, 'source_code', 'Hal.swift - My Architecture', ?, ?, 1, ?)
+                                        VALUES (?, 'source_code', 'Hal.swift - My Architecture', ?, ?, ?, ?)
                                         """
-                                        
                                         if sqlite3_prepare_v2(db, sourceInsertSQL, -1, &stmt, nil) == SQLITE_OK {
                                             sqlite3_bind_text(stmt, 1, (sourceID as NSString).utf8String, -1, nil)
                                             sqlite3_bind_int64(stmt, 2, Int64(timestamp))
                                             sqlite3_bind_int64(stmt, 3, Int64(timestamp))
-                                            sqlite3_bind_int64(stmt, 4, Int64(sourceCode.count))
+                                            sqlite3_bind_int(stmt, 4, Int32(chunks.count))
+                                            sqlite3_bind_int64(stmt, 5, Int64(sourceCode.count))
                                             sqlite3_step(stmt)
                                         }
                                         sqlite3_finalize(stmt)
-                                        
-                                        // Store full source code in unified_content table (the actual searchable text)
-                                        // Once this completes, Hal can search his memories and find function definitions,
-                                        // LEGO block comments, and understand his own implementation
-                                        // position=0 because source code is stored as a single chunk (not split up)
+
+                                        // Insert each chunk as its own row (position = chunk index). Bare
+                                        // INSERT with no embedding keeps launch fast: the AFTER INSERT
+                                        // trigger makes every chunk BM25-searchable immediately, and
+                                        // ensureSourceCodeEmbeddings() fills the semantic vectors in the
+                                        // background right after. Hundreds of chunks, no UI stall.
                                         let contentInsertSQL = """
                                         INSERT OR REPLACE INTO unified_content
                                         (id, content, timestamp, source_type, source_id, position, is_from_user)
-                                        VALUES (?, ?, ?, 'source_code', ?, 0, 0)
+                                        VALUES (?, ?, ?, 'source_code', ?, ?, 0)
                                         """
-                                        
+                                        var inserted = 0
                                         if sqlite3_prepare_v2(db, contentInsertSQL, -1, &stmt, nil) == SQLITE_OK {
-                                            let contentID = UUID().uuidString
-                                            sqlite3_bind_text(stmt, 1, (contentID as NSString).utf8String, -1, nil)
-                                            sqlite3_bind_text(stmt, 2, (sourceCode as NSString).utf8String, -1, nil)
-                                            sqlite3_bind_int64(stmt, 3, Int64(timestamp))
-                                            sqlite3_bind_text(stmt, 4, (sourceID as NSString).utf8String, -1, nil)
-                                            
-                                            if sqlite3_step(stmt) == SQLITE_DONE {
-                                                print("HALDEBUG-SELFKNOWLEDGE: Hal can now read his own source code (\(sourceCode.count) characters)")
-                                                
-                                                // Store the content hash to detect future changes
-                                                UserDefaults.standard.set(currentHash, forKey: "hal_source_hash")
-                                            } else {
-                                                let errorMessage = String(cString: sqlite3_errmsg(db))
-                                                print("HALDEBUG-SELFKNOWLEDGE: ERROR: Failed to store source code: \(errorMessage)")
+                                            for (index, chunk) in chunks.enumerated() {
+                                                sqlite3_reset(stmt)
+                                                sqlite3_clear_bindings(stmt)
+                                                let contentID = UUID().uuidString as NSString
+                                                let chunkNS = chunk as NSString
+                                                sqlite3_bind_text(stmt, 1, contentID.utf8String, -1, nil)
+                                                sqlite3_bind_text(stmt, 2, chunkNS.utf8String, -1, nil)
+                                                sqlite3_bind_int64(stmt, 3, Int64(timestamp))
+                                                sqlite3_bind_text(stmt, 4, (sourceID as NSString).utf8String, -1, nil)
+                                                sqlite3_bind_int(stmt, 5, Int32(index))
+                                                if sqlite3_step(stmt) == SQLITE_DONE {
+                                                    inserted += 1
+                                                } else {
+                                                    let errorMessage = String(cString: sqlite3_errmsg(db))
+                                                    print("HALDEBUG-SELFKNOWLEDGE: ERROR storing source chunk \(index): \(errorMessage)")
+                                                }
                                             }
                                         }
                                         sqlite3_finalize(stmt)
+
+                                        if inserted == chunks.count && inserted > 0 {
+                                            // Only record the hash once every chunk landed, so an
+                                            // interrupted ingest retries cleanly on the next launch.
+                                            UserDefaults.standard.set(currentHash, forKey: "hal_source_hash")
+                                            print("HALDEBUG-SELFKNOWLEDGE: Hal can now read his own source — \(inserted) chunks from \(sourceCode.count) characters")
+                                        } else {
+                                            print("HALDEBUG-SELFKNOWLEDGE: ERROR: stored \(inserted)/\(chunks.count) source chunks — leaving hash unset so next launch retries")
+                                        }
+
+                                        // Fill semantic vectors in the background (idempotent + resumable;
+                                        // see ensureSourceCodeEmbeddings). BM25 already works via the FTS
+                                        // trigger, so retrieval is live even before this completes.
+                                        let storeRef = self
+                                        Task.detached(priority: .utility) {
+                                            storeRef.ensureSourceCodeEmbeddings()
+                                        }
+                                    }
+
+                                    // Split the concatenated source into retrieval-sized, self-describing
+                                    // chunks. Boundaries follow the file's own structure — the
+                                    // `// ==== FILE: X ====` and `// ==== LEGO START: N Name ====` markers
+                                    // that scripts/sync_hal_source.sh emits — so each chunk knows exactly
+                                    // where in Hal it came from. Any block bigger than maxChunkChars is
+                                    // split at line boundaries so no chunk exceeds what an embedder can
+                                    // represent. The provenance header is part of the stored text, so a
+                                    // retrieved snippet is self-labelling when injected into a prompt.
+                                    nonisolated private func chunkSourceCode(_ source: String) -> [String] {
+                                        let maxChunkChars = 3000
+                                        var chunks: [String] = []
+                                        var currentFile = "Hal.swift"
+                                        var currentBlock = "file header"
+                                        var buffer: [String] = []
+
+                                        func flush() {
+                                            let body = buffer.joined(separator: "\n").trimmingCharacters(in: .whitespacesAndNewlines)
+                                            buffer.removeAll(keepingCapacity: true)
+                                            guard !body.isEmpty else { return }
+                                            // Break the block body into <= maxChunkChars pieces on line
+                                            // boundaries (never mid-line), so code stays readable.
+                                            var pieces: [String] = []
+                                            var pieceLines: [String] = []
+                                            var pieceLen = 0
+                                            for line in body.components(separatedBy: "\n") {
+                                                if pieceLen + line.count + 1 > maxChunkChars && !pieceLines.isEmpty {
+                                                    pieces.append(pieceLines.joined(separator: "\n"))
+                                                    pieceLines.removeAll(keepingCapacity: true)
+                                                    pieceLen = 0
+                                                }
+                                                pieceLines.append(line)
+                                                pieceLen += line.count + 1
+                                            }
+                                            if !pieceLines.isEmpty { pieces.append(pieceLines.joined(separator: "\n")) }
+                                            let total = pieces.count
+                                            for (i, piece) in pieces.enumerated() {
+                                                let partTag = total > 1 ? " | part \(i + 1)/\(total)" : ""
+                                                let header = "[Hal source | FILE: \(currentFile) | \(currentBlock)\(partTag)]"
+                                                chunks.append(header + "\n" + piece)
+                                            }
+                                        }
+
+                                        for line in source.components(separatedBy: "\n") {
+                                            if line.hasPrefix("// ==== FILE: ") {
+                                                flush()
+                                                currentFile = line
+                                                    .replacingOccurrences(of: "// ==== FILE: ", with: "")
+                                                    .replacingOccurrences(of: " ====", with: "")
+                                                    .trimmingCharacters(in: .whitespaces)
+                                                currentBlock = "file header"
+                                                continue
+                                            }
+                                            if line.hasPrefix("// ==== LEGO START: ") {
+                                                flush()
+                                                currentBlock = "LEGO " + line
+                                                    .replacingOccurrences(of: "// ==== LEGO START: ", with: "")
+                                                    .replacingOccurrences(of: " ====", with: "")
+                                                    .trimmingCharacters(in: .whitespaces)
+                                                continue
+                                            }
+                                            buffer.append(line)
+                                        }
+                                        flush()
+                                        return chunks
+                                    }
+
+                                    // Background pass that fills the ACTIVE embedder's vector column for
+                                    // any source_code chunk still missing it — after a fresh ingest, a
+                                    // backend switch, or an interrupted prior pass. Idempotent and
+                                    // resumable: it self-guards with a COUNT, so an ordinary launch (all
+                                    // chunks already embedded) costs one query and returns. Runs off the
+                                    // main thread via Task.detached; BM25 retrieval already works without
+                                    // it, so semantic search simply sharpens once this completes.
+                                    nonisolated private func ensureSourceCodeEmbeddings() {
+                                        guard ensureHealthyConnection() else { return }
+                                        let backend = EmbeddingBackend.current()
+                                        let col = backend.vectorColumn
+
+                                        var pending = 0
+                                        var countStmt: OpaquePointer?
+                                        if sqlite3_prepare_v2(db, "SELECT COUNT(*) FROM unified_content WHERE source_type = 'source_code' AND \(col) IS NULL;", -1, &countStmt, nil) == SQLITE_OK {
+                                            if sqlite3_step(countStmt) == SQLITE_ROW { pending = Int(sqlite3_column_int(countStmt, 0)) }
+                                        }
+                                        sqlite3_finalize(countStmt)
+                                        guard pending > 0 else { return }
+                                        halLog("HALDEBUG-SELFKNOWLEDGE: embedding \(pending) source_code chunk(s) into \(col) in background")
+
+                                        // Make sure the embedder is loaded before we embed (mirrors the
+                                        // EmbedderMigrationCoordinator warm-up wait; capped so a bad load
+                                        // can't hang the pass — chunks stay BM25-only until a later launch
+                                        // retries).
+                                        if !EmbeddingProvider.shared.isLoaded {
+                                            EmbeddingProvider.shared.warmUp()
+                                            let deadline = Date().addingTimeInterval(60)
+                                            while !EmbeddingProvider.shared.isLoaded {
+                                                if Date() > deadline {
+                                                    halLog("HALDEBUG-SELFKNOWLEDGE: embedder not ready in 60s — source_code stays BM25-only for now")
+                                                    return
+                                                }
+                                                Thread.sleep(forTimeInterval: 0.25)
+                                            }
+                                        }
+
+                                        var rows: [(id: String, content: String)] = []
+                                        var sel: OpaquePointer?
+                                        if sqlite3_prepare_v2(db, "SELECT id, content FROM unified_content WHERE source_type = 'source_code' AND \(col) IS NULL;", -1, &sel, nil) == SQLITE_OK {
+                                            while sqlite3_step(sel) == SQLITE_ROW {
+                                                let id = String(cString: sqlite3_column_text(sel, 0))
+                                                let content = String(cString: sqlite3_column_text(sel, 1))
+                                                rows.append((id, content))
+                                            }
+                                        }
+                                        sqlite3_finalize(sel)
+
+                                        let updateSQL = "UPDATE unified_content SET \(col) = ? WHERE id = ?;"
+                                        var upd: OpaquePointer?
+                                        guard sqlite3_prepare_v2(db, updateSQL, -1, &upd, nil) == SQLITE_OK else { return }
+                                        var filled = 0
+                                        for row in rows {
+                                            let vector = EmbeddingProvider.shared.embed(row.content, as: .document, in: backend) ?? []
+                                            guard !vector.isEmpty else { continue }
+                                            let bytes = vector.withUnsafeBufferPointer { Data(buffer: $0) }
+                                            sqlite3_reset(upd)
+                                            sqlite3_clear_bindings(upd)
+                                            _ = bytes.withUnsafeBytes { rawBuf in
+                                                sqlite3_bind_blob(upd, 1, rawBuf.baseAddress, Int32(bytes.count), nil)
+                                            }
+                                            let idNS = row.id as NSString
+                                            sqlite3_bind_text(upd, 2, idNS.utf8String, -1, nil)
+                                            if sqlite3_step(upd) == SQLITE_DONE { filled += 1 }
+                                        }
+                                        sqlite3_finalize(upd)
+                                        halLog("HALDEBUG-SELFKNOWLEDGE: source_code embedding pass done — filled \(filled)/\(rows.count) into \(col)")
                                     }
 
                                     // Curated USAGE guide for the Lab (API / RoboRunner / hal CLI), ingested as its
@@ -32177,7 +32350,9 @@ enum CommandCategory: String, CaseIterable {
 }
 
 /// One command's public description. `destructive` drives the Lab safety layer.
-struct CommandDescriptor: Identifiable {
+/// `nonisolated` (pure value type) so `CommandCatalog`'s nonisolated formatters
+/// can read `usage`/`summary` without a main-actor hop.
+nonisolated struct CommandDescriptor: Identifiable {
     let verb: String
     let args: String?
     let summary: String
@@ -32191,7 +32366,13 @@ struct CommandDescriptor: Identifiable {
     var usage: String { args.map { "\(verb):\($0)" } ?? verb }
 }
 
-enum CommandCatalog {
+// `nonisolated` because this is pure data + formatting with no @MainActor state
+// (its one mutable field, `mode`, is already `nonisolated(unsafe)`). Under the
+// project's main-actor-by-default isolation the members would otherwise be
+// inferred @MainActor, which warned when the nonisolated self-knowledge ingest
+// (enableLabReferenceAccess) called helpText(). This matches the documented
+// intent above: "usable from any actor."
+nonisolated enum CommandCatalog {
 
     static let all: [CommandDescriptor] = [
         // Models & Downloads
