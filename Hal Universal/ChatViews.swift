@@ -896,7 +896,7 @@ private struct ThinkingDisclosure: View {
         } label: {
             HStack(spacing: 6) {
                 Image(systemName: "brain")
-                Text(isStreaming ? "Thinking…" : "Reasoning")
+                Text(isStreaming ? "Thinking…" : "Thinking")
                 if isStreaming {
                     ProgressView().scaleEffect(0.7)
                 }
@@ -943,7 +943,7 @@ struct ReasoningPopover: View {
 
     private var title: String {
         if unavailableInSalon { return "Thinking off in Salon Mode" }
-        return isOn ? "Reasoning on" : "Reasoning off"
+        return isOn ? "Thinking on" : "Thinking off"
     }
 
     private var explanation: String {
@@ -951,9 +951,9 @@ struct ReasoningPopover: View {
             return "Watching Hal think runs one model through a reason-then-answer pass. Thinking is only available in single LLM mode. Switch back to a single model to turn it on."
         }
         if isOn {
-            return "\(modelName) will think each answer through first. You'll see its reasoning stream into a panel above the reply, then the answer beneath. It's slower and more deliberate. Tap the brain again to switch back to direct replies."
+            return "\(modelName) will think each answer through first. You'll see its thinking stream into a panel above the reply, then the answer beneath. It's slower and more deliberate. Tap the brain again to switch back to direct replies."
         } else {
-            return "\(modelName) answers directly, with no visible reasoning. Tap the brain whenever you want to watch it think a question through before it replies."
+            return "\(modelName) answers directly, with no visible thinking. Tap the brain whenever you want to watch it think a question through before it replies."
         }
     }
 }
@@ -964,7 +964,9 @@ struct ReasoningPopover: View {
 // PrivacyLockPopover. Only shown above nominal (the glyph hides at level 0), so the
 // text describes fair/serious/critical; a nominal fallback is kept for safety. Each
 // line states what the ThermalGovernor (Block 61) actually does at that level, so
-// the explanation is honest, not decorative. Copy approved by Mark 2026-07-23.
+// the explanation is honest, not decorative. Copy approved by Mark 2026-07-23;
+// "phone" changed to the neutral "device" 2026-07-29 so it reads right on iPad
+// and Mac too, the sentences are otherwise unchanged.
 struct ThermalIndicatorPopover: View {
     let level: Int
 
@@ -994,13 +996,13 @@ struct ThermalIndicatorPopover: View {
     private var explanation: String {
         switch level {
         case 1:
-            return "Your phone is warming up. Hal is easing off slightly to slow the climb."
+            return "Your device is warming up. Hal is easing off slightly to slow the climb."
         case 2:
-            return "Your phone is hot. Hal is slowing down to let it cool."
+            return "Your device is hot. Hal is slowing down to let it cool."
         case 3:
-            return "Your phone is very hot. Hal is pausing until it cools."
+            return "Your device is very hot. Hal is pausing until it cools."
         default:
-            return "Your phone is running cool."
+            return "Your device is running cool."
         }
     }
 }

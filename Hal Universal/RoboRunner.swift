@@ -542,9 +542,9 @@ enum CommandCatalog {
         CommandDescriptor(verb: "RESET_THREAD", args: nil, summary: "Reset the current thread, clearing the active conversation.", category: .conversation, destructive: true),
         CommandDescriptor(verb: "GET_THREADS", args: nil, summary: "List conversation threads.", category: .conversation, destructive: false),
         CommandDescriptor(verb: "SWITCH_THREAD", args: "<threadID>", summary: "Switch to an existing conversation thread.", category: .conversation, destructive: false),
-        CommandDescriptor(verb: "GET_MESSAGES", args: nil, summary: "Return the persisted messages of the current thread from the database.", category: .conversation, destructive: false),
-        CommandDescriptor(verb: "GET_RENDERED_MESSAGES", args: nil, summary: "Return the in-memory chat messages as shown, truncated.", category: .conversation, destructive: false),
-        CommandDescriptor(verb: "GET_RENDERED_MESSAGES_FULL", args: nil, summary: "Return the in-memory chat messages with full, untruncated content.", category: .conversation, destructive: false),
+        CommandDescriptor(verb: "GET_MESSAGES", args: nil, summary: "Return the current thread's messages, full content. Add :preview for a 500-char cap.", category: .conversation, destructive: false),
+        CommandDescriptor(verb: "GET_RENDERED_MESSAGES", args: nil, summary: "Return the in-memory chat messages as shown, full content. Add :preview for a 500-char cap.", category: .conversation, destructive: false),
+        CommandDescriptor(verb: "GET_RENDERED_MESSAGES_FULL", args: nil, summary: "Alias of GET_RENDERED_MESSAGES (kept for older scripts); full content.", category: .conversation, destructive: false),
         CommandDescriptor(verb: "EXPORT_THREAD", args: nil, summary: "Export the current thread as text.", category: .conversation, destructive: false),
 
         // System Prompt

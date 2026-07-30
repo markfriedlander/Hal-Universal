@@ -1098,13 +1098,19 @@ class HalTestConsole: ObservableObject {
             writeStateJSON(vm: vm)
             return "{\"status\":\"ok\",\"command\":\"SWITCH_THREAD\",\"conversationId\":\"\(threadID)\",\"messageCount\":\(vm.messages.count)}"
 
-        } else if trimmed == "GET_MESSAGES" {
+        } else if trimmed == "GET_MESSAGES" || trimmed == "GET_MESSAGES:preview" {
+            // Full content by DEFAULT (2026-07-29): the antenna should hand back the
+            // real message, not a clipped one, so a caller never has to guess whether
+            // it's seeing everything. `GET_MESSAGES:preview` keeps the old cheap
+            // 500-char cap for quick observability. `apiPreviewCapChars` = 500.
+            let preview = (trimmed == "GET_MESSAGES:preview")
             let msgs = vm.messages.filter { !$0.isPartial }
             let entries = msgs.map { m -> String in
                 let role = m.isFromUser ? "user" : "assistant"
-                let content = jsonStringEscape(String(m.content.prefix(500)))
+                let shown = preview ? String(m.content.prefix(Self.apiPreviewCapChars)) : m.content
+                let content = jsonStringEscape(shown)
                 let ts = Int(m.timestamp.timeIntervalSince1970)
-                return "{\"role\":\"\(role)\",\"timestamp\":\(ts),\"content\":\"\(content)\",\"truncated\":\(m.content.count > 500)}"
+                return "{\"role\":\"\(role)\",\"timestamp\":\(ts),\"content\":\"\(content)\",\"truncated\":\(preview && m.content.count > Self.apiPreviewCapChars)}"
             }.joined(separator: ",")
             return "{\"status\":\"ok\",\"conversationId\":\"\(vm.conversationId)\",\"messageCount\":\(msgs.count),\"messages\":[\(entries)]}"
 
@@ -1235,15 +1241,17 @@ class HalTestConsole: ObservableObject {
             return await captureScreenshotJSON()
 
         } else if trimmed == "GET_RENDERED_MESSAGES" {
+            // Full content by DEFAULT (2026-07-29). Use :preview for the cheap cap.
             return buildRenderedMessagesJSON(vm: vm)
 
+        } else if trimmed == "GET_RENDERED_MESSAGES:preview" {
+            // Cheap 500-char-capped variant for quick UI observability.
+            return buildRenderedMessagesJSON(vm: vm, truncateChars: Self.apiPreviewCapChars)
+
         } else if trimmed == "GET_RENDERED_MESSAGES_FULL" {
-            // Untruncated variant for transcript capture (salon conversations,
-            // report writing, etc.). The default GET_RENDERED_MESSAGES caps
-            // each content field at 500 chars to keep the API response cheap
-            // for UI observability; this command returns the full content.
-            // Used by the salon conductor script — model responses routinely
-            // exceed 500 chars and we need them whole for the transcript.
+            // Back-compat alias — identical to the (now full-by-default)
+            // GET_RENDERED_MESSAGES. Kept so the salon conductor script and any
+            // saved RoboRunner scripts that call it keep working unchanged.
             return buildRenderedMessagesJSON(vm: vm, truncateChars: nil)
 
         } else if trimmed == "GET_LOGS" {
@@ -2135,7 +2143,8 @@ class HalTestConsole: ObservableObject {
         let renderedMessages = vm.messages
         let partialMessages = renderedMessages.filter { $0.isPartial }
         let lastPartial = partialMessages.last
-        let partialContent = lastPartial.map { jsonStringEscape(String($0.content.prefix(500))) }
+        // Full content (2026-07-29): diagnostic payloads are no longer clipped.
+        let partialContent = lastPartial.map { jsonStringEscape($0.content) }
 
         let thinkingDuration: String
         if let start = vm.thinkingStart {
@@ -2146,8 +2155,8 @@ class HalTestConsole: ObservableObject {
 
         let liveModelID = vm.llmService.activeModelID
         let selectedModelDisplayName = jsonStringEscape(vm.selectedModel.displayName)
-        let errorMsg = vm.errorMessage.map { jsonStringEscape(String($0.prefix(500))) }
-        let inputFieldText = jsonStringEscape(String(vm.currentMessage.prefix(2000)))
+        let errorMsg = vm.errorMessage.map { jsonStringEscape($0) }
+        let inputFieldText = jsonStringEscape(vm.currentMessage)
 
         let mlxLoading = vm.llmService.mlxWrapper.loadingProgress
         let mlxLoadingMessage = jsonStringEscape(vm.llmService.mlxWrapper.loadingMessage)
@@ -2232,7 +2241,11 @@ class HalTestConsole: ObservableObject {
         return "{\"status\":\"ok\",\"count\":\(entries.count),\"logs\":[\(json)]}"
     }
 
-    func buildRenderedMessagesJSON(vm: ChatViewModel, truncateChars: Int? = 500) -> String {
+    /// The cap used only by the explicit `:preview` variants of the read-back verbs.
+    /// The default everywhere is now FULL (nil cap); this is the opt-in cheap size.
+    static let apiPreviewCapChars = 500
+
+    func buildRenderedMessagesJSON(vm: ChatViewModel, truncateChars: Int? = nil) -> String {
         // vm.messages is the in-memory array bound to the chat view's ForEach.
         // This is precisely what the user sees in the chat scroll. Differs from
         // GET_MESSAGES (which reads from memoryStore / SQLite) in that it:
@@ -2240,9 +2253,9 @@ class HalTestConsole: ObservableObject {
         //   - Reflects in-flight ordering before persistence
         //   - Includes per-message metadata (id, isPartial, recordedByModel, turnNumber)
         //
-        // `truncateChars` caps each content field at the given length for
-        // cheap observability (default 500). Pass nil to get full content
-        // (used by GET_RENDERED_MESSAGES_FULL for transcript capture).
+        // `truncateChars` caps each content field at the given length. Default is
+        // now nil (FULL content) as of 2026-07-29; pass a cap only for the explicit
+        // `:preview` variant. GET_RENDERED_MESSAGES_FULL remains as a back-compat alias.
         let entries = vm.messages.map { m -> String in
             let role = m.isFromUser ? "user" : "assistant"
             let rawContent: String

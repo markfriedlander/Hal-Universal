@@ -9557,11 +9557,11 @@ class ChatViewModel: ObservableObject {
         let userMsg: String
         let halMsg: String
         if on {
-            userMsg = "Hal, show me your reasoning."
-            halMsg = "Reasoning is on. Before each answer you'll see me think it through in a panel above the reply. It makes \(modelName) slower and more deliberate. Tap the brain again anytime to switch back to direct replies."
+            userMsg = "Hal, show me your thinking."
+            halMsg = "Thinking is on. Before each answer you'll see me think it through in a panel above the reply. It makes \(modelName) slower and more deliberate. Tap the brain again anytime to switch back to direct replies."
         } else {
             userMsg = "Hal, go back to direct replies."
-            halMsg = "Reasoning is off. Back to direct answers from \(modelName)."
+            halMsg = "Thinking is off. Back to direct answers from \(modelName)."
         }
         let currentTurn = memoryStore.getCurrentTurnNumber(conversationId: conversationId) + 1
         messages.append(ChatMessage(content: userMsg, isFromUser: true, recordedByModel: "user", turnNumber: currentTurn))

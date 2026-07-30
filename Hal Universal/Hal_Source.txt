@@ -9558,11 +9558,11 @@ class ChatViewModel: ObservableObject {
         let userMsg: String
         let halMsg: String
         if on {
-            userMsg = "Hal, show me your reasoning."
-            halMsg = "Reasoning is on. Before each answer you'll see me think it through in a panel above the reply. It makes \(modelName) slower and more deliberate. Tap the brain again anytime to switch back to direct replies."
+            userMsg = "Hal, show me your thinking."
+            halMsg = "Thinking is on. Before each answer you'll see me think it through in a panel above the reply. It makes \(modelName) slower and more deliberate. Tap the brain again anytime to switch back to direct replies."
         } else {
             userMsg = "Hal, go back to direct replies."
-            halMsg = "Reasoning is off. Back to direct answers from \(modelName)."
+            halMsg = "Thinking is off. Back to direct answers from \(modelName)."
         }
         let currentTurn = memoryStore.getCurrentTurnNumber(conversationId: conversationId) + 1
         messages.append(ChatMessage(content: userMsg, isFromUser: true, recordedByModel: "user", turnNumber: currentTurn))
@@ -24787,13 +24787,19 @@ class HalTestConsole: ObservableObject {
             writeStateJSON(vm: vm)
             return "{\"status\":\"ok\",\"command\":\"SWITCH_THREAD\",\"conversationId\":\"\(threadID)\",\"messageCount\":\(vm.messages.count)}"
 
-        } else if trimmed == "GET_MESSAGES" {
+        } else if trimmed == "GET_MESSAGES" || trimmed == "GET_MESSAGES:preview" {
+            // Full content by DEFAULT (2026-07-29): the antenna should hand back the
+            // real message, not a clipped one, so a caller never has to guess whether
+            // it's seeing everything. `GET_MESSAGES:preview` keeps the old cheap
+            // 500-char cap for quick observability. `apiPreviewCapChars` = 500.
+            let preview = (trimmed == "GET_MESSAGES:preview")
             let msgs = vm.messages.filter { !$0.isPartial }
             let entries = msgs.map { m -> String in
                 let role = m.isFromUser ? "user" : "assistant"
-                let content = jsonStringEscape(String(m.content.prefix(500)))
+                let shown = preview ? String(m.content.prefix(Self.apiPreviewCapChars)) : m.content
+                let content = jsonStringEscape(shown)
                 let ts = Int(m.timestamp.timeIntervalSince1970)
-                return "{\"role\":\"\(role)\",\"timestamp\":\(ts),\"content\":\"\(content)\",\"truncated\":\(m.content.count > 500)}"
+                return "{\"role\":\"\(role)\",\"timestamp\":\(ts),\"content\":\"\(content)\",\"truncated\":\(preview && m.content.count > Self.apiPreviewCapChars)}"
             }.joined(separator: ",")
             return "{\"status\":\"ok\",\"conversationId\":\"\(vm.conversationId)\",\"messageCount\":\(msgs.count),\"messages\":[\(entries)]}"
 
@@ -24924,15 +24930,17 @@ class HalTestConsole: ObservableObject {
             return await captureScreenshotJSON()
 
         } else if trimmed == "GET_RENDERED_MESSAGES" {
+            // Full content by DEFAULT (2026-07-29). Use :preview for the cheap cap.
             return buildRenderedMessagesJSON(vm: vm)
 
+        } else if trimmed == "GET_RENDERED_MESSAGES:preview" {
+            // Cheap 500-char-capped variant for quick UI observability.
+            return buildRenderedMessagesJSON(vm: vm, truncateChars: Self.apiPreviewCapChars)
+
         } else if trimmed == "GET_RENDERED_MESSAGES_FULL" {
-            // Untruncated variant for transcript capture (salon conversations,
-            // report writing, etc.). The default GET_RENDERED_MESSAGES caps
-            // each content field at 500 chars to keep the API response cheap
-            // for UI observability; this command returns the full content.
-            // Used by the salon conductor script — model responses routinely
-            // exceed 500 chars and we need them whole for the transcript.
+            // Back-compat alias — identical to the (now full-by-default)
+            // GET_RENDERED_MESSAGES. Kept so the salon conductor script and any
+            // saved RoboRunner scripts that call it keep working unchanged.
             return buildRenderedMessagesJSON(vm: vm, truncateChars: nil)
 
         } else if trimmed == "GET_LOGS" {
@@ -25824,7 +25832,8 @@ class HalTestConsole: ObservableObject {
         let renderedMessages = vm.messages
         let partialMessages = renderedMessages.filter { $0.isPartial }
         let lastPartial = partialMessages.last
-        let partialContent = lastPartial.map { jsonStringEscape(String($0.content.prefix(500))) }
+        // Full content (2026-07-29): diagnostic payloads are no longer clipped.
+        let partialContent = lastPartial.map { jsonStringEscape($0.content) }
 
         let thinkingDuration: String
         if let start = vm.thinkingStart {
@@ -25835,8 +25844,8 @@ class HalTestConsole: ObservableObject {
 
         let liveModelID = vm.llmService.activeModelID
         let selectedModelDisplayName = jsonStringEscape(vm.selectedModel.displayName)
-        let errorMsg = vm.errorMessage.map { jsonStringEscape(String($0.prefix(500))) }
-        let inputFieldText = jsonStringEscape(String(vm.currentMessage.prefix(2000)))
+        let errorMsg = vm.errorMessage.map { jsonStringEscape($0) }
+        let inputFieldText = jsonStringEscape(vm.currentMessage)
 
         let mlxLoading = vm.llmService.mlxWrapper.loadingProgress
         let mlxLoadingMessage = jsonStringEscape(vm.llmService.mlxWrapper.loadingMessage)
@@ -25921,7 +25930,11 @@ class HalTestConsole: ObservableObject {
         return "{\"status\":\"ok\",\"count\":\(entries.count),\"logs\":[\(json)]}"
     }
 
-    func buildRenderedMessagesJSON(vm: ChatViewModel, truncateChars: Int? = 500) -> String {
+    /// The cap used only by the explicit `:preview` variants of the read-back verbs.
+    /// The default everywhere is now FULL (nil cap); this is the opt-in cheap size.
+    static let apiPreviewCapChars = 500
+
+    func buildRenderedMessagesJSON(vm: ChatViewModel, truncateChars: Int? = nil) -> String {
         // vm.messages is the in-memory array bound to the chat view's ForEach.
         // This is precisely what the user sees in the chat scroll. Differs from
         // GET_MESSAGES (which reads from memoryStore / SQLite) in that it:
@@ -25929,9 +25942,9 @@ class HalTestConsole: ObservableObject {
         //   - Reflects in-flight ordering before persistence
         //   - Includes per-message metadata (id, isPartial, recordedByModel, turnNumber)
         //
-        // `truncateChars` caps each content field at the given length for
-        // cheap observability (default 500). Pass nil to get full content
-        // (used by GET_RENDERED_MESSAGES_FULL for transcript capture).
+        // `truncateChars` caps each content field at the given length. Default is
+        // now nil (FULL content) as of 2026-07-29; pass a cap only for the explicit
+        // `:preview` variant. GET_RENDERED_MESSAGES_FULL remains as a back-compat alias.
         let entries = vm.messages.map { m -> String in
             let role = m.isFromUser ? "user" : "assistant"
             let rawContent: String
@@ -29744,7 +29757,7 @@ private struct ThinkingDisclosure: View {
         } label: {
             HStack(spacing: 6) {
                 Image(systemName: "brain")
-                Text(isStreaming ? "Thinking…" : "Reasoning")
+                Text(isStreaming ? "Thinking…" : "Thinking")
                 if isStreaming {
                     ProgressView().scaleEffect(0.7)
                 }
@@ -29791,7 +29804,7 @@ struct ReasoningPopover: View {
 
     private var title: String {
         if unavailableInSalon { return "Thinking off in Salon Mode" }
-        return isOn ? "Reasoning on" : "Reasoning off"
+        return isOn ? "Thinking on" : "Thinking off"
     }
 
     private var explanation: String {
@@ -29799,9 +29812,9 @@ struct ReasoningPopover: View {
             return "Watching Hal think runs one model through a reason-then-answer pass. Thinking is only available in single LLM mode. Switch back to a single model to turn it on."
         }
         if isOn {
-            return "\(modelName) will think each answer through first. You'll see its reasoning stream into a panel above the reply, then the answer beneath. It's slower and more deliberate. Tap the brain again to switch back to direct replies."
+            return "\(modelName) will think each answer through first. You'll see its thinking stream into a panel above the reply, then the answer beneath. It's slower and more deliberate. Tap the brain again to switch back to direct replies."
         } else {
-            return "\(modelName) answers directly, with no visible reasoning. Tap the brain whenever you want to watch it think a question through before it replies."
+            return "\(modelName) answers directly, with no visible thinking. Tap the brain whenever you want to watch it think a question through before it replies."
         }
     }
 }
@@ -29812,7 +29825,9 @@ struct ReasoningPopover: View {
 // PrivacyLockPopover. Only shown above nominal (the glyph hides at level 0), so the
 // text describes fair/serious/critical; a nominal fallback is kept for safety. Each
 // line states what the ThermalGovernor (Block 61) actually does at that level, so
-// the explanation is honest, not decorative. Copy approved by Mark 2026-07-23.
+// the explanation is honest, not decorative. Copy approved by Mark 2026-07-23;
+// "phone" changed to the neutral "device" 2026-07-29 so it reads right on iPad
+// and Mac too, the sentences are otherwise unchanged.
 struct ThermalIndicatorPopover: View {
     let level: Int
 
@@ -29842,13 +29857,13 @@ struct ThermalIndicatorPopover: View {
     private var explanation: String {
         switch level {
         case 1:
-            return "Your phone is warming up. Hal is easing off slightly to slow the climb."
+            return "Your device is warming up. Hal is easing off slightly to slow the climb."
         case 2:
-            return "Your phone is hot. Hal is slowing down to let it cool."
+            return "Your device is hot. Hal is slowing down to let it cool."
         case 3:
-            return "Your phone is very hot. Hal is pausing until it cools."
+            return "Your device is very hot. Hal is pausing until it cools."
         default:
-            return "Your phone is running cool."
+            return "Your device is running cool."
         }
     }
 }
@@ -32038,9 +32053,9 @@ enum CommandCatalog {
         CommandDescriptor(verb: "RESET_THREAD", args: nil, summary: "Reset the current thread, clearing the active conversation.", category: .conversation, destructive: true),
         CommandDescriptor(verb: "GET_THREADS", args: nil, summary: "List conversation threads.", category: .conversation, destructive: false),
         CommandDescriptor(verb: "SWITCH_THREAD", args: "<threadID>", summary: "Switch to an existing conversation thread.", category: .conversation, destructive: false),
-        CommandDescriptor(verb: "GET_MESSAGES", args: nil, summary: "Return the persisted messages of the current thread from the database.", category: .conversation, destructive: false),
-        CommandDescriptor(verb: "GET_RENDERED_MESSAGES", args: nil, summary: "Return the in-memory chat messages as shown, truncated.", category: .conversation, destructive: false),
-        CommandDescriptor(verb: "GET_RENDERED_MESSAGES_FULL", args: nil, summary: "Return the in-memory chat messages with full, untruncated content.", category: .conversation, destructive: false),
+        CommandDescriptor(verb: "GET_MESSAGES", args: nil, summary: "Return the current thread's messages, full content. Add :preview for a 500-char cap.", category: .conversation, destructive: false),
+        CommandDescriptor(verb: "GET_RENDERED_MESSAGES", args: nil, summary: "Return the in-memory chat messages as shown, full content. Add :preview for a 500-char cap.", category: .conversation, destructive: false),
+        CommandDescriptor(verb: "GET_RENDERED_MESSAGES_FULL", args: nil, summary: "Alias of GET_RENDERED_MESSAGES (kept for older scripts); full content.", category: .conversation, destructive: false),
         CommandDescriptor(verb: "EXPORT_THREAD", args: nil, summary: "Export the current thread as text.", category: .conversation, destructive: false),
 
         // System Prompt
