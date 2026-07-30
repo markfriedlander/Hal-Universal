@@ -7771,7 +7771,7 @@ struct HardwareDisclosureSheet: View {
                             .font(.system(size: 32))
                             .foregroundColor(.accentColor)
                         VStack(alignment: .leading, spacing: 2) {
-                            Text("Local Models on Your iPhone")
+                            Text("Local Models on Your Device")
                                 .font(.title2)
                                 .fontWeight(.semibold)
                             Text("First-time setup")
@@ -7781,7 +7781,7 @@ struct HardwareDisclosureSheet: View {
                     }
                     .padding(.top, 6)
 
-                    Text("Hal's local models run entirely on your iPhone — nothing leaves the device. The trade-off compared to Apple Intelligence is they need more memory and storage, and respond more slowly.")
+                    Text("Hal's local models run entirely on your device, nothing leaves it. The trade-off compared to Apple Intelligence is they need more memory and storage, and respond more slowly.")
                         .font(.body)
 
                     Divider()
@@ -14653,7 +14653,7 @@ struct EmbedderDownloadDisclosureSheet: View {
                         Text("Optional memory-search model")
                             .font(.subheadline).foregroundColor(.secondary)
                     }
-                    Text("This embedder improves how Hal searches your memory. It runs entirely on your iPhone (nothing you store or ask leaves the device) and works offline once downloaded.")
+                    Text("This embedder improves how Hal searches your memory. It runs entirely on your device (nothing you store or ask leaves it) and works offline once downloaded.")
                         .font(.body)
                     VStack(alignment: .leading, spacing: 10) {
                         Label("Storage & download", systemImage: "internaldrive")
@@ -19060,7 +19060,7 @@ nonisolated func memoryRefusalMessage(
         ? "an unknown amount"
         : String(format: "%.1f GB", availableGB)
     let requiredStr = String(format: "%.1f GB", requiredGB)
-    return "Not enough memory to load \(model.displayName) right now. I need roughly \(requiredStr) but only have \(availableStr) available. Try closing other apps, switching back to a smaller model, or restarting Hal — sometimes iOS needs a moment to reclaim memory after a model swap."
+    return "Not enough memory to load \(model.displayName) right now. I need roughly \(requiredStr) but only have \(availableStr) available. Try closing other apps, switching back to a smaller model, or restarting Hal. Sometimes the OS needs a moment to reclaim memory after a model swap."
 }
 // ==== LEGO END: 39 ProcessMemoryGuard (Load-Time Memory Headroom) ====
 
@@ -19748,8 +19748,11 @@ struct PrivacyLockPopover: View {
     // (lock / lock.open) changes. It describes both conditions, so it is true in
     // either state and can never mislead. Any future CC: leave it exactly as written.
     // If a change is ever genuinely needed it comes from Mark, in his words, not yours.
+    // 2026-07-29, Mark's directive: "iPhone" → "device" (correct on iPad/Mac too). The
+    // paragraph must stay word-for-word in sync with the App Store "Genuinely Private"
+    // description, so that copy needs the same one-word change at submission.
     private var explanation: String {
-        "When you use a local MLX model, your conversations never leave your iPhone. No network calls. No server. When using Apple Intelligence, inference is on-device when offline; when connected, Apple's Private Cloud Compute may be used (encrypted in transit, processed in non-persistent memory on Apple-controlled servers)."
+        "When you use a local MLX model, your conversations never leave your device. No network calls. No server. When using Apple Intelligence, inference is on-device when offline; when connected, Apple's Private Cloud Compute may be used (encrypted in transit, processed in non-persistent memory on Apple-controlled servers)."
     }
 }
 
@@ -23821,7 +23824,7 @@ extension DocumentImportManager {
         // collapsed into a skipped-files list.
         if url.pathExtension.lowercased() == "doc" {
             print("HALDEBUG-IMPORT: .doc legacy binary format rejected: \(url.lastPathComponent)")
-            return (false, DocumentImportManager.DocumentProcessingError.legacyDocFormat(url.lastPathComponent).errorDescription ?? "Legacy .doc format not supported on iOS")
+            return (false, DocumentImportManager.DocumentProcessingError.legacyDocFormat(url.lastPathComponent).errorDescription ?? "Legacy .doc format not supported on this device")
         }
         // On macOS startAccessingSecurityScopedResource always returns true for plain paths.
         // On iOS the file must be in an accessible location (e.g. the app's Documents dir).
@@ -26784,7 +26787,7 @@ class DocumentImportManager: ObservableObject {
             case .fileTooLarge(let filename, let sizeMB):
                 return "File too large: \(filename) (\(String(format: "%.1f", sizeMB)) MB). Maximum size is 25 MB."
             case .legacyDocFormat(let filename):
-                return "Legacy .doc format not supported on iOS: \(filename). Please open the file in Word, Pages, or any modern editor and save as .docx, then re-import."
+                return "Legacy .doc format not supported on this device: \(filename). Please open the file in Word, Pages, or any modern editor and save as .docx, then re-import."
             }
         }
     }

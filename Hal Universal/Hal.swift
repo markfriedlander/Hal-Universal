@@ -7770,7 +7770,7 @@ struct HardwareDisclosureSheet: View {
                             .font(.system(size: 32))
                             .foregroundColor(.accentColor)
                         VStack(alignment: .leading, spacing: 2) {
-                            Text("Local Models on Your iPhone")
+                            Text("Local Models on Your Device")
                                 .font(.title2)
                                 .fontWeight(.semibold)
                             Text("First-time setup")
@@ -7780,7 +7780,7 @@ struct HardwareDisclosureSheet: View {
                     }
                     .padding(.top, 6)
 
-                    Text("Hal's local models run entirely on your iPhone — nothing leaves the device. The trade-off compared to Apple Intelligence is they need more memory and storage, and respond more slowly.")
+                    Text("Hal's local models run entirely on your device, nothing leaves it. The trade-off compared to Apple Intelligence is they need more memory and storage, and respond more slowly.")
                         .font(.body)
 
                     Divider()

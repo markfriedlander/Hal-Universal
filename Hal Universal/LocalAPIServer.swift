@@ -132,7 +132,7 @@ extension DocumentImportManager {
         // collapsed into a skipped-files list.
         if url.pathExtension.lowercased() == "doc" {
             print("HALDEBUG-IMPORT: .doc legacy binary format rejected: \(url.lastPathComponent)")
-            return (false, DocumentImportManager.DocumentProcessingError.legacyDocFormat(url.lastPathComponent).errorDescription ?? "Legacy .doc format not supported on iOS")
+            return (false, DocumentImportManager.DocumentProcessingError.legacyDocFormat(url.lastPathComponent).errorDescription ?? "Legacy .doc format not supported on this device")
         }
         // On macOS startAccessingSecurityScopedResource always returns true for plain paths.
         // On iOS the file must be in an accessible location (e.g. the app's Documents dir).

@@ -439,7 +439,7 @@ struct EmbedderDownloadDisclosureSheet: View {
                         Text("Optional memory-search model")
                             .font(.subheadline).foregroundColor(.secondary)
                     }
-                    Text("This embedder improves how Hal searches your memory. It runs entirely on your iPhone (nothing you store or ask leaves the device) and works offline once downloaded.")
+                    Text("This embedder improves how Hal searches your memory. It runs entirely on your device (nothing you store or ask leaves it) and works offline once downloaded.")
                         .font(.body)
                     VStack(alignment: .leading, spacing: 10) {
                         Label("Storage & download", systemImage: "internaldrive")

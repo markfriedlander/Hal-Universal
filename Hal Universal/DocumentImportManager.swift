@@ -290,7 +290,7 @@ class DocumentImportManager: ObservableObject {
             case .fileTooLarge(let filename, let sizeMB):
                 return "File too large: \(filename) (\(String(format: "%.1f", sizeMB)) MB). Maximum size is 25 MB."
             case .legacyDocFormat(let filename):
-                return "Legacy .doc format not supported on iOS: \(filename). Please open the file in Word, Pages, or any modern editor and save as .docx, then re-import."
+                return "Legacy .doc format not supported on this device: \(filename). Please open the file in Word, Pages, or any modern editor and save as .docx, then re-import."
             }
         }
     }

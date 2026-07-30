@@ -162,8 +162,11 @@ struct PrivacyLockPopover: View {
     // (lock / lock.open) changes. It describes both conditions, so it is true in
     // either state and can never mislead. Any future CC: leave it exactly as written.
     // If a change is ever genuinely needed it comes from Mark, in his words, not yours.
+    // 2026-07-29, Mark's directive: "iPhone" → "device" (correct on iPad/Mac too). The
+    // paragraph must stay word-for-word in sync with the App Store "Genuinely Private"
+    // description, so that copy needs the same one-word change at submission.
     private var explanation: String {
-        "When you use a local MLX model, your conversations never leave your iPhone. No network calls. No server. When using Apple Intelligence, inference is on-device when offline; when connected, Apple's Private Cloud Compute may be used (encrypted in transit, processed in non-persistent memory on Apple-controlled servers)."
+        "When you use a local MLX model, your conversations never leave your device. No network calls. No server. When using Apple Intelligence, inference is on-device when offline; when connected, Apple's Private Cloud Compute may be used (encrypted in transit, processed in non-persistent memory on Apple-controlled servers)."
     }
 }
 
