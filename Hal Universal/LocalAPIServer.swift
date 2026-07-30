@@ -721,6 +721,27 @@ class HalTestConsole: ObservableObject {
             }
             return "{\"status\":\"error\",\"message\":\"SET_REASONING: must be true/false\"}"
 
+        } else if trimmed.hasPrefix("SET_HELP_TOPIC:") {
+            // Test hook for explicit Help Mode (the life-ring menu). Sets vm.helpTopic
+            // directly; the in-chat entry/exit narration is exercised by the actual
+            // menu in the UI. Accepts roborunner | api | cli | architecture, or
+            // off/none/"" to leave Help Mode. Lets CC drive a scoped help session
+            // through the antenna (the menu itself can't be tapped remotely).
+            let valStr = String(trimmed.dropFirst("SET_HELP_TOPIC:".count)).trimmingCharacters(in: .whitespaces).lowercased()
+            let topic: HelpTopic?
+            switch valStr {
+            case "roborunner", "robo":            topic = .roboRunner
+            case "api":                           topic = .api
+            case "cli":                           topic = .cli
+            case "architecture", "arch", "source": topic = .architecture
+            case "off", "none", "":               topic = nil
+            default:
+                return "{\"status\":\"error\",\"message\":\"SET_HELP_TOPIC: must be roborunner|api|cli|architecture|off\"}"
+            }
+            vm.helpTopic = topic
+            writeStateJSON(vm: vm)
+            return "{\"status\":\"ok\",\"helpTopic\":\(topic.map { "\"\($0.rawValue)\"" } ?? "null")}"
+
         } else if trimmed.hasPrefix("SET_REASONING_PROMPT:") {
             // Tuning: override the Layer-0 reasoning directive. Empty value or
             // "default" clears the override (back to the built-in default).

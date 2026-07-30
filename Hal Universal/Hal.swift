@@ -2150,7 +2150,12 @@ class MemoryStore: ObservableObject {
                                     /// path's "trust BM25 only if it agrees with semantic" gate is backwards for this
                                     /// corpus. BM25 also makes the top chunk deterministic, which matters for small-
                                     /// window models that effectively see only the first chunk. Best first.
-                                    func searchSelfKnowledge(query: String, maxResults: Int) -> [String] {
+                                    /// `scope`: when the user is in explicit Help Mode they have already CHOSEN
+                                    /// the pile (Architecture -> ["source_code"]; any tool topic -> ["lab_reference"]).
+                                    /// Pass those source types and this searches ONLY them — no other pile is
+                                    /// fetched, so there is nothing irrelevant to poison a small model. nil keeps
+                                    /// the auto two-search (guide + code, labelled) for the normal-mode path.
+                                    func searchSelfKnowledge(query: String, maxResults: Int, scope: [String]? = nil) -> [String] {
                                         guard ensureHealthyConnection() else { return [] }
                                         let sanitized = sanitizeFTSQuery(query)
                                         guard !sanitized.isEmpty, sanitized != "\"\"" else { return [] }
@@ -2188,6 +2193,18 @@ class MemoryStore: ObservableObject {
                                                 }
                                             }
                                             sqlite3_finalize(stmt)
+                                            return out
+                                        }
+                                        // EXPLICIT HELP MODE: the user chose the pile. Search only the scoped
+                                        // source type(s) — usually one — and never fetch the other corpus. This
+                                        // is the deterministic "which pile" answer: no classifier, no cross-pile
+                                        // contamination (the cause of the AFM fake-ROBO_RUN confabulation).
+                                        if let scope, !scope.isEmpty {
+                                            var out: [String] = []
+                                            let per = max(1, maxResults / scope.count)
+                                            for st in scope { out += bm25(sourceType: st, limit: per) }
+                                            let topHeader = out.first.map { String($0.prefix(90)).replacingOccurrences(of: "\n", with: " ") } ?? "(none)"
+                                            halLog("HALDEBUG-ROUTER: self-knowledge search (scoped \(scope.joined(separator: "+"))) '\(sanitized.prefix(40))' -> \(out.count) hits, top: \(topHeader)")
                                             return out
                                         }
                                         let guideHits = bm25(sourceType: "lab_reference", limit: 2)
@@ -6259,16 +6276,100 @@ struct AFMRAGGateDecision {
 
 // KnowledgeRouter (2026-07-30, collapsed) — sits BESIDE the memory gate. The memory
 // gate (AFMRAGGateDecision / decideTools) decides whether to search the user's
-// PERSONAL memory; this decides only whether the turn is about HAL HIMSELF. The
-// earlier two-way "architecture vs tools" split was dropped: models drew that
-// distinction unreliably ("model switching in your code" -> tools). Now the model
-// answers one easy yes/no, and the LEXICAL match in searchSelfKnowledge does the
-// actual routing across the combined source-code + tool-docs pool. Kept separate
-// from the memory gate so the proven personal-recall path is untouched.
+// PERSONAL memory; this decides only whether answering the turn REQUIRES Hal's own
+// source code or tool documentation. The earlier two-way "architecture vs tools"
+// split was dropped: models drew that distinction unreliably ("model switching in
+// your code" -> tools). Now the model answers one easy yes/no, and the LEXICAL match
+// in searchSelfKnowledge does the actual routing across the combined source-code +
+// tool-docs pool. Kept separate from the memory gate so the proven personal-recall
+// path is untouched.
+//
+// CRITICAL DISTINCTION (2026-07-30, issue #3): this gate must fire ONLY for Hal-as-
+// artifact (his code, his architecture, how to use his tools) — NOT for Hal-as-being
+// (consciousness, identity, feelings, values, his place among other AIs). Those are
+// maximally about Hal, yet help mode is exactly wrong for them: it STRIPS his personal-
+// memory RAG (soul document, experiential memory) to make room for source code. An
+// identity question must go the normal full-context path with his self intact. So the
+// question the model answers is "does this need my code/docs?", not "is this about me?",
+// and it is biased toward NO on any ambiguity.
 @Generable
 struct AFMSelfQueryDecision {
-    @Guide(description: "True if the user's message is about Hal himself: how he works, his architecture, his source code, his memory or retrieval or models, OR how to use his built-in tools (the Lab, the command API, RoboRunner scripts, the command-line tool). False for anything not about Hal's own workings or tools — general knowledge, the user's life, other topics, chit-chat.")
-    var aboutHalHimself: Bool
+    @Guide(description: "True ONLY if answering the user's message requires Hal's actual source code or tool documentation: how one of his features is implemented, his technical architecture (memory retrieval, embeddings, model loading, search), or how to use his built-in tools (the Lab, the command API, RoboRunner scripts, the command-line tool). False for questions about who Hal IS rather than how he is built — his consciousness, identity, feelings, values, sense of self, or how he relates to people or to other AIs — and false for general knowledge, the user's life, other topics, or chit-chat. When unsure, false.")
+    var requiresSourceOrToolDocs: Bool
+}
+
+// Help Mode topics (2026-07-30) — the explicit, user-owned "Help door." The user
+// turns Help on and picks a topic; retrieval then loads ONLY that topic's docs.
+// Deterministic: the USER chooses the pile, so there is no classifier to misfire
+// and no irrelevant pile to poison a small model (the AFM fake-ROBO_RUN
+// confabulation came from feeding both piles at once). This is the "which pile"
+// answer — the pile is chosen, not guessed. Help Mode is a visible, tuned utility
+// cul-de-sac, NOT Hal talking about himself as a being (that stays on the normal
+// full-context path). See ChatViewModel.helpTopic, buildChatMessages STEP 4b, and
+// chromeIconRow (the lifepreserver toggle beside the brain).
+enum HelpTopic: String, CaseIterable, Identifiable {
+    case roboRunner
+    case api
+    case cli
+    case architecture
+
+    var id: String { rawValue }
+
+    /// Full name for an active-mode label/banner ("RoboRunner Help").
+    var title: String {
+        switch self {
+        case .roboRunner:   return "RoboRunner Help"
+        case .api:          return "Command API Help"
+        case .cli:          return "Command Line Help"
+        case .architecture: return "Architecture Help"
+        }
+    }
+
+    /// Short name for the Help menu rows, where a "Help" section header already
+    /// supplies the word "Help" (no need to repeat it on every line).
+    var shortLabel: String {
+        switch self {
+        case .roboRunner:   return "RoboRunner"
+        case .api:          return "Command API"
+        case .cli:          return "Command Line"
+        case .architecture: return "Architecture"
+        }
+    }
+
+    /// SF Symbol shown beside the topic in the Help submenu.
+    var glyph: String {
+        switch self {
+        case .roboRunner:   return "gearshape.2"
+        case .api:          return "curlybraces"
+        case .cli:          return "terminal"
+        case .architecture: return "cpu"
+        }
+    }
+
+    /// Short natural phrase Hal uses when he names what he's focused on, in his own
+    /// voice ("I've pulled up my own RoboRunner documentation"). No leading article
+    /// baked in awkwardly — reads correctly after "my own ...".
+    var focus: String {
+        switch self {
+        case .roboRunner:   return "RoboRunner"
+        case .api:          return "command API"
+        case .cli:          return "command line"
+        case .architecture: return "source code"
+        }
+    }
+
+    /// Which self-knowledge corpora this topic draws from. The three tool topics
+    /// live in the Lab usage guide; Architecture is Hal's own source. Coarse for
+    /// now (Layer 1) — this already keeps the 672 code chunks out of a tool session
+    /// and vice-versa, which is what killed the AFM cross-pile poison. Layer 2 adds
+    /// a per-topic tag so CLI / API / RoboRunner scope FINELY within the guide
+    /// instead of all three sharing it.
+    var sourceTypes: [String] {
+        switch self {
+        case .roboRunner, .api, .cli: return ["lab_reference"]
+        case .architecture:           return ["source_code"]
+        }
+    }
 }
 
 @Generable
@@ -9968,6 +10069,38 @@ class ChatViewModel: ObservableObject {
         messages.append(ChatMessage(content: halMsg, isFromUser: false, recordedByModel: selectedModel.id, turnNumber: currentTurn))
     }
 
+    // MARK: - Help Mode (lifepreserver glyph) — the explicit Help door (2026-07-30)
+    //
+    // nil = off (normal Hal, full context, himself). Non-nil = the user opened the
+    // Help door and chose a topic: retrieval scopes to ONLY that topic's docs, the
+    // personal-memory RAG is skipped, and Hal is visibly tuned to that one subject.
+    // Deliberately NOT persisted across launches — a mode this loud should be a fresh
+    // per-session choice, never a surprise state you forgot you were in. Distinct from
+    // the auto self-reference gate (isSelfReferentialQuestion): that stays as the
+    // normal-mode "notice and offer" nudge; THIS is the user taking explicit control.
+    @Published var helpTopic: HelpTopic? = nil
+
+    /// Enter, switch, or leave Help Mode, narrating the change into the chat the way
+    /// setReasoning does. Passing a topic enters (or switches to) it; nil leaves.
+    /// The narration is transparency made visible: Hal says plainly that he's set
+    /// himself aside and is working only from his own docs for this one topic.
+    func setHelpTopic(_ topic: HelpTopic?) {
+        guard topic != helpTopic else { return }
+        helpTopic = topic
+        let currentTurn = memoryStore.getCurrentTurnNumber(conversationId: conversationId) + 1
+        let userMsg: String
+        let halMsg: String
+        if let topic {
+            userMsg = "Hal, help me with \(topic.focus)."
+            halMsg = "Help Mode is on, focused on \(topic.focus). I've set myself aside for a moment and I'm working only from my own \(topic.focus) documentation, so my answers here come straight from that rather than from memory or general knowledge. Tap the life ring again to leave."
+        } else {
+            userMsg = "Hal, leave Help Mode."
+            halMsg = "Help Mode off. I'm back to being myself, with my full memory and context."
+        }
+        messages.append(ChatMessage(content: userMsg, isFromUser: true, recordedByModel: "user", turnNumber: currentTurn))
+        messages.append(ChatMessage(content: halMsg, isFromUser: false, recordedByModel: selectedModel.id, turnNumber: currentTurn))
+    }
+
     // NEW: Self-knowledge toggle (enables/disables temporal, self-awareness, self-knowledge context)
     @AppStorage("enableSelfKnowledge") var enableSelfKnowledge: Bool = true
 
@@ -11181,11 +11314,15 @@ class ChatViewModel: ObservableObject {
                                                                             guard !trimmed.isEmpty else { return false }
 
                                                                             let question = """
-                                                                            Is the user's message asking about Hal HIMSELF — how he works, his architecture, his source code, his memory, retrieval, or models, OR how to use his built-in tools (the Lab, the command API, RoboRunner scripts, the command-line tool)?
+                                                                            Decide what KIND of question the user is asking, so Hal can answer it well.
 
                                                                             User message: "\(trimmed)"
 
-                                                                            Answer YES if it is about Hal's own workings or his tools. Answer NO for anything else — general knowledge, the user's own life, other topics, or chit-chat.
+                                                                            Answer YES ONLY if answering it requires Hal's actual SOURCE CODE or TOOL DOCUMENTATION: how one of his features is built or implemented, his technical architecture (memory retrieval, embeddings, model loading, search), or how to operate one of his built-in tools (the Lab, the command API, RoboRunner scripts, the command-line tool).
+
+                                                                            Answer NO for questions about who Hal IS rather than how he is built: his consciousness, identity, feelings, values, sense of self, or how he relates to people or to other AIs. Those are about Hal as a being and must be answered normally, without pulling up his source code. Also answer NO for general knowledge, the user's own life, other topics, and chit-chat.
+
+                                                                            If the message is not clearly about his code, his technical architecture, or using one of his tools, answer NO.
                                                                             """
 
                                                                             let routeStart = Date()
@@ -11194,11 +11331,11 @@ class ChatViewModel: ObservableObject {
                                                                                 if selectedModel.source == .appleFoundation {
                                                                                     let decision = try await llmService.generateStructuredOnAFM(
                                                                                         prompt: question,
-                                                                                        instructions: "You classify whether a question is about Hal himself — his workings or his tools.",
+                                                                                        instructions: "You classify whether answering a question requires Hal's own source code or tool documentation — its technical mechanics or how to use its tools — as opposed to a question about who Hal is, or any other topic.",
                                                                                         type: AFMSelfQueryDecision.self,
                                                                                         temperature: 0.1
                                                                                     )
-                                                                                    aboutHal = decision.aboutHalHimself
+                                                                                    aboutHal = decision.requiresSourceOrToolDocs
                                                                                 } else {
                                                                                     let mlxPrompt = mlxGatePromptAugmentation(modelID: selectedModel.id, base: question + "\n\nAnswer only YES or NO.")
                                                                                     let response = try await llmService.generateChatResponse(
@@ -11667,12 +11804,30 @@ class ChatViewModel: ObservableObject {
                                                                             // runs the memory search and returns up to 10 snippets within the
                                                                             // model's RAG token budget.
                                                                             // SELF-REFERENCE HELP MODE (2026-07-30). Decide ONCE, up front, whether
-                                                                            // this turn is about Hal himself. If so we take a different path: skip
-                                                                            // the personal-memory RAG entirely (it is noise for a self-question and
-                                                                            // it was crowding the window) and dedicate the freed space to Hal's own
-                                                                            // source/docs. A mode with intent — Hal clearing the table to focus on
-                                                                            // himself — not a blind both-piles injection.
-                                                                            let helpMode = (!currentInput.isEmpty && !isolated) ? await isSelfReferentialQuestion(userInput: currentInput) : false
+                                                                            // answering this turn REQUIRES Hal's own source code or tool docs (a
+                                                                            // Hal-as-artifact question), NOT merely whether it is about Hal. Identity/
+                                                                            // consciousness/values questions are about Hal too but must NOT enter help
+                                                                            // mode — it would strip his personal-memory RAG (soul/experiential) to make
+                                                                            // room for code (issue #3). Only a genuine code/tool question takes this
+                                                                            // path: skip the personal-memory RAG (noise here, and it crowds the window)
+                                                                            // and dedicate the freed space to Hal's own source/docs. A mode with intent
+                                                                            // — Hal clearing the table to read himself — not a blind both-piles injection.
+                                                                            // EXPLICIT HELP MODE takes priority (2026-07-30). If the user opened the
+                                                                            // Help door and chose a topic, honor it directly — no auto-gate, and a
+                                                                            // DETERMINISTIC scope (helpScope) so STEP 4b searches only that topic's
+                                                                            // pile. Only when the user has NOT chosen a topic does the auto self-
+                                                                            // reference gate decide (the normal-mode path; later this becomes a
+                                                                            // notice-and-offer nudge rather than an authority).
+                                                                            let explicitHelp = helpTopic
+                                                                            let helpMode: Bool
+                                                                            let helpScope: [String]?
+                                                                            if let explicitHelp {
+                                                                                helpMode = true
+                                                                                helpScope = explicitHelp.sourceTypes
+                                                                            } else {
+                                                                                helpMode = (!currentInput.isEmpty && !isolated) ? await isSelfReferentialQuestion(userInput: currentInput) : false
+                                                                                helpScope = nil
+                                                                            }
 
                                                                             if !currentInput.isEmpty && !isolated && !helpMode {
                                                                                 let toolDecision = await decideTools(userInput: currentInput)
@@ -11721,7 +11876,7 @@ class ChatViewModel: ObservableObject {
                                                                             // usage instead of reading it (2026-07-29/30, Maxim #2).
                                                                             // STEP 4b: SELF-REFERENCE HELP MODE injection. Runs INSTEAD of the
                                                                             // personal-memory RAG above (which was gated off for helpMode). The
-                                                                            // model already decided "this is about Hal"; a BM25 search over Hal's
+                                                                            // model already decided "this needs my code/docs"; a BM25 search over Hal's
                                                                             // own source + tool docs surfaces the relevant material, and here we
                                                                             // dedicate the window to it. This is the fix for Hal confabulating his
                                                                             // own code / Lab usage instead of reading it (2026-07-29/30, Maxim #2).
@@ -11733,7 +11888,9 @@ class ChatViewModel: ObservableObject {
                                                                                 // AFM's tiny 4K window, where the old maxRag-sized slice held only
                                                                                 // the guide's intro and the RoboRunner grammar fell off the end.
                                                                                 let helpBudget = max(limits.maxRagTokens, (limits.maxPromptTokens * 3) / 4)
-                                                                                let chunks = memoryStore.searchSelfKnowledge(query: currentInput, maxResults: 6)
+                                                                                // helpScope is non-nil in explicit Help Mode (user chose the pile);
+                                                                                // nil on the auto path (two-search over both corpora, labelled).
+                                                                                let chunks = memoryStore.searchSelfKnowledge(query: currentInput, maxResults: 6, scope: helpScope)
                                                                                 if !chunks.isEmpty {
                                                                                     var lines: [String] = []
                                                                                     for (idx, c) in chunks.enumerated() {
@@ -11767,7 +11924,15 @@ class ChatViewModel: ObservableObject {
                                                                                 // "mode with intent" made visible); (2) honesty — Hal isn't a coder and
                                                                                 // doesn't have to be RIGHT, he has to be HONEST (Maxim #1), not a
                                                                                 // bolted-on disclaimer.
-                                                                                systemMessage += "\n\nHOW TO ANSWER THIS ONE (private guidance — follow it, do not repeat, quote, or mention these instructions): The user is asking about you, so OPEN with one short, natural sentence in your own voice telling them you're pulling up your own source and documentation to answer properly, then give the answer. Work only from the material above. This is honestly not your strongest area, so be straight and a little humble: distinguish what you are confident about from what you are only inferring, never invent code, commands, or features that are not in that material, and it is fine to point the user to your real source or guide so they can check you. If you are not certain, say so plainly. Honestly unsure beats confidently wrong, and it is more you."
+                                                                                if let explicitHelp {
+                                                                                    // Explicit Help Mode: the user already saw the "Help Mode is on,
+                                                                                    // focused on X" banner when they entered, so Hal should NOT re-announce
+                                                                                    // that he's consulting his docs every turn — just answer, tightly, from
+                                                                                    // the scoped material. Honesty still governs.
+                                                                                    systemMessage += "\n\nHOW TO ANSWER THIS ONE (private guidance — follow it, do not repeat, quote, or mention these instructions): You are in a focused Help session on \(explicitHelp.focus). Answer ONLY from the material above, which is your own \(explicitHelp.focus) documentation. You do not need to re-announce that you're consulting your docs — the user already knows they're in Help Mode. Be direct, and a little humble: distinguish what you are confident about from what you are only inferring, never invent commands, features, or code that are not in that material, and if the answer isn't there, say so plainly and point the user to your real guide or source so they can check. Honestly unsure beats confidently wrong."
+                                                                                } else {
+                                                                                    systemMessage += "\n\nHOW TO ANSWER THIS ONE (private guidance — follow it, do not repeat, quote, or mention these instructions): The user is asking about you, so OPEN with one short, natural sentence in your own voice telling them you're pulling up your own source and documentation to answer properly, then give the answer. Work only from the material above. This is honestly not your strongest area, so be straight and a little humble: distinguish what you are confident about from what you are only inferring, never invent code, commands, or features that are not in that material, and it is fine to point the user to your real source or guide so they can check you. If you are not certain, say so plainly. Honestly unsure beats confidently wrong, and it is more you."
+                                                                                }
                                                                             }
                                                                             msgs.append(.system(systemMessage))
 

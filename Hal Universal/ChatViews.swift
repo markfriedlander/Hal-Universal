@@ -535,6 +535,38 @@ struct iOSChatView: View {
                 )
                 .presentationCompactAdaptation(.popover)
             }
+            // Help Mode — the explicit "Help door" (2026-07-30). A life ring, and a
+            // sibling to the brain: brain = thinking, life ring = help. Placed to the
+            // RIGHT of the brain on purpose — the thermal glyph only ever appears to
+            // the brain's LEFT, so it can never wedge itself between these two mode
+            // toggles. Tapping opens a menu of scoped Help topics; picking one enters a
+            // focused, memory-exempt session tuned to that one subject (see
+            // ChatViewModel.setHelpTopic). Bright when a topic is active, dim when off,
+            // mirroring the brain so the tuned state reads at a glance.
+            Menu {
+                // One "Help" header, then the topics beneath it — no need to repeat
+                // "Help" on every row (Mark, 2026-07-30). "Leave" sits below, set off
+                // as its own item, and only when a topic is active.
+                Section("Help") {
+                    ForEach(HelpTopic.allCases) { topic in
+                        Button {
+                            chatViewModel.setHelpTopic(topic)
+                        } label: {
+                            Label(topic.shortLabel, systemImage: topic.glyph)
+                        }
+                    }
+                }
+                if chatViewModel.helpTopic != nil {
+                    Button(role: .cancel) {
+                        chatViewModel.setHelpTopic(nil)
+                    } label: {
+                        Label("Leave Help Mode", systemImage: "xmark.circle")
+                    }
+                }
+            } label: {
+                Image(systemName: "lifepreserver")
+                    .foregroundStyle(chatViewModel.helpTopic != nil ? Color.primary : Color.secondary)
+            }
             // Privacy lock.
             Button {
                 showingPrivacyPopover = true
