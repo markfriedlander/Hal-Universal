@@ -13,6 +13,7 @@
 
 import SwiftUI
 import Combine   // objectWillChange.send() on the shared downloader (Free-up-models row)
+import SharedModelStoreKit   // SharedModelStore.clearEntireSharedStore() (Clear all family models)
 
 // ==== LEGO START: 63 MaintenanceView (Maintenance & Reset) ====
 
@@ -24,6 +25,7 @@ struct MaintenanceView: View {
     @State private var showResetSettingsAlert = false
     @State private var showingClearCacheAlert = false
     @State private var showingNuclearResetConfirmationAlert = false
+    @State private var showingClearFamilyAlert = false
 
     // "Free up old model files" — moved here from the AI Model section 2026-07-29 to sit
     // beside "Clear Hal's Models" as the gentle-reclaim vs full-clear pair. `oldModelsPlan`
@@ -79,6 +81,20 @@ struct MaintenanceView: View {
             Button("Cancel", role: .cancel) { }
         } message: {
             Text(clearModelsMessage)
+        }
+        .alert("Clear all family models?", isPresented: $showingClearFamilyAlert) {
+            Button("Clear all family models", role: .destructive) {
+                let removed = SharedModelStore.clearEntireSharedStore()
+                oldModelsPlan = MaintenanceTasks.previewFreeOldModelFiles()
+                lastFreedOldBytes = 0
+                mlxDownloader.objectWillChange.send()
+                ModelCatalogService.shared.refreshDownloadStates()
+                Task { await mlxDownloader.updateCacheSize() }
+                print("HALDEBUG-CACHE: cleared entire shared store: \(removed) repos removed")
+            }
+            Button("Cancel", role: .cancel) { }
+        } message: {
+            Text("Removes every downloaded AI model shared across Hal, Posey, and AI Camera to reclaim all model storage at once. Each app re-downloads what it needs the next time you use it. Your conversations, documents, and settings are not affected.")
         }
     }
 
@@ -264,6 +280,29 @@ struct MaintenanceView: View {
                 // Disable when nothing is Hal's to free (all kept by siblings, or a
                 // cleanup just finished): the row stays visible + honest, but not tappable.
                 .disabled(oldModelsPlan.freeableBytes == 0)
+            }
+
+            // Clear all family models — the last-resort safety valve. Unlike "Clear
+            // Hal's Models" (which only releases Hal's claims and leaves sibling-claimed
+            // models on disk), this removes EVERY shared model for the whole family at
+            // once and resets the manifest, reclaiming all model storage immediately.
+            // Each app re-downloads what it needs on next use. Manifest-aware
+            // (SharedModelStore.clearEntireSharedStore) so it never leaves ghost entries.
+            Button {
+                showingClearFamilyAlert = true
+            } label: {
+                HStack(alignment: .top) {
+                    Image(systemName: "trash.fill")
+                        .foregroundColor(.red)
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text("Clear all family models")
+                            .foregroundColor(.red)
+                        Text("Removes every shared model for Hal, Posey, and AI Camera at once. Each app re-downloads as needed. Last resort.")
+                            .font(.caption2)
+                            .foregroundColor(.secondary)
+                    }
+                    Spacer()
+                }
             }
         } header: {
             Label("Storage", systemImage: "externaldrive")

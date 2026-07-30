@@ -129,6 +129,17 @@ struct Hal10000App: App {
         // See the SharedModelStoreKit package.
         SharedModelStore.configure(appGroupID: "group.com.MarkFriedlander.aifamily")
         SharedModelStore.touchHeartbeat()
+        // Active dead-app cleanup (SharedModelStoreKit 1.1.0). Runs off the main thread
+        // so a large reap never blocks launch. Order matters and touchHeartbeat above
+        // has already stamped US, so Hal is never seen as stale: grace-stamp any
+        // pre-lease (heartbeat-less) claims to give them a fair lease window, then reap
+        // provably-dead claimants and delete any now-unclaimed model files. Safe against
+        // the rest of launch: a model Hal is about to load is claimed by Hal (fresh), so
+        // it can never be reaped; only genuinely abandoned models are removed.
+        DispatchQueue.global(qos: .utility).async {
+            SharedModelStore.graceStampMissingHeartbeats()
+            SharedModelStore.reapStaleClaims()
+        }
         // Eagerly construct the background download coordinator so its URLSession
         // is wired up before iOS dispatches any pending completion events on
         // app launch (e.g. when iOS wakes us to deliver a finished download).
