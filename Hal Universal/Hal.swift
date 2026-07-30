@@ -9206,6 +9206,8 @@ class ChatViewModel: ObservableObject {
     @Published var apiNavPowerUser: Bool = false
     @Published var apiNavSalonSettings: Bool = false
     @Published var apiNavModelLibrary: Bool = false
+    @Published var apiNavMaintenance: Bool = false
+    @Published var apiNavLab: Bool = false
 
     // API-driven scroll inside the open Settings sheet. Set to "personality",
     // "importexport", or "ai" via SET_UI_STATE; the ActionsView observes and

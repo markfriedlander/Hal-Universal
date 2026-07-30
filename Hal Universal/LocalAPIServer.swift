@@ -1167,6 +1167,12 @@ class HalTestConsole: ObservableObject {
             case "modellibrary":
                 if value { vm.showingSettings = false }
                 vm.apiNavModelLibrary = value
+            case "maintenance":
+                if value { vm.showingSettings = false }
+                vm.apiNavMaintenance = value
+            case "lab":
+                if value { vm.showingSettings = false }
+                vm.apiNavLab = value
             case "selfmodelshowprivate":
                 // Mirror the @AppStorage key flipped by the SelfReflectionView
                 // toggle. Driving it via UserDefaults lets the API set it

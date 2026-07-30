@@ -391,6 +391,19 @@ struct iOSChatView: View {
                         .environmentObject(MLXModelDownloader.shared)
                 }
             }
+            // Antenna-driven nav to the reorg's two sub-screens (Lab #7), so screenshot
+            // automation can reach them without the settings-button routing (which sends
+            // Salon users to SalonModeView). Presenting these directly also lets us verify
+            // the Salon-grayed Thinking Cap, which the normal path can't reach.
+            .sheet(isPresented: $chatViewModel.apiNavMaintenance) {
+                MaintenanceView()
+                    .environmentObject(chatViewModel)
+                    .environmentObject(MLXModelDownloader.shared)
+            }
+            .sheet(isPresented: $chatViewModel.apiNavLab) {
+                LabView()
+                    .environmentObject(chatViewModel)
+            }
             // One-time model-storage migration notice (Layer 2). Shown once at launch
             // to users who had pre-version model copies; both buttons mark it handled
             // so it never returns. See ModelStorageMigrationNotice.

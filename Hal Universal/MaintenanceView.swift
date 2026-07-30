@@ -211,7 +211,7 @@ struct MaintenanceView: View {
                     .padding(.vertical, 4)
                 }
 
-                Text("Restore every tunable parameter — across every model — to factory defaults. This does not affect conversation history, documents, or Hal's learned self-knowledge.")
+                Text("Restore every tunable parameter, across every model, to factory defaults. This does not affect conversation history, documents, or Hal's learned self-knowledge.")
                     .font(.caption)
                     .foregroundColor(.secondary)
             }
