@@ -845,7 +845,18 @@ class MemoryStore: ObservableObject {
             isConnected = false
         }
 
-        let result = sqlite3_open(dbPath, &db)
+        // Open in SQLite SERIALIZED threading mode (SQLITE_OPEN_FULLMUTEX). This one
+        // connection is shared (`nonisolated(unsafe) var db`) and reached from several
+        // threads — the main actor, detached background embedding/summarization passes,
+        // and the local API antenna. Without a per-connection mutex, two threads calling
+        // into the connection at once is undefined behavior: it corrupts SQLite's internal
+        // state and the next sqlite3_step dereferences a garbage pointer → EXC_BAD_ACCESS.
+        // That race was the proven root cause of the intermittent sqlite3_step segfaults
+        // (Help Mode search colliding with a background write; rapid writes overlapping),
+        // reproduced deterministically with two concurrent search threads and fixed by this
+        // flag (2026-07-30). FULLMUTEX serializes each C-API call on the connection so
+        // concurrent access blocks safely instead of corrupting. WAL mode is set below.
+        let result = sqlite3_open_v2(dbPath, &db, SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE | SQLITE_OPEN_FULLMUTEX, nil)
         guard result == SQLITE_OK else {
             print("HALDEBUG-DATABASE: CRITICAL ERROR - Failed to open database at \(dbPath), SQLite error: \(result)")
             isConnected = false
@@ -1375,6 +1386,30 @@ class MemoryStore: ObservableObject {
                                                 print("HALDEBUG-DATABASE: ERROR: Failed to create FTS trigger: \(errorMessage)")
                                             }
                                         }
+
+                                        // FTS SELF-HEAL (2026-07-30). A crash or jetsam mid-write can leave
+                                        // unified_content_fts corrupt ("database disk image is malformed"), which
+                                        // makes certain lexical searches ERROR and silently return nothing — the
+                                        // token lands on a broken part of the index (device-diagnosed 2026-07-30:
+                                        // "send"/"token" errored while "command" matched, same chunk). Verify the
+                                        // index HERE, before the backfill and before any search or self-knowledge
+                                        // ingestion, and rebuild it from the content table if it is malformed.
+                                        // integrity-check returns non-OK when the index is bad; 'rebuild'
+                                        // reconstructs the whole FTS from unified_content, so the backfill below
+                                        // then finds nothing to add. Cheap on a healthy index; a rare full rebuild
+                                        // on a corrupt one is far better than silently broken search.
+                                        // NOTE: unified_content_fts is CONTENTLESS (content=''), so the FTS5
+                                        // 'rebuild' command does NOT work (there is no stored content to rebuild
+                                        // from). The only repair is DROP + recreate + re-backfill from
+                                        // unified_content — see rebuildContentlessFTS().
+                                        if sqlite3_exec(db, "INSERT INTO unified_content_fts(unified_content_fts) VALUES('integrity-check')", nil, nil, nil) != SQLITE_OK {
+                                            let err = String(cString: sqlite3_errmsg(db))
+                                            print("HALDEBUG-DATABASE: FTS integrity-check FAILED (\(err)) — dropping + recreating index from content")
+                                            _ = rebuildContentlessFTS()
+                                        } else {
+                                            print("HALDEBUG-DATABASE: FTS integrity-check passed")
+                                        }
+
                                         // Backfill FTS for any pre-existing rows that aren't in
                                         // the FTS table yet (handles first-launch-after-upgrade
                                         // and any rows added before triggers existed).
@@ -2171,12 +2206,16 @@ class MemoryStore: ObservableObject {
                                         // Guide FIRST so it survives truncation on small-window models for the
                                         // usage questions that need it; a pure-architecture query simply returns
                                         // no guide hit and the code leads.
-                                        func bm25(sourceType: String, limit: Int) -> [String] {
+                                        // `predicate` is a source_type WHERE fragment built from internal
+                                        // constants (never user input): an exact "u.source_type = 'X'" for a
+                                        // scoped topic, or "u.source_type LIKE 'lab_reference%'" for the auto
+                                        // path that spans every guide sub-pile.
+                                        func bm25(predicate: String, limit: Int) -> [String] {
                                             let sql = """
                                             SELECT u.content, -bm25(unified_content_fts) AS score
                                             FROM unified_content_fts
                                             JOIN unified_content u ON u.rowid = unified_content_fts.rowid
-                                            WHERE unified_content_fts MATCH ? AND u.source_type = '\(sourceType)'
+                                            WHERE unified_content_fts MATCH ? AND \(predicate)
                                             ORDER BY score DESC
                                             LIMIT ?;
                                             """
@@ -2202,17 +2241,145 @@ class MemoryStore: ObservableObject {
                                         if let scope, !scope.isEmpty {
                                             var out: [String] = []
                                             let per = max(1, maxResults / scope.count)
-                                            for st in scope { out += bm25(sourceType: st, limit: per) }
+                                            for st in scope { out += bm25(predicate: "u.source_type = '\(st)'", limit: per) }
                                             let topHeader = out.first.map { String($0.prefix(90)).replacingOccurrences(of: "\n", with: " ") } ?? "(none)"
                                             halLog("HALDEBUG-ROUTER: self-knowledge search (scoped \(scope.joined(separator: "+"))) '\(sanitized.prefix(40))' -> \(out.count) hits, top: \(topHeader)")
                                             return out
                                         }
-                                        let guideHits = bm25(sourceType: "lab_reference", limit: 2)
-                                        let codeHits = bm25(sourceType: "source_code", limit: max(1, maxResults - guideHits.count))
+                                        let guideHits = bm25(predicate: "u.source_type LIKE 'lab_reference%'", limit: 2)
+                                        let codeHits = bm25(predicate: "u.source_type = 'source_code'", limit: max(1, maxResults - guideHits.count))
                                         let out = guideHits + codeHits
                                         let topHeader = out.first.map { String($0.prefix(90)).replacingOccurrences(of: "\n", with: " ") } ?? "(none)"
                                         halLog("HALDEBUG-ROUTER: self-knowledge search '\(sanitized.prefix(40))' -> \(guideHits.count) guide + \(codeHits.count) code, top: \(topHeader)")
                                         return out
+                                    }
+
+                                    /// DEBUG probe (2026-07-30): for a source_type and a single word, report (a) whether
+                                    /// the stored content literally CONTAINS the word, and (b) how the raw FTS index matches
+                                    /// it three ways — bare token, quoted phrase, prefix. Lets CC see the ground truth about
+                                    /// why a lexical search misses ("send"/"token" returned nothing while in the same chunk)
+                                    /// instead of theorising. Not user-facing; reached via the antenna FTS_PROBE verb.
+                                    func debugFTSProbe(sourceType: String, word: String) -> String {
+                                        guard ensureHealthyConnection() else { return "{\"error\":\"no db\"}" }
+                                        let w = word.lowercased()
+                                        var storedRows = 0
+                                        var containsSubstring = false
+                                        var stmt: OpaquePointer?
+                                        let countSQL = "SELECT COUNT(*), SUM(CASE WHEN lower(content) LIKE '%' || ? || '%' THEN 1 ELSE 0 END) FROM unified_content WHERE source_type = ?"
+                                        if sqlite3_prepare_v2(db, countSQL, -1, &stmt, nil) == SQLITE_OK {
+                                            sqlite3_bind_text(stmt, 1, (w as NSString).utf8String, -1, nil)
+                                            sqlite3_bind_text(stmt, 2, (sourceType as NSString).utf8String, -1, nil)
+                                            if sqlite3_step(stmt) == SQLITE_ROW {
+                                                storedRows = Int(sqlite3_column_int(stmt, 0))
+                                                containsSubstring = sqlite3_column_int(stmt, 1) > 0
+                                            }
+                                        }
+                                        sqlite3_finalize(stmt)
+                                        var lastError = ""
+                                        func ftsCount(_ match: String) -> Int {
+                                            var n = -1  // -1 signals a prepare/step error (e.g. invalid MATCH syntax)
+                                            var s: OpaquePointer?
+                                            let sql = "SELECT COUNT(*) FROM unified_content_fts JOIN unified_content u ON u.rowid = unified_content_fts.rowid WHERE unified_content_fts MATCH ? AND u.source_type = ?"
+                                            if sqlite3_prepare_v2(db, sql, -1, &s, nil) == SQLITE_OK {
+                                                sqlite3_bind_text(s, 1, (match as NSString).utf8String, -1, nil)
+                                                sqlite3_bind_text(s, 2, (sourceType as NSString).utf8String, -1, nil)
+                                                if sqlite3_step(s) == SQLITE_ROW {
+                                                    n = Int(sqlite3_column_int(s, 0))
+                                                } else if let e = sqlite3_errmsg(db) {
+                                                    lastError = String(cString: e)
+                                                }
+                                            } else if let e = sqlite3_errmsg(db) {
+                                                lastError = String(cString: e)
+                                            }
+                                            sqlite3_finalize(s)
+                                            return n
+                                        }
+                                        let bare = ftsCount(w)
+                                        let quoted = ftsCount("\"\(w)\"")
+                                        let prefix = ftsCount(w + "*")
+                                        let errEsc = lastError.replacingOccurrences(of: "\"", with: "'")
+                                        return "{\"sourceType\":\"\(sourceType)\",\"word\":\"\(w)\",\"storedRows\":\(storedRows),\"containsSubstring\":\(containsSubstring),\"ftsBare\":\(bare),\"ftsQuoted\":\(quoted),\"ftsPrefix\":\(prefix),\"error\":\"\(errEsc)\"}"
+                                    }
+
+                                    /// Repair a corrupt CONTENTLESS FTS5 index. Because the table is defined with
+                                    /// content='' (contentless), the FTS5 'rebuild' command does not apply — there is
+                                    /// no source content stored inside the FTS to rebuild from. The only fix is to DROP
+                                    /// the virtual table (freeing its corrupt shadow pages), recreate it, and re-index
+                                    /// every unified_content row. Keep the CREATE here in sync with ftsTableSQL in the
+                                    /// DB setup. Returns true if the index came back healthy. nonisolated so the
+                                    /// launch self-heal (which runs in the nonisolated DB-setup path) can call it.
+                                    nonisolated func rebuildContentlessFTS() -> Bool {
+                                        guard ensureHealthyConnection() else { return false }
+                                        let createSQL = """
+                                        CREATE VIRTUAL TABLE unified_content_fts USING fts5(
+                                            content,
+                                            entity_keywords,
+                                            source_type UNINDEXED,
+                                            source_id UNINDEXED,
+                                            position UNINDEXED,
+                                            content='',
+                                            tokenize='porter unicode61 remove_diacritics 2'
+                                        );
+                                        """
+                                        let backfillSQL = """
+                                        INSERT INTO unified_content_fts(rowid, content, entity_keywords, source_type, source_id, position)
+                                        SELECT u.rowid, u.content, u.entity_keywords, u.source_type, u.source_id, u.position
+                                        FROM unified_content u;
+                                        """
+                                        for (label, sql) in [("DROP", "DROP TABLE IF EXISTS unified_content_fts;"), ("CREATE", createSQL), ("BACKFILL", backfillSQL)] {
+                                            if sqlite3_exec(db, sql, nil, nil, nil) != SQLITE_OK {
+                                                print("HALDEBUG-DATABASE: FTS rebuild \(label) failed: \(String(cString: sqlite3_errmsg(db)))")
+                                                return false
+                                            }
+                                        }
+                                        let rows = sqlite3_changes(db)
+                                        let healthy = sqlite3_exec(db, "INSERT INTO unified_content_fts(unified_content_fts) VALUES('integrity-check')", nil, nil, nil) == SQLITE_OK
+                                        print("HALDEBUG-DATABASE: FTS dropped + recreated + backfilled \(rows) rows; integrity now \(healthy ? "OK" : "STILL BAD")")
+                                        return healthy
+                                    }
+
+                                    /// DEBUG (antenna FTS_HEAL): report integrity before, run the contentless rebuild,
+                                    /// report integrity after and a probe of a previously-failing token, so CC can watch
+                                    /// the repair work rather than infer it.
+                                    func debugFTSHeal() -> String {
+                                        guard ensureHealthyConnection() else { return "{\"error\":\"no db\"}" }
+                                        func run(_ sql: String) -> String {
+                                            if sqlite3_exec(db, sql, nil, nil, nil) == SQLITE_OK { return "ok" }
+                                            return String(cString: sqlite3_errmsg(db)).replacingOccurrences(of: "\"", with: "'")
+                                        }
+                                        let dropR = run("DROP TABLE IF EXISTS unified_content_fts;")
+                                        let createR = run("CREATE VIRTUAL TABLE unified_content_fts USING fts5(content, entity_keywords, source_type UNINDEXED, source_id UNINDEXED, position UNINDEXED, content='', tokenize='porter unicode61 remove_diacritics 2');")
+                                        let backfillR = run("INSERT INTO unified_content_fts(rowid, content, entity_keywords, source_type, source_id, position) SELECT u.rowid, u.content, u.entity_keywords, u.source_type, u.source_id, u.position FROM unified_content u;")
+                                        let changed = Int(sqlite3_changes(db))
+                                        let probe = debugFTSProbe(sourceType: "lab_reference_api", word: "send")
+                                        return "{\"drop\":\"\(dropR)\",\"create\":\"\(createR)\",\"backfill\":\"\(backfillR)\",\"rowsInserted\":\(changed),\"probeSend\":\(probe)}"
+                                    }
+
+                                    /// DEBUG (antenna RACE_STRESS): run the scoped self-knowledge search on TWO real
+                                    /// background threads AT ONCE, hammering the single shared `db` connection
+                                    /// concurrently. Read-only (no writes → no corruption risk), but if the connection
+                                    /// is not thread-safe for concurrent use, this reproduces the intermittent
+                                    /// sqlite3_step segfault deterministically — the isolated single-thread loop never
+                                    /// crashed (2026-07-30), so this isolates concurrency as the trigger. Blocks the
+                                    /// caller until both workers finish; iterations is capped by the verb.
+                                    nonisolated func debugRaceStress(query: String, scope: [String]?, iterations: Int) -> String {
+                                        let group = DispatchGroup()
+                                        let lock = NSLock()
+                                        var done = [0, 0]
+                                        for worker in 0..<2 {
+                                            group.enter()
+                                            DispatchQueue.global(qos: .userInitiated).async {
+                                                var local = 0
+                                                for _ in 0..<iterations {
+                                                    _ = self.searchSelfKnowledge(query: query, maxResults: 6, scope: scope)
+                                                    local += 1
+                                                }
+                                                lock.lock(); done[worker] = local; lock.unlock()
+                                                group.leave()
+                                            }
+                                        }
+                                        group.wait()
+                                        return "{\"workerA\":\(done[0]),\"workerB\":\(done[1]),\"iterationsEach\":\(iterations)}"
                                     }
 
                                     // Curated USAGE guide for the Lab (API / RoboRunner / hal CLI), ingested as its
@@ -2224,56 +2391,78 @@ class MemoryStore: ObservableObject {
                                     // it is small + usage-worded, RAG surfaces it over the 33k-line source blob on
                                     // "how do I use…" questions. Hash-gated like the source ingestion.
                                     nonisolated private func enableLabReferenceAccess() {
-                                        let primer = """
-                                        THE LAB — HOW TO USE HAL'S DEVELOPER TOOLS
+                                        // FOUR PILES (2026-07-30). The guide is authored in labelled SECTIONS,
+                                        // each ingested under its OWN source_type, so an explicit Help topic funnels
+                                        // ONLY its door: RoboRunner Help never surfaces the API/CLI door text, etc.
+                                        // The command VERBS are the same across all three doors, so the COMMAND
+                                        // CATALOG is one shared pile that every tool topic also draws from (a
+                                        // RoboRunner script still needs to know what verbs exist). `general` (the
+                                        // three-doors overview) is auto-path only. Scopes: see HelpTopic.sourceTypes.
+                                        let intro = """
+                                        THE LAB: HOW TO USE HAL'S DEVELOPER TOOLS
 
                                         This is a USAGE guide (how to operate the tools), not source code. When a user asks how to use \
                                         the API, RoboRunner, or the hal CLI, answer from here, do NOT show Swift implementation.
 
-                                        Hal's Lab has three doors into ONE command interpreter, the SAME command verbs work in all three:
+                                        Hal's Lab has three doors into ONE command interpreter, and the SAME command verbs work in all three: \
+                                        the Developer API (a local HTTP server), RoboRunner (an in-app script editor), and the hal CLI \
+                                        (the Mac Terminal). Each door has its own section below, and every verb is in the COMMAND CATALOG.
+                                        """
 
-                                        1) DEVELOPER API (the "antenna"): a local HTTP server on the device.
-                                           Turn it on in Settings > The Lab > Developer API (off by default). It shows the address, port, and a bearer token.
-                                           Send a command: POST http://<address>:<port>/command with JSON {"command":"VERB..."} and header Authorization: Bearer <token>.
-                                           Full conversation turn: POST /chat with {"message":"..."}.
-                                           It answers only while Hal is the foreground app.
+                                        let apiSection = """
+                                        DEVELOPER API (the "antenna"): a local HTTP server on the device.
+                                        Turn it on in Settings > The Lab > Developer API (off by default). It shows the address, port, and a bearer token.
+                                        Send a command: POST http://<address>:<port>/command with JSON {"command":"VERB..."} and header Authorization: Bearer <token>.
+                                        Full conversation turn: POST /chat with {"message":"..."}.
+                                        It answers only while Hal is the foreground app.
+                                        """
 
-                                        2) ROBORUNNER: an in-app script editor (Settings > The Lab). One command per line. The grammar is tiny:
-                                           - Any command verb on its own line runs that verb (for example SWITCH_MODEL:..., SET_REASONING:true, NEW_THREAD).
-                                           - ASK <prompt>          runs one real conversation turn with that prompt.
-                                           - WAIT <seconds>        pauses (longer if the device is warm).
-                                           - FOR <VAR> IN a, b, c  repeats the block below once per value, substituting {VAR} each pass; close it with END.
-                                             ... END               It only sweeps a written list; it cannot branch or loop forever.
-                                           - # comment             a line starting with # is a comment.
-                                           Example, ask the same prompt three times, each in a fresh thread:
-                                             FOR N IN 1, 2, 3
-                                             NEW_THREAD
-                                             ASK Tell me something interesting (try {N})
-                                             END
+                                        let roboSection = """
+                                        ROBORUNNER: an in-app script editor (Settings > The Lab). One command per line. The grammar is tiny:
+                                        - Any command verb on its own line runs that verb (for example SWITCH_MODEL:..., SET_REASONING:true, NEW_THREAD).
+                                        - ASK <prompt>          runs one real conversation turn with that prompt.
+                                        - WAIT <seconds>        pauses (longer if the device is warm).
+                                        - FOR <VAR> IN a, b, c  repeats the block below once per value, substituting {VAR} each pass; close it with END.
+                                          ... END               It only sweeps a written list; it cannot branch or loop forever.
+                                        - # comment             a line starting with # is a comment.
+                                        Example, ask the same prompt three times, each in a fresh thread:
+                                          FOR N IN 1, 2, 3
+                                          NEW_THREAD
+                                          ASK Tell me something interesting (try {N})
+                                          END
+                                        """
 
-                                        3) HAL CLI (Mac only): talk to Hal from the Terminal.
-                                           Install it from Settings > The Lab > Hal CLI (shown when Hal runs on a Mac with the API on). Then:
-                                             hal "your message"               one conversation turn.
-                                             cat notes.txt | hal "summarize"   pipe input in.
-                                           Quote any message containing shell characters like ? so the shell does not expand them.
+                                        let cliSection = """
+                                        HAL CLI (Mac only): talk to Hal from the Terminal.
+                                        Install it from Settings > The Lab > Hal CLI (shown when Hal runs on a Mac with the API on). Then:
+                                          hal "your message"               one conversation turn.
+                                          cat notes.txt | hal "summarize"   pipe input in.
+                                        Quote any message containing shell characters like ? so the shell does not expand them.
+                                        """
 
+                                        let catalogSection = """
                                         SAFETY: the interpreter starts in Safe mode and refuses destructive verbs. Switch with SET_SAFETY:advanced; \
                                         in Advanced a destructive verb must end with --yes (or CONFIRM) to run.
 
-                                        COMMAND CATALOG (every verb, its usage, and what it does):
-                                        """
-                                        let labReference = primer + "\n" + CommandCatalog.helpText()
+                                        COMMAND CATALOG (every verb, its usage, and what it does). These verbs work in all three doors (API, RoboRunner, CLI):
+                                        """ + "\n" + CommandCatalog.helpText()
 
-                                        // Version the hash so a change to the CHUNKING scheme (not just the guide
-                                        // text) forces a re-ingest. The guide is now SPLIT into pieces so BM25 can
-                                        // match a section — the RoboRunner part, the API part, one command — instead
-                                        // of the whole blob. This is what lets the router collapse the fragile
-                                        // architecture-vs-tools split and let lexical match do the routing (2026-07-30).
-                                        let currentHash = (labReference + "#labchunk-v1").hash
+                                        let sections: [(type: String, name: String, label: String, text: String)] = [
+                                            ("lab_reference_general",    "The Lab - Overview",        "Hal Lab overview",        intro),
+                                            ("lab_reference_api",        "The Lab - Developer API",   "Hal Developer API guide", apiSection),
+                                            ("lab_reference_roborunner", "The Lab - RoboRunner",      "Hal RoboRunner guide",    roboSection),
+                                            ("lab_reference_cli",        "The Lab - Hal CLI",         "Hal CLI guide",           cliSection),
+                                            ("lab_reference_catalog",    "The Lab - Command Catalog", "Hal command catalog",     catalogSection),
+                                        ]
+
+                                        // Hash over every section's type+text, versioned so a change to the SPLIT
+                                        // scheme (not just the text) forces a re-ingest. v2 = the four-piles split.
+                                        let combined = sections.map { $0.type + "\u{1}" + $0.text }.joined(separator: "\u{2}")
+                                        let currentHash = (combined + "#labchunk-v2").hash
                                         let storedHash = UserDefaults.standard.integer(forKey: "hal_lab_reference_hash")
                                         var existsStmt: OpaquePointer?
                                         var rowCount = 0
-                                        if sqlite3_prepare_v2(db, "SELECT COUNT(*) FROM unified_content WHERE source_type = 'lab_reference'", -1, &existsStmt, nil) == SQLITE_OK {
+                                        if sqlite3_prepare_v2(db, "SELECT COUNT(*) FROM unified_content WHERE source_type LIKE 'lab_reference%'", -1, &existsStmt, nil) == SQLITE_OK {
                                             if sqlite3_step(existsStmt) == SQLITE_ROW { rowCount = Int(sqlite3_column_int(existsStmt, 0)) }
                                         }
                                         sqlite3_finalize(existsStmt)
@@ -2281,79 +2470,96 @@ class MemoryStore: ObservableObject {
                                             print("HALDEBUG-SELFKNOWLEDGE: Lab reference unchanged, current")
                                             return
                                         }
-                                        print("HALDEBUG-SELFKNOWLEDGE: (re)ingesting Lab usage reference...")
+                                        print("HALDEBUG-SELFKNOWLEDGE: (re)ingesting Lab usage reference (four piles)...")
 
-                                        // Split the guide into ~1400-char pieces on line boundaries so BM25 can
-                                        // surface the relevant SECTION. Each piece is self-labelling so a retrieved
-                                        // chunk still reads sensibly when injected into a prompt.
-                                        let labChunks: [String] = {
+                                        // Clear the whole lab_reference* family (old single 'lab_reference' rows and
+                                        // any prior sub-pile rows) so a scheme change never leaves orphans. FTS stays
+                                        // in sync via the unified_content delete/insert triggers.
+                                        sqlite3_exec(db, "DELETE FROM unified_content WHERE source_type LIKE 'lab_reference%'", nil, nil, nil)
+                                        sqlite3_exec(db, "DELETE FROM sources WHERE source_type LIKE 'lab_reference%'", nil, nil, nil)
+
+                                        let timestamp = Int(Date().timeIntervalSince1970)
+
+                                        // Chunk one section on line boundaries (~1400 chars) and insert each chunk
+                                        // under the section's own source_type. Self-labelling header so a retrieved
+                                        // chunk reads sensibly AND cites its source ("Hal RoboRunner guide | part k/n").
+                                        // Returns (produced, inserted) so the caller verifies a complete write before
+                                        // trusting the hash.
+                                        func ingestSection(type: String, name: String, label: String, text: String) -> (Int, Int) {
                                             let maxChunkChars = 1400
-                                            var chunks: [String] = []
+                                            var pieces: [String] = []
                                             var buf: [String] = []
                                             var bufLen = 0
                                             func flush() {
                                                 let body = buf.joined(separator: "\n").trimmingCharacters(in: .whitespacesAndNewlines)
                                                 buf.removeAll(keepingCapacity: true); bufLen = 0
-                                                if !body.isEmpty { chunks.append(body) }
+                                                if !body.isEmpty { pieces.append(body) }
                                             }
-                                            for line in labReference.components(separatedBy: "\n") {
+                                            for line in text.components(separatedBy: "\n") {
                                                 if bufLen + line.count + 1 > maxChunkChars && !buf.isEmpty { flush() }
                                                 buf.append(line); bufLen += line.count + 1
                                             }
                                             flush()
-                                            let total = chunks.count
-                                            return chunks.enumerated().map { (i, c) in
-                                                "[Hal Lab usage guide | part \(i + 1)/\(total)]\n\(c)"
+                                            let total = pieces.count
+                                            let chunks = pieces.enumerated().map { (i, c) in "[\(label) | part \(i + 1)/\(total)]\n\(c)" }
+
+                                            let sourceID = "hal-\(type)"
+                                            var stmt: OpaquePointer?
+                                            let sourceInsertSQL = """
+                                            INSERT OR REPLACE INTO sources
+                                            (id, source_type, display_name, created_at, last_updated, total_chunks, file_size)
+                                            VALUES (?, ?, ?, ?, ?, ?, ?)
+                                            """
+                                            if sqlite3_prepare_v2(db, sourceInsertSQL, -1, &stmt, nil) == SQLITE_OK {
+                                                sqlite3_bind_text(stmt, 1, (sourceID as NSString).utf8String, -1, nil)
+                                                sqlite3_bind_text(stmt, 2, (type as NSString).utf8String, -1, nil)
+                                                sqlite3_bind_text(stmt, 3, (name as NSString).utf8String, -1, nil)
+                                                sqlite3_bind_int64(stmt, 4, Int64(timestamp))
+                                                sqlite3_bind_int64(stmt, 5, Int64(timestamp))
+                                                sqlite3_bind_int(stmt, 6, Int32(chunks.count))
+                                                sqlite3_bind_int64(stmt, 7, Int64(text.count))
+                                                sqlite3_step(stmt)
                                             }
-                                        }()
+                                            sqlite3_finalize(stmt)
 
-                                        var stmt: OpaquePointer?
-                                        sqlite3_exec(db, "DELETE FROM unified_content WHERE source_type = 'lab_reference'", nil, nil, nil)
-                                        sqlite3_exec(db, "DELETE FROM sources WHERE source_type = 'lab_reference'", nil, nil, nil)
-
-                                        let sourceID = "hal-lab-reference"
-                                        let timestamp = Int(Date().timeIntervalSince1970)
-                                        let sourceInsertSQL = """
-                                        INSERT OR REPLACE INTO sources
-                                        (id, source_type, display_name, created_at, last_updated, total_chunks, file_size)
-                                        VALUES (?, 'lab_reference', 'The Lab - How To Use It', ?, ?, ?, ?)
-                                        """
-                                        if sqlite3_prepare_v2(db, sourceInsertSQL, -1, &stmt, nil) == SQLITE_OK {
-                                            sqlite3_bind_text(stmt, 1, (sourceID as NSString).utf8String, -1, nil)
-                                            sqlite3_bind_int64(stmt, 2, Int64(timestamp))
-                                            sqlite3_bind_int64(stmt, 3, Int64(timestamp))
-                                            sqlite3_bind_int(stmt, 4, Int32(labChunks.count))
-                                            sqlite3_bind_int64(stmt, 5, Int64(labReference.count))
-                                            sqlite3_step(stmt)
-                                        }
-                                        sqlite3_finalize(stmt)
-
-                                        let contentInsertSQL = """
-                                        INSERT OR REPLACE INTO unified_content
-                                        (id, content, timestamp, source_type, source_id, position, is_from_user)
-                                        VALUES (?, ?, ?, 'lab_reference', ?, ?, 0)
-                                        """
-                                        var inserted = 0
-                                        if sqlite3_prepare_v2(db, contentInsertSQL, -1, &stmt, nil) == SQLITE_OK {
-                                            for (index, chunk) in labChunks.enumerated() {
-                                                sqlite3_reset(stmt)
-                                                sqlite3_clear_bindings(stmt)
-                                                let contentID = UUID().uuidString as NSString
-                                                let chunkNS = chunk as NSString
-                                                sqlite3_bind_text(stmt, 1, contentID.utf8String, -1, nil)
-                                                sqlite3_bind_text(stmt, 2, chunkNS.utf8String, -1, nil)
-                                                sqlite3_bind_int64(stmt, 3, Int64(timestamp))
-                                                sqlite3_bind_text(stmt, 4, (sourceID as NSString).utf8String, -1, nil)
-                                                sqlite3_bind_int(stmt, 5, Int32(index))
-                                                if sqlite3_step(stmt) == SQLITE_DONE { inserted += 1 }
+                                            let contentInsertSQL = """
+                                            INSERT OR REPLACE INTO unified_content
+                                            (id, content, timestamp, source_type, source_id, position, is_from_user)
+                                            VALUES (?, ?, ?, ?, ?, ?, 0)
+                                            """
+                                            var inserted = 0
+                                            if sqlite3_prepare_v2(db, contentInsertSQL, -1, &stmt, nil) == SQLITE_OK {
+                                                for (index, chunk) in chunks.enumerated() {
+                                                    sqlite3_reset(stmt)
+                                                    sqlite3_clear_bindings(stmt)
+                                                    let contentID = UUID().uuidString as NSString
+                                                    let chunkNS = chunk as NSString
+                                                    sqlite3_bind_text(stmt, 1, contentID.utf8String, -1, nil)
+                                                    sqlite3_bind_text(stmt, 2, chunkNS.utf8String, -1, nil)
+                                                    sqlite3_bind_int64(stmt, 3, Int64(timestamp))
+                                                    sqlite3_bind_text(stmt, 4, (type as NSString).utf8String, -1, nil)
+                                                    sqlite3_bind_text(stmt, 5, (sourceID as NSString).utf8String, -1, nil)
+                                                    sqlite3_bind_int(stmt, 6, Int32(index))
+                                                    if sqlite3_step(stmt) == SQLITE_DONE { inserted += 1 }
+                                                }
                                             }
+                                            sqlite3_finalize(stmt)
+                                            return (chunks.count, inserted)
                                         }
-                                        sqlite3_finalize(stmt)
-                                        if inserted == labChunks.count && inserted > 0 {
+
+                                        var producedTotal = 0
+                                        var insertedTotal = 0
+                                        for s in sections {
+                                            let (produced, inserted) = ingestSection(type: s.type, name: s.name, label: s.label, text: s.text)
+                                            producedTotal += produced
+                                            insertedTotal += inserted
+                                            print("HALDEBUG-SELFKNOWLEDGE: \(s.type): \(inserted)/\(produced) chunks")
+                                        }
+                                        if insertedTotal == producedTotal && insertedTotal > 0 {
                                             UserDefaults.standard.set(currentHash, forKey: "hal_lab_reference_hash")
-                                            print("HALDEBUG-SELFKNOWLEDGE: Lab usage reference ingested — \(inserted) chunks from \(labReference.count) chars")
+                                            print("HALDEBUG-SELFKNOWLEDGE: Lab usage reference ingested: \(insertedTotal) chunks across \(sections.count) piles")
                                         } else {
-                                            print("HALDEBUG-SELFKNOWLEDGE: ERROR: stored \(inserted)/\(labChunks.count) lab chunks — leaving hash unset so next launch retries")
+                                            print("HALDEBUG-SELFKNOWLEDGE: ERROR: stored \(insertedTotal)/\(producedTotal) lab chunks, leaving hash unset so next launch retries")
                                         }
                                     }
 
@@ -2806,10 +3012,21 @@ extension MemoryStore {
         let raw = query.lowercased()
         let allowed = CharacterSet.alphanumerics.union(.whitespaces)
         let cleaned = String(raw.unicodeScalars.map { allowed.contains($0) ? Character($0) : Character(" ") })
+        // FTS5 reads AND / OR / NOT / NEAR as query operators, so drop any bareword
+        // token equal to one of them — a natural question like "bearer token and port"
+        // would otherwise emit "... OR and OR ..." and error the whole MATCH. We do
+        // NOT quote the tokens: the FTS index uses the `porter` stemmer, and quoting a
+        // token as a one-word phrase makes certain stems fail to match (device-observed
+        // 2026-07-30: "token"/"send"/"conversation" returned zero while "command"
+        // matched, all in the same chunk). Bare, lowercased tokens are stemmed the same
+        // way on both sides and match reliably; lowercasing already prevents the
+        // reserved words from being read as operators except when the user literally
+        // types them, which the filter below handles.
+        let reserved: Set<String> = ["and", "or", "not", "near"]
         let tokens = cleaned
             .components(separatedBy: .whitespaces)
             .map { $0.trimmingCharacters(in: .whitespaces) }
-            .filter { $0.count >= 2 }  // drop "a", "i", noise
+            .filter { $0.count >= 2 && !reserved.contains($0) }  // drop "a"/"i" noise + FTS operators
         guard !tokens.isEmpty else { return "\"\"" }  // empty match — returns nothing
         return tokens.joined(separator: " OR ")
     }
@@ -3210,13 +3427,14 @@ extension MemoryStore {
 
         let exclusionClause = buildExclusionClause(conversationId: currentConversationId, excludeTurns: excludeTurns)
 
-        // Self-knowledge corpora (source_code + lab_reference) are ALWAYS hidden
-        // from general RAG so they only ever enter a prompt via the KnowledgeRouter's
-        // deliberate injection — the "one door" rule. Both are retrieved together by
-        // the router's BM25-only searchSelfKnowledge. `semantic*` is unqualified
-        // (FROM unified_content, no alias); `bm25*` is `u.`-qualified for the FTS JOIN.
-        let semanticSourceClause = " AND source_type NOT IN ('source_code','lab_reference')"
-        let bm25SourceClause = " AND u.source_type NOT IN ('source_code','lab_reference')"
+        // Self-knowledge corpora (source_code + every lab_reference* sub-pile) are
+        // ALWAYS hidden from general RAG so they only ever enter a prompt via the
+        // KnowledgeRouter's deliberate injection — the "one door" rule. The guide is
+        // split into per-door source_types (lab_reference_roborunner/_api/_cli/_catalog),
+        // so match the whole family with LIKE, not a fixed IN list. `semantic*` is
+        // unqualified (FROM unified_content, no alias); `bm25*` is `u.`-qualified.
+        let semanticSourceClause = " AND source_type != 'source_code' AND source_type NOT LIKE 'lab_reference%'"
+        let bm25SourceClause = " AND u.source_type != 'source_code' AND u.source_type NOT LIKE 'lab_reference%'"
 
         // Row metadata captured per id during retrieval, then reattached
         // to the RRF-fused result list. Keyed by `id` (TEXT PRIMARY KEY
@@ -6358,16 +6576,20 @@ enum HelpTopic: String, CaseIterable, Identifiable {
         }
     }
 
-    /// Which self-knowledge corpora this topic draws from. The three tool topics
-    /// live in the Lab usage guide; Architecture is Hal's own source. Coarse for
-    /// now (Layer 1) — this already keeps the 672 code chunks out of a tool session
-    /// and vice-versa, which is what killed the AFM cross-pile poison. Layer 2 adds
-    /// a per-topic tag so CLI / API / RoboRunner scope FINELY within the guide
-    /// instead of all three sharing it.
+    /// Which self-knowledge corpora this topic draws from, in priority order (the
+    /// scoped search fetches each in turn, so the FIRST entry leads). Layer 2 (the
+    /// "four piles"): the guide is split into per-door source_types, so a tool topic
+    /// pulls ITS door section first, then the shared command catalog (the verb list
+    /// is the same across all three doors, so it isn't partitioned). This removes the
+    /// Layer-1 coarseness where RoboRunner Help also surfaced the API/CLI door text.
+    /// Architecture is Hal's own source. The catalog is intentionally shared — a
+    /// RoboRunner script still needs to know what verbs exist.
     var sourceTypes: [String] {
         switch self {
-        case .roboRunner, .api, .cli: return ["lab_reference"]
-        case .architecture:           return ["source_code"]
+        case .roboRunner:   return ["lab_reference_roborunner", "lab_reference_catalog"]
+        case .api:          return ["lab_reference_api", "lab_reference_catalog"]
+        case .cli:          return ["lab_reference_cli", "lab_reference_catalog"]
+        case .architecture: return ["source_code"]
         }
     }
 }

@@ -613,6 +613,10 @@ nonisolated enum CommandCatalog {
         CommandDescriptor(verb: "EMBEDDING_DOWNLOAD_STATUS", args: "[:<id>]", summary: "Report embedder download status.", category: .embeddings, destructive: false),
         CommandDescriptor(verb: "FTS_DIAG", args: nil, summary: "Diagnostic for the full-text search index.", category: .embeddings, destructive: false),
         CommandDescriptor(verb: "DB_SCHEMA", args: "<table>", summary: "Report the schema of a database table.", category: .embeddings, destructive: false),
+        CommandDescriptor(verb: "FTS_PROBE", args: "<source_type>|<word>", summary: "DEBUG: probe the FTS index for a word in a source type (bare/quoted/prefix match counts).", category: .embeddings, destructive: false, debugOnly: true),
+        CommandDescriptor(verb: "FTS_HEAL", args: nil, summary: "DEBUG: drop and rebuild the contentless FTS index from unified_content.", category: .embeddings, destructive: true, debugOnly: true),
+        CommandDescriptor(verb: "SELF_SEARCH_LOOP", args: "<topic>|<count>|<query>", summary: "DEBUG: run the Help Mode self-knowledge search in a single-thread loop, for crash/perf diagnostics.", category: .embeddings, destructive: false, debugOnly: true),
+        CommandDescriptor(verb: "RACE_STRESS", args: "<topic>|<iterationsEach>|<query>", summary: "DEBUG: run the Help Mode search on two concurrent threads to verify the shared DB connection is thread-safe.", category: .embeddings, destructive: false, debugOnly: true),
 
         // Thermal
         CommandDescriptor(verb: "GET_THERMAL_STATE", args: nil, summary: "Report the current thermal level and governor state.", category: .thermal, destructive: false),

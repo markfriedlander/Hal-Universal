@@ -742,6 +742,87 @@ class HalTestConsole: ObservableObject {
             writeStateJSON(vm: vm)
             return "{\"status\":\"ok\",\"helpTopic\":\(topic.map { "\"\($0.rawValue)\"" } ?? "null")}"
 
+        } else if trimmed.hasPrefix("FTS_PROBE:") {
+            // DEBUG (2026-07-30): FTS_PROBE:<source_type>|<word> — ground truth on why a
+            // lexical self-knowledge search misses. Reports whether the stored content
+            // contains the word and how the FTS index matches it (bare/quoted/prefix).
+            let arg = String(trimmed.dropFirst("FTS_PROBE:".count))
+            let parts = arg.components(separatedBy: "|").map { $0.trimmingCharacters(in: .whitespaces) }
+            guard parts.count == 2, !parts[0].isEmpty, !parts[1].isEmpty else {
+                return "{\"status\":\"error\",\"message\":\"FTS_PROBE:<source_type>|<word>\"}"
+            }
+            let probe = vm.memoryStore.debugFTSProbe(sourceType: parts[0], word: parts[1])
+            return "{\"status\":\"ok\",\"probe\":\(probe)}"
+
+        } else if trimmed == "FTS_HEAL" {
+            // DEBUG (2026-07-30): force the contentless-FTS drop+recreate repair and
+            // report integrity before/after + a probe, so CC can verify the self-heal.
+            let result = vm.memoryStore.debugFTSHeal()
+            return "{\"status\":\"ok\",\"heal\":\(result)}"
+
+        } else if trimmed.hasPrefix("SELF_SEARCH_LOOP:") {
+            // DEBUG (2026-07-30): SELF_SEARCH_LOOP:<topic>|<count>|<query> — run ONLY the
+            // Help Mode scoped self-knowledge search (searchSelfKnowledge) in a tight loop,
+            // no LLM generation. Isolates the exact crashing path (sqlite3_step inside bm25)
+            // so an intermittent segfault reproduces cheaply, on the main thread, without
+            // heating the device. Returns iterations completed + hit-count range; if it
+            // crashes, the app dies mid-loop at the reproducing iteration.
+            let arg = String(trimmed.dropFirst("SELF_SEARCH_LOOP:".count))
+            let parts = arg.components(separatedBy: "|")
+            guard parts.count == 3 else {
+                return "{\"status\":\"error\",\"message\":\"SELF_SEARCH_LOOP:<topic>|<count>|<query>\"}"
+            }
+            let topicStr = parts[0].trimmingCharacters(in: .whitespaces).lowercased()
+            let count = max(1, min(2000, Int(parts[1].trimmingCharacters(in: .whitespaces)) ?? 100))
+            let query = parts[2].trimmingCharacters(in: .whitespaces)
+            let scope: [String]?
+            switch topicStr {
+            case "roborunner", "robo":            scope = HelpTopic.roboRunner.sourceTypes
+            case "api":                           scope = HelpTopic.api.sourceTypes
+            case "cli":                           scope = HelpTopic.cli.sourceTypes
+            case "architecture", "arch", "source": scope = HelpTopic.architecture.sourceTypes
+            case "all", "auto", "":               scope = nil
+            default:
+                return "{\"status\":\"error\",\"message\":\"topic must be roborunner|api|cli|architecture|all\"}"
+            }
+            var completed = 0
+            var minHits = Int.max
+            var maxHits = 0
+            for _ in 0..<count {
+                let hits = vm.memoryStore.searchSelfKnowledge(query: query, maxResults: 6, scope: scope)
+                completed += 1
+                minHits = min(minHits, hits.count)
+                maxHits = max(maxHits, hits.count)
+            }
+            return "{\"status\":\"ok\",\"iterationsRequested\":\(count),\"iterationsCompleted\":\(completed),\"minHits\":\(minHits == Int.max ? 0 : minHits),\"maxHits\":\(maxHits)}"
+
+        } else if trimmed.hasPrefix("RACE_STRESS:") {
+            // DEBUG (2026-07-30): RACE_STRESS:<topic>|<iterationsEach>|<query> — run the
+            // scoped Help Mode search on TWO background threads concurrently against the one
+            // shared db connection. Isolates CONCURRENCY as the crash trigger (the single-
+            // thread SELF_SEARCH_LOOP never crashed). Read-only, so no corruption risk; if
+            // the connection isn't thread-safe this reproduces the sqlite3_step segfault.
+            let arg = String(trimmed.dropFirst("RACE_STRESS:".count))
+            let parts = arg.components(separatedBy: "|")
+            guard parts.count == 3 else {
+                return "{\"status\":\"error\",\"message\":\"RACE_STRESS:<topic>|<iterationsEach>|<query>\"}"
+            }
+            let topicStr = parts[0].trimmingCharacters(in: .whitespaces).lowercased()
+            let iters = max(1, min(5000, Int(parts[1].trimmingCharacters(in: .whitespaces)) ?? 200))
+            let query = parts[2].trimmingCharacters(in: .whitespaces)
+            let scope: [String]?
+            switch topicStr {
+            case "roborunner", "robo":            scope = HelpTopic.roboRunner.sourceTypes
+            case "api":                           scope = HelpTopic.api.sourceTypes
+            case "cli":                           scope = HelpTopic.cli.sourceTypes
+            case "architecture", "arch", "source": scope = HelpTopic.architecture.sourceTypes
+            case "all", "auto", "":               scope = nil
+            default:
+                return "{\"status\":\"error\",\"message\":\"topic must be roborunner|api|cli|architecture|all\"}"
+            }
+            let result = vm.memoryStore.debugRaceStress(query: query, scope: scope, iterations: iters)
+            return "{\"status\":\"ok\",\"race\":\(result)}"
+
         } else if trimmed.hasPrefix("SET_REASONING_PROMPT:") {
             // Tuning: override the Layer-0 reasoning directive. Empty value or
             // "default" clears the override (back to the built-in default).
