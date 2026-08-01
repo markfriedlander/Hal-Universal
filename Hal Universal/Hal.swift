@@ -12077,13 +12077,32 @@ class ChatViewModel: ObservableObject {
                                                                                     // added here, so the model had no signal the lookup
                                                                                     // failed and would invent plausible specifics (a cat's
                                                                                     // name, a date) to satisfy a question that clearly
-                                                                                    // expected stored context. Tell it the search missed so it
-                                                                                    // says "I don't have that" instead — Maxim 1 in the
-                                                                                    // retrieval path. Only on a real search (a gate SKIP means
-                                                                                    // the query didn't need memory, so no note is warranted).
-                                                                                    let missNote = "Memory search: you looked in your stored memory and any imported documents for this and found no relevant match. If the answer isn't already in the current conversation or your general knowledge, tell the user plainly that you don't have that information stored — do not invent names, facts, dates, numbers, or other specifics to fill the gap. Saying you don't know is the correct answer here."
+                                                                                    // expected stored context. The note now tells it how to READ
+                                                                                    // the miss: a memory miss is not the same as not knowing, so
+                                                                                    // answer general knowledge normally and reserve "I don't have
+                                                                                    // that stored" for a genuinely personal miss (an empty search is
+                                                                                    // necessary but not sufficient to claim ignorance). Maxim 1 in the
+                                                                                    // retrieval path: don't fabricate, and don't misreport what you
+                                                                                    // actually know as unstored. This fires only when a search ran;
+                                                                                    // the gate-skip case (no search this turn) is handled by the
+                                                                                    // else branch below, which states plainly that no lookup happened.
+                                                                                    let missNote = "Memory check this turn: you searched your stored memory and imported documents and found no relevant match. A memory miss is not the same as not knowing. An empty search only means this was not in your stored memory; it does not mean you are ignorant of it. So if this is general knowledge you actually know (a fact about the world, a public place, a definition), answer it normally, the miss changes nothing. Only when this is something personal or specific the user expected you to have on record, and it is not there and you do not otherwise know it, tell them plainly you do not have it stored, and never invent names, facts, dates, numbers, or other specifics to fill a gap. Admitting you do not know is fine. Reporting something you do know as \"not stored\" is not."
                                                                                     contextSections.append(missNote)
                                                                                     halLog("HALDEBUG-CHAT: memory_search ran but found nothing — appended Bug-2b confabulation-gate note")
+                                                                                } else {
+                                                                                    // Provenance (2026-08-01): the gate judged this turn didn't
+                                                                                    // need a lookup, so NO memory search ran. This branch used to
+                                                                                    // be silent, and silence forces the model to infer the absence.
+                                                                                    // Told elsewhere that it "has" a retrieval memory, it would fill
+                                                                                    // that silence by narrating a search that never happened (the
+                                                                                    // France confabulation). State the truth plainly so Hal reads it
+                                                                                    // instead of inferring it. Sibling of the miss-note above: that
+                                                                                    // one covers "searched, found nothing"; this one covers "did not
+                                                                                    // search". Together they make the memory section always tell the
+                                                                                    // truth about itself (Maxim #1 / #2).
+                                                                                    let noSearchNote = "Memory status this turn: your stored memory and imported documents were not searched. Nothing about this question called for a lookup, so no results were retrieved. Answer from the current conversation and your general knowledge. Do not say or imply that you searched, scanned, or retrieved anything from memory this turn, because no lookup happened."
+                                                                                    contextSections.append(noSearchNote)
+                                                                                    halLog("HALDEBUG-CHAT: no memory search ran this turn — appended provenance 'not searched' note")
                                                                                 }
                                                                             }
 
@@ -12455,7 +12474,20 @@ class ChatViewModel: ObservableObject {
                                                 let turnsSinceReflection = currentTurnCount - lastReflectionTurn
                                                 let reflectionDue = turnsSinceReflection >= 5
                                                 
-                                                // Build base self-awareness context
+                                                // Build base self-awareness context.
+                                                //
+                                                // These lines are true runtime STATS (counts, active model, uptime) —
+                                                // Hal's factual self-awareness. Deliberately NOT asserted here: any
+                                                // standing claim that a retrieval mechanism ("SQLite RAG with semantic
+                                                // search across all conversations") is perpetually operating. Stated as
+                                                // an always-on fact every turn, it gave the model a script to recite even
+                                                // when no search actually ran — it would narrate "I scanned my memory and
+                                                // retrieved X" with no lookup behind it (the 2026-08-01 France
+                                                // confabulation). The truth about whether memory was searched THIS turn,
+                                                // and what it found, is stated per-turn in buildChatMessages instead: one
+                                                // honest source keyed to the real event, not a standing claim. The
+                                                // "read your own source" line stays on purpose — it points Hal at the
+                                                // real thing rather than a summary of it.
                                                 var context = """
                                                 
                                                 #=== BEGIN SELF_AWARENESS ===#
@@ -12469,7 +12501,6 @@ class ChatViewModel: ObservableObject {
                                                 - Documents processed: \(documentCount)
                                                 - Currently using: \(activeModel)
                                                 - Available models: \(modelList)
-                                                - Memory system: SQLite-based RAG with semantic search across all conversations
                                                 - Architecture: modular Swift, organized into numbered LEGO blocks you can read in your own source
                                                 - Storage: All memories persistent via encrypted local database
                                                 
