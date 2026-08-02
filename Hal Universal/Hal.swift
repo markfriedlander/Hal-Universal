@@ -122,6 +122,9 @@
 //  MaintenanceView.swift
 //   63  MaintenanceView (Maintenance & Reset)
 //
+//  SpeechService.swift
+//   64  SpeechService (Text-to-Speech Read-Aloud)
+//
 import SwiftUI
 import SharedModelStoreKit
 import Foundation

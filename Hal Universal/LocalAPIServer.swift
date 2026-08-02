@@ -650,6 +650,31 @@ class HalTestConsole: ObservableObject {
             RoboRunner.shared.requestStop()
             return "{\"status\":\"ok\",\"command\":\"ROBO_STOP\",\"wasRunning\":\(wasRunning)}"
 
+        } else if trimmed.hasPrefix("TTS_SPEAK") {
+            // Read a response aloud. "TTS_SPEAK:<text>" speaks the given text; "TTS_SPEAK" alone
+            // speaks the last Hal turn. Markdown is stripped first so it reads prose, not syntax.
+            let text: String
+            var mid: String? = nil
+            if trimmed.hasPrefix("TTS_SPEAK:") {
+                text = String(trimmed.dropFirst("TTS_SPEAK:".count))
+            } else if let last = vm.messages.last(where: { !$0.isFromUser && !$0.isPartial }) {
+                text = last.content
+                mid = last.id.uuidString
+            } else {
+                return "{\"status\":\"error\",\"message\":\"no Hal turn to speak\"}"
+            }
+            let clean = SpeechService.spokenText(from: text)
+            SpeechService.shared.speak(text, messageID: mid)
+            return "{\"status\":\"ok\",\"command\":\"TTS_SPEAK\",\"isSpeaking\":\(SpeechService.shared.isSpeaking),\"spokenChars\":\(clean.count),\"spokenPreview\":\"\(jsonStringEscape(String(clean.prefix(90))))\"}"
+
+        } else if trimmed == "TTS_STOP" {
+            SpeechService.shared.stop()
+            return "{\"status\":\"ok\",\"command\":\"TTS_STOP\",\"isSpeaking\":\(SpeechService.shared.isSpeaking)}"
+
+        } else if trimmed == "TTS_STATE" {
+            let s = SpeechService.shared
+            return "{\"status\":\"ok\",\"command\":\"TTS_STATE\",\"isSpeaking\":\(s.isSpeaking),\"messageID\":\"\(s.speakingMessageID ?? "")\"}"
+
         } else if trimmed == "RESET_THREAD" {
             vm.memoryStore.deleteThread(id: vm.conversationId)
             vm.startNewConversation()

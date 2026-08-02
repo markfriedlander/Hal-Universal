@@ -43,6 +43,7 @@ FILES=(
   "Hal Universal/RoboRunner.swift"
   "Hal Universal/LabView.swift"
   "Hal Universal/MaintenanceView.swift"
+  "Hal Universal/SpeechService.swift"
 )
 
 OUT="Hal Universal/Hal_Source.txt"
