@@ -2452,24 +2452,41 @@ class HalTestConsole: ObservableObject {
     // MARK: - Output JSON Builder
 
     func buildOutputJSON(turn: Int, userMessage: String, aiMessage: ChatMessage, elapsed: TimeInterval, vm: ChatViewModel) -> String {
+        // Single-source token accounting: the SAME reconstruction the
+        // Prompt Details view and the Copy-as-Text export read (one string,
+        // fullPromptUsed), so the API can never disagree with the UI. Only
+        // the completion size and the context-window constant come from the
+        // stored record — neither is part of "what was sent."
+        let apiSegments = reconstructPromptSegments(fullPrompt: aiMessage.fullPromptUsed)
+        let apiTotals = promptTokenTotals(for: apiSegments)
+        var apiTokByRank: [Int: Int] = [:]
+        for t in apiTotals { apiTokByRank[t.kind.kindRank, default: 0] += t.tokens }
+        func apiTok(_ kinds: [PromptDetailSegmentKind]) -> Int {
+            kinds.reduce(0) { $0 + (apiTokByRank[$1.kindRank] ?? 0) }
+        }
         let tokenJSON: String
-        if let tb = aiMessage.tokenBreakdown {
+        if apiSegments.isEmpty {
+            tokenJSON = "null"
+        } else {
+            let promptTok = apiTotals.reduce(0) { $0 + $1.tokens }
+            let compTok = aiMessage.tokenBreakdown?.completionTokens ?? 0
+            let ctxWin = aiMessage.tokenBreakdown?.contextWindow ?? 0
+            let totalTok = promptTok + compTok
+            let pct = ctxWin > 0 ? (Double(totalTok) / Double(ctxWin)) * 100.0 : 0
             tokenJSON = """
             {
-                "system": \(tb.systemTokens),
-                "shortTerm": \(tb.shortTermTokens),
-                "summary": \(tb.summaryTokens),
-                "rag": \(tb.ragTokens),
-                "userInput": \(tb.userInputTokens),
-                "completion": \(tb.completionTokens),
-                "totalPrompt": \(tb.totalPromptTokens),
-                "total": \(tb.totalTokens),
-                "contextWindow": \(tb.contextWindowSize),
-                "percentUsed": \(String(format: "%.1f", tb.percentageUsed))
+                "system": \(apiTok([.systemPrompt, .temporal, .selfAwareness, .selfKnowledge, .other])),
+                "shortTerm": \(apiTok([.conversationHistory])),
+                "summary": \(apiTok([.summary])),
+                "rag": \(apiTok([.ragRetrieval])),
+                "userInput": \(apiTok([.userMessage])),
+                "completion": \(compTok),
+                "totalPrompt": \(promptTok),
+                "total": \(totalTok),
+                "contextWindow": \(ctxWin),
+                "percentUsed": \(String(format: "%.1f", pct))
               }
             """
-        } else {
-            tokenJSON = "null"
         }
 
         let memoryJSON: String
@@ -2497,15 +2514,27 @@ class HalTestConsole: ObservableObject {
         }
 
         let prompt = aiMessage.fullPromptUsed ?? ""
-        let sections = [
-            prompt.contains("#=== BEGIN SYSTEM ===#")           ? "\"system\""            : nil,
-            prompt.contains("#=== BEGIN MEMORY_SHORT ===#")    ? "\"short_term_memory\""  : nil,
-            prompt.contains("#=== BEGIN SUMMARY ===#")          ? "\"summary\""            : nil,
-            prompt.contains("#=== BEGIN TEMPORAL_CONTEXT ===#") ? "\"temporal_context\""  : nil,
-            prompt.contains("#=== BEGIN MEMORY_LONG ===#")     ? "\"rag\""                : nil,
-            prompt.contains("#=== BEGIN SELF_AWARENESS ===#")  ? "\"self_awareness\""     : nil,
-            prompt.contains("#=== BEGIN SELF_KNOWLEDGE ===#")  ? "\"self_knowledge\""     : nil,
-        ].compactMap { $0 }.joined(separator: ", ")
+        // Which sections are present, derived from the SAME reconstruction
+        // (not from HelPML markers the chat-format builder no longer emits).
+        func sectionKey(_ k: PromptDetailSegmentKind) -> String? {
+            switch k {
+            case .systemPrompt:        return "system"
+            case .temporal:            return "temporal_context"
+            case .summary:             return "summary"
+            case .selfAwareness:       return "self_awareness"
+            case .selfKnowledge:       return "self_knowledge"
+            case .ragRetrieval:        return "rag"
+            case .conversationHistory: return "short_term_memory"
+            case .userMessage:         return "user_message"
+            case .other:               return nil
+            }
+        }
+        var seenSection = Set<String>()
+        let sections = apiSegments
+            .compactMap { sectionKey($0.kind) }
+            .filter { seenSection.insert($0).inserted }
+            .map { "\"\($0)\"" }
+            .joined(separator: ", ")
 
         let promptContent = prompt.isEmpty ? "(not captured — check HALDEBUG-PROMPT logs)" : prompt
 

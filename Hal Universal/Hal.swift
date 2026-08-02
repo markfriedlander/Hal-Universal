@@ -13870,44 +13870,28 @@ class ChatViewModel: ObservableObject {
                                                                 }
 
                                                                 // MARK: - Token Breakdown Calculator
+                                                                // Single-source (2026-08-01): the prompt-side token counts are NO
+                                                                // longer computed here. They are derived on demand from the one
+                                                                // canonical reconstruction — `reconstructPromptSegments` over
+                                                                // `fullPromptUsed` — that the Prompt Details view, the Copy-as-Text
+                                                                // export, and the antenna all read. This deletes the old parallel
+                                                                // counter: it scanned for HelPML `#=== BEGIN … ===#` markers the
+                                                                // chat-format builder stopped emitting, so RAG / summary / short-term
+                                                                // silently read 0 — a second source of truth that disagreed with the
+                                                                // real prompt. What remains here are the only two values that are NOT
+                                                                // part of "what was sent": the completion (reply) size and the
+                                                                // model's context-window constant. The prompt-side struct fields are
+                                                                // left 0 (vestigial; no reader consumes them — retire them with the
+                                                                // struct in a later tidy). The `prompt`/`userInput` params are now
+                                                                // unused for the same reason.
                                                                 private func calculateTokenBreakdown(prompt: String, userInput: String, completion: String) -> TokenBreakdown {
-                                                                    // Extract components from the prompt
-                                                                    let systemTokens = TokenEstimator.estimateTokens(from: systemPrompt)
-                                                                    
-                                                                    // Extract summary section if present (HelPML delimiters)
-                                                                    var summaryTokens = 0
-                                                                    if let start = prompt.range(of: "#=== BEGIN SUMMARY ===#"),
-                                                                       let end = prompt.range(of: "#=== END SUMMARY ===#") {
-                                                                        summaryTokens = TokenEstimator.estimateTokens(from: String(prompt[start.upperBound..<end.lowerBound]))
-                                                                    }
-
-                                                                    // Extract RAG context section if present (HelPML delimiters)
-                                                                    var ragTokens = 0
-                                                                    if let start = prompt.range(of: "#=== BEGIN MEMORY_LONG ===#"),
-                                                                       let end = prompt.range(of: "#=== END MEMORY_LONG ===#") {
-                                                                        ragTokens = TokenEstimator.estimateTokens(from: String(prompt[start.upperBound..<end.lowerBound]))
-                                                                    }
-
-                                                                    // Extract short-term history section if present (HelPML delimiters)
-                                                                    var shortTermTokens = 0
-                                                                    if let start = prompt.range(of: "#=== BEGIN MEMORY_SHORT ===#"),
-                                                                       let end = prompt.range(of: "#=== END MEMORY_SHORT ===#") {
-                                                                        shortTermTokens = TokenEstimator.estimateTokens(from: String(prompt[start.upperBound..<end.lowerBound]))
-                                                                    }
-                                                                    
-                                                                    // User input tokens
-                                                                    let userInputTokens = TokenEstimator.estimateTokens(from: userInput)
-                                                                    
-                                                                    // Completion tokens
-                                                                    let completionTokens = TokenEstimator.estimateTokens(from: completion)
-                                                                    
                                                                     return TokenBreakdown(
-                                                                        systemTokens: systemTokens,
-                                                                        summaryTokens: summaryTokens,
-                                                                        ragTokens: ragTokens,
-                                                                        shortTermTokens: shortTermTokens,
-                                                                        userInputTokens: userInputTokens,
-                                                                        completionTokens: completionTokens,
+                                                                        systemTokens: 0,
+                                                                        summaryTokens: 0,
+                                                                        ragTokens: 0,
+                                                                        shortTermTokens: 0,
+                                                                        userInputTokens: 0,
+                                                                        completionTokens: TokenEstimator.estimateTokens(from: completion),
                                                                         contextWindow: selectedModel.contextWindow
                                                                     )
                                                                 }

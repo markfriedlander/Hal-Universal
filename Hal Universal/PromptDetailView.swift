@@ -339,6 +339,97 @@ nonisolated func parsePromptSegments(fullPrompt: String) -> [PromptDetailSegment
     return segments
 }
 
+/// THE single canonical reconstruction of a turn's prompt: the ordered
+/// pieces that were actually sent to the model, derived entirely from the
+/// ONE stored string `fullPromptUsed`.
+///
+/// `fullPromptUsed` is the synthetic serialization the send flow builds
+/// (`Hal.swift` ~12855): every chat message mapped to "[role] content"
+/// and joined by "\n\n". So one string already holds the whole input —
+/// the `[system]` block (persona + CURRENT CONTEXT), then the
+/// `[user]`/`[assistant]` history turns, then the final `[user]` message.
+/// We regroup it back into role blocks: a paragraph that begins with a
+/// role tag starts a new block; every other paragraph continues the
+/// current one (so a multi-paragraph system message or reply stays
+/// whole). Only the send flow's own tags start a paragraph this way —
+/// RAG snippets use "[1]" / "[3 hours ago]:" forms, not "[user] ".
+///
+/// This is the ONE place that answers "what was sent, in what order."
+/// The segment cards, the token budget, the Copy-as-Text export, and the
+/// antenna all read from it and none re-derives it — one reconstruction,
+/// many readers, cannot drift. It replaces two prior second-sources: the
+/// old token counter that scanned for HelPML markers the builder no
+/// longer emits (RAG/summary read 0), and the view's separate re-adding
+/// of history that both double-counted AND let the trailing turns get
+/// absorbed into the RAG segment (inflating its size).
+nonisolated func reconstructPromptSegments(fullPrompt: String?) -> [PromptDetailSegment] {
+    guard let full = fullPrompt, !full.isEmpty else { return [] }
+
+    // Regroup the "[role] content" serialization back into role blocks.
+    var blocks: [(role: String, paras: [String])] = []
+    for para in full.components(separatedBy: "\n\n") {
+        if para.hasPrefix("[system] ") {
+            blocks.append(("system", [String(para.dropFirst("[system] ".count))]))
+        } else if para.hasPrefix("[user] ") {
+            blocks.append(("user", [String(para.dropFirst("[user] ".count))]))
+        } else if para.hasPrefix("[assistant] ") {
+            blocks.append(("assistant", [String(para.dropFirst("[assistant] ".count))]))
+        } else if !blocks.isEmpty {
+            blocks[blocks.count - 1].paras.append(para)
+        }
+        // A leading tag-less paragraph (shouldn't occur) is dropped.
+    }
+
+    var result: [PromptDetailSegment] = []
+
+    // System block → persona + CURRENT CONTEXT sections. Parsing ONLY the
+    // system block (not the whole string) is what stops the trailing
+    // turns from being absorbed into the RAG segment.
+    if let sys = blocks.first(where: { $0.role == "system" }) {
+        result.append(contentsOf: parsePromptSegments(fullPrompt: sys.paras.joined(separator: "\n\n")))
+    }
+
+    // Turns: the final [user] is this turn's message; everything before it
+    // is conversation history.
+    let turns = blocks.filter { $0.role == "user" || $0.role == "assistant" }
+    var history = turns
+    var finalUser: String? = nil
+    if let last = turns.last, last.role == "user" {
+        finalUser = last.paras.joined(separator: "\n\n")
+        history = Array(turns.dropLast())
+    }
+    if !history.isEmpty {
+        let body = history.map { blk in
+            "[\(blk.role == "user" ? "User" : "Hal")] \(blk.paras.joined(separator: "\n\n"))"
+        }.joined(separator: "\n\n")
+        result.append(PromptDetailSegment(kind: .conversationHistory, content: body, index: result.count))
+    }
+    if let fu = finalUser, !fu.isEmpty {
+        result.append(PromptDetailSegment(kind: .userMessage, content: fu, index: result.count))
+    }
+    return result
+}
+
+/// Per-kind token totals for a reconstructed segment list, in first-
+/// appearance (assembly) order. The token budget IS exactly this —
+/// `TokenEstimator` summed over the SAME segments the cards render — so
+/// the budget can never disagree with what is shown above it, and the
+/// conversation-history turns get counted like every other piece.
+/// Keyed on `kindRank` (Int) rather than the enum, because the enum's
+/// synthesized `Hashable`/`Equatable` is @MainActor-isolated here (see
+/// `kindRank`'s note) and this function is nonisolated.
+nonisolated func promptTokenTotals(
+    for segments: [PromptDetailSegment]
+) -> [(kind: PromptDetailSegmentKind, tokens: Int)] {
+    var order: [PromptDetailSegmentKind] = []
+    var byRank: [Int: Int] = [:]
+    for seg in segments {
+        if byRank[seg.kind.kindRank] == nil { order.append(seg.kind) }
+        byRank[seg.kind.kindRank, default: 0] += TokenEstimator.estimateTokens(from: seg.content)
+    }
+    return order.map { (kind: $0, tokens: byRank[$0.kindRank] ?? 0) }
+}
+
 // MARK: - View
 
 /// Color-coded, collapsible prompt detail view. Replaces the
@@ -358,26 +449,12 @@ struct PromptDetailView: View {
     // redraw. Now each card owns its own @State; this view doesn't
     // need to track expansion at all.
 
+    // Reads THE canonical reconstruction (reconstructPromptSegments) from
+    // the one stored string — the same source the token budget, the
+    // export, and the antenna use. The cards and the budget can't disagree
+    // because they're the same list.
     private var segments: [PromptDetailSegment] {
-        var result: [PromptDetailSegment] = []
-        if let prompt = message.fullPromptUsed, !prompt.isEmpty {
-            result.append(contentsOf: parsePromptSegments(fullPrompt: prompt))
-        }
-        // Append conversation-history and user-message segments so the
-        // viewer presents the WHOLE input to the LLM as one ordered
-        // narrative, even though the chat layer split it across
-        // multiple .system / .user / .assistant messages.
-        if !recentHistory.isEmpty {
-            let body = recentHistory.map { m in
-                let speaker = m.isFromUser ? "User" : "Hal"
-                return "[\(speaker)] \(m.content)"
-            }.joined(separator: "\n\n")
-            result.append(PromptDetailSegment(kind: .conversationHistory, content: body))
-        }
-        if let userMsg = precedingUserContent, !userMsg.isEmpty {
-            result.append(PromptDetailSegment(kind: .userMessage, content: userMsg))
-        }
-        return result
+        reconstructPromptSegments(fullPrompt: message.fullPromptUsed)
     }
 
     var body: some View {
@@ -398,10 +475,18 @@ struct PromptDetailView: View {
                     // tagged to the colors above so users can read
                     // the budget in the same visual language as the
                     // segments.
-                    if let breakdown = message.tokenBreakdown {
-                        TokenBudgetSummary(breakdown: breakdown)
-                            .padding(.horizontal, 16)
-                            .padding(.top, 6)
+                    // Completion tokens (the reply's size) and the context-
+                    // window constant are the only two values NOT part of "what
+                    // was sent," so they come from the stored record; every
+                    // prompt-side number is summed from `segments`.
+                    if !segments.isEmpty {
+                        TokenBudgetSummary(
+                            segments: segments,
+                            completionTokens: message.tokenBreakdown?.completionTokens ?? 0,
+                            contextWindow: message.tokenBreakdown?.contextWindow ?? 0
+                        )
+                        .padding(.horizontal, 16)
+                        .padding(.top, 6)
                     }
                 }
                 .padding(.bottom, 24)
@@ -497,7 +582,19 @@ private struct PromptDetailSegmentCard: View {
 }
 
 private struct TokenBudgetSummary: View {
-    let breakdown: TokenBreakdown
+    // Single source: the same reconstructed segments the cards render.
+    let segments: [PromptDetailSegment]
+    let completionTokens: Int   // the reply's size — not part of the prompt
+    let contextWindow: Int      // model constant
+
+    private var rows: [(kind: PromptDetailSegmentKind, tokens: Int)] {
+        promptTokenTotals(for: segments)
+    }
+    private var promptTokens: Int { rows.reduce(0) { $0 + $1.tokens } }
+    private var totalTokens: Int { promptTokens + completionTokens }
+    private var percentageUsed: Double {
+        contextWindow > 0 ? (Double(totalTokens) / Double(contextWindow)) * 100.0 : 0
+    }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
@@ -508,35 +605,38 @@ private struct TokenBudgetSummary: View {
                     .font(.subheadline)
                     .fontWeight(.semibold)
             }
+            // One row per segment kind actually present, labeled and
+            // colored by the segment itself — so these rows match the
+            // cards above by construction, with no separate vocabulary.
             VStack(alignment: .leading, spacing: 4) {
-                tokenRow(label: "System Prompt", value: breakdown.systemTokens, color: .purple)
-                tokenRow(label: "Conversation Summary", value: breakdown.summaryTokens, color: .yellow)
-                tokenRow(label: "Memory Snippets (RAG)", value: breakdown.ragTokens, color: .green)
-                tokenRow(label: "Short-Term History", value: breakdown.shortTermTokens, color: .blue)
-                tokenRow(label: "User Input", value: breakdown.userInputTokens, color: .gray)
+                ForEach(rows.indices, id: \.self) { i in
+                    tokenRow(label: rows[i].kind.displayName,
+                             value: rows[i].tokens,
+                             color: rows[i].kind.color)
+                }
             }
             Divider().padding(.vertical, 2)
             HStack {
                 Text("Prompt (in)").font(.footnote).fontWeight(.semibold)
                 Spacer()
-                Text(formatTokens(breakdown.totalPromptTokens)).font(.footnote).fontWeight(.semibold).monospacedDigit()
+                Text(formatTokens(promptTokens)).font(.footnote).fontWeight(.semibold).monospacedDigit()
             }
             HStack {
                 Text("Completion (out)").font(.footnote).fontWeight(.semibold)
                 Spacer()
-                Text(formatTokens(breakdown.completionTokens)).font(.footnote).fontWeight(.semibold).monospacedDigit()
+                Text(formatTokens(completionTokens)).font(.footnote).fontWeight(.semibold).monospacedDigit()
             }
             Divider().padding(.vertical, 2)
             HStack {
                 Text("Total").font(.footnote).fontWeight(.bold)
                 Spacer()
-                Text("\(formatTokens(breakdown.totalTokens)) / \(formatTokens(breakdown.contextWindowSize))")
+                Text("\(formatTokens(totalTokens)) / \(formatTokens(contextWindow))")
                     .font(.footnote).fontWeight(.bold).monospacedDigit()
             }
             HStack {
                 Text("Window Usage").font(.footnote).foregroundColor(.secondary)
                 Spacer()
-                Text(String(format: "%.1f%%", breakdown.percentageUsed))
+                Text(String(format: "%.1f%%", percentageUsed))
                     .font(.footnote).foregroundColor(.secondary).monospacedDigit()
             }
         }
@@ -579,37 +679,29 @@ nonisolated func buildPromptDetailExportText(
     lines.append("Turn \(message.turnNumber) — \(message.recordedByModel)")
     lines.append("")
 
-    if let prompt = message.fullPromptUsed, !prompt.isEmpty {
-        for segment in parsePromptSegments(fullPrompt: prompt) {
-            lines.append("━━ \(segment.kind.exportTag) ━━")
-            lines.append(segment.content)
-            lines.append("")
-        }
-    }
-    if !recentHistory.isEmpty {
-        lines.append("━━ \(PromptDetailSegmentKind.conversationHistory.exportTag) ━━")
-        for m in recentHistory {
-            let speaker = m.isFromUser ? "User" : "Hal"
-            lines.append("[\(speaker)] \(m.content)")
-            lines.append("")
-        }
-    }
-    if let userMsg = precedingUserContent, !userMsg.isEmpty {
-        lines.append("━━ \(PromptDetailSegmentKind.userMessage.exportTag) ━━")
-        lines.append(userMsg)
+    // Same canonical reconstruction the on-screen view uses — one source
+    // for both the section dump and the token budget below.
+    let segments = reconstructPromptSegments(fullPrompt: message.fullPromptUsed)
+    for segment in segments {
+        lines.append("━━ \(segment.kind.exportTag) ━━")
+        lines.append(segment.content)
         lines.append("")
     }
-    if let breakdown = message.tokenBreakdown {
-        lines.append("━━ 📊 TOKEN BUDGET ━━")
-        lines.append("System Prompt:      \(breakdown.systemTokens)")
-        lines.append("Conv. Summary:      \(breakdown.summaryTokens)")
-        lines.append("Memory (RAG):       \(breakdown.ragTokens)")
-        lines.append("Short-Term History: \(breakdown.shortTermTokens)")
-        lines.append("User Input:         \(breakdown.userInputTokens)")
-        lines.append("Prompt (in):        \(breakdown.totalPromptTokens)")
-        lines.append("Completion (out):   \(breakdown.completionTokens)")
-        lines.append("Total:              \(breakdown.totalTokens) / \(breakdown.contextWindowSize)")
-        lines.append(String(format: "Window Usage:       %.1f%%", breakdown.percentageUsed))
+    // Token budget summed from those SAME segments — never a second parse.
+    let totals = promptTokenTotals(for: segments)
+    let promptIn = totals.reduce(0) { $0 + $1.tokens }
+    let completion = message.tokenBreakdown?.completionTokens ?? 0
+    let window = message.tokenBreakdown?.contextWindow ?? 0
+    let total = promptIn + completion
+    lines.append("━━ 📊 TOKEN BUDGET ━━")
+    for t in totals {
+        lines.append("\(t.kind.displayName): \(t.tokens)")
+    }
+    lines.append("Prompt (in):      \(promptIn)")
+    lines.append("Completion (out): \(completion)")
+    lines.append("Total:            \(total) / \(window)")
+    if window > 0 {
+        lines.append(String(format: "Window Usage:     %.1f%%", Double(total) / Double(window) * 100.0))
     }
     return lines.joined(separator: "\n")
 }

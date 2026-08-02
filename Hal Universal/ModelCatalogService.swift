@@ -652,7 +652,7 @@ struct ModelConfiguration: Identifiable, Codable, Equatable, Hashable {
         sizeGB: nil,
         contextWindow: 4_096,
         license: nil,
-        description: "Always available, no download required. Note: Apple Intelligence does not receive Hal's persistent self-knowledge in prompts — its context window is too small to host the full corpus, and we will not ship lossy compression. For continuous self-knowledge across turns, use a curated MLX model.",
+        description: "Always available, no download required. Note: Apple Intelligence does not receive Hal's persistent self-knowledge in prompts — its context window is too small to host the full corpus, and we will not ship lossy compression. For continuous self-knowledge across turns, use a curated MLX model. Apple's on-device model can respond differently depending on the device it's running on. We've seen it, and we can't fully explain why, so we're telling you rather than hiding it.",
         isDownloaded: true,
         localPath: nil,
         // AFM has the tightest context window of any model in the catalog
