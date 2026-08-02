@@ -622,6 +622,19 @@ class HalTestConsole: ObservableObject {
             Task { @MainActor in _ = await RoboRunner.shared.run(script: script, vm: vm, console: console) }
             return "{\"status\":\"ok\",\"command\":\"ROBO_RUN\",\"started\":true}"
 
+        } else if trimmed.hasPrefix("ROBO_CHECK:") {
+            // Validate a RoboRunner script WITHOUT running it — the antenna equivalent of the
+            // editor's Check button (RoboValidator). Returns every issue (errors + warnings) with
+            // line numbers, so the coach can be driven and verified over the antenna. Runs nothing,
+            // touches no state; safe (non-destructive) even though ROBO_RUN is destructive.
+            let script = String(trimmed.dropFirst("ROBO_CHECK:".count))
+            let issues = RoboValidator.validate(script, knownModelIDs: RoboRunner.currentKnownModelIDs())
+            let errorCount = issues.filter { $0.isError }.count
+            let items = issues.map {
+                "{\"severity\":\"\($0.isError ? "error" : "warning")\",\"line\":\($0.line),\"message\":\"\(jsonStringEscape($0.message))\"}"
+            }.joined(separator: ",")
+            return "{\"status\":\"ok\",\"command\":\"ROBO_CHECK\",\"errorCount\":\(errorCount),\"warningCount\":\(issues.count - errorCount),\"issues\":[\(items)]}"
+
         } else if trimmed == "ROBO_STATUS" {
             let r = RoboRunner.shared
             return "{\"status\":\"ok\",\"running\":\(r.busy),\"progress\":\"\(r.progress)\",\"resultsPath\":\"\(r.lastResultsPath ?? "")\",\"error\":\"\(r.lastError ?? "")\"}"

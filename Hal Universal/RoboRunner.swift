@@ -682,6 +682,7 @@ nonisolated enum CommandCatalog {
 
         // RoboRunner Automation
         CommandDescriptor(verb: "ROBO_RUN", args: "<script>", summary: "Run an on-device RoboRunner script. Advanced, a script can issue any verb, including destructive ones.", category: .automation, destructive: true),
+        CommandDescriptor(verb: "ROBO_CHECK", args: "<script>", summary: "Validate a RoboRunner script WITHOUT running it (the coach): returns errors + warnings with line numbers. Runs nothing.", category: .automation, destructive: false),
         CommandDescriptor(verb: "ROBO_STOP", args: nil, summary: "Ask a running RoboRunner script to halt at the next step boundary. Keeps the partial results already captured.", category: .automation, destructive: false),
         CommandDescriptor(verb: "ROBO_STATUS", args: nil, summary: "Report RoboRunner run status.", category: .automation, destructive: false),
         CommandDescriptor(verb: "ROBO_RESULTS", args: nil, summary: "Return the captured results of the last RoboRunner run.", category: .automation, destructive: false),
