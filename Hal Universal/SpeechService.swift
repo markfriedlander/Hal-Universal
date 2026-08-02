@@ -40,8 +40,10 @@ final class SpeechService: NSObject, ObservableObject {
         configureAudioSession()
         let utterance = AVSpeechUtterance(string: clean)
         utterance.rate = AVSpeechUtteranceDefaultSpeechRate
-        // System default voice for the current locale; a picker can come later.
-        utterance.voice = AVSpeechSynthesisVoice(language: AVSpeechSynthesisVoice.currentLanguageCode())
+        // Best-quality voice available for the current language — premium/enhanced (the
+        // "Siri-quality" voices) when the user has them downloaded, else the default compact
+        // voice. A manual voice picker (adapt Posey's VoicePickerView) is a later nicety.
+        utterance.voice = Self.bestVoice()
         speakingMessageID = messageID
         isSpeaking = true
         synth.speak(utterance)
@@ -93,6 +95,51 @@ final class SpeechService: NSObject, ObservableObject {
         let session = AVAudioSession.sharedInstance()
         try? session.setCategory(.playback, mode: .spokenAudio, options: [.mixWithOthers, .duckOthers])
         try? session.setActive(true)
+    }
+
+    // MARK: - Voice selection
+
+    /// The best-quality voice for the current language: premium first, then enhanced, then the
+    /// default compact voice. Premium/enhanced are the natural "Siri-quality" voices — present
+    /// only if the user has downloaded them (Settings › Accessibility › Spoken Content › Voices).
+    /// Falls back gracefully so speech always works. Approach adapted from Posey's voice picker;
+    /// a manual picker (choose a specific voice) is the next step.
+    private static func bestVoice() -> AVSpeechSynthesisVoice? {
+        let lang = AVSpeechSynthesisVoice.currentLanguageCode()
+        let all = AVSpeechSynthesisVoice.speechVoices()
+        // Prefer exact-language matches; else the same base language (e.g. "en"); else anything.
+        let exact = all.filter { $0.language == lang }
+        let base = String(lang.prefix(2))
+        let pool = !exact.isEmpty ? exact : all.filter { $0.language.hasPrefix(base) }
+        let candidates = pool.isEmpty ? all : pool
+        return candidates.max { qualityRank($0.quality) < qualityRank($1.quality) }
+            ?? AVSpeechSynthesisVoice(language: lang)
+    }
+
+    private static func qualityRank(_ q: AVSpeechSynthesisVoiceQuality) -> Int {
+        switch q {
+        case .premium:  return 3
+        case .enhanced: return 2
+        default:        return 1   // .default (compact)
+        }
+    }
+
+    /// Diagnostic: the voice `speak()` would use right now, plus how many premium/enhanced voices
+    /// are installed. Lets the antenna confirm the "Siri-quality" pick without needing an ear.
+    func voiceReport() -> (name: String, quality: String, premiumInstalled: Int, enhancedInstalled: Int) {
+        let v = Self.bestVoice()
+        let all = AVSpeechSynthesisVoice.speechVoices()
+        let quality: String
+        switch v?.quality {
+        case .premium:  quality = "premium"
+        case .enhanced: quality = "enhanced"
+        case .some:     quality = "default"
+        case .none:     quality = "none"
+        @unknown default: quality = "unknown"
+        }
+        return (v?.name ?? "none", quality,
+                all.filter { $0.quality == .premium }.count,
+                all.filter { $0.quality == .enhanced }.count)
     }
 }
 

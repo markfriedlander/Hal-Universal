@@ -687,6 +687,7 @@ nonisolated enum CommandCatalog {
         CommandDescriptor(verb: "TTS_SPEAK", args: "<text?>", summary: "Read text aloud (or the last Hal turn if no text). Strips markdown first.", category: .ui, destructive: false),
         CommandDescriptor(verb: "TTS_STOP", args: nil, summary: "Stop read-aloud.", category: .ui, destructive: false),
         CommandDescriptor(verb: "TTS_STATE", args: nil, summary: "Report read-aloud state (isSpeaking + message id).", category: .ui, destructive: false),
+        CommandDescriptor(verb: "TTS_VOICES", args: nil, summary: "Report the read-aloud voice that would be used (name + quality) and how many premium/enhanced voices are installed.", category: .ui, destructive: false),
         CommandDescriptor(verb: "ROBO_STOP", args: nil, summary: "Ask a running RoboRunner script to halt at the next step boundary. Keeps the partial results already captured.", category: .automation, destructive: false),
         CommandDescriptor(verb: "ROBO_STATUS", args: nil, summary: "Report RoboRunner run status.", category: .automation, destructive: false),
         CommandDescriptor(verb: "ROBO_RESULTS", args: nil, summary: "Return the captured results of the last RoboRunner run.", category: .automation, destructive: false),

@@ -690,6 +690,10 @@ class HalTestConsole: ObservableObject {
             let s = SpeechService.shared
             return "{\"status\":\"ok\",\"command\":\"TTS_STATE\",\"isSpeaking\":\(s.isSpeaking),\"messageID\":\"\(s.speakingMessageID ?? "")\"}"
 
+        } else if trimmed == "TTS_VOICES" {
+            let r = SpeechService.shared.voiceReport()
+            return "{\"status\":\"ok\",\"command\":\"TTS_VOICES\",\"selected\":\"\(jsonStringEscape(r.name))\",\"quality\":\"\(r.quality)\",\"premiumInstalled\":\(r.premiumInstalled),\"enhancedInstalled\":\(r.enhancedInstalled)}"
+
         } else if trimmed == "RESET_THREAD" {
             vm.memoryStore.deleteThread(id: vm.conversationId)
             vm.startNewConversation()
