@@ -31433,6 +31433,9 @@ struct ChatBubbleView: View {
     // file as of 2026-05-17). Only ever set true on the assistant-side
     // branch of the bubble's contextMenu — user bubbles don't surface it.
     @State private var showingPromptDetail: Bool = false
+    // Read-aloud state, so the speaker icon in the message action row can show active
+    // (filled) while THIS message is being spoken, and toggle stop.
+    @ObservedObject private var speech = SpeechService.shared
 
     // MARK: - Prompt-detail context resolution
     //
@@ -31672,6 +31675,59 @@ struct ChatBubbleView: View {
     }
     
 
+    // MARK: - Message action row (visible affordances mirroring the context menu)
+    //
+    // A row of small tappable icons under the footer, one per context-menu action, so the
+    // actions are DISCOVERABLE (and mouse-clickable on Mac) instead of hidden behind a
+    // long-press / right-click. Shown on ALL devices (Mark 2026-08-02 — cross-platform makes
+    // them more discoverable everywhere); the context menu stays too. Hal's turns get the full
+    // set (four copies + inline details + prompt details + read-aloud). Not shown on partial or
+    // status rows. NOTE: this mirrors the assistant contextMenu (~1546) by hand for now — a
+    // later refactor could drive both from one action list (single source); kept simple for v1
+    // since Mark plans to whittle the set after living with it.
+    @ViewBuilder private var messageActionRow: some View {
+        HStack(spacing: 20) {
+            actionIcon("doc.on.doc", "Copy message") {
+                UIPasteboard.general.string = message.content
+            }
+            actionIcon("doc.on.doc.fill", "Copy thread") {
+                UIPasteboard.general.string = chatViewModel.exportChatHistory()
+            }
+            actionIcon("doc.text.magnifyingglass", "Copy message with details") {
+                UIPasteboard.general.string = buildDetailsShareText()
+            }
+            actionIcon("doc.text.fill", "Copy thread with details") {
+                UIPasteboard.general.string = chatViewModel.exportChatHistoryDetailed()
+            }
+            if !message.isFromUser {
+                actionIcon(chatViewModel.showInlineDetails ? "info.circle.fill" : "info.circle",
+                           "Toggle inline details") {
+                    chatViewModel.showInlineDetails.toggle()
+                }
+                actionIcon("text.magnifyingglass", "Prompt details") {
+                    showingPromptDetail = true
+                }
+                let speaking = speech.isSpeaking && speech.speakingMessageID == message.id.uuidString
+                actionIcon(speaking ? "speaker.wave.2.fill" : "speaker.wave.2",
+                           speaking ? "Stop reading" : "Read aloud") {
+                    speech.toggle(message.content, messageID: message.id.uuidString)
+                }
+            }
+        }
+        .font(.caption)
+        .foregroundColor(.secondary)
+        .padding(.top, 3)
+    }
+
+    private func actionIcon(_ systemName: String, _ label: String,
+                            _ action: @escaping () -> Void) -> some View {
+        Button(action: action) {
+            Image(systemName: systemName).contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .accessibilityLabel(label)
+    }
+
     // Inline-details segments — the SAME breakdown, in the SAME order, that
     // the PromptDetailView sheet builds. Rendering these with each kind's
     // color (below) makes the inline view speak the identical color language
@@ -31891,6 +31947,12 @@ struct ChatBubbleView: View {
                     footerView
                         .padding(.horizontal, chatDensity.assistantHInset)
                         .frame(maxWidth: assistantMaxWidth, alignment: .leading)
+                    // Visible action row on its own line under the footer text (all devices).
+                    if !message.isPartial && !isStatusMessage {
+                        messageActionRow
+                            .padding(.horizontal, chatDensity.assistantHInset)
+                            .frame(maxWidth: assistantMaxWidth, alignment: .leading)
+                    }
                 }
                 Spacer()
             }
