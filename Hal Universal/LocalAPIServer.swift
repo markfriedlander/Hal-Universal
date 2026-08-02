@@ -635,6 +635,21 @@ class HalTestConsole: ObservableObject {
             }.joined(separator: ",")
             return "{\"status\":\"ok\",\"command\":\"ROBO_CHECK\",\"errorCount\":\(errorCount),\"warningCount\":\(issues.count - errorCount),\"issues\":[\(items)]}"
 
+        } else if trimmed.hasPrefix("ROBO_GENERATE:") {
+            // Draft a RoboRunner script from a natural-language description using Hal's own model,
+            // guaranteed valid by the validator repair loop. Runs nothing (just generates text +
+            // validates); the returned script is for the user to review/edit/run. Uses one model
+            // generation (slow on big models — allow a long timeout on the client).
+            let desc = String(trimmed.dropFirst("ROBO_GENERATE:".count))
+            let ids = RoboRunner.currentKnownModelIDs()
+            let draft = await RoboScriptGenerator.draft(from: desc, knownModelIDs: ids) { prompt in
+                try await vm.llmService.generateResponse(prompt: prompt, temperature: 0.2)
+            }
+            let items = draft.issues.map {
+                "{\"severity\":\"\($0.isError ? "error" : "warning")\",\"line\":\($0.line),\"message\":\"\(jsonStringEscape($0.message))\"}"
+            }.joined(separator: ",")
+            return "{\"status\":\"ok\",\"command\":\"ROBO_GENERATE\",\"valid\":\(draft.isValid),\"attempts\":\(draft.attempts),\"script\":\"\(jsonStringEscape(draft.script))\",\"issues\":[\(items)]}"
+
         } else if trimmed == "ROBO_STATUS" {
             let r = RoboRunner.shared
             return "{\"status\":\"ok\",\"running\":\(r.busy),\"progress\":\"\(r.progress)\",\"resultsPath\":\"\(r.lastResultsPath ?? "")\",\"error\":\"\(r.lastError ?? "")\"}"

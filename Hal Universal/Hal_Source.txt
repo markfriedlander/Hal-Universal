@@ -25429,6 +25429,21 @@ class HalTestConsole: ObservableObject {
             }.joined(separator: ",")
             return "{\"status\":\"ok\",\"command\":\"ROBO_CHECK\",\"errorCount\":\(errorCount),\"warningCount\":\(issues.count - errorCount),\"issues\":[\(items)]}"
 
+        } else if trimmed.hasPrefix("ROBO_GENERATE:") {
+            // Draft a RoboRunner script from a natural-language description using Hal's own model,
+            // guaranteed valid by the validator repair loop. Runs nothing (just generates text +
+            // validates); the returned script is for the user to review/edit/run. Uses one model
+            // generation (slow on big models — allow a long timeout on the client).
+            let desc = String(trimmed.dropFirst("ROBO_GENERATE:".count))
+            let ids = RoboRunner.currentKnownModelIDs()
+            let draft = await RoboScriptGenerator.draft(from: desc, knownModelIDs: ids) { prompt in
+                try await vm.llmService.generateResponse(prompt: prompt, temperature: 0.2)
+            }
+            let items = draft.issues.map {
+                "{\"severity\":\"\($0.isError ? "error" : "warning")\",\"line\":\($0.line),\"message\":\"\(jsonStringEscape($0.message))\"}"
+            }.joined(separator: ",")
+            return "{\"status\":\"ok\",\"command\":\"ROBO_GENERATE\",\"valid\":\(draft.isValid),\"attempts\":\(draft.attempts),\"script\":\"\(jsonStringEscape(draft.script))\",\"issues\":[\(items)]}"
+
         } else if trimmed == "ROBO_STATUS" {
             let r = RoboRunner.shared
             return "{\"status\":\"ok\",\"running\":\(r.busy),\"progress\":\"\(r.progress)\",\"resultsPath\":\"\(r.lastResultsPath ?? "")\",\"error\":\"\(r.lastError ?? "")\"}"
@@ -33732,6 +33747,7 @@ nonisolated enum CommandCatalog {
         // RoboRunner Automation
         CommandDescriptor(verb: "ROBO_RUN", args: "<script>", summary: "Run an on-device RoboRunner script. Advanced, a script can issue any verb, including destructive ones.", category: .automation, destructive: true),
         CommandDescriptor(verb: "ROBO_CHECK", args: "<script>", summary: "Validate a RoboRunner script WITHOUT running it (the coach): returns errors + warnings with line numbers. Runs nothing.", category: .automation, destructive: false),
+        CommandDescriptor(verb: "ROBO_GENERATE", args: "<description>", summary: "Draft a RoboRunner script from a natural-language description (Hal's model + the validator repair loop). Returns a validated script; runs nothing.", category: .automation, destructive: false),
         CommandDescriptor(verb: "TTS_SPEAK", args: "<text?>", summary: "Read text aloud (or the last Hal turn if no text). Strips markdown first.", category: .ui, destructive: false),
         CommandDescriptor(verb: "TTS_STOP", args: nil, summary: "Stop read-aloud.", category: .ui, destructive: false),
         CommandDescriptor(verb: "TTS_STATE", args: nil, summary: "Report read-aloud state (isSpeaking + message id).", category: .ui, destructive: false),
@@ -34025,6 +34041,110 @@ nonisolated enum RoboValidator {
         return names
     }
 }
+
+/// Turns a natural-language description into a VALID RoboRunner script using Hal's own model,
+/// then guarantees validity by running each draft through `RoboValidator` and feeding any errors
+/// back for repair (up to `maxAttempts`). The optional teaching tool (NEXT #3): a user can
+/// describe what they want and get a runnable script — or ignore it and write their own. The
+/// model call is injected as a closure so this stays pure and off any specific actor (and unit-
+/// testable with a canned generator).
+nonisolated enum RoboScriptGenerator {
+
+    struct Draft {
+        let script: String
+        let issues: [RoboIssue]   // remaining issues after the last attempt (empty on success)
+        let attempts: Int
+        var isValid: Bool { !issues.contains { $0.isError } }
+    }
+
+    /// Draft → validate → repair loop. Returns the first valid script, or the best attempt with
+    /// its remaining issues if it never fully validates (honest: the caller shows what's wrong).
+    static func draft(from description: String,
+                      knownModelIDs: Set<String>,
+                      maxAttempts: Int = 3,
+                      generate: (String) async throws -> String) async -> Draft {
+        var script = ""
+        var issues: [RoboIssue] = []
+        for attempt in 1...max(1, maxAttempts) {
+            let prompt = (attempt == 1)
+                ? initialPrompt(description: description, modelIDs: knownModelIDs)
+                : repairPrompt(description: description, script: script, errors: issues.filter { $0.isError })
+            let raw = (try? await generate(prompt)) ?? ""
+            script = extractScript(raw)
+            issues = RoboValidator.validate(script, knownModelIDs: knownModelIDs)
+            if !issues.contains(where: { $0.isError }) {
+                return Draft(script: script, issues: issues, attempts: attempt)
+            }
+        }
+        return Draft(script: script, issues: issues, attempts: max(1, maxAttempts))
+    }
+
+    // MARK: - Prompts
+
+    private static let grammar = """
+    RoboRunner script language (it is NOT Swift):
+    - ASK <question>          run one real turn and capture it
+    - WAIT <seconds>          pause (longer if the device is hot)
+    - # comment               a comment line
+    - FOR <VAR> IN a, b, c    repeat the lines below once per value, substituting {VAR} each pass
+      END                     close the FOR
+    - any other line is a verb, e.g. SWITCH_MODEL:<id> or SET_TEMPERATURE:0.7
+    """
+
+    private static let verbCheatsheet = """
+    Common verbs:
+    SWITCH_MODEL:<id>         switch the active model
+    SET_TEMPERATURE:<0-2>     sampling temperature
+    SET_REASONING:true|false  thinking mode on or off
+    SET_MAX_OUTPUT_TOKENS:<n> cap the answer length
+    NEW_THREAD                start a fresh conversation
+    GET_THERMAL_STATE         read the thermal state
+    """
+
+    private static func initialPrompt(description: String, modelIDs: Set<String>) -> String {
+        let models = modelIDs.sorted().prefix(8).joined(separator: ", ")
+        return """
+        You write scripts for RoboRunner, Hal's tiny on-device automation language.
+        \(grammar)
+        \(verbCheatsheet)
+        Valid model IDs for SWITCH_MODEL: \(models)
+        Write a script that does what the user asks. Output ONLY the script — no explanation, no
+        markdown code fences, no prose. Keep it short and correct.
+
+        User request: \(description)
+        """
+    }
+
+    private static func repairPrompt(description: String, script: String, errors: [RoboIssue]) -> String {
+        let problems = errors.map { $0.line > 0 ? "line \($0.line): \($0.message)" : $0.message }
+            .joined(separator: "\n")
+        return """
+        This RoboRunner script for the request "\(description)" has errors. Fix them and output
+        ONLY the corrected script (no prose, no markdown fences).
+
+        Script:
+        \(script)
+
+        Errors:
+        \(problems)
+        """
+    }
+
+    // MARK: - Extraction
+
+    /// Pull the script out of a model response: if it wrapped the script in a ```fence```, take the
+    /// fence body; otherwise use the text as-is. (The validator is the real backstop either way.)
+    private static func extractScript(_ raw: String) -> String {
+        let s = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        if let m = s.range(of: #"(?s)```[a-zA-Z]*\s*\n(.*?)```"#, options: .regularExpression) {
+            return String(s[m])
+                .replacingOccurrences(of: #"^```[a-zA-Z]*\s*\n"#, with: "", options: .regularExpression)
+                .replacingOccurrences(of: #"```\s*$"#, with: "", options: .regularExpression)
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+        }
+        return s
+    }
+}
 // ==== LEGO END: 60 CommandCatalog (Lab Command Surface, Single Source of Truth) ====
 
 
@@ -34044,6 +34164,7 @@ struct RoboEditorView: View {
     @State private var showingHelp = false
     @State private var showingResults = false
     @State private var showingIssues = false
+    @State private var showingDraft = false
 
     static let sampleScript = """
     # RoboRunner script. Most lines are antenna verbs, passed straight through.
@@ -34111,6 +34232,10 @@ struct RoboEditorView: View {
                 ToolbarItemGroup(placement: .bottomBar) {
                     Button { showingHelp = true } label: { Label("Commands", systemImage: "list.bullet.rectangle") }
                     Spacer()
+                    // Draft-from-description: the optional teaching tool — describe what you want,
+                    // Hal drafts a validated script. You can edit it or ignore it and write your own.
+                    Button { showingDraft = true } label: { Label("Draft", systemImage: "wand.and.stars") }
+                    Spacer()
                     // The coach: validate WITHOUT running. Icon reflects the live state so a
                     // glance tells you if the script is clean before you ever hit Run.
                     Button { showingIssues = true } label: {
@@ -34126,6 +34251,7 @@ struct RoboEditorView: View {
             .sheet(isPresented: $showingHelp) { RoboHelpView() }
             .sheet(isPresented: $showingResults) { RoboResultsView() }
             .sheet(isPresented: $showingIssues) { RoboIssuesView(issues: liveIssues) }
+            .sheet(isPresented: $showingDraft) { RoboDraftView(onInsert: { script = $0 }) }
         }
     }
 
@@ -34212,6 +34338,90 @@ struct RoboIssuesView: View {
             }
         }
         .padding(.vertical, 2)
+    }
+}
+
+/// The optional teaching tool: describe what you want in plain language, and Hal drafts a
+/// RoboRunner script — guaranteed valid by RoboScriptGenerator's validate/repair loop, or shown
+/// honestly with whatever couldn't be fixed. "Use this script" drops it into the editor; you can
+/// edit it or ignore it entirely and write your own. Uses one model generation, so it shows a
+/// working state and can be slow on big models.
+struct RoboDraftView: View {
+    @Environment(\.dismiss) private var dismiss
+    @EnvironmentObject private var chatViewModel: ChatViewModel
+    let onInsert: (String) -> Void
+
+    @State private var request = ""
+    @State private var generating = false
+    @State private var draftScript: String?
+    @State private var draftIssues: [RoboIssue] = []
+    @State private var attempts = 0
+
+    private var draftErrors: [RoboIssue] { draftIssues.filter { $0.isError } }
+
+    var body: some View {
+        NavigationView {
+            Form {
+                Section("Describe what you want the script to do") {
+                    TextEditor(text: $request)
+                        .font(.callout)
+                        .frame(minHeight: 70)
+                }
+                Section {
+                    Button(action: generate) {
+                        HStack(spacing: 8) {
+                            if generating { ProgressView().controlSize(.small) }
+                            Image(systemName: "wand.and.stars")
+                            Text(generating ? "Drafting…" : "Draft script")
+                        }
+                    }
+                    .disabled(request.trimmingCharacters(in: .whitespaces).isEmpty || generating)
+                }
+                if let s = draftScript {
+                    Section(draftErrors.isEmpty
+                            ? "Draft — validated in \(attempts) attempt\(attempts == 1 ? "" : "s")"
+                            : "Draft — still has issues, review before running") {
+                        Text(s)
+                            .font(.system(.caption, design: .monospaced))
+                            .textSelection(.enabled)
+                        ForEach(draftErrors) { issue in
+                            Label(issue.line > 0 ? "line \(issue.line): \(issue.message)" : issue.message,
+                                  systemImage: "xmark.octagon.fill")
+                                .font(.caption).foregroundColor(.red)
+                        }
+                        Button("Use this script") { onInsert(s); dismiss() }
+                            .fontWeight(.semibold)
+                    }
+                }
+                Section {
+                    Text("Hal drafts this from your description and checks it against the RoboRunner rules. It's a teaching aid — edit it, or ignore it and write your own.")
+                        .font(.caption).foregroundColor(.secondary)
+                }
+            }
+            .navigationTitle("Draft from Description")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar { ToolbarItem(placement: .cancellationAction) { Button("Done") { dismiss() } } }
+        }
+    }
+
+    private func generate() {
+        generating = true
+        draftScript = nil
+        draftIssues = []
+        let desc = request
+        let vm = chatViewModel
+        Task { @MainActor in
+            let draft = await RoboScriptGenerator.draft(
+                from: desc,
+                knownModelIDs: RoboRunner.currentKnownModelIDs()
+            ) { prompt in
+                try await vm.llmService.generateResponse(prompt: prompt, temperature: 0.2)
+            }
+            draftScript = draft.script
+            draftIssues = draft.issues
+            attempts = draft.attempts
+            generating = false
+        }
     }
 }
 
