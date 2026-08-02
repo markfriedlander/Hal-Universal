@@ -136,6 +136,18 @@ final class RoboRunner: ObservableObject {
         halLog("HALDEBUG-ROBO: stop requested, will halt at the next step boundary")
     }
 
+    /// The set of model IDs the interpreter will accept for a SWITCH_MODEL / SET_MODEL (or any
+    /// other `<modelID>` verb): the live catalog, the curated seeds (present even before they're
+    /// downloaded), and Apple Foundation. The validator uses this to reject a mistyped or
+    /// nonexistent model BEFORE a run touches the device. MainActor because it reads the
+    /// @MainActor catalog; the nonisolated validator receives the result as a plain set.
+    @MainActor static func currentKnownModelIDs() -> Set<String> {
+        var ids = Set(ModelCatalogService.shared.availableModels.map { $0.id })
+        ids.formUnion(ModelConfiguration.curatedSeeds.map { $0.id })
+        ids.insert(ModelConfiguration.appleFoundation.id)
+        return ids
+    }
+
     // MARK: - Entry point
 
     /// Parse and run `script`. Returns a short human-readable summary. Dispatches
@@ -143,6 +155,23 @@ final class RoboRunner: ObservableObject {
     /// vocabulary is available with no duplication.
     func run(script: String, vm: ChatViewModel, console: HalTestConsole) async -> String {
         if isRunning { return "RoboRunner already running (\(progress))" }
+
+        // Pre-flight: refuse to run an invalid script BEFORE touching state or executing a
+        // single verb. This is the enforcement half of the coach — the editor surfaces these
+        // same issues live; here a hard error stops the run so a typo'd verb, an unbalanced
+        // FOR/END, an unbound {VAR}, or a bogus model ID can never fire real turns (the
+        // "protect it from invalid scripts / invalid models" guard). Warnings don't block.
+        let preflight = RoboValidator.validate(script, knownModelIDs: RoboRunner.currentKnownModelIDs())
+        let hardErrors = preflight.filter { $0.isError }
+        if !hardErrors.isEmpty {
+            let shown = hardErrors.prefix(8).map { $0.line > 0 ? "line \($0.line): \($0.message)" : $0.message }
+            let more = hardErrors.count > 8 ? " (+\(hardErrors.count - 8) more)" : ""
+            lastError = "Script not run — \(hardErrors.count) problem\(hardErrors.count == 1 ? "" : "s"): "
+                + shown.joined(separator: "  •  ") + more
+            halLog("HALDEBUG-ROBO: refused invalid script — \(lastError ?? "")")
+            return "RoboRunner refused: \(lastError ?? "")"
+        }
+
         isRunning = true
         stopRequested = false
         lastError = nil
@@ -165,7 +194,7 @@ final class RoboRunner: ObservableObject {
         // Expand FOR ... IN ... / END sweeps into a flat step list before running, so the loop
         // below is unchanged (it just gets a longer list) and the ask count is already correct.
         var steps: [String] = []
-        expandLoops(rawSteps, into: &steps)
+        RoboRunner.expandLoops(rawSteps, into: &steps)
         if steps.count >= RoboRunner.maxExpandedSteps {
             lastError = "script expanded past the \(RoboRunner.maxExpandedSteps)-step cap; truncated"
             halLog("HALDEBUG-ROBO: \(lastError ?? "")")
@@ -213,7 +242,9 @@ final class RoboRunner: ObservableObject {
     // MARK: - Loop expansion (FOR ... IN ... END)
 
     /// Hard ceiling on expanded steps so a fat or deeply nested sweep can't blow up a run.
-    static let maxExpandedSteps = 2000
+    /// `nonisolated` so the pure, off-main loop helpers (and RoboValidator) can read it without
+    /// a main-actor hop — it's a compile-time constant, so there's nothing to isolate.
+    nonisolated static let maxExpandedSteps = 2000
 
     /// Expand `FOR <VAR> IN a, b, c` / `END` blocks into a flat step list, substituting `{VAR}`
     /// with each value in turn. Bounded ON PURPOSE: it repeats a written block over a written
@@ -221,7 +252,7 @@ final class RoboRunner: ObservableObject {
     /// branch (that keeps the Lab's "fixed verbs, not arbitrary code" posture). Nesting works via
     /// recursion (an inner loop expands once per outer value). Appends into `out`, stopping at
     /// `maxExpandedSteps`.
-    private func expandLoops(_ lines: [String], into out: inout [String]) {
+    nonisolated static func expandLoops(_ lines: [String], into out: inout [String]) {
         var i = 0
         while i < lines.count {
             if out.count >= RoboRunner.maxExpandedSteps { return }
@@ -259,7 +290,7 @@ final class RoboRunner: ObservableObject {
     }
 
     /// Parse `FOR <VAR> IN v1, v2, v3` into (VAR, [values]). Returns nil if malformed.
-    private func parseForHeader(_ line: String) -> (String, [String])? {
+    nonisolated static func parseForHeader(_ line: String) -> (String, [String])? {
         let afterFor = String(line.dropFirst(3)).trimmingCharacters(in: .whitespaces)  // drop "FOR"
         guard let inRange = afterFor.range(of: " IN ", options: [.caseInsensitive]) else { return nil }
         let varName = String(afterFor[..<inRange.lowerBound]).trimmingCharacters(in: .whitespaces)
@@ -270,7 +301,7 @@ final class RoboRunner: ObservableObject {
     }
 
     /// Replace `{VAR}` (case-insensitive on the name, braces literal) with `value`.
-    private func substitute(_ line: String, varName: String, value: String) -> String {
+    nonisolated static func substitute(_ line: String, varName: String, value: String) -> String {
         line.replacingOccurrences(of: "{\(varName)}", with: value, options: [.caseInsensitive])
     }
 
@@ -789,6 +820,158 @@ nonisolated enum CommandCatalog {
          .replacingOccurrences(of: "\n", with: "\\n")
     }
 }
+
+/// One problem found in a RoboRunner script before it runs. `line` is 1-based into the
+/// ORIGINAL script text so the editor's coach can point at the offending line; `line == 0`
+/// marks a whole-script issue with no single home (e.g. a bad model value produced by a
+/// FOR sweep, or the expanded-step cap).
+nonisolated struct RoboIssue: Identifiable {
+    enum Severity { case error, warning }
+    let line: Int
+    let severity: Severity
+    let message: String
+    var id: String { "\(line)|\(message)" }
+    var isError: Bool { severity == .error }
+}
+
+/// Static, pure pre-flight check for RoboRunner scripts — "the coach". It catches the
+/// mistakes that previously only surfaced mid-run (or silently produced junk): unbalanced
+/// FOR/END, malformed FOR headers, unknown verbs, unbound `{VAR}` placeholders, unknown
+/// model IDs, and sweeps that blow past the step cap. `RoboRunner.run()` refuses to execute
+/// a script with any `.error`; the editor shows every issue (errors + warnings) live and on
+/// demand. Verbs come from `CommandCatalog` (the single source of truth, nonisolated); the
+/// set of known model IDs is passed in by the MainActor caller (nil = skip the model checks,
+/// so an unavailable catalog can never yield a false "unknown model").
+nonisolated enum RoboValidator {
+
+    /// Runner keywords handled specially by `run()` — NOT antenna verbs, so they must not be
+    /// flagged as "unknown command". FOR/END are consumed by the structural pass; ASK/WAIT
+    /// fall through to the verb check and are skipped here.
+    private static let keywords: Set<String> = ["ASK", "WAIT", "FOR", "END"]
+
+    static func validate(_ script: String, knownModelIDs: Set<String>? = nil) -> [RoboIssue] {
+        var issues: [RoboIssue] = []
+
+        // Known verbs + model-taking verbs, straight from the catalog (case-insensitive).
+        let knownVerbs = Set(CommandCatalog.all.map { $0.verb.uppercased() })
+        let modelVerbs = Set(CommandCatalog.all
+            .filter { ($0.args ?? "").contains("modelID") }
+            .map { $0.verb.uppercased() })
+
+        // The executable lines exactly as run() sees them (trimmed, minus blanks/comments),
+        // but we keep each one's original 1-based line number for pointing.
+        let numbered: [(no: Int, text: String)] = script
+            .split(separator: "\n", omittingEmptySubsequences: false)
+            .enumerated()
+            .map { (no: $0.offset + 1, text: $0.element.trimmingCharacters(in: .whitespaces)) }
+            .filter { !$0.text.isEmpty && !$0.text.hasPrefix("#") }
+
+        // --- Structural + verb + placeholder pass (line-accurate) ---
+        var forStack: [(name: String, line: Int, malformed: Bool)] = []
+        for (no, text) in numbered {
+            let upper = text.uppercased()
+
+            if upper == "FOR" || upper.hasPrefix("FOR ") {
+                if let header = RoboRunner.parseForHeader(text) {
+                    forStack.append((header.0.uppercased(), no, false))
+                } else {
+                    issues.append(RoboIssue(line: no, severity: .error,
+                        message: "Malformed FOR. Expected: FOR <VAR> IN value1, value2, value3"))
+                    forStack.append(("?", no, true))   // still push so a later END balances
+                }
+                continue
+            }
+            if upper == "END" {
+                if forStack.isEmpty {
+                    issues.append(RoboIssue(line: no, severity: .error,
+                        message: "END with no matching FOR."))
+                } else {
+                    forStack.removeLast()
+                }
+                continue
+            }
+
+            // {VAR} placeholders must be defined by an enclosing FOR.
+            let inScope = Set(forStack.map { $0.name })
+            for name in bracedNames(in: text) where !inScope.contains(name.uppercased()) {
+                issues.append(RoboIssue(line: no, severity: .error,
+                    message: "{\(name)} is not defined by any enclosing FOR."))
+            }
+            if text.filter({ $0 == "{" }).count != text.filter({ $0 == "}" }).count {
+                issues.append(RoboIssue(line: no, severity: .warning, message: "Unbalanced { } braces."))
+            }
+
+            // Verb check (ASK/WAIT are keywords and pass straight through).
+            let verb = verbToken(text)
+            if keywords.contains(verb) { continue }
+            if !knownVerbs.contains(verb) {
+                issues.append(RoboIssue(line: no, severity: .error,
+                    message: "Unknown command '\(verb)'. Open Commands for the full list."))
+            }
+        }
+        for open in forStack where !open.malformed {
+            issues.append(RoboIssue(line: open.line, severity: .error,
+                message: "FOR block never closed with END."))
+        }
+
+        // --- Expanded pass: model IDs (literal + sweep values) and the step cap ---
+        // Expanding resolves {VAR} to real values, so a sweep like `FOR M IN afm, bogus`
+        // gets each model checked. Reuses the SAME expander run() uses, so validation and
+        // execution can never disagree about what the script becomes.
+        var expanded: [String] = []
+        RoboRunner.expandLoops(numbered.map { $0.text }, into: &expanded)
+        if expanded.count >= RoboRunner.maxExpandedSteps {
+            issues.append(RoboIssue(line: 0, severity: .error,
+                message: "Script expands to \(expanded.count)+ steps, over the \(RoboRunner.maxExpandedSteps)-step cap. Shorten the sweep."))
+        }
+        if let ids = knownModelIDs {
+            var reported = Set<String>()
+            for step in expanded {
+                let verb = verbToken(step)
+                guard modelVerbs.contains(verb) else { continue }
+                let arg = argAfterColon(step)
+                // Skip empties and any still-unresolved {VAR} (already flagged above).
+                if arg.isEmpty || arg.contains("{") || ids.contains(arg) || reported.contains(arg) { continue }
+                reported.insert(arg)
+                issues.append(RoboIssue(line: 0, severity: .error,
+                    message: "Unknown model '\(arg)'. Not in the catalog — check the ID in Model Library or CURRENT_MODEL."))
+            }
+        }
+
+        return issues
+    }
+
+    // MARK: - Small pure helpers
+
+    /// The verb of a line: the token up to the first ':' or whitespace, uppercased.
+    /// `SWITCH_MODEL:foo` -> `SWITCH_MODEL`; `GET_LOGS` -> `GET_LOGS`; `ASK hi` -> `ASK`.
+    static func verbToken(_ line: String) -> String {
+        var t = ""
+        for ch in line {
+            if ch == ":" || ch == " " || ch == "\t" { break }
+            t.append(ch)
+        }
+        return t.uppercased()
+    }
+
+    /// The argument after the first ':' (trimmed). `SWITCH_MODEL:foo` -> `foo`.
+    static func argAfterColon(_ line: String) -> String {
+        guard let r = line.range(of: ":") else { return "" }
+        return String(line[r.upperBound...]).trimmingCharacters(in: .whitespaces)
+    }
+
+    /// The names inside `{ }` on a line (empty braces ignored). `SET_TEMPERATURE:{TEMP}` -> ["TEMP"].
+    static func bracedNames(in line: String) -> [String] {
+        var names: [String] = []
+        var current: String? = nil
+        for ch in line {
+            if ch == "{" { current = "" }
+            else if ch == "}" { if let c = current, !c.isEmpty { names.append(c) }; current = nil }
+            else if current != nil { current?.append(ch) }
+        }
+        return names
+    }
+}
 // ==== LEGO END: 60 CommandCatalog (Lab Command Surface, Single Source of Truth) ====
 
 
@@ -807,6 +990,7 @@ struct RoboEditorView: View {
     @AppStorage("lab.roboScript") private var script: String = RoboEditorView.sampleScript
     @State private var showingHelp = false
     @State private var showingResults = false
+    @State private var showingIssues = false
 
     static let sampleScript = """
     # RoboRunner script. Most lines are antenna verbs, passed straight through.
@@ -831,6 +1015,15 @@ struct RoboEditorView: View {
             .filter { !$0.isEmpty && !$0.hasPrefix("#") }
             .count
     }
+
+    /// Live pre-flight, recomputed as the script changes — the coach. Cheap for editor-sized
+    /// scripts (a couple of linear passes), and it uses the SAME validator run() enforces with,
+    /// so what the editor shows and what run() refuses can never drift apart.
+    private var liveIssues: [RoboIssue] {
+        RoboValidator.validate(script, knownModelIDs: RoboRunner.currentKnownModelIDs())
+    }
+    private var liveErrorCount: Int { liveIssues.filter { $0.isError }.count }
+    private var liveWarningCount: Int { liveIssues.count - liveErrorCount }
 
     var body: some View {
         NavigationView {
@@ -857,11 +1050,20 @@ struct RoboEditorView: View {
                     if robo.isRunning {
                         Button("Stop", role: .destructive) { robo.requestStop() }
                     } else {
-                        Button("Run", action: runScript).fontWeight(.semibold)
+                        // Disabled while the script has hard errors — the coach won't let a
+                        // known-bad script run. (run() also refuses, so this is belt-and-braces.)
+                        Button("Run", action: runScript).fontWeight(.semibold).disabled(liveErrorCount > 0)
                     }
                 }
                 ToolbarItemGroup(placement: .bottomBar) {
                     Button { showingHelp = true } label: { Label("Commands", systemImage: "list.bullet.rectangle") }
+                    Spacer()
+                    // The coach: validate WITHOUT running. Icon reflects the live state so a
+                    // glance tells you if the script is clean before you ever hit Run.
+                    Button { showingIssues = true } label: {
+                        Label("Check", systemImage: liveErrorCount > 0 ? "exclamationmark.triangle.fill"
+                              : (liveWarningCount > 0 ? "exclamationmark.triangle" : "checkmark.seal"))
+                    }
                     Spacer()
                     // Always enabled: the Results sheet is the run HISTORY, which can hold runs
                     // from earlier sessions even before anything runs this session.
@@ -870,6 +1072,7 @@ struct RoboEditorView: View {
             }
             .sheet(isPresented: $showingHelp) { RoboHelpView() }
             .sheet(isPresented: $showingResults) { RoboResultsView() }
+            .sheet(isPresented: $showingIssues) { RoboIssuesView(issues: liveIssues) }
         }
     }
 
@@ -881,8 +1084,15 @@ struct RoboEditorView: View {
             }
         } else if let err = robo.lastError, !err.isEmpty {
             Label(err, systemImage: "exclamationmark.triangle").foregroundColor(.orange)
+        } else if liveErrorCount > 0 {
+            Label("\(liveErrorCount) problem\(liveErrorCount == 1 ? "" : "s") — tap Check to see them",
+                  systemImage: "exclamationmark.triangle.fill").foregroundColor(.red)
+        } else if liveWarningCount > 0 {
+            Label("\(stepCount) step\(stepCount == 1 ? "" : "s"), \(liveWarningCount) warning\(liveWarningCount == 1 ? "" : "s")",
+                  systemImage: "exclamationmark.triangle").foregroundColor(.orange)
         } else {
-            Text("\(stepCount) step\(stepCount == 1 ? "" : "s") ready").foregroundColor(.secondary)
+            Label("\(stepCount) step\(stepCount == 1 ? "" : "s") ready", systemImage: "checkmark.seal")
+                .foregroundColor(.secondary)
         }
     }
 
@@ -892,6 +1102,63 @@ struct RoboEditorView: View {
         // MainActor Task so RoboRunner's @Published status updates land on the main thread,
         // matching the antenna's ROBO_RUN path.
         Task { @MainActor in _ = await RoboRunner.shared.run(script: text, vm: vm, console: vm.testConsole) }
+    }
+}
+
+/// The coach's report card: every problem the validator found, errors first, each with its
+/// source line. Read-only (the fix happens back in the editor), reachable any time from the
+/// editor's Check button so a script can be validated WITHOUT running it — the whole point of
+/// "help people write scripts and validate them before they run."
+struct RoboIssuesView: View {
+    @Environment(\.dismiss) private var dismiss
+    let issues: [RoboIssue]
+
+    private var errors: [RoboIssue] { issues.filter { $0.isError } }
+    private var warnings: [RoboIssue] { issues.filter { !$0.isError } }
+
+    var body: some View {
+        NavigationView {
+            Group {
+                if issues.isEmpty {
+                    VStack(spacing: 12) {
+                        Image(systemName: "checkmark.seal.fill").font(.largeTitle).foregroundColor(.green)
+                        Text("No problems found").font(.headline)
+                        Text("Balanced FOR/END, known verbs, valid model IDs, and every {VAR} bound to a FOR. Safe to run.")
+                            .font(.callout).foregroundColor(.secondary).multilineTextAlignment(.center)
+                    }
+                    .padding()
+                } else {
+                    List {
+                        if !errors.isEmpty {
+                            Section("Errors — the script won't run until these are fixed") {
+                                ForEach(errors) { issueRow($0) }
+                            }
+                        }
+                        if !warnings.isEmpty {
+                            Section("Warnings — allowed, but worth a look") {
+                                ForEach(warnings) { issueRow($0) }
+                            }
+                        }
+                    }
+                }
+            }
+            .navigationTitle("Script Check")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar { ToolbarItem(placement: .confirmationAction) { Button("Done") { dismiss() } } }
+        }
+    }
+
+    @ViewBuilder private func issueRow(_ issue: RoboIssue) -> some View {
+        HStack(alignment: .top, spacing: 10) {
+            Image(systemName: issue.isError ? "xmark.octagon.fill" : "exclamationmark.triangle.fill")
+                .foregroundColor(issue.isError ? .red : .orange)
+            VStack(alignment: .leading, spacing: 2) {
+                Text(issue.message).font(.callout)
+                Text(issue.line > 0 ? "Line \(issue.line)" : "Whole script")
+                    .font(.caption).foregroundColor(.secondary)
+            }
+        }
+        .padding(.vertical, 2)
     }
 }
 
