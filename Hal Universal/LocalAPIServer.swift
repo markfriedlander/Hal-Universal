@@ -1717,7 +1717,7 @@ class HalTestConsole: ObservableObject {
             if !loaded {
                 return "{\"status\":\"error\",\"message\":\"active backend '\(backend.rawValue)' is not loaded; cannot re-embed. For EmbeddingGemma, ensure the model is downloaded.\"}"
             }
-            let result = vm.memoryStore.reEmbedAllNullRows()
+            let result = await vm.memoryStore.reEmbedAllNullRows()
             return "{\"status\":\"ok\",\"command\":\"MIGRATE_EMBEDDINGS_REEMBED\",\"backend\":\"\(backend.rawValue)\",\"updated\":\(result.updated),\"skipped\":\(result.skipped),\"failed\":\(result.failed)}"
 
         } else if trimmed.hasPrefix("SWITCH_EMBEDDER:") {
@@ -1738,6 +1738,34 @@ class HalTestConsole: ObservableObject {
             }
             EmbedderMigrationCoordinator.shared.switchAndMigrate(to: backend, memoryStore: vm.memoryStore)
             return "{\"status\":\"ok\",\"command\":\"SWITCH_EMBEDDER\",\"target\":\"\(backend.rawValue)\",\"note\":\"coordinator switch started; poll GET_UI_STATE or screenshot for live progress\"}"
+
+        } else if trimmed == "STOP_EMBEDDING" {
+            // Cancel an in-flight re-embed pass. DEV/TEST tooling — there is no
+            // user-facing Stop by design (the thermal governor is the safety net; see
+            // HISTORY 2026-08-01). Lets CC verify pacing (start a pass, watch it
+            // pace, stop it) without force-quitting the app. Cancels within ~a row.
+            let wasRunning = EmbedderMigrationCoordinator.shared.cancelActiveMigration()
+            return "{\"status\":\"ok\",\"command\":\"STOP_EMBEDDING\",\"wasRunning\":\(wasRunning)}"
+
+        } else if trimmed == "START_EMBEDDING" || trimmed.hasPrefix("START_EMBEDDING:") {
+            // Converse of STOP_EMBEDDING (dev/test). Starts — or CONTINUES, since the
+            // backfill only touches rows still NULL for the target — an embed pass
+            // through the coordinator, so it shows the live bar and is itself
+            // STOP_EMBEDDING-able. No arg = the current active backend (resume what a
+            // STOP left unfinished); optional :<backend> targets a specific one.
+            let arg = trimmed.contains(":")
+                ? String(trimmed.dropFirst("START_EMBEDDING:".count)).trimmingCharacters(in: .whitespaces)
+                : ""
+            let backend: EmbeddingBackend
+            if arg.isEmpty {
+                backend = EmbeddingBackend.current()
+            } else if let b = EmbeddingBackend(rawValue: arg) {
+                backend = b
+            } else {
+                return "{\"status\":\"error\",\"message\":\"Unknown embedder '\(arg)'. Use nlcontextual|nomicswift|mxbai, or omit for the active backend.\"}"
+            }
+            EmbedderMigrationCoordinator.shared.switchAndMigrate(to: backend, memoryStore: vm.memoryStore)
+            return "{\"status\":\"ok\",\"command\":\"START_EMBEDDING\",\"backend\":\"\(backend.rawValue)\",\"note\":\"pass started via coordinator (fills rows still NULL for this backend); STOP_EMBEDDING to cancel\"}"
 
         } else if trimmed == "EMBEDDING_COVERAGE" {
             // v2.1 step 2 diagnostic (read-only): per-backend embedding coverage
@@ -1773,7 +1801,7 @@ class HalTestConsole: ObservableObject {
             }
             var results: [String] = []
             for b in targets {
-                let r = vm.memoryStore.backfillEmbeddings(for: b)
+                let r = await vm.memoryStore.backfillEmbeddings(for: b)
                 results.append("{\"backend\":\"\(b.rawValue)\",\"updated\":\(r.updated),\"skipped\":\(r.skipped),\"failed\":\(r.failed)}")
             }
             let cov = vm.memoryStore.embeddingCoverage()

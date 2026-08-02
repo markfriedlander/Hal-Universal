@@ -168,17 +168,20 @@ final class EmbedderMigrationCoordinator: ObservableObject {
                 coordinator.phase = .migrating(updated: 0, total: 0)
             }
             // Run the migration. It reports (rowsDone, total) from its own loop
-            // at each decile; we republish that as .migrating(updated:total:) on
-            // the main actor so the UI shows a LIVE bar + "i / n rows" counter
-            // instead of a frozen indeterminate spinner (the total stayed 0 for
-            // the whole pass before this — it never left the indeterminate
-            // branch). The first callback (0, total) flips it to determinate at
-            // once. Decile cadence keeps this to ~10 main-actor hops per pass.
-            let result = storeRef.reEmbedAllNullRows(progress: { done, total in
+            // (time-throttled to ~once a second); we republish that as
+            // .migrating(updated:total:) on the main actor so the UI shows a LIVE bar
+            // + "i / n rows" counter instead of a frozen indeterminate spinner (total
+            // was pinned at 0 the whole pass before this). The first callback (0, total)
+            // flips it to determinate at once.
+            let result = await storeRef.reEmbedAllNullRows(progress: { done, total in
                 Task { @MainActor in
                     coordinator.phase = .migrating(updated: done, total: total)
                 }
             })
+            // If cancelled mid-pass (cancelActiveMigration cancels this task, which the
+            // backfill loop honors within a row), leave the phase the canceller set —
+            // don't overwrite it with a .done for a pass that didn't finish.
+            if Task.isCancelled { return }
             await MainActor.run {
                 coordinator.phase = .done(message: "Migrated \(result.updated) rows to \(target.displayName). (\(result.skipped) skipped, \(result.failed) failed.)")
             }
@@ -188,6 +191,28 @@ final class EmbedderMigrationCoordinator: ObservableObject {
     /// Reset to idle so the user can try again or see fresh state.
     func dismissResult() {
         phase = .idle
+    }
+
+    /// Cancel an in-flight re-embed pass. DEV/TEST tooling only — there is
+    /// deliberately NO user-facing Stop (the thermal governor is the safety net,
+    /// and Hal's re-embed isn't the unbounded-load case Posey's user escape was
+    /// built for; see HISTORY 2026-08-01). Cancels the migration task; the backfill
+    /// loop checks `Task.isCancelled` each row and `ThermalGovernor.pace()` returns
+    /// immediately when cancelled, so a stop lands within ~a row — no force-quit.
+    /// Returns whether a pass was actually running.
+    @discardableResult
+    func cancelActiveMigration() -> Bool {
+        let wasRunning: Bool
+        if case .migrating = phase { wasRunning = true }
+        else if case .switching = phase { wasRunning = true }
+        else { wasRunning = false }
+        pollTask?.cancel()
+        pollTask = nil
+        // Only reset the visible phase for a migration/switch — never clobber a
+        // download or error state. The task's own `if Task.isCancelled { return }`
+        // keeps it from racing a .done over this.
+        if wasRunning { phase = .idle }
+        return wasRunning
     }
 }
 

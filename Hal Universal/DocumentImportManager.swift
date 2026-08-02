@@ -546,6 +546,14 @@ class DocumentImportManager: ObservableObject {
             print("HALDEBUG-IMPORT: Processing document \(document.filename) with \(document.entities.count) entities")
 
             for (index, chunk) in document.chunks.enumerated() {
+                // Thermal pacing for BULK import. Each chunk is embedded INLINE by
+                // storeUnifiedContentWithEntities (generateEmbedding), so importing a
+                // large document is sustained back-to-back embedding — the same load the
+                // backend-switch backfill paces. Free at .nominal (a normal import is
+                // untouched); yields only as the device warms. Single per-turn embeds
+                // are deliberately NOT paced — this is the bulk path, the one that can
+                // saturate the chip (the document-import vector flagged 2026-08-01).
+                await ThermalGovernor.shared.pace()
                 // Corrected: Call extractNamedEntities on MemoryStore.shared
                 let chunkEntities = memoryStore.extractNamedEntities(from: chunk)
                 let allRelevantEntities = (document.entities + chunkEntities)

@@ -989,7 +989,7 @@ class MemoryStore: ObservableObject {
     // itself; it's @Sendable for that reason. Optional + defaulted so the API
     // BACKFILL/MIGRATE verbs and every other caller are untouched.
     nonisolated func backfillEmbeddings(for backend: EmbeddingBackend,
-                                        progress: (@Sendable (_ done: Int, _ total: Int) -> Void)? = nil) -> (updated: Int, skipped: Int, failed: Int) {
+                                        progress: (@Sendable (_ done: Int, _ total: Int) -> Void)? = nil) async -> (updated: Int, skipped: Int, failed: Int) {
         guard ensureHealthyConnection() else {
             halLog("HALDEBUG-EMBEDDING: backfillEmbeddings aborted — no DB connection")
             return (0, 0, 0)
@@ -1052,11 +1052,25 @@ class MemoryStore: ObservableObject {
         progress?(0, pairs.count)
 
         for (index, pair) in pairs.enumerated() {
+            // Honor cancellation promptly (Stop / antenna STOP_EMBEDDING cancels the
+            // migration task). We bail at a row boundary, so at most one embed is in
+            // flight when the stop lands. Partial counts are returned; the caller
+            // doesn't overwrite the cancelled phase with a .done.
+            if Task.isCancelled { break }
             let trimmed = pair.content.trimmingCharacters(in: .whitespacesAndNewlines)
             if trimmed.isEmpty {
                 skipped += 1
                 continue
             }
+            // Thermal pacing: yield before each embed when the chip is warming (free
+            // at .nominal, so a cool run is untouched, full speed). The bulk backfill
+            // is sustained back-to-back inference — the exact load this governor was
+            // built to pace (ported from Posey's per-embed indexing pacing). Applied
+            // to EVERY backend: even the lighter NLContextual shouldn't barrel straight
+            // through when the device is already hot. (The SET_THERMAL_PACING debug
+            // off-switch only gates the generation path; the backfill always paces,
+            // which is fine since it's a no-op cost when cool.)
+            await ThermalGovernor.shared.pace()
             // Embed with the TARGET backend explicitly (not the active one).
             let vector = EmbeddingProvider.shared.embed(trimmed, as: .document, in: backend) ?? []
             if vector.isEmpty {
@@ -1100,8 +1114,8 @@ class MemoryStore: ObservableObject {
     /// Existing callers (the embedder migration coordinator, the
     /// MIGRATE_EMBEDDINGS_REEMBED API verb) keep working; they now target the
     /// active backend's per-backend column instead of the retired single column.
-    nonisolated func reEmbedAllNullRows(progress: (@Sendable (_ done: Int, _ total: Int) -> Void)? = nil) -> (updated: Int, skipped: Int, failed: Int) {
-        return backfillEmbeddings(for: EmbeddingBackend.current(), progress: progress)
+    nonisolated func reEmbedAllNullRows(progress: (@Sendable (_ done: Int, _ total: Int) -> Void)? = nil) async -> (updated: Int, skipped: Int, failed: Int) {
+        return await backfillEmbeddings(for: EmbeddingBackend.current(), progress: progress)
     }
 
     /// Per-backend embedding coverage across `unified_content`: total rows and,
@@ -15332,17 +15346,20 @@ final class EmbedderMigrationCoordinator: ObservableObject {
                 coordinator.phase = .migrating(updated: 0, total: 0)
             }
             // Run the migration. It reports (rowsDone, total) from its own loop
-            // at each decile; we republish that as .migrating(updated:total:) on
-            // the main actor so the UI shows a LIVE bar + "i / n rows" counter
-            // instead of a frozen indeterminate spinner (the total stayed 0 for
-            // the whole pass before this — it never left the indeterminate
-            // branch). The first callback (0, total) flips it to determinate at
-            // once. Decile cadence keeps this to ~10 main-actor hops per pass.
-            let result = storeRef.reEmbedAllNullRows(progress: { done, total in
+            // (time-throttled to ~once a second); we republish that as
+            // .migrating(updated:total:) on the main actor so the UI shows a LIVE bar
+            // + "i / n rows" counter instead of a frozen indeterminate spinner (total
+            // was pinned at 0 the whole pass before this). The first callback (0, total)
+            // flips it to determinate at once.
+            let result = await storeRef.reEmbedAllNullRows(progress: { done, total in
                 Task { @MainActor in
                     coordinator.phase = .migrating(updated: done, total: total)
                 }
             })
+            // If cancelled mid-pass (cancelActiveMigration cancels this task, which the
+            // backfill loop honors within a row), leave the phase the canceller set —
+            // don't overwrite it with a .done for a pass that didn't finish.
+            if Task.isCancelled { return }
             await MainActor.run {
                 coordinator.phase = .done(message: "Migrated \(result.updated) rows to \(target.displayName). (\(result.skipped) skipped, \(result.failed) failed.)")
             }
@@ -15352,6 +15369,28 @@ final class EmbedderMigrationCoordinator: ObservableObject {
     /// Reset to idle so the user can try again or see fresh state.
     func dismissResult() {
         phase = .idle
+    }
+
+    /// Cancel an in-flight re-embed pass. DEV/TEST tooling only — there is
+    /// deliberately NO user-facing Stop (the thermal governor is the safety net,
+    /// and Hal's re-embed isn't the unbounded-load case Posey's user escape was
+    /// built for; see HISTORY 2026-08-01). Cancels the migration task; the backfill
+    /// loop checks `Task.isCancelled` each row and `ThermalGovernor.pace()` returns
+    /// immediately when cancelled, so a stop lands within ~a row — no force-quit.
+    /// Returns whether a pass was actually running.
+    @discardableResult
+    func cancelActiveMigration() -> Bool {
+        let wasRunning: Bool
+        if case .migrating = phase { wasRunning = true }
+        else if case .switching = phase { wasRunning = true }
+        else { wasRunning = false }
+        pollTask?.cancel()
+        pollTask = nil
+        // Only reset the visible phase for a migration/switch — never clobber a
+        // download or error state. The task's own `if Task.isCancelled { return }`
+        // keeps it from racing a .done over this.
+        if wasRunning { phase = .idle }
+        return wasRunning
     }
 }
 
@@ -26469,7 +26508,7 @@ class HalTestConsole: ObservableObject {
             if !loaded {
                 return "{\"status\":\"error\",\"message\":\"active backend '\(backend.rawValue)' is not loaded; cannot re-embed. For EmbeddingGemma, ensure the model is downloaded.\"}"
             }
-            let result = vm.memoryStore.reEmbedAllNullRows()
+            let result = await vm.memoryStore.reEmbedAllNullRows()
             return "{\"status\":\"ok\",\"command\":\"MIGRATE_EMBEDDINGS_REEMBED\",\"backend\":\"\(backend.rawValue)\",\"updated\":\(result.updated),\"skipped\":\(result.skipped),\"failed\":\(result.failed)}"
 
         } else if trimmed.hasPrefix("SWITCH_EMBEDDER:") {
@@ -26490,6 +26529,34 @@ class HalTestConsole: ObservableObject {
             }
             EmbedderMigrationCoordinator.shared.switchAndMigrate(to: backend, memoryStore: vm.memoryStore)
             return "{\"status\":\"ok\",\"command\":\"SWITCH_EMBEDDER\",\"target\":\"\(backend.rawValue)\",\"note\":\"coordinator switch started; poll GET_UI_STATE or screenshot for live progress\"}"
+
+        } else if trimmed == "STOP_EMBEDDING" {
+            // Cancel an in-flight re-embed pass. DEV/TEST tooling — there is no
+            // user-facing Stop by design (the thermal governor is the safety net; see
+            // HISTORY 2026-08-01). Lets CC verify pacing (start a pass, watch it
+            // pace, stop it) without force-quitting the app. Cancels within ~a row.
+            let wasRunning = EmbedderMigrationCoordinator.shared.cancelActiveMigration()
+            return "{\"status\":\"ok\",\"command\":\"STOP_EMBEDDING\",\"wasRunning\":\(wasRunning)}"
+
+        } else if trimmed == "START_EMBEDDING" || trimmed.hasPrefix("START_EMBEDDING:") {
+            // Converse of STOP_EMBEDDING (dev/test). Starts — or CONTINUES, since the
+            // backfill only touches rows still NULL for the target — an embed pass
+            // through the coordinator, so it shows the live bar and is itself
+            // STOP_EMBEDDING-able. No arg = the current active backend (resume what a
+            // STOP left unfinished); optional :<backend> targets a specific one.
+            let arg = trimmed.contains(":")
+                ? String(trimmed.dropFirst("START_EMBEDDING:".count)).trimmingCharacters(in: .whitespaces)
+                : ""
+            let backend: EmbeddingBackend
+            if arg.isEmpty {
+                backend = EmbeddingBackend.current()
+            } else if let b = EmbeddingBackend(rawValue: arg) {
+                backend = b
+            } else {
+                return "{\"status\":\"error\",\"message\":\"Unknown embedder '\(arg)'. Use nlcontextual|nomicswift|mxbai, or omit for the active backend.\"}"
+            }
+            EmbedderMigrationCoordinator.shared.switchAndMigrate(to: backend, memoryStore: vm.memoryStore)
+            return "{\"status\":\"ok\",\"command\":\"START_EMBEDDING\",\"backend\":\"\(backend.rawValue)\",\"note\":\"pass started via coordinator (fills rows still NULL for this backend); STOP_EMBEDDING to cancel\"}"
 
         } else if trimmed == "EMBEDDING_COVERAGE" {
             // v2.1 step 2 diagnostic (read-only): per-backend embedding coverage
@@ -26525,7 +26592,7 @@ class HalTestConsole: ObservableObject {
             }
             var results: [String] = []
             for b in targets {
-                let r = vm.memoryStore.backfillEmbeddings(for: b)
+                let r = await vm.memoryStore.backfillEmbeddings(for: b)
                 results.append("{\"backend\":\"\(b.rawValue)\",\"updated\":\(r.updated),\"skipped\":\(r.skipped),\"failed\":\(r.failed)}")
             }
             let cov = vm.memoryStore.embeddingCoverage()
@@ -28325,6 +28392,14 @@ class DocumentImportManager: ObservableObject {
             print("HALDEBUG-IMPORT: Processing document \(document.filename) with \(document.entities.count) entities")
 
             for (index, chunk) in document.chunks.enumerated() {
+                // Thermal pacing for BULK import. Each chunk is embedded INLINE by
+                // storeUnifiedContentWithEntities (generateEmbedding), so importing a
+                // large document is sustained back-to-back embedding — the same load the
+                // backend-switch backfill paces. Free at .nominal (a normal import is
+                // untouched); yields only as the device warms. Single per-turn embeds
+                // are deliberately NOT paced — this is the bulk path, the one that can
+                // saturate the chip (the document-import vector flagged 2026-08-01).
+                await ThermalGovernor.shared.pace()
                 // Corrected: Call extractNamedEntities on MemoryStore.shared
                 let chunkEntities = memoryStore.extractNamedEntities(from: chunk)
                 let allRelevantEntities = (document.entities + chunkEntities)

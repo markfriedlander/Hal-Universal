@@ -988,7 +988,7 @@ class MemoryStore: ObservableObject {
     // itself; it's @Sendable for that reason. Optional + defaulted so the API
     // BACKFILL/MIGRATE verbs and every other caller are untouched.
     nonisolated func backfillEmbeddings(for backend: EmbeddingBackend,
-                                        progress: (@Sendable (_ done: Int, _ total: Int) -> Void)? = nil) -> (updated: Int, skipped: Int, failed: Int) {
+                                        progress: (@Sendable (_ done: Int, _ total: Int) -> Void)? = nil) async -> (updated: Int, skipped: Int, failed: Int) {
         guard ensureHealthyConnection() else {
             halLog("HALDEBUG-EMBEDDING: backfillEmbeddings aborted — no DB connection")
             return (0, 0, 0)
@@ -1051,11 +1051,25 @@ class MemoryStore: ObservableObject {
         progress?(0, pairs.count)
 
         for (index, pair) in pairs.enumerated() {
+            // Honor cancellation promptly (Stop / antenna STOP_EMBEDDING cancels the
+            // migration task). We bail at a row boundary, so at most one embed is in
+            // flight when the stop lands. Partial counts are returned; the caller
+            // doesn't overwrite the cancelled phase with a .done.
+            if Task.isCancelled { break }
             let trimmed = pair.content.trimmingCharacters(in: .whitespacesAndNewlines)
             if trimmed.isEmpty {
                 skipped += 1
                 continue
             }
+            // Thermal pacing: yield before each embed when the chip is warming (free
+            // at .nominal, so a cool run is untouched, full speed). The bulk backfill
+            // is sustained back-to-back inference — the exact load this governor was
+            // built to pace (ported from Posey's per-embed indexing pacing). Applied
+            // to EVERY backend: even the lighter NLContextual shouldn't barrel straight
+            // through when the device is already hot. (The SET_THERMAL_PACING debug
+            // off-switch only gates the generation path; the backfill always paces,
+            // which is fine since it's a no-op cost when cool.)
+            await ThermalGovernor.shared.pace()
             // Embed with the TARGET backend explicitly (not the active one).
             let vector = EmbeddingProvider.shared.embed(trimmed, as: .document, in: backend) ?? []
             if vector.isEmpty {
@@ -1099,8 +1113,8 @@ class MemoryStore: ObservableObject {
     /// Existing callers (the embedder migration coordinator, the
     /// MIGRATE_EMBEDDINGS_REEMBED API verb) keep working; they now target the
     /// active backend's per-backend column instead of the retired single column.
-    nonisolated func reEmbedAllNullRows(progress: (@Sendable (_ done: Int, _ total: Int) -> Void)? = nil) -> (updated: Int, skipped: Int, failed: Int) {
-        return backfillEmbeddings(for: EmbeddingBackend.current(), progress: progress)
+    nonisolated func reEmbedAllNullRows(progress: (@Sendable (_ done: Int, _ total: Int) -> Void)? = nil) async -> (updated: Int, skipped: Int, failed: Int) {
+        return await backfillEmbeddings(for: EmbeddingBackend.current(), progress: progress)
     }
 
     /// Per-backend embedding coverage across `unified_content`: total rows and,
