@@ -981,7 +981,14 @@ class MemoryStore: ObservableObject {
     // (BERT-large) runs ~0.66 s/encode; for a few-hundred-row corpus that's a
     // few minutes, so callers run it off the main actor (the API verb kicks it
     // off in a background Task and reports progress via EMBEDDING_COVERAGE).
-    nonisolated func backfillEmbeddings(for backend: EmbeddingBackend) -> (updated: Int, skipped: Int, failed: Int) {
+    // `progress`, when supplied, is called as (rowsDone, totalRows) — once at
+    // the start with (0, total) and again at each decile — so a caller (the
+    // embedder migration coordinator) can drive a LIVE progress bar. It runs on
+    // this method's background thread, so the closure hops to the main actor
+    // itself; it's @Sendable for that reason. Optional + defaulted so the API
+    // BACKFILL/MIGRATE verbs and every other caller are untouched.
+    nonisolated func backfillEmbeddings(for backend: EmbeddingBackend,
+                                        progress: (@Sendable (_ done: Int, _ total: Int) -> Void)? = nil) -> (updated: Int, skipped: Int, failed: Int) {
         guard ensureHealthyConnection() else {
             halLog("HALDEBUG-EMBEDDING: backfillEmbeddings aborted — no DB connection")
             return (0, 0, 0)
@@ -1029,7 +1036,19 @@ class MemoryStore: ObservableObject {
         var updated = 0
         var skipped = 0
         var failed = 0
-        let progressStep = max(1, totalCandidates / 10)
+        let progressStep = max(1, totalCandidates / 10)   // log cadence: ~10 decile lines
+        // The UI bar exists only to tell a GLANCING user "still working, not hung" —
+        // nobody sits and watches it tick. So it's throttled by TIME, not row count:
+        // re-emit at most once per `uiEmitInterval`. A glance every second or two always
+        // sees movement (not hung), it creeps rather than lurches, and it costs ~1
+        // main-actor hop per second — cheap, and it doesn't steal cycles/thermal headroom
+        // from the embedding itself. (A row-fraction cadence was the wrong frame: it ties
+        // the update RATE to embedder speed — a fast backend fires many times/sec, a slow
+        // one looks hung — so no single fraction is right.)
+        let uiEmitInterval: TimeInterval = 1.0
+        var lastUIEmit = Date()
+        // Paint 0-of-N immediately so the bar starts determinate, not an indeterminate spinner.
+        progress?(0, pairs.count)
 
         for (index, pair) in pairs.enumerated() {
             let trimmed = pair.content.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -1060,7 +1079,14 @@ class MemoryStore: ObservableObject {
                 halLog("HALDEBUG-EMBEDDING: backfillEmbeddings — UPDATE failed for id=\(pair.id.prefix(8)) result=\(stepResult)")
             }
 
-            if (index + 1) % progressStep == 0 || index == pairs.count - 1 {
+            let isLastRow = (index == pairs.count - 1)
+            // Time-throttled UI update; always fire the final row so 100% is honest.
+            if isLastRow || Date().timeIntervalSince(lastUIEmit) >= uiEmitInterval {
+                progress?(index + 1, pairs.count)
+                lastUIEmit = Date()
+            }
+            // Log stays on the coarse decile cadence (keeps the console readable).
+            if (index + 1) % progressStep == 0 || isLastRow {
                 let pct = Int(Double(index + 1) / Double(pairs.count) * 100)
                 halLog("HALDEBUG-EMBEDDING: backfillEmbeddings(\(backend.rawValue)) progress \(pct)% (\(index + 1)/\(pairs.count)) updated=\(updated) skipped=\(skipped) failed=\(failed)")
             }
@@ -1073,8 +1099,8 @@ class MemoryStore: ObservableObject {
     /// Existing callers (the embedder migration coordinator, the
     /// MIGRATE_EMBEDDINGS_REEMBED API verb) keep working; they now target the
     /// active backend's per-backend column instead of the retired single column.
-    nonisolated func reEmbedAllNullRows() -> (updated: Int, skipped: Int, failed: Int) {
-        return backfillEmbeddings(for: EmbeddingBackend.current())
+    nonisolated func reEmbedAllNullRows(progress: (@Sendable (_ done: Int, _ total: Int) -> Void)? = nil) -> (updated: Int, skipped: Int, failed: Int) {
+        return backfillEmbeddings(for: EmbeddingBackend.current(), progress: progress)
     }
 
     /// Per-backend embedding coverage across `unified_content`: total rows and,

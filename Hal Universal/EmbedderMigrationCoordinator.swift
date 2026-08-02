@@ -167,10 +167,18 @@ final class EmbedderMigrationCoordinator: ObservableObject {
                 coordinator.activeBackend = target
                 coordinator.phase = .migrating(updated: 0, total: 0)
             }
-            // Run the migration. Single synchronous call — total runtime
-            // depends on row count and backend speed. Future variant
-            // could batch and publish per-row progress.
-            let result = storeRef.reEmbedAllNullRows()
+            // Run the migration. It reports (rowsDone, total) from its own loop
+            // at each decile; we republish that as .migrating(updated:total:) on
+            // the main actor so the UI shows a LIVE bar + "i / n rows" counter
+            // instead of a frozen indeterminate spinner (the total stayed 0 for
+            // the whole pass before this — it never left the indeterminate
+            // branch). The first callback (0, total) flips it to determinate at
+            // once. Decile cadence keeps this to ~10 main-actor hops per pass.
+            let result = storeRef.reEmbedAllNullRows(progress: { done, total in
+                Task { @MainActor in
+                    coordinator.phase = .migrating(updated: done, total: total)
+                }
+            })
             await MainActor.run {
                 coordinator.phase = .done(message: "Migrated \(result.updated) rows to \(target.displayName). (\(result.skipped) skipped, \(result.failed) failed.)")
             }

@@ -1348,6 +1348,20 @@ class HalTestConsole: ObservableObject {
             // simulator MCP tooling doesn't apply.
             return await captureScreenshotJSON()
 
+        } else if trimmed == "SCROLL" || trimmed.hasPrefix("SCROLL:") {
+            // General UI scroll — parity with a human swipe on ANY scrollable
+            // screen. SwiftUI List/Form/ScrollView are all UIScrollView-backed,
+            // so this finds the largest visible UIScrollView across the app's
+            // windows (handles modal sheets like the Model Library / Settings)
+            // and moves its contentOffset. This exists so CC can bring
+            // below-the-fold content into view for screenshots/tests WITHOUT a
+            // human touching the device — a capability the antenna must always
+            // have. SCROLL:<down|up|top|bottom|pagedown|pageup>  (default down).
+            let dir = trimmed.contains(":")
+                ? String(trimmed.dropFirst("SCROLL:".count)).trimmingCharacters(in: .whitespaces).lowercased()
+                : "down"
+            return scrollFrontmostJSON(direction: dir)
+
         } else if trimmed == "GET_RENDERED_MESSAGES" {
             // Full content by DEFAULT (2026-07-29). Use :preview for the cheap cap.
             return buildRenderedMessagesJSON(vm: vm)
@@ -1705,6 +1719,25 @@ class HalTestConsole: ObservableObject {
             }
             let result = vm.memoryStore.reEmbedAllNullRows()
             return "{\"status\":\"ok\",\"command\":\"MIGRATE_EMBEDDINGS_REEMBED\",\"backend\":\"\(backend.rawValue)\",\"updated\":\(result.updated),\"skipped\":\(result.skipped),\"failed\":\(result.failed)}"
+
+        } else if trimmed.hasPrefix("SWITCH_EMBEDDER:") {
+            // Trigger the SAME path the Model Library "Switch" button uses —
+            // EmbedderMigrationCoordinator.switchAndMigrate — so the LIVE
+            // re-embedding progress bar is exercised end to end. The sibling
+            // verbs (SET_EMBEDDING_BACKEND / MIGRATE_EMBEDDINGS_REEMBED) call the
+            // store directly and BYPASS the coordinator, so they never drive its
+            // .migrating UI phase; this verb exists so that UI can be witnessed
+            // and regression-tested without a manual tap. Fire-and-forget: the
+            // coordinator kicks the work onto a background task and publishes
+            // progress, so this returns immediately (poll GET_UI_STATE / screenshot
+            // to watch the bar). Non-destructive — each backend keeps its own
+            // vector column, so switching back is instant.
+            let raw = String(trimmed.dropFirst("SWITCH_EMBEDDER:".count)).trimmingCharacters(in: .whitespaces)
+            guard let backend = EmbeddingBackend(rawValue: raw) else {
+                return "{\"status\":\"error\",\"message\":\"Unknown embedder '\(raw)'. Use nlcontextual|nomicswift|mxbai.\"}"
+            }
+            EmbedderMigrationCoordinator.shared.switchAndMigrate(to: backend, memoryStore: vm.memoryStore)
+            return "{\"status\":\"ok\",\"command\":\"SWITCH_EMBEDDER\",\"target\":\"\(backend.rawValue)\",\"note\":\"coordinator switch started; poll GET_UI_STATE or screenshot for live progress\"}"
 
         } else if trimmed == "EMBEDDING_COVERAGE" {
             // v2.1 step 2 diagnostic (read-only): per-backend embedding coverage
@@ -2334,6 +2367,58 @@ class HalTestConsole: ObservableObject {
         }
         let w = Int(bounds.width), h = Int(bounds.height)
         return "{\"status\":\"ok\",\"command\":\"SCREENSHOT\",\"path\":\"\(jsonStringEscape(file.path))\",\"width\":\(w),\"height\":\(h),\"bytes\":\(png.count)}"
+    }
+
+    /// General programmatic scroll — the antenna's equivalent of a human swipe.
+    /// Finds the largest on-screen `UIScrollView` across all visible windows
+    /// (SwiftUI List/Form/ScrollView are UIScrollView-backed, and this reaches
+    /// into modally-presented sheets like the Model Library), then moves its
+    /// vertical contentOffset. `direction`: down / up (one ~85% page), top,
+    /// bottom, pagedown, pageup. Not animated, so a screenshot taken right after
+    /// reflects the settled position. Returns the new offset + bounds so a caller
+    /// can tell whether it actually moved (already at the end → offsets match).
+    @MainActor
+    func scrollFrontmostJSON(direction: String) -> String {
+        let scenes = UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }
+        let windows = scenes.flatMap { $0.windows }.filter { !$0.isHidden && $0.alpha > 0.01 }
+        guard !windows.isEmpty else {
+            return "{\"status\":\"error\",\"message\":\"SCROLL: no visible window\"}"
+        }
+        // Largest-area visible UIScrollView wins (the main content), tie-broken by
+        // the higher window level so a sheet on top beats the content beneath it.
+        var best: UIScrollView?
+        var bestScore: (level: CGFloat, area: CGFloat) = (-.greatestFiniteMagnitude, 0)
+        func walk(_ v: UIView, level: CGFloat) {
+            if let sv = v as? UIScrollView, sv.window != nil, !sv.isHidden, sv.alpha > 0.01,
+               sv.bounds.width > 1, sv.bounds.height > 1 {
+                let area = sv.bounds.width * sv.bounds.height
+                if level > bestScore.level || (level == bestScore.level && area > bestScore.area) {
+                    bestScore = (level, area); best = sv
+                }
+            }
+            for sub in v.subviews { walk(sub, level: level) }
+        }
+        for w in windows { walk(w, level: w.windowLevel.rawValue) }
+        guard let sv = best else {
+            return "{\"status\":\"error\",\"message\":\"SCROLL: no scroll view found on screen\"}"
+        }
+        let inset = sv.adjustedContentInset
+        let minY = -inset.top
+        let maxY = max(minY, sv.contentSize.height + inset.bottom - sv.bounds.height)
+        let page = sv.bounds.height * 0.85
+        let beforeY = sv.contentOffset.y
+        var y = beforeY
+        switch direction {
+        case "down", "pagedown", "": y = min(maxY, beforeY + page)
+        case "up", "pageup":         y = max(minY, beforeY - page)
+        case "top":                  y = minY
+        case "bottom":               y = maxY
+        default:
+            return "{\"status\":\"error\",\"message\":\"SCROLL: unknown direction '\(jsonStringEscape(direction))' (use down|up|top|bottom|pagedown|pageup)\"}"
+        }
+        sv.setContentOffset(CGPoint(x: sv.contentOffset.x, y: y), animated: false)
+        let moved = abs(y - beforeY) > 0.5
+        return "{\"status\":\"ok\",\"command\":\"SCROLL\",\"direction\":\"\(jsonStringEscape(direction))\",\"moved\":\(moved),\"offsetY\":\(Int(y)),\"beforeY\":\(Int(beforeY)),\"maxY\":\(Int(maxY)),\"viewportH\":\(Int(sv.bounds.height))}"
     }
 
     // Returns the most recent log entries captured by RuntimeLog. Useful for

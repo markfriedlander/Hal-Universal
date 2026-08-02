@@ -982,7 +982,14 @@ class MemoryStore: ObservableObject {
     // (BERT-large) runs ~0.66 s/encode; for a few-hundred-row corpus that's a
     // few minutes, so callers run it off the main actor (the API verb kicks it
     // off in a background Task and reports progress via EMBEDDING_COVERAGE).
-    nonisolated func backfillEmbeddings(for backend: EmbeddingBackend) -> (updated: Int, skipped: Int, failed: Int) {
+    // `progress`, when supplied, is called as (rowsDone, totalRows) — once at
+    // the start with (0, total) and again at each decile — so a caller (the
+    // embedder migration coordinator) can drive a LIVE progress bar. It runs on
+    // this method's background thread, so the closure hops to the main actor
+    // itself; it's @Sendable for that reason. Optional + defaulted so the API
+    // BACKFILL/MIGRATE verbs and every other caller are untouched.
+    nonisolated func backfillEmbeddings(for backend: EmbeddingBackend,
+                                        progress: (@Sendable (_ done: Int, _ total: Int) -> Void)? = nil) -> (updated: Int, skipped: Int, failed: Int) {
         guard ensureHealthyConnection() else {
             halLog("HALDEBUG-EMBEDDING: backfillEmbeddings aborted — no DB connection")
             return (0, 0, 0)
@@ -1030,7 +1037,19 @@ class MemoryStore: ObservableObject {
         var updated = 0
         var skipped = 0
         var failed = 0
-        let progressStep = max(1, totalCandidates / 10)
+        let progressStep = max(1, totalCandidates / 10)   // log cadence: ~10 decile lines
+        // The UI bar exists only to tell a GLANCING user "still working, not hung" —
+        // nobody sits and watches it tick. So it's throttled by TIME, not row count:
+        // re-emit at most once per `uiEmitInterval`. A glance every second or two always
+        // sees movement (not hung), it creeps rather than lurches, and it costs ~1
+        // main-actor hop per second — cheap, and it doesn't steal cycles/thermal headroom
+        // from the embedding itself. (A row-fraction cadence was the wrong frame: it ties
+        // the update RATE to embedder speed — a fast backend fires many times/sec, a slow
+        // one looks hung — so no single fraction is right.)
+        let uiEmitInterval: TimeInterval = 1.0
+        var lastUIEmit = Date()
+        // Paint 0-of-N immediately so the bar starts determinate, not an indeterminate spinner.
+        progress?(0, pairs.count)
 
         for (index, pair) in pairs.enumerated() {
             let trimmed = pair.content.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -1061,7 +1080,14 @@ class MemoryStore: ObservableObject {
                 halLog("HALDEBUG-EMBEDDING: backfillEmbeddings — UPDATE failed for id=\(pair.id.prefix(8)) result=\(stepResult)")
             }
 
-            if (index + 1) % progressStep == 0 || index == pairs.count - 1 {
+            let isLastRow = (index == pairs.count - 1)
+            // Time-throttled UI update; always fire the final row so 100% is honest.
+            if isLastRow || Date().timeIntervalSince(lastUIEmit) >= uiEmitInterval {
+                progress?(index + 1, pairs.count)
+                lastUIEmit = Date()
+            }
+            // Log stays on the coarse decile cadence (keeps the console readable).
+            if (index + 1) % progressStep == 0 || isLastRow {
                 let pct = Int(Double(index + 1) / Double(pairs.count) * 100)
                 halLog("HALDEBUG-EMBEDDING: backfillEmbeddings(\(backend.rawValue)) progress \(pct)% (\(index + 1)/\(pairs.count)) updated=\(updated) skipped=\(skipped) failed=\(failed)")
             }
@@ -1074,8 +1100,8 @@ class MemoryStore: ObservableObject {
     /// Existing callers (the embedder migration coordinator, the
     /// MIGRATE_EMBEDDINGS_REEMBED API verb) keep working; they now target the
     /// active backend's per-backend column instead of the retired single column.
-    nonisolated func reEmbedAllNullRows() -> (updated: Int, skipped: Int, failed: Int) {
-        return backfillEmbeddings(for: EmbeddingBackend.current())
+    nonisolated func reEmbedAllNullRows(progress: (@Sendable (_ done: Int, _ total: Int) -> Void)? = nil) -> (updated: Int, skipped: Int, failed: Int) {
+        return backfillEmbeddings(for: EmbeddingBackend.current(), progress: progress)
     }
 
     /// Per-backend embedding coverage across `unified_content`: total rows and,
@@ -15305,10 +15331,18 @@ final class EmbedderMigrationCoordinator: ObservableObject {
                 coordinator.activeBackend = target
                 coordinator.phase = .migrating(updated: 0, total: 0)
             }
-            // Run the migration. Single synchronous call — total runtime
-            // depends on row count and backend speed. Future variant
-            // could batch and publish per-row progress.
-            let result = storeRef.reEmbedAllNullRows()
+            // Run the migration. It reports (rowsDone, total) from its own loop
+            // at each decile; we republish that as .migrating(updated:total:) on
+            // the main actor so the UI shows a LIVE bar + "i / n rows" counter
+            // instead of a frozen indeterminate spinner (the total stayed 0 for
+            // the whole pass before this — it never left the indeterminate
+            // branch). The first callback (0, total) flips it to determinate at
+            // once. Decile cadence keeps this to ~10 main-actor hops per pass.
+            let result = storeRef.reEmbedAllNullRows(progress: { done, total in
+                Task { @MainActor in
+                    coordinator.phase = .migrating(updated: done, total: total)
+                }
+            })
             await MainActor.run {
                 coordinator.phase = .done(message: "Migrated \(result.updated) rows to \(target.displayName). (\(result.skipped) skipped, \(result.failed) failed.)")
             }
@@ -26066,6 +26100,20 @@ class HalTestConsole: ObservableObject {
             // simulator MCP tooling doesn't apply.
             return await captureScreenshotJSON()
 
+        } else if trimmed == "SCROLL" || trimmed.hasPrefix("SCROLL:") {
+            // General UI scroll — parity with a human swipe on ANY scrollable
+            // screen. SwiftUI List/Form/ScrollView are all UIScrollView-backed,
+            // so this finds the largest visible UIScrollView across the app's
+            // windows (handles modal sheets like the Model Library / Settings)
+            // and moves its contentOffset. This exists so CC can bring
+            // below-the-fold content into view for screenshots/tests WITHOUT a
+            // human touching the device — a capability the antenna must always
+            // have. SCROLL:<down|up|top|bottom|pagedown|pageup>  (default down).
+            let dir = trimmed.contains(":")
+                ? String(trimmed.dropFirst("SCROLL:".count)).trimmingCharacters(in: .whitespaces).lowercased()
+                : "down"
+            return scrollFrontmostJSON(direction: dir)
+
         } else if trimmed == "GET_RENDERED_MESSAGES" {
             // Full content by DEFAULT (2026-07-29). Use :preview for the cheap cap.
             return buildRenderedMessagesJSON(vm: vm)
@@ -26423,6 +26471,25 @@ class HalTestConsole: ObservableObject {
             }
             let result = vm.memoryStore.reEmbedAllNullRows()
             return "{\"status\":\"ok\",\"command\":\"MIGRATE_EMBEDDINGS_REEMBED\",\"backend\":\"\(backend.rawValue)\",\"updated\":\(result.updated),\"skipped\":\(result.skipped),\"failed\":\(result.failed)}"
+
+        } else if trimmed.hasPrefix("SWITCH_EMBEDDER:") {
+            // Trigger the SAME path the Model Library "Switch" button uses —
+            // EmbedderMigrationCoordinator.switchAndMigrate — so the LIVE
+            // re-embedding progress bar is exercised end to end. The sibling
+            // verbs (SET_EMBEDDING_BACKEND / MIGRATE_EMBEDDINGS_REEMBED) call the
+            // store directly and BYPASS the coordinator, so they never drive its
+            // .migrating UI phase; this verb exists so that UI can be witnessed
+            // and regression-tested without a manual tap. Fire-and-forget: the
+            // coordinator kicks the work onto a background task and publishes
+            // progress, so this returns immediately (poll GET_UI_STATE / screenshot
+            // to watch the bar). Non-destructive — each backend keeps its own
+            // vector column, so switching back is instant.
+            let raw = String(trimmed.dropFirst("SWITCH_EMBEDDER:".count)).trimmingCharacters(in: .whitespaces)
+            guard let backend = EmbeddingBackend(rawValue: raw) else {
+                return "{\"status\":\"error\",\"message\":\"Unknown embedder '\(raw)'. Use nlcontextual|nomicswift|mxbai.\"}"
+            }
+            EmbedderMigrationCoordinator.shared.switchAndMigrate(to: backend, memoryStore: vm.memoryStore)
+            return "{\"status\":\"ok\",\"command\":\"SWITCH_EMBEDDER\",\"target\":\"\(backend.rawValue)\",\"note\":\"coordinator switch started; poll GET_UI_STATE or screenshot for live progress\"}"
 
         } else if trimmed == "EMBEDDING_COVERAGE" {
             // v2.1 step 2 diagnostic (read-only): per-backend embedding coverage
@@ -27052,6 +27119,58 @@ class HalTestConsole: ObservableObject {
         }
         let w = Int(bounds.width), h = Int(bounds.height)
         return "{\"status\":\"ok\",\"command\":\"SCREENSHOT\",\"path\":\"\(jsonStringEscape(file.path))\",\"width\":\(w),\"height\":\(h),\"bytes\":\(png.count)}"
+    }
+
+    /// General programmatic scroll — the antenna's equivalent of a human swipe.
+    /// Finds the largest on-screen `UIScrollView` across all visible windows
+    /// (SwiftUI List/Form/ScrollView are UIScrollView-backed, and this reaches
+    /// into modally-presented sheets like the Model Library), then moves its
+    /// vertical contentOffset. `direction`: down / up (one ~85% page), top,
+    /// bottom, pagedown, pageup. Not animated, so a screenshot taken right after
+    /// reflects the settled position. Returns the new offset + bounds so a caller
+    /// can tell whether it actually moved (already at the end → offsets match).
+    @MainActor
+    func scrollFrontmostJSON(direction: String) -> String {
+        let scenes = UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }
+        let windows = scenes.flatMap { $0.windows }.filter { !$0.isHidden && $0.alpha > 0.01 }
+        guard !windows.isEmpty else {
+            return "{\"status\":\"error\",\"message\":\"SCROLL: no visible window\"}"
+        }
+        // Largest-area visible UIScrollView wins (the main content), tie-broken by
+        // the higher window level so a sheet on top beats the content beneath it.
+        var best: UIScrollView?
+        var bestScore: (level: CGFloat, area: CGFloat) = (-.greatestFiniteMagnitude, 0)
+        func walk(_ v: UIView, level: CGFloat) {
+            if let sv = v as? UIScrollView, sv.window != nil, !sv.isHidden, sv.alpha > 0.01,
+               sv.bounds.width > 1, sv.bounds.height > 1 {
+                let area = sv.bounds.width * sv.bounds.height
+                if level > bestScore.level || (level == bestScore.level && area > bestScore.area) {
+                    bestScore = (level, area); best = sv
+                }
+            }
+            for sub in v.subviews { walk(sub, level: level) }
+        }
+        for w in windows { walk(w, level: w.windowLevel.rawValue) }
+        guard let sv = best else {
+            return "{\"status\":\"error\",\"message\":\"SCROLL: no scroll view found on screen\"}"
+        }
+        let inset = sv.adjustedContentInset
+        let minY = -inset.top
+        let maxY = max(minY, sv.contentSize.height + inset.bottom - sv.bounds.height)
+        let page = sv.bounds.height * 0.85
+        let beforeY = sv.contentOffset.y
+        var y = beforeY
+        switch direction {
+        case "down", "pagedown", "": y = min(maxY, beforeY + page)
+        case "up", "pageup":         y = max(minY, beforeY - page)
+        case "top":                  y = minY
+        case "bottom":               y = maxY
+        default:
+            return "{\"status\":\"error\",\"message\":\"SCROLL: unknown direction '\(jsonStringEscape(direction))' (use down|up|top|bottom|pagedown|pageup)\"}"
+        }
+        sv.setContentOffset(CGPoint(x: sv.contentOffset.x, y: y), animated: false)
+        let moved = abs(y - beforeY) > 0.5
+        return "{\"status\":\"ok\",\"command\":\"SCROLL\",\"direction\":\"\(jsonStringEscape(direction))\",\"moved\":\(moved),\"offsetY\":\(Int(y)),\"beforeY\":\(Int(beforeY)),\"maxY\":\(Int(maxY)),\"viewportH\":\(Int(sv.bounds.height))}"
     }
 
     // Returns the most recent log entries captured by RuntimeLog. Useful for
