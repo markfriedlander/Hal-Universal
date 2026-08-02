@@ -20679,7 +20679,17 @@ final class PrivacyMonitor: ObservableObject {
                 }
             }
         }
-        monitor.start(queue: queue)
+        // Start the monitor OFF the main thread. NWPathMonitor.start(queue:) runs a
+        // synchronous initial path evaluation on the CALLING thread; a wedged system
+        // network agent can block it. Because start() is called from Hal10000App.init()
+        // on the main thread, that could FREEZE app launch (2026-07-31: a hung launch
+        // sampled 2551/2551 on the main thread in nw_path_access_agent_cache). Dispatch
+        // onto the monitor's own queue so launch never blocks; the lock indicator just
+        // resolves a beat later (the @Published still lands on main via the handler's
+        // DispatchQueue.main.async above). Captured as locals so this doesn't retain self.
+        let m = monitor
+        let q = queue
+        q.async { m.start(queue: q) }
     }
 
     // MARK: - Lock decision (pure truth table)
