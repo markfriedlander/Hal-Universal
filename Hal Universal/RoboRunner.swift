@@ -994,26 +994,45 @@ nonisolated enum RoboScriptGenerator {
         var isValid: Bool { !issues.contains { $0.isError } }
     }
 
-    /// Draft → validate → repair loop. Returns the first valid script, or the best attempt with
-    /// its remaining issues if it never fully validates (honest: the caller shows what's wrong).
+    /// Draft → validate → repair loop. Returns the first valid, NON-EMPTY script, or the best
+    /// attempt with its remaining issues if it never fully validates (honest: the caller shows
+    /// what's wrong). `generate` is a (system, user) → text call: the rules go in `system` (AFM
+    /// maps a system message to Instructions, which is what makes it actually comply — a single
+    /// bare prompt comes back empty), the request/repair goes in `user`.
     static func draft(from description: String,
                       knownModelIDs: Set<String>,
                       maxAttempts: Int = 3,
-                      generate: (String) async throws -> String) async -> Draft {
+                      generate: (_ system: String, _ user: String) async throws -> String) async -> Draft {
+        let system = systemInstructions(modelIDs: knownModelIDs)
         var script = ""
         var issues: [RoboIssue] = []
         for attempt in 1...max(1, maxAttempts) {
-            let prompt = (attempt == 1)
-                ? initialPrompt(description: description, modelIDs: knownModelIDs)
-                : repairPrompt(description: description, script: script, errors: issues.filter { $0.isError })
-            let raw = (try? await generate(prompt)) ?? ""
+            let user = (attempt == 1)
+                ? "Write a RoboRunner script that does this, then output ONLY the script:\n\(description)"
+                : repairRequest(description: description, script: script, errors: issues.filter { $0.isError })
+            let raw = (try? await generate(system, user)) ?? ""
             script = extractScript(raw)
+            // Empty-guard: a blank / comments-only result is NOT success — an empty script has no
+            // validation errors, which previously counted as "valid" and returned nothing. Treat
+            // it as a failure so we retry, and (if still empty at the end) report it honestly.
+            if !hasExecutableLine(script) {
+                issues = [RoboIssue(line: 0, severity: .error,
+                                    message: "The model returned an empty script. Try rephrasing the request.")]
+                continue
+            }
             issues = RoboValidator.validate(script, knownModelIDs: knownModelIDs)
             if !issues.contains(where: { $0.isError }) {
                 return Draft(script: script, issues: issues, attempts: attempt)
             }
         }
         return Draft(script: script, issues: issues, attempts: max(1, maxAttempts))
+    }
+
+    /// True if the script has at least one real line (non-blank, non-comment) to run.
+    private static func hasExecutableLine(_ s: String) -> Bool {
+        s.split(separator: "\n")
+            .map { $0.trimmingCharacters(in: .whitespaces) }
+            .contains { !$0.isEmpty && !$0.hasPrefix("#") }
     }
 
     // MARK: - Prompts
@@ -1038,26 +1057,25 @@ nonisolated enum RoboScriptGenerator {
     GET_THERMAL_STATE         read the thermal state
     """
 
-    private static func initialPrompt(description: String, modelIDs: Set<String>) -> String {
+    /// System message (→ AFM Instructions): all the rules. The actual request rides in the user
+    /// message. Splitting them this way is what makes AFM comply (a single bare prompt returns empty).
+    private static func systemInstructions(modelIDs: Set<String>) -> String {
         let models = modelIDs.sorted().prefix(8).joined(separator: ", ")
         return """
         You write scripts for RoboRunner, Hal's tiny on-device automation language.
         \(grammar)
         \(verbCheatsheet)
         Valid model IDs for SWITCH_MODEL: \(models)
-        Write a script that does what the user asks. Output ONLY the script — no explanation, no
-        markdown code fences, no prose. Keep it short and correct.
-
-        User request: \(description)
+        Output ONLY the script — no explanation, no markdown code fences, no prose. Keep it short and correct.
         """
     }
 
-    private static func repairPrompt(description: String, script: String, errors: [RoboIssue]) -> String {
+    /// User message for a repair pass: the broken script + its errors.
+    private static func repairRequest(description: String, script: String, errors: [RoboIssue]) -> String {
         let problems = errors.map { $0.line > 0 ? "line \($0.line): \($0.message)" : $0.message }
             .joined(separator: "\n")
         return """
-        This RoboRunner script for the request "\(description)" has errors. Fix them and output
-        ONLY the corrected script (no prose, no markdown fences).
+        The script below (for the request "\(description)") has errors. Fix them and output ONLY the corrected script.
 
         Script:
         \(script)
@@ -1351,8 +1369,9 @@ struct RoboDraftView: View {
             let draft = await RoboScriptGenerator.draft(
                 from: desc,
                 knownModelIDs: RoboRunner.currentKnownModelIDs()
-            ) { prompt in
-                try await vm.llmService.generateResponse(prompt: prompt, temperature: 0.2)
+            ) { system, user in
+                try await vm.llmService.generateChatResponse(
+                    messages: [.system(system), .user(user)], temperature: 0.2)
             }
             draftScript = draft.script
             draftIssues = draft.issues

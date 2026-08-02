@@ -642,8 +642,9 @@ class HalTestConsole: ObservableObject {
             // generation (slow on big models — allow a long timeout on the client).
             let desc = String(trimmed.dropFirst("ROBO_GENERATE:".count))
             let ids = RoboRunner.currentKnownModelIDs()
-            let draft = await RoboScriptGenerator.draft(from: desc, knownModelIDs: ids) { prompt in
-                try await vm.llmService.generateResponse(prompt: prompt, temperature: 0.2)
+            let draft = await RoboScriptGenerator.draft(from: desc, knownModelIDs: ids) { system, user in
+                try await vm.llmService.generateChatResponse(
+                    messages: [.system(system), .user(user)], temperature: 0.2)
             }
             let items = draft.issues.map {
                 "{\"severity\":\"\($0.isError ? "error" : "warning")\",\"line\":\($0.line),\"message\":\"\(jsonStringEscape($0.message))\"}"
