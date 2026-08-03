@@ -1123,6 +1123,74 @@ nonisolated enum RoboScriptGenerator {
 // Reached from a "Developer" row in Settings (ActionsView). Ships as a user-facing opt-in.
 // v1 persists a single script via @AppStorage; multi-file save/load is a follow-up.
 
+/// A UITextView-backed editor for RoboRunner scripts. It replaces SwiftUI's TextEditor so we can
+/// (Stage 2) add a line-number gutter and red error-line highlighting — things TextEditor cannot do.
+/// Stage 1 is a behavior-preserving drop-in: two-way text binding, monospaced font, dim-when-disabled,
+/// a focus binding (replacing @FocusState), and a UIKit input-accessory toolbar carrying Clear + Done
+/// (a SwiftUI `.keyboard` toolbar won't attach to a UITextView). Smart dashes/quotes are OFF so the
+/// keyboard can't turn "--" into an em dash or "" into curly quotes inside a script.
+struct RoboScriptEditor: UIViewRepresentable {
+    @Binding var text: String
+    @Binding var focused: Bool
+    var isEditable: Bool
+    var onClear: () -> Void
+
+    func makeUIView(context: Context) -> UITextView {
+        let tv = UITextView()
+        tv.delegate = context.coordinator
+        tv.font = UIFont.monospacedSystemFont(
+            ofSize: UIFont.preferredFont(forTextStyle: .callout).pointSize, weight: .regular)
+        tv.backgroundColor = .clear
+        tv.textContainerInset = UIEdgeInsets(top: 8, left: 8, bottom: 8, right: 8)
+        tv.autocapitalizationType = .none
+        tv.autocorrectionType = .no
+        tv.spellCheckingType = .no
+        tv.smartQuotesType = .no
+        tv.smartDashesType = .no
+        tv.smartInsertDeleteType = .no
+        tv.inputAccessoryView = context.coordinator.accessory
+        tv.text = text
+        return tv
+    }
+
+    func updateUIView(_ tv: UITextView, context: Context) {
+        context.coordinator.parent = self
+        if tv.text != text { tv.text = text }
+        tv.isEditable = isEditable
+        tv.alpha = isEditable ? 1.0 : 0.6
+        if focused, isEditable, !tv.isFirstResponder { tv.becomeFirstResponder() }
+        if !focused, tv.isFirstResponder { tv.resignFirstResponder() }
+        context.coordinator.setClearEnabled(!text.isEmpty)
+    }
+
+    func makeCoordinator() -> Coordinator { Coordinator(self) }
+
+    final class Coordinator: NSObject, UITextViewDelegate {
+        var parent: RoboScriptEditor
+        let accessory = UIToolbar()
+        private var clearItem: UIBarButtonItem!
+
+        init(_ parent: RoboScriptEditor) {
+            self.parent = parent
+            super.init()
+            clearItem = UIBarButtonItem(title: "Clear", style: .plain, target: self, action: #selector(clearTapped))
+            let flex = UIBarButtonItem(barButtonSystemItem: .flexibleSpace, target: nil, action: nil)
+            let doneItem = UIBarButtonItem(title: "Done", style: .done, target: self, action: #selector(doneTapped))
+            accessory.items = [clearItem, flex, doneItem]
+            accessory.sizeToFit()
+        }
+
+        func setClearEnabled(_ enabled: Bool) { clearItem.isEnabled = enabled }
+
+        @objc private func clearTapped() { parent.onClear() }
+        @objc private func doneTapped() { parent.focused = false }
+
+        func textViewDidChange(_ tv: UITextView) { parent.text = tv.text }
+        func textViewDidBeginEditing(_ tv: UITextView) { parent.focused = true }
+        func textViewDidEndEditing(_ tv: UITextView) { parent.focused = false }
+    }
+}
+
 /// The RoboRunner script editor sheet.
 struct RoboEditorView: View {
     @Environment(\.dismiss) private var dismiss
@@ -1141,8 +1209,10 @@ struct RoboEditorView: View {
     @State private var undoFromDraft = false
     // Confirm before the wand clobbers text that already looks like a real script (see draftFromField).
     @State private var showingDraftOverwriteConfirm = false
-    // Drives the keyboard toolbar's Done (dismiss the keyboard without closing the whole sheet).
-    @FocusState private var editorFocused: Bool
+    // Editor focus — drives the input-accessory Done (dismiss the keyboard without closing the
+    // sheet) and hides the status bar while typing. A plain @State so it can bind into the
+    // UIViewRepresentable editor (which can't take a @FocusState).
+    @State private var editorFocused = false
 
     static let sampleScript = """
     # RoboRunner script. Most lines are antenna verbs, passed straight through.
@@ -1180,12 +1250,12 @@ struct RoboEditorView: View {
     var body: some View {
         NavigationView {
             VStack(spacing: 0) {
-                TextEditor(text: $script)
-                    .font(.system(.callout, design: .monospaced))
-                    .padding(8)
-                    .focused($editorFocused)
-                    .disabled(robo.isRunning || generatingDraft)
-                    .opacity((robo.isRunning || generatingDraft) ? 0.6 : 1.0)
+                RoboScriptEditor(
+                    text: $script,
+                    focused: $editorFocused,
+                    isEditable: !(robo.isRunning || generatingDraft),
+                    onClear: { clearField() }
+                )
 
                 // Hidden while the keyboard is up: the keyboard toolbar (Clear/Done) occupies that
                 // space, and showing the status bar too made them visually collide. The validation
@@ -1239,15 +1309,8 @@ struct RoboEditorView: View {
                     // from earlier sessions even before anything runs this session.
                     Button { showingResults = true } label: { Label("Results", systemImage: "doc.text.magnifyingglass") }
                 }
-                // Editing tools, shown above the keyboard while typing: Clear (empties the editor,
-                // undoable via the same stash) and Done (dismiss the keyboard WITHOUT closing the
-                // sheet — the fix for swipe-down closing all of RoboRunner).
-                ToolbarItemGroup(placement: .keyboard) {
-                    Button("Clear") { clearField() }
-                        .disabled(script.isEmpty)
-                    Spacer()
-                    Button("Done") { editorFocused = false }
-                }
+                // Clear/Done now live in RoboScriptEditor's input-accessory toolbar (above the
+                // keyboard), because a SwiftUI .keyboard toolbar won't attach to a UITextView.
             }
             .sheet(isPresented: $showingHelp) { RoboHelpView(onInsert: { appendToScript($0) }) }
             .sheet(isPresented: $showingResults) { RoboResultsView() }
