@@ -1129,7 +1129,11 @@ struct RoboEditorView: View {
     @State private var showingHelp = false
     @State private var showingResults = false
     @State private var showingIssues = false
-    @State private var showingDraft = false
+    // Wand-in-field: draft a script FROM the editor's own text (your description), replacing it in
+    // place — replaces the old separate Draft sheet. `preDraftText` stashes the pre-wand text so a
+    // single Undo restores it (the wand can never silently eat a script you'd written).
+    @State private var generatingDraft = false
+    @State private var preDraftText: String? = nil
 
     static let sampleScript = """
     # RoboRunner script. Most lines are antenna verbs, passed straight through.
@@ -1170,8 +1174,8 @@ struct RoboEditorView: View {
                 TextEditor(text: $script)
                     .font(.system(.callout, design: .monospaced))
                     .padding(8)
-                    .disabled(robo.isRunning)
-                    .opacity(robo.isRunning ? 0.6 : 1.0)
+                    .disabled(robo.isRunning || generatingDraft)
+                    .opacity((robo.isRunning || generatingDraft) ? 0.6 : 1.0)
 
                 statusBar
                     .font(.caption)
@@ -1203,9 +1207,11 @@ struct RoboEditorView: View {
                 ToolbarItemGroup(placement: .bottomBar) {
                     Button { showingHelp = true } label: { Label("Commands", systemImage: "list.bullet.rectangle") }
                     Spacer()
-                    // Draft-from-description: the optional teaching tool — describe what you want,
-                    // Hal drafts a validated script. You can edit it or ignore it and write your own.
-                    Button { showingDraft = true } label: { Label("Draft", systemImage: "wand.and.stars") }
+                    // Wand: draft a script FROM whatever's in the editor (your plain-language
+                    // description), replacing it in place — the old text is stashed for one-tap Undo.
+                    // Disabled when the editor is empty or a draft/run is already in flight.
+                    Button { draftFromField() } label: { Label("Draft", systemImage: "wand.and.stars") }
+                        .disabled(script.trimmingCharacters(in: .whitespaces).isEmpty || generatingDraft || robo.isRunning)
                     Spacer()
                     // The coach: validate WITHOUT running. Icon reflects the live state so a
                     // glance tells you if the script is clean before you ever hit Run.
@@ -1222,12 +1228,29 @@ struct RoboEditorView: View {
             .sheet(isPresented: $showingHelp) { RoboHelpView(onInsert: { appendToScript($0) }) }
             .sheet(isPresented: $showingResults) { RoboResultsView() }
             .sheet(isPresented: $showingIssues) { RoboIssuesView(issues: liveIssues) }
-            .sheet(isPresented: $showingDraft) { RoboDraftView(onInsert: { script = $0 }) }
         }
     }
 
     @ViewBuilder private var statusBar: some View {
-        if robo.isRunning {
+        HStack(spacing: 8) {
+            statusLabel
+            // One-tap Undo, shown after a wand draft until it's used or the next draft. Restores the
+            // exact text that was in the editor before the wand replaced it.
+            if preDraftText != nil && !robo.isRunning && !generatingDraft {
+                Spacer()
+                Button { undoDraft() } label: { Label("Undo", systemImage: "arrow.uturn.backward") }
+                    .buttonStyle(.borderless)
+            }
+        }
+    }
+
+    @ViewBuilder private var statusLabel: some View {
+        if generatingDraft {
+            HStack(spacing: 6) {
+                ProgressView().controlSize(.small)
+                Text("Drafting from your description…").foregroundColor(.secondary)
+            }
+        } else if robo.isRunning {
             HStack(spacing: 6) {
                 ProgressView().controlSize(.small)
                 Text("Running \(robo.progress)").foregroundColor(.secondary)
@@ -1240,10 +1263,42 @@ struct RoboEditorView: View {
         } else if liveWarningCount > 0 {
             Label("\(stepCount) step\(stepCount == 1 ? "" : "s"), \(liveWarningCount) warning\(liveWarningCount == 1 ? "" : "s")",
                   systemImage: "exclamationmark.triangle").foregroundColor(.orange)
+        } else if preDraftText != nil {
+            Label("Drafted — edit, run, or Undo", systemImage: "wand.and.stars").foregroundColor(.secondary)
         } else {
             Label("\(stepCount) step\(stepCount == 1 ? "" : "s") ready", systemImage: "checkmark.seal")
                 .foregroundColor(.secondary)
         }
+    }
+
+    /// Draft a script FROM the editor's current text (treated as a plain-language description),
+    /// replacing it in place. Stashes the previous text for Undo. Uses the SAME validated generator
+    /// the old Draft sheet used; the live Check coach then validates whatever lands.
+    private func draftFromField() {
+        let desc = script.trimmingCharacters(in: .whitespaces)
+        guard !desc.isEmpty, !generatingDraft, !robo.isRunning else { return }
+        let previous = script
+        let vm = chatViewModel
+        generatingDraft = true
+        Task { @MainActor in
+            let draft = await RoboScriptGenerator.draft(
+                from: desc,
+                knownModelIDs: RoboRunner.currentKnownModelIDs()
+            ) { system, user in
+                try await vm.llmService.generateChatResponse(
+                    messages: [.system(system), .user(user)], temperature: 0.2)
+            }
+            preDraftText = previous
+            script = draft.script
+            generatingDraft = false
+        }
+    }
+
+    /// Restore the text the wand replaced, and clear the stash.
+    private func undoDraft() {
+        guard let previous = preDraftText else { return }
+        script = previous
+        preDraftText = nil
     }
 
     /// Append an inserted command usage or template to the END of the script, keeping exactly one
@@ -1324,91 +1379,6 @@ struct RoboIssuesView: View {
             }
         }
         .padding(.vertical, 2)
-    }
-}
-
-/// The optional teaching tool: describe what you want in plain language, and Hal drafts a
-/// RoboRunner script — guaranteed valid by RoboScriptGenerator's validate/repair loop, or shown
-/// honestly with whatever couldn't be fixed. "Use this script" drops it into the editor; you can
-/// edit it or ignore it entirely and write your own. Uses one model generation, so it shows a
-/// working state and can be slow on big models.
-struct RoboDraftView: View {
-    @Environment(\.dismiss) private var dismiss
-    @EnvironmentObject private var chatViewModel: ChatViewModel
-    let onInsert: (String) -> Void
-
-    @State private var request = ""
-    @State private var generating = false
-    @State private var draftScript: String?
-    @State private var draftIssues: [RoboIssue] = []
-    @State private var attempts = 0
-
-    private var draftErrors: [RoboIssue] { draftIssues.filter { $0.isError } }
-
-    var body: some View {
-        NavigationView {
-            Form {
-                Section("Describe what you want the script to do") {
-                    TextEditor(text: $request)
-                        .font(.callout)
-                        .frame(minHeight: 70)
-                }
-                Section {
-                    Button(action: generate) {
-                        HStack(spacing: 8) {
-                            if generating { ProgressView().controlSize(.small) }
-                            Image(systemName: "wand.and.stars")
-                            Text(generating ? "Drafting…" : "Draft script")
-                        }
-                    }
-                    .disabled(request.trimmingCharacters(in: .whitespaces).isEmpty || generating)
-                }
-                if let s = draftScript {
-                    Section(draftErrors.isEmpty
-                            ? "Draft — validated in \(attempts) attempt\(attempts == 1 ? "" : "s")"
-                            : "Draft — still has issues, review before running") {
-                        Text(s)
-                            .font(.system(.caption, design: .monospaced))
-                            .textSelection(.enabled)
-                        ForEach(draftErrors) { issue in
-                            Label(issue.line > 0 ? "line \(issue.line): \(issue.message)" : issue.message,
-                                  systemImage: "xmark.octagon.fill")
-                                .font(.caption).foregroundColor(.red)
-                        }
-                        Button("Use this script") { onInsert(s); dismiss() }
-                            .fontWeight(.semibold)
-                    }
-                }
-                Section {
-                    Text("Hal drafts this from your description and checks it against the RoboRunner rules. It's a teaching aid — edit it, or ignore it and write your own.")
-                        .font(.caption).foregroundColor(.secondary)
-                }
-            }
-            .navigationTitle("Draft from Description")
-            .navigationBarTitleDisplayMode(.inline)
-            .toolbar { ToolbarItem(placement: .cancellationAction) { Button("Done") { dismiss() } } }
-        }
-    }
-
-    private func generate() {
-        generating = true
-        draftScript = nil
-        draftIssues = []
-        let desc = request
-        let vm = chatViewModel
-        Task { @MainActor in
-            let draft = await RoboScriptGenerator.draft(
-                from: desc,
-                knownModelIDs: RoboRunner.currentKnownModelIDs()
-            ) { system, user in
-                try await vm.llmService.generateChatResponse(
-                    messages: [.system(system), .user(user)], temperature: 0.2)
-            }
-            draftScript = draft.script
-            draftIssues = draft.issues
-            attempts = draft.attempts
-            generating = false
-        }
     }
 }
 
