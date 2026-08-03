@@ -511,7 +511,16 @@ struct ChatMessage: Identifiable, Equatable { // Added Equatable for ForEach
     /// honest visual record of the interruption. Default false.
     var wasStopped: Bool
 
-    init(id: UUID = UUID(), content: String, isFromUser: Bool, timestamp: Date = Date(), isPartial: Bool = false, thinkingDuration: TimeInterval? = nil, thinking: String? = nil, fullPromptUsed: String? = nil, usedContextSnippets: [UnifiedSearchResult]? = nil, tokenBreakdown: TokenBreakdown? = nil, toolsUsed: [String]? = nil, recordedByModel: String, turnNumber: Int, seatNumber: Int? = nil, deliberationRound: Int = 1, compressedSegments: Set<PromptSegmentKind> = [], truncatedSegments: Set<PromptSegmentKind> = [], wasStopped: Bool = false) {
+    /// For a stopped turn: how many seconds the turn ran before the user's STOP
+    /// landed — the frozen value of the live spinner's clock (now minus this
+    /// message's timestamp). This is the FULL wall-clock the user waited
+    /// (retrieval + prompt assembly + inference), so a turn stopped after a long
+    /// wait never reads as instant. The footer stamps it. Distinct from
+    /// `thinkingDuration` (phase-1 reasoning only, completed turns). nil on any
+    /// turn that wasn't stopped. Default nil.
+    var stoppedAfterSeconds: TimeInterval?
+
+    init(id: UUID = UUID(), content: String, isFromUser: Bool, timestamp: Date = Date(), isPartial: Bool = false, thinkingDuration: TimeInterval? = nil, thinking: String? = nil, fullPromptUsed: String? = nil, usedContextSnippets: [UnifiedSearchResult]? = nil, tokenBreakdown: TokenBreakdown? = nil, toolsUsed: [String]? = nil, recordedByModel: String, turnNumber: Int, seatNumber: Int? = nil, deliberationRound: Int = 1, compressedSegments: Set<PromptSegmentKind> = [], truncatedSegments: Set<PromptSegmentKind> = [], wasStopped: Bool = false, stoppedAfterSeconds: TimeInterval? = nil) {
         self.id = id
         self.content = content
         self.isFromUser = isFromUser
@@ -530,6 +539,7 @@ struct ChatMessage: Identifiable, Equatable { // Added Equatable for ForEach
         self.compressedSegments = compressedSegments
         self.truncatedSegments = truncatedSegments
         self.wasStopped = wasStopped
+        self.stoppedAfterSeconds = stoppedAfterSeconds
     }
 }
 
@@ -12872,6 +12882,15 @@ class ChatViewModel: ObservableObject {
                                                                     if let i = messages.firstIndex(where: { $0.id == partialID }) {
                                                                         messages[i].isPartial = false
                                                                         messages[i].wasStopped = true
+                                                                        // Freeze the clock the user was already watching. The live spinner
+                                                                        // counts wall-clock from this message's timestamp (TimerView's
+                                                                        // startDate), so stamping now - timestamp makes the footer show
+                                                                        // exactly the number the timer displayed the instant they hit stop.
+                                                                        // This is the FULL time the turn ran (retrieval + prompt assembly +
+                                                                        // inference), not just token generation — a turn stopped after a long
+                                                                        // wait must never read as instant, and anchoring at stream start
+                                                                        // (t0) misses the pre-token wait that dominates on some backends.
+                                                                        messages[i].stoppedAfterSeconds = Date().timeIntervalSince(messages[i].timestamp)
                                                                         stoppedTurnNumber = messages[i].turnNumber
                                                                         // If the stop landed before any real answer text arrived, the bubble
                                                                         // still holds a transient status line ("Formulating a reply...") or the

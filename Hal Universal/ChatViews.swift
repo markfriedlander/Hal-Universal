@@ -1315,6 +1315,13 @@ struct ChatBubbleView: View {
                 let formattedDate = message.timestamp.formatted(date: .abbreviated, time: .shortened)
                 let turnText = "Turn \(actualTurnNumber)"
                 let durationText = message.thinkingDuration.map { String(format: "Inference %.1f sec", $0) }
+                // Stopped turns carry no thinkingDuration, so without this a turn
+                // stopped after a long wait would read as instant. Shows the frozen
+                // spinner clock — the full time the turn ran before STOP. Assistant
+                // side only (the user bubble wears no timing).
+                let stoppedText: String? = (message.wasStopped && !message.isFromUser)
+                    ? message.stoppedAfterSeconds.map { String(format: "Stopped after %.1f sec", $0) }
+                    : nil
                 let modelName = !message.isFromUser ? (ModelCatalogService.shared.getModel(byID: message.recordedByModel)?.displayName ?? message.recordedByModel) : nil
                 // Salon footer fields (Strategic §6/§13 follow-up):
                 //   Seat: "Seat N of M" when the message came from a salon
@@ -1337,7 +1344,7 @@ struct ChatBubbleView: View {
                     return "Seat \(seat)"
                 }()
                 let hostText: String? = (!message.isFromUser && message.content.hasPrefix("\u{1F4CB} Summary:")) ? "Host" : nil
-                let footerString = ([formattedDate, turnText, durationText, modelName, seatText, hostText].compactMap { $0 }).joined(separator: ", ")
+                let footerString = ([formattedDate, turnText, durationText, stoppedText, modelName, seatText, hostText].compactMap { $0 }).joined(separator: ", ")
 
                 // Compression / truncation footer (Phase 6b, refined per Mark
                 // 2026-05-16): when a segment was compressed or truncated
