@@ -1779,7 +1779,7 @@ struct CompressionExplanationView: View {
                 if !compressedSegments.isEmpty {
                     Text("Memory condensed")
                         .font(.headline)
-                    Text("The model you're using has a smaller context window than the size of Hal's full memory. To stay honest about everything Hal knows about you, Hal's full memory is preserved in the database, but for this turn it was condensed by the model itself to fit. Open Settings → Power User → Database to see Hal's full memory anytime.")
+                    Text("The model you're using has a smaller context window than the size of Hal's full memory. To stay honest about everything Hal knows about you, Hal's full memory is preserved in the database, but for this turn it was condensed by the model itself to fit. This only affects what the model saw for this single turn.")
                         .font(.callout)
                         .fixedSize(horizontal: false, vertical: true)
                 }
