@@ -695,6 +695,45 @@ class HalTestConsole: ObservableObject {
             let r = SpeechService.shared.voiceReport()
             return "{\"status\":\"ok\",\"command\":\"TTS_VOICES\",\"selected\":\"\(jsonStringEscape(r.name))\",\"quality\":\"\(r.quality)\",\"premiumInstalled\":\(r.premiumInstalled),\"enhancedInstalled\":\(r.enhancedInstalled)}"
 
+        } else if trimmed.hasPrefix("SET_TTS_AUTO_READ:") {
+            // Turn auto-read on/off (mirrors the Settings › Read-Aloud toggle). Accepts
+            // 1/0, true/false, on/off, yes/no.
+            let arg = String(trimmed.dropFirst("SET_TTS_AUTO_READ:".count)).trimmingCharacters(in: .whitespaces).lowercased()
+            let on = ["1", "true", "on", "yes"].contains(arg)
+            SpeechService.shared.setAutoRead(on)
+            return "{\"status\":\"ok\",\"command\":\"SET_TTS_AUTO_READ\",\"autoRead\":\(on)}"
+
+        } else if trimmed.hasPrefix("SET_TTS_VOICE:") {
+            // Choose the speaking voice by identifier (from TTS_VOICE_LIST). Empty string ->
+            // Automatic (best available). Mirrors the Settings voice picker.
+            let id = String(trimmed.dropFirst("SET_TTS_VOICE:".count)).trimmingCharacters(in: .whitespaces)
+            SpeechService.shared.setPreferredVoiceID(id)
+            let p = SpeechService.shared.prefsReport()
+            return "{\"status\":\"ok\",\"command\":\"SET_TTS_VOICE\",\"storedVoiceID\":\"\(jsonStringEscape(p.storedVoiceID))\",\"effectiveVoiceName\":\"\(jsonStringEscape(p.effectiveVoiceName))\",\"effectiveQuality\":\"\(p.effectiveQuality)\"}"
+
+        } else if trimmed.hasPrefix("SET_TTS_RATE:") {
+            // Set the speaking rate (AVSpeechUtterance rate space, ~0.0…1.0; default 0.5).
+            let arg = String(trimmed.dropFirst("SET_TTS_RATE:".count)).trimmingCharacters(in: .whitespaces)
+            guard let rate = Double(arg) else {
+                return "{\"status\":\"error\",\"message\":\"SET_TTS_RATE needs a number, e.g. SET_TTS_RATE:0.5\"}"
+            }
+            SpeechService.shared.setPreferredRate(rate)
+            let p = SpeechService.shared.prefsReport()
+            return "{\"status\":\"ok\",\"command\":\"SET_TTS_RATE\",\"storedRate\":\(p.storedRate),\"effectiveRate\":\(p.effectiveRate)}"
+
+        } else if trimmed == "TTS_PREFS" {
+            // Read back the three read-aloud prefs plus the voice/rate speak() would actually use.
+            let p = SpeechService.shared.prefsReport()
+            return "{\"status\":\"ok\",\"command\":\"TTS_PREFS\",\"autoRead\":\(p.autoRead),\"storedVoiceID\":\"\(jsonStringEscape(p.storedVoiceID))\",\"storedRate\":\(p.storedRate),\"effectiveVoiceName\":\"\(jsonStringEscape(p.effectiveVoiceName))\",\"effectiveVoiceID\":\"\(jsonStringEscape(p.effectiveVoiceID))\",\"effectiveQuality\":\"\(p.effectiveQuality)\",\"effectiveRate\":\(p.effectiveRate)}"
+
+        } else if trimmed == "TTS_VOICE_LIST" {
+            // List installed voices for the current language so a real identifier can be chosen.
+            let voices = SpeechService.shared.installedVoices()
+            let items = voices.map { v in
+                "{\"name\":\"\(jsonStringEscape(v.name))\",\"identifier\":\"\(jsonStringEscape(v.identifier))\",\"quality\":\"\(v.quality)\",\"language\":\"\(jsonStringEscape(v.language))\"}"
+            }.joined(separator: ",")
+            return "{\"status\":\"ok\",\"command\":\"TTS_VOICE_LIST\",\"count\":\(voices.count),\"voices\":[\(items)]}"
+
         } else if trimmed == "STOP_GENERATION" {
             // Drive the user STOP button from the antenna: cancel the in-flight turn. The stream
             // loops honor cancellation, keep the partial answer, and reset the sending flags.

@@ -175,6 +175,63 @@ final class SpeechService: NSObject, ObservableObject {
                 all.filter { $0.quality == .premium }.count,
                 all.filter { $0.quality == .enhanced }.count)
     }
+
+    // MARK: - Preferences (Settings UI + antenna share these)
+
+    // The Settings › Read-Aloud controls bind these same UserDefaults keys via @AppStorage, so
+    // setting them here updates the UI live (@AppStorage observes UserDefaults change notices).
+    // These setters exist so the key names live in exactly one place and the antenna can drive
+    // the prefs for verification without needing on-screen taps (the picker is a NavigationLink).
+
+    /// Turn auto-read on/off (read every completed response aloud).
+    func setAutoRead(_ on: Bool) { UserDefaults.standard.set(on, forKey: Self.autoReadKey) }
+
+    /// Choose the speaking voice by identifier; empty string means Automatic (best available).
+    func setPreferredVoiceID(_ id: String) { UserDefaults.standard.set(id, forKey: Self.voiceIDKey) }
+
+    /// Set the speaking rate (AVSpeechUtterance rate space, ~0.0…1.0; default is 0.5).
+    func setPreferredRate(_ rate: Double) { UserDefaults.standard.set(rate, forKey: Self.rateKey) }
+
+    /// The current read-aloud preferences AND the voice/rate `speak()` would actually use right
+    /// now. "stored" is what's persisted (voice id may be "" for Automatic); "effective" resolves
+    /// that to the real voice — the user's pick if still installed, else the automatic best.
+    /// Lets the antenna verify a chosen voice/rate is applied without needing an ear.
+    func prefsReport() -> (autoRead: Bool, storedVoiceID: String, storedRate: Double,
+                           effectiveVoiceName: String, effectiveVoiceID: String,
+                           effectiveQuality: String, effectiveRate: Float) {
+        let storedID = UserDefaults.standard.string(forKey: Self.voiceIDKey) ?? ""
+        let storedRate = UserDefaults.standard.object(forKey: Self.rateKey) as? Double
+            ?? Double(AVSpeechUtteranceDefaultSpeechRate)
+        let v = preferredVoice
+        let quality: String
+        switch v?.quality {
+        case .premium:  quality = "premium"
+        case .enhanced: quality = "enhanced"
+        case .some:     quality = "default"
+        case .none:     quality = "none"
+        @unknown default: quality = "unknown"
+        }
+        return (autoReadEnabled, storedID, storedRate,
+                v?.name ?? "none", v?.identifier ?? "", quality, preferredRate)
+    }
+
+    /// Installed voices for the current base language as (name, identifier, quality, language).
+    /// Lets the antenna pick a real identifier to set when verifying the voice-picker path.
+    func installedVoices() -> [(name: String, identifier: String, quality: String, language: String)] {
+        let base = String(AVSpeechSynthesisVoice.currentLanguageCode().prefix(2))
+        return AVSpeechSynthesisVoice.speechVoices()
+            .filter { $0.language.hasPrefix(base) }
+            .sorted { Self.qualityRank($0.quality) > Self.qualityRank($1.quality) }
+            .map { v in
+                let q: String
+                switch v.quality {
+                case .premium:  q = "premium"
+                case .enhanced: q = "enhanced"
+                default:        q = "default"
+                }
+                return (v.name, v.identifier, q, v.language)
+            }
+    }
 }
 
 extension SpeechService: AVSpeechSynthesizerDelegate {

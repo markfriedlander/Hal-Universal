@@ -25702,6 +25702,45 @@ class HalTestConsole: ObservableObject {
             let r = SpeechService.shared.voiceReport()
             return "{\"status\":\"ok\",\"command\":\"TTS_VOICES\",\"selected\":\"\(jsonStringEscape(r.name))\",\"quality\":\"\(r.quality)\",\"premiumInstalled\":\(r.premiumInstalled),\"enhancedInstalled\":\(r.enhancedInstalled)}"
 
+        } else if trimmed.hasPrefix("SET_TTS_AUTO_READ:") {
+            // Turn auto-read on/off (mirrors the Settings › Read-Aloud toggle). Accepts
+            // 1/0, true/false, on/off, yes/no.
+            let arg = String(trimmed.dropFirst("SET_TTS_AUTO_READ:".count)).trimmingCharacters(in: .whitespaces).lowercased()
+            let on = ["1", "true", "on", "yes"].contains(arg)
+            SpeechService.shared.setAutoRead(on)
+            return "{\"status\":\"ok\",\"command\":\"SET_TTS_AUTO_READ\",\"autoRead\":\(on)}"
+
+        } else if trimmed.hasPrefix("SET_TTS_VOICE:") {
+            // Choose the speaking voice by identifier (from TTS_VOICE_LIST). Empty string ->
+            // Automatic (best available). Mirrors the Settings voice picker.
+            let id = String(trimmed.dropFirst("SET_TTS_VOICE:".count)).trimmingCharacters(in: .whitespaces)
+            SpeechService.shared.setPreferredVoiceID(id)
+            let p = SpeechService.shared.prefsReport()
+            return "{\"status\":\"ok\",\"command\":\"SET_TTS_VOICE\",\"storedVoiceID\":\"\(jsonStringEscape(p.storedVoiceID))\",\"effectiveVoiceName\":\"\(jsonStringEscape(p.effectiveVoiceName))\",\"effectiveQuality\":\"\(p.effectiveQuality)\"}"
+
+        } else if trimmed.hasPrefix("SET_TTS_RATE:") {
+            // Set the speaking rate (AVSpeechUtterance rate space, ~0.0…1.0; default 0.5).
+            let arg = String(trimmed.dropFirst("SET_TTS_RATE:".count)).trimmingCharacters(in: .whitespaces)
+            guard let rate = Double(arg) else {
+                return "{\"status\":\"error\",\"message\":\"SET_TTS_RATE needs a number, e.g. SET_TTS_RATE:0.5\"}"
+            }
+            SpeechService.shared.setPreferredRate(rate)
+            let p = SpeechService.shared.prefsReport()
+            return "{\"status\":\"ok\",\"command\":\"SET_TTS_RATE\",\"storedRate\":\(p.storedRate),\"effectiveRate\":\(p.effectiveRate)}"
+
+        } else if trimmed == "TTS_PREFS" {
+            // Read back the three read-aloud prefs plus the voice/rate speak() would actually use.
+            let p = SpeechService.shared.prefsReport()
+            return "{\"status\":\"ok\",\"command\":\"TTS_PREFS\",\"autoRead\":\(p.autoRead),\"storedVoiceID\":\"\(jsonStringEscape(p.storedVoiceID))\",\"storedRate\":\(p.storedRate),\"effectiveVoiceName\":\"\(jsonStringEscape(p.effectiveVoiceName))\",\"effectiveVoiceID\":\"\(jsonStringEscape(p.effectiveVoiceID))\",\"effectiveQuality\":\"\(p.effectiveQuality)\",\"effectiveRate\":\(p.effectiveRate)}"
+
+        } else if trimmed == "TTS_VOICE_LIST" {
+            // List installed voices for the current language so a real identifier can be chosen.
+            let voices = SpeechService.shared.installedVoices()
+            let items = voices.map { v in
+                "{\"name\":\"\(jsonStringEscape(v.name))\",\"identifier\":\"\(jsonStringEscape(v.identifier))\",\"quality\":\"\(v.quality)\",\"language\":\"\(jsonStringEscape(v.language))\"}"
+            }.joined(separator: ",")
+            return "{\"status\":\"ok\",\"command\":\"TTS_VOICE_LIST\",\"count\":\(voices.count),\"voices\":[\(items)]}"
+
         } else if trimmed == "STOP_GENERATION" {
             // Drive the user STOP button from the antenna: cancel the in-flight turn. The stream
             // loops honor cancellation, keep the partial answer, and reset the sending flags.
@@ -34174,6 +34213,11 @@ nonisolated enum CommandCatalog {
         CommandDescriptor(verb: "TTS_STOP", args: nil, summary: "Stop read-aloud.", category: .ui, destructive: false),
         CommandDescriptor(verb: "TTS_STATE", args: nil, summary: "Report read-aloud state (isSpeaking + message id).", category: .ui, destructive: false),
         CommandDescriptor(verb: "TTS_VOICES", args: nil, summary: "Report the read-aloud voice that would be used (name + quality) and how many premium/enhanced voices are installed.", category: .ui, destructive: false),
+        CommandDescriptor(verb: "TTS_VOICE_LIST", args: nil, summary: "List installed voices for the current language (name, identifier, quality) so a specific voice can be chosen.", category: .ui, destructive: false),
+        CommandDescriptor(verb: "TTS_PREFS", args: nil, summary: "Read back the read-aloud prefs (auto-read, stored voice/rate) plus the voice/rate speak() would actually use.", category: .ui, destructive: false),
+        CommandDescriptor(verb: "SET_TTS_AUTO_READ", args: "<1|0>", summary: "Turn auto-read on/off (read every completed response aloud).", category: .ui, destructive: false),
+        CommandDescriptor(verb: "SET_TTS_VOICE", args: "<identifier?>", summary: "Choose the read-aloud voice by identifier (from TTS_VOICE_LIST); empty means Automatic.", category: .ui, destructive: false),
+        CommandDescriptor(verb: "SET_TTS_RATE", args: "<0.0-1.0>", summary: "Set the read-aloud speaking rate (default 0.5).", category: .ui, destructive: false),
         CommandDescriptor(verb: "STOP_GENERATION", args: nil, summary: "Stop the in-flight chat generation (the user STOP button). Keeps the partial answer, reverts to send.", category: .conversation, destructive: false),
         CommandDescriptor(verb: "ROBO_STOP", args: nil, summary: "Ask a running RoboRunner script to halt at the next step boundary. Keeps the partial results already captured.", category: .automation, destructive: false),
         CommandDescriptor(verb: "ROBO_STATUS", args: nil, summary: "Report RoboRunner run status.", category: .automation, destructive: false),
@@ -35868,6 +35912,63 @@ final class SpeechService: NSObject, ObservableObject {
         return (v?.name ?? "none", quality,
                 all.filter { $0.quality == .premium }.count,
                 all.filter { $0.quality == .enhanced }.count)
+    }
+
+    // MARK: - Preferences (Settings UI + antenna share these)
+
+    // The Settings › Read-Aloud controls bind these same UserDefaults keys via @AppStorage, so
+    // setting them here updates the UI live (@AppStorage observes UserDefaults change notices).
+    // These setters exist so the key names live in exactly one place and the antenna can drive
+    // the prefs for verification without needing on-screen taps (the picker is a NavigationLink).
+
+    /// Turn auto-read on/off (read every completed response aloud).
+    func setAutoRead(_ on: Bool) { UserDefaults.standard.set(on, forKey: Self.autoReadKey) }
+
+    /// Choose the speaking voice by identifier; empty string means Automatic (best available).
+    func setPreferredVoiceID(_ id: String) { UserDefaults.standard.set(id, forKey: Self.voiceIDKey) }
+
+    /// Set the speaking rate (AVSpeechUtterance rate space, ~0.0…1.0; default is 0.5).
+    func setPreferredRate(_ rate: Double) { UserDefaults.standard.set(rate, forKey: Self.rateKey) }
+
+    /// The current read-aloud preferences AND the voice/rate `speak()` would actually use right
+    /// now. "stored" is what's persisted (voice id may be "" for Automatic); "effective" resolves
+    /// that to the real voice — the user's pick if still installed, else the automatic best.
+    /// Lets the antenna verify a chosen voice/rate is applied without needing an ear.
+    func prefsReport() -> (autoRead: Bool, storedVoiceID: String, storedRate: Double,
+                           effectiveVoiceName: String, effectiveVoiceID: String,
+                           effectiveQuality: String, effectiveRate: Float) {
+        let storedID = UserDefaults.standard.string(forKey: Self.voiceIDKey) ?? ""
+        let storedRate = UserDefaults.standard.object(forKey: Self.rateKey) as? Double
+            ?? Double(AVSpeechUtteranceDefaultSpeechRate)
+        let v = preferredVoice
+        let quality: String
+        switch v?.quality {
+        case .premium:  quality = "premium"
+        case .enhanced: quality = "enhanced"
+        case .some:     quality = "default"
+        case .none:     quality = "none"
+        @unknown default: quality = "unknown"
+        }
+        return (autoReadEnabled, storedID, storedRate,
+                v?.name ?? "none", v?.identifier ?? "", quality, preferredRate)
+    }
+
+    /// Installed voices for the current base language as (name, identifier, quality, language).
+    /// Lets the antenna pick a real identifier to set when verifying the voice-picker path.
+    func installedVoices() -> [(name: String, identifier: String, quality: String, language: String)] {
+        let base = String(AVSpeechSynthesisVoice.currentLanguageCode().prefix(2))
+        return AVSpeechSynthesisVoice.speechVoices()
+            .filter { $0.language.hasPrefix(base) }
+            .sorted { Self.qualityRank($0.quality) > Self.qualityRank($1.quality) }
+            .map { v in
+                let q: String
+                switch v.quality {
+                case .premium:  q = "premium"
+                case .enhanced: q = "enhanced"
+                default:        q = "default"
+                }
+                return (v.name, v.identifier, q, v.language)
+            }
     }
 }
 
