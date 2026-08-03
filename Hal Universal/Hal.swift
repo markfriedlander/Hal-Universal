@@ -7023,7 +7023,7 @@ class LLMService: ObservableObject {
             }
 
             return AsyncThrowingStream { continuation in
-                Task {
+                let genTask = Task {
                     do {
                         var accumulatedText = ""
                         var lastRepetitionCheck = 0
@@ -7032,6 +7032,7 @@ class LLMService: ObservableObject {
 
                         let stream = session.streamResponse(options: GenerationOptions(temperature: temperature, maximumResponseTokens: maxTokens)) { Prompt(lastUser) }
                         streamLoop: for try await snapshot in stream {
+                            if Task.isCancelled { break streamLoop }
                             accumulatedText = snapshot.content
                             // snapshot.content IS the cumulative text per
                             // Apple's API contract; just forward it through.
@@ -7077,6 +7078,9 @@ class LLMService: ObservableObject {
                         continuation.finish(throwing: LLMError.predictionFailed(error))
                     }
                 }
+                // If the consumer stops iterating (user hit stop), cancel the producer so AFM
+                // actually stops generating instead of running on to completion in the background.
+                continuation.onTermination = { @Sendable _ in genTask.cancel() }
             }
 
         case .mlx:
@@ -12752,6 +12756,26 @@ class ChatViewModel: ObservableObject {
 
                                                                 @Published var showInlineDetails: Bool = false
 
+                                                                // MARK: - Generation cancellation (user STOP button)
+
+                                                                /// The Task running the current turn's generation, stored so the stop button can cancel
+                                                                /// it. Set by beginSend(); the streaming loops honor cancellation and clean up.
+                                                                private var generationTask: Task<Void, Never>?
+
+                                                                /// Start a turn from the composer, storing the Task so stopGeneration() can cancel it.
+                                                                func beginSend() {
+                                                                    generationTask = Task { [weak self] in await self?.sendMessage() }
+                                                                }
+
+                                                                /// User-initiated stop: cancel the in-flight turn. The streaming loops (the sendMessage
+                                                                /// consumer and the AFM/MLX producer via onTermination) honor cancellation, break, keep the
+                                                                /// partial answer, and reset the sending flags — so the button reverts to send. No-op when idle.
+                                                                func stopGeneration() {
+                                                                    guard isSendingMessage else { return }
+                                                                    generationTask?.cancel()
+                                                                    halLog("HALDEBUG-STOP: user cancelled the current turn")
+                                                                }
+
                                                                 /// Send a chat turn through the full pipeline. Reads the bound
                                                                 /// `currentMessage` TextField, clears it on success, and resigns
                                                                 /// the keyboard.
@@ -12938,6 +12962,7 @@ class ChatViewModel: ObservableObject {
                                                                                 #endif
                                                                                 let reasonStream = llmService.generateChatResponseStream(messages: chatMessages, temperature: turnTemp, maxTokens: reasonBudget)
                                                                                 for try await chunk in reasonStream {
+                                                                                    if Task.isCancelled { break }
                                                                                     reasoningRaw = chunk
                                                                                     if let i = messages.firstIndex(where: { $0.id == pid }) {
                                                                                         messages[i].thinking = HalReasoning.stripThinkTags(chunk)
@@ -12966,6 +12991,7 @@ class ChatViewModel: ObservableObject {
                                                                                 #endif
                                                                                 let answerStream = llmService.generateChatResponseStream(messages: concludeMessages, temperature: turnTemp)
                                                                                 for try await chunk in answerStream {
+                                                                                    if Task.isCancelled { break }
                                                                                     finalText = chunk
                                                                                     if let i = messages.firstIndex(where: { $0.id == pid }) {
                                                                                         messages[i].content = chunk
@@ -12978,6 +13004,7 @@ class ChatViewModel: ObservableObject {
                                                                                 // ===== SINGLE PASS (brain off) — the normal path =====
                                                                                 let stream = llmService.generateChatResponseStream(messages: chatMessages, temperature: turnTemp)
                                                                                 for try await chunk in stream {
+                                                                                    if Task.isCancelled { break }
                                                                                     finalText = chunk
                                                                                     if let i = messages.firstIndex(where: { $0.id == pid }) {
                                                                                         messages[i].content = chunk
@@ -13210,20 +13237,35 @@ class ChatViewModel: ObservableObject {
                                                                         }
 
                                                                     } catch {
-                                                                        await MainActor.run {
-                                                                            if let i = self.messages.firstIndex(where: { $0.id == pid }) {
-                                                                                self.messages[i].content = "Error: \(error.localizedDescription)"
-                                                                                self.messages[i].isPartial = false
+                                                                        if Task.isCancelled {
+                                                                            // User stop that surfaced as a thrown cancellation: keep the partial answer
+                                                                            // exactly as streamed (no error), finalize it, and reset the flags so the
+                                                                            // button reverts to send.
+                                                                            await MainActor.run {
+                                                                                if let i = self.messages.firstIndex(where: { $0.id == pid }) {
+                                                                                    self.messages[i].isPartial = false
+                                                                                }
+                                                                                self.isAIResponding = false
+                                                                                self.thinkingStart = nil
+                                                                                self.isSendingMessage = false
                                                                             }
-                                                                            self.errorMessage = error.localizedDescription
-                                                                            self.isAIResponding = false
-                                                                            self.thinkingStart = nil
-                                                                            self.isSendingMessage = false
-                                                                            print("HALDEBUG-MODEL: Message processing failed: \(error.localizedDescription)")
+                                                                            halLog("HALDEBUG-STOP: turn cancelled (thrown) — partial answer kept")
+                                                                        } else {
+                                                                            await MainActor.run {
+                                                                                if let i = self.messages.firstIndex(where: { $0.id == pid }) {
+                                                                                    self.messages[i].content = "Error: \(error.localizedDescription)"
+                                                                                    self.messages[i].isPartial = false
+                                                                                }
+                                                                                self.errorMessage = error.localizedDescription
+                                                                                self.isAIResponding = false
+                                                                                self.thinkingStart = nil
+                                                                                self.isSendingMessage = false
+                                                                                print("HALDEBUG-MODEL: Message processing failed: \(error.localizedDescription)")
+                                                                            }
                                                                         }
                                                                     }
                                                                 }
-                                                                
+
                                                                 // MARK: - Salon Mode Execution
                                                                 
                                                                 // Salon Mode turn execution

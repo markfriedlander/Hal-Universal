@@ -663,7 +663,9 @@ struct iOSChatView: View {
 
     // MARK: - Composer (Text Input Area)
     private var composer: some View {
-        HStack(alignment: .bottom, spacing: 12) {
+        // .center so the send/stop button floats to the vertical middle of the input field and
+        // stays there as the field grows (was .bottom, which dropped it to the corner — unbalanced).
+        HStack(alignment: .center, spacing: 12) {
             TextField("Message", text: $chatViewModel.currentMessage, axis: .vertical)
                 .textFieldStyle(.plain)
                 .padding(12)
@@ -679,19 +681,22 @@ struct iOSChatView: View {
 
             Button {
                 if chatViewModel.isSendingMessage {
-                    // TODO: Implement cancellation logic if needed
+                    // Mid-generation the arrow is a stop button: cancel the current turn now.
+                    // Generation halts, the partial answer is kept, and this reverts to send.
+                    chatViewModel.stopGeneration()
                 } else {
-                    // Dismiss keyboard before sending
+                    // Dismiss keyboard before sending. beginSend() stores the generation Task
+                    // so the stop button above can cancel it.
                     dismissKeyboard()
-                    Task {
-                        await chatViewModel.sendMessage()
-                    }
+                    chatViewModel.beginSend()
                 }
             } label: {
                 Image(systemName: chatViewModel.isSendingMessage ? "stop.circle.fill" : "paperplane.fill")
                     .font(.system(size: 20, weight: .semibold))
             }
-            .disabled(chatViewModel.isSendingMessage || chatViewModel.currentMessage.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+            // Enabled while sending (so stop is tappable); when idle, disabled only if there's
+            // nothing to send.
+            .disabled(!chatViewModel.isSendingMessage && chatViewModel.currentMessage.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
         }
         .padding(.horizontal, 12)
         .padding(.vertical, 10)

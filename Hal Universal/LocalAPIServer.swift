@@ -695,6 +695,13 @@ class HalTestConsole: ObservableObject {
             let r = SpeechService.shared.voiceReport()
             return "{\"status\":\"ok\",\"command\":\"TTS_VOICES\",\"selected\":\"\(jsonStringEscape(r.name))\",\"quality\":\"\(r.quality)\",\"premiumInstalled\":\(r.premiumInstalled),\"enhancedInstalled\":\(r.enhancedInstalled)}"
 
+        } else if trimmed == "STOP_GENERATION" {
+            // Drive the user STOP button from the antenna: cancel the in-flight turn. The stream
+            // loops honor cancellation, keep the partial answer, and reset the sending flags.
+            let wasGenerating = vm.isSendingMessage
+            vm.stopGeneration()
+            return "{\"status\":\"ok\",\"command\":\"STOP_GENERATION\",\"wasGenerating\":\(wasGenerating)}"
+
         } else if trimmed == "RESET_THREAD" {
             vm.memoryStore.deleteThread(id: vm.conversationId)
             vm.startNewConversation()
