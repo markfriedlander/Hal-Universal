@@ -3045,7 +3045,10 @@ class LocalAPIServer {
                 }
                 let start = Date()
                 vm.currentMessage = message
-                await vm.sendMessage()
+                // Route through sendAndTrack (not sendMessage directly) so the turn is
+                // stored as the cancellable generationTask — this is what lets STOP_GENERATION
+                // (and the UI stop button) actually cancel a turn started via the antenna.
+                await vm.sendAndTrack()
                 let elapsed = Date().timeIntervalSince(start)
                 let aiMessages = vm.messages.filter { !$0.isFromUser && !$0.isPartial }
                 guard let lastAI = aiMessages.last else {

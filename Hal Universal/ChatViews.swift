@@ -1152,6 +1152,10 @@ struct ChatBubbleView: View {
     private var chatBodyPt: CGFloat { CGFloat(chatTextSizePt) * dynamicTypeScale }
     @State private var showingDetails: Bool = false
     @State private var showingCompressionExplanation: Bool = false
+    // Stopped-turn explanation popover (B′). Tapping the red "stopped" glyph in
+    // the footer explains that the turn was interrupted, kept on screen, but
+    // excluded from Hal's context and never saved to his memory.
+    @State private var showingStoppedExplanation: Bool = false
     // Item 4 (2026-05-17): "View Prompt Details" sheet state. Presents
     // the color-coded, collapsible PromptDetailView (lives in its own
     // file as of 2026-05-17). Only ever set true on the assistant-side
@@ -1352,20 +1356,33 @@ struct ChatBubbleView: View {
                 // explanation. The glyph is distinctive enough on its own.
                 let hasCompression = !message.compressedSegments.isEmpty
                 let hasTruncation = !message.truncatedSegments.isEmpty
-                let hasBadge = hasCompression || hasTruncation
+                // Stopped turn (B′): the user interrupted this response. Takes
+                // visual priority over the compression/truncation badges — it's
+                // about the whole turn, not a single prompt segment. The glyph
+                // rides on the ASSISTANT bubble only (the response that was
+                // stopped); the user message is still flagged wasStopped for the
+                // context/memory exclusion, but doesn't wear the red badge.
+                let hasStopped = message.wasStopped && !message.isFromUser
+                let hasBadge = hasCompression || hasTruncation || hasStopped
 
                 HStack {
                     if hasBadge {
-                        let glyphName = hasTruncation ? "scissors" : "rectangle.compress.vertical"
-                        // Color the entire metadata line by the most-severe
-                        // state: red when any segment was truncated, gray
-                        // when only compression succeeded. The strong
-                        // signal on truncation is intentional — the user
-                        // should notice when intelligent compression failed
-                        // and we had to cut content instead.
-                        let lineColor: Color = hasTruncation ? .red : .gray
+                        // Glyph priority: stopped > truncation > compression.
+                        //   stop.circle                 = user stopped this turn
+                        //   scissors                    = truncation fallback
+                        //   rectangle.compress.vertical = intelligent compression
+                        let glyphName = hasStopped ? "stop.circle"
+                                        : (hasTruncation ? "scissors" : "rectangle.compress.vertical")
+                        // Color the whole metadata line by the most-severe state:
+                        // red for a stopped turn or a truncation (both are strong
+                        // signals the user should notice), gray when only
+                        // compression succeeded.
+                        let lineColor: Color = (hasStopped || hasTruncation) ? .red : .gray
                         Button {
-                            showingCompressionExplanation = true
+                            // Stopped takes tap priority — its popover explains the
+                            // memory consequence, which matters more than segment detail.
+                            if hasStopped { showingStoppedExplanation = true }
+                            else { showingCompressionExplanation = true }
                         } label: {
                             // Text interpolation with embedded Image (iOS 17+
                             // replacement for the deprecated `Text + Text`
@@ -1384,6 +1401,12 @@ struct ChatBubbleView: View {
                                 truncatedSegments: message.truncatedSegments
                             )
                             .presentationCompactAdaptation(.popover)
+                        }
+                        .popover(isPresented: $showingStoppedExplanation,
+                                 attachmentAnchor: .point(.center),
+                                 arrowEdge: .top) {
+                            StoppedExplanationView()
+                                .presentationCompactAdaptation(.popover)
                         }
                     } else {
                         Text(footerString)
@@ -1806,6 +1829,31 @@ struct CompressionExplanationView: View {
         }
         .frame(idealWidth: 340, maxWidth: 340,
                idealHeight: 320, maxHeight: 480)
+    }
+}
+
+// Explains the red "stopped" glyph (B′). Reached by tapping the footer of a
+// turn the user interrupted. The copy is the honest account of the memory
+// consequence: kept on screen, but absent from Hal's context and memory.
+struct StoppedExplanationView: View {
+    var body: some View {
+        ScrollView {
+            VStack(alignment: .leading, spacing: 14) {
+                Text("Response stopped")
+                    .font(.headline)
+                    .foregroundColor(.red)
+                Text("You stopped this response while Hal was still generating it. What he had written so far is kept here on screen so you have a record of it.")
+                    .font(.callout)
+                    .fixedSize(horizontal: false, vertical: true)
+                Divider()
+                Text("Because you interrupted it, this exchange is left out of Hal's memory. It is not saved to his long-term memory, and it is not included as context in the rest of this conversation, so Hal carries no memory of it. If you want Hal to keep it, ask again and let the response finish.")
+                    .font(.callout)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            .padding(20)
+        }
+        .frame(idealWidth: 340, maxWidth: 340,
+               idealHeight: 220, maxHeight: 360)
     }
 }
 

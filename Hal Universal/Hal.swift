@@ -496,7 +496,19 @@ struct ChatMessage: Identifiable, Equatable { // Added Equatable for ForEach
     /// Should be rare in normal use.
     var truncatedSegments: Set<PromptSegmentKind>
 
-    init(id: UUID = UUID(), content: String, isFromUser: Bool, timestamp: Date = Date(), isPartial: Bool = false, thinkingDuration: TimeInterval? = nil, thinking: String? = nil, fullPromptUsed: String? = nil, usedContextSnippets: [UnifiedSearchResult]? = nil, tokenBreakdown: TokenBreakdown? = nil, toolsUsed: [String]? = nil, recordedByModel: String, turnNumber: Int, seatNumber: Int? = nil, deliberationRound: Int = 1, compressedSegments: Set<PromptSegmentKind> = [], truncatedSegments: Set<PromptSegmentKind> = []) {
+    /// The user hit STOP mid-generation on this turn. Set on BOTH the user
+    /// message and the partial answer of a stopped turn. Two consequences,
+    /// both in service of keeping Hal's reality consistent (Maxim 3):
+    ///   1. The turn is EXCLUDED from the live prompt history (buildChatMessages
+    ///      filters it out) — so Hal is never told in-the-moment about an
+    ///      exchange he'll never be allowed to remember long-term.
+    ///   2. It is never persisted to memory/RAG (the stop path returns before
+    ///      storeTurn), and it never advances the stored turn count.
+    /// It STAYS on screen (with a red "stopped" glyph in the footer) as an
+    /// honest visual record of the interruption. Default false.
+    var wasStopped: Bool
+
+    init(id: UUID = UUID(), content: String, isFromUser: Bool, timestamp: Date = Date(), isPartial: Bool = false, thinkingDuration: TimeInterval? = nil, thinking: String? = nil, fullPromptUsed: String? = nil, usedContextSnippets: [UnifiedSearchResult]? = nil, tokenBreakdown: TokenBreakdown? = nil, toolsUsed: [String]? = nil, recordedByModel: String, turnNumber: Int, seatNumber: Int? = nil, deliberationRound: Int = 1, compressedSegments: Set<PromptSegmentKind> = [], truncatedSegments: Set<PromptSegmentKind> = [], wasStopped: Bool = false) {
         self.id = id
         self.content = content
         self.isFromUser = isFromUser
@@ -514,6 +526,7 @@ struct ChatMessage: Identifiable, Equatable { // Added Equatable for ForEach
         self.deliberationRound = deliberationRound
         self.compressedSegments = compressedSegments
         self.truncatedSegments = truncatedSegments
+        self.wasStopped = wasStopped
     }
 }
 
@@ -4147,6 +4160,34 @@ extension MemoryStore {
         }
     }
 
+    /// Delete a single turn's conversation artifacts (B′ stopped-turn cleanup).
+    /// The user message is written to conversation_artifacts at turn START (before
+    /// generation), so a turn the user STOPs has already left a row here even
+    /// though it never reached storeTurn / unified_content. This removes that
+    /// row so a stopped turn leaves NOTHING persisted — consistent with it being
+    /// barred from RAG and the live prompt history.
+    ///
+    /// Safe against turn-number reuse: a stopped turn doesn't advance the stored
+    /// turn count (that comes from unified_content), so the NEXT real turn reuses
+    /// this turn_number. Callers MUST delete synchronously on stop, before any
+    /// next turn writes its artifact at the same number.
+    func deleteConversationTurnArtifacts(conversationId: String, turnNumber: Int) {
+        guard ensureHealthyConnection() else { return }
+        let sql = "DELETE FROM conversation_artifacts WHERE conversation_id = ? AND turn_number = ?;"
+        var stmt: OpaquePointer?
+        defer { sqlite3_finalize(stmt) }
+        guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else {
+            print("HALDEBUG-MEMORY: Failed to prepare stopped-turn artifact delete")
+            return
+        }
+        sqlite3_bind_text(stmt, 1, (conversationId as NSString).utf8String, -1, nil)
+        sqlite3_bind_int(stmt, 2, Int32(turnNumber))
+        if sqlite3_step(stmt) == SQLITE_DONE {
+            let removed = Int(sqlite3_changes(db))
+            print("HALDEBUG-MEMORY: Deleted \(removed) stopped-turn artifact(s) for turn \(turnNumber)")
+        }
+    }
+
     /// Deletes ALL conversation data (threads, messages, facts, artifacts) while preserving
     /// documents, source code, and self-knowledge. Used by the CLEAR_TEST_DATA harness command
     /// to wipe accumulated test threads without a full nuclear reset.
@@ -6170,7 +6211,7 @@ class MLXWrapper: ObservableObject {
     /// thrown via the stream's failure path.
     func generateChatStream(messages: [HalChatMessage], temperature: Double = 0.7, maxTokens: Int? = nil) -> AsyncThrowingStream<String, Error> {
         AsyncThrowingStream { continuation in
-            Task {
+            let genTask = Task {
                 guard isModelLoaded, let container = self.modelContainer else {
                     halLog("HALDEBUG-MLX-CHAT: Cannot generate - MLX model not loaded")
                     continuation.finish(throwing: LLMService.LLMError.modelNotLoaded)
@@ -6361,6 +6402,11 @@ class MLXWrapper: ObservableObject {
                     #endif
 
                     streamLoop: while let event = await iterator.next() {
+                        // User STOP: the consumer stopped iterating, which drops this
+                        // stream and fires onTermination → genTask.cancel(). Break the
+                        // token loop promptly so the model stops producing (and stops
+                        // heating the GPU) instead of grinding to the token cap.
+                        if Task.isCancelled { break streamLoop }
                         switch event {
                         case .chunk(let text):
                             if !sawFirstToken {
@@ -6474,6 +6520,10 @@ class MLXWrapper: ObservableObject {
                     continuation.finish(throwing: LLMService.LLMError.predictionFailed(error))
                 }
             }
+            // When the consumer stops iterating (user STOP breaks the sendMessage
+            // loop), the stream terminates and this fires — cancel the producer so
+            // the MLX token loop above sees Task.isCancelled and stops promptly.
+            continuation.onTermination = { @Sendable _ in genTask.cancel() }
         }
     }
 }
@@ -7101,7 +7151,7 @@ class LLMService: ObservableObject {
             // big model — the user sees the normal thinking state a beat longer,
             // then the answer, instead of an error).
             return AsyncThrowingStream { continuation in
-                Task { [weak self] in
+                let genTask = Task { [weak self] in
                     guard let self else {
                         continuation.finish(throwing: LLMError.modelNotLoaded)
                         return
@@ -7124,6 +7174,9 @@ class LLMService: ObservableObject {
                     // 4. Bridge the inner generation stream through to the caller.
                     do {
                         for try await chunk in self.mlxWrapper.generateChatStream(messages: messages, temperature: temperature, maxTokens: maxTokens) {
+                            // User STOP: break so the inner iterator is dropped, firing
+                            // the inner stream's onTermination → its producer cancels.
+                            if Task.isCancelled { break }
                             continuation.yield(chunk)
                         }
                         continuation.finish()
@@ -7131,6 +7184,9 @@ class LLMService: ObservableObject {
                         continuation.finish(throwing: error)
                     }
                 }
+                // Consumer stopped iterating (user STOP) → cancel this bridge Task so
+                // the loop above breaks and the inner MLX stream tears down promptly.
+                continuation.onTermination = { @Sendable _ in genTask.cancel() }
             }
         }
     }
@@ -12246,7 +12302,11 @@ class ChatViewModel: ObservableObject {
                                                                             // seats' responses), use it. Otherwise fall back to the live
                                                                             // array. See Docs/Two_Bug_Diagnosis_2026-05-15.md.
                                                                             let historySource = historyOverride ?? messages
-                                                                            let nonPartial = historySource.filter { !$0.isPartial }
+                                                                            // Exclude partials AND stopped turns (B′): a turn the user interrupted
+                                                                            // is barred from Hal's context entirely — never fed into the prompt
+                                                                            // history in-the-moment, just as it is never persisted to memory/RAG.
+                                                                            // Keeping his in-session reality consistent with his long-term memory.
+                                                                            let nonPartial = historySource.filter { !$0.isPartial && !$0.wasStopped }
                                                                             let trailingIsCurrentTurn: Bool = {
                                                                                 guard let last = nonPartial.last else { return false }
                                                                                 return last.isFromUser && last.content == currentInput
@@ -12762,9 +12822,29 @@ class ChatViewModel: ObservableObject {
                                                                 /// it. Set by beginSend(); the streaming loops honor cancellation and clean up.
                                                                 private var generationTask: Task<Void, Never>?
 
+                                                                /// User pressed STOP. This is the path-independent stop signal: the UI STOP button
+                                                                /// and the antenna both flip this, and the streaming consumer loops check it every
+                                                                /// chunk. `generationTask?.cancel()` only reaches turns started via beginSend() (the
+                                                                /// composer); the antenna calls sendMessage() directly, so this flag is what makes
+                                                                /// stop work regardless of who started the turn. Reset at the top of sendMessage().
+                                                                private var stopRequested: Bool = false
+
                                                                 /// Start a turn from the composer, storing the Task so stopGeneration() can cancel it.
                                                                 func beginSend() {
                                                                     generationTask = Task { [weak self] in await self?.sendMessage() }
+                                                                }
+
+                                                                /// Start a turn AND await it, storing the Task so stopGeneration() can cancel it.
+                                                                /// This is the path callers that need the result use (the antenna's /chat handler):
+                                                                /// routing through the stored Task means stopGeneration()'s cancel reaches this
+                                                                /// turn too. Cancelling the consuming Task unblocks the streaming `for try await`
+                                                                /// promptly — even if the model has gone quiet mid-generation and no new snapshot
+                                                                /// is arriving — and fires the producer's onTermination so generation actually
+                                                                /// halts, instead of only breaking when the next chunk happens to arrive.
+                                                                func sendAndTrack() async {
+                                                                    let task: Task<Void, Never> = Task { [weak self] in await self?.sendMessage() }
+                                                                    generationTask = task
+                                                                    await task.value
                                                                 }
 
                                                                 /// User-initiated stop: cancel the in-flight turn. The streaming loops (the sendMessage
@@ -12772,8 +12852,45 @@ class ChatViewModel: ObservableObject {
                                                                 /// partial answer, and reset the sending flags — so the button reverts to send. No-op when idle.
                                                                 func stopGeneration() {
                                                                     guard isSendingMessage else { return }
+                                                                    stopRequested = true
                                                                     generationTask?.cancel()
                                                                     halLog("HALDEBUG-STOP: user cancelled the current turn")
+                                                                }
+
+                                                                /// Mark the just-stopped turn (B′ behavior). Flags BOTH the partial answer
+                                                                /// and this turn's user message (the last user message in the list) as
+                                                                /// `wasStopped`, and finalizes the partial (isPartial=false) so it settles
+                                                                /// on screen. Consequences of the flag: excluded from the live prompt
+                                                                /// history (buildChatMessages) so Hal is never shown an exchange he can't
+                                                                /// keep, never persisted (the stop paths return before storeTurn), and the
+                                                                /// footer renders the red "stopped" glyph. Kept visible as an honest record.
+                                                                func markTurnStopped(partialID: UUID, keptRealContent: Bool) {
+                                                                    var stoppedTurnNumber: Int?
+                                                                    if let i = messages.firstIndex(where: { $0.id == partialID }) {
+                                                                        messages[i].isPartial = false
+                                                                        messages[i].wasStopped = true
+                                                                        stoppedTurnNumber = messages[i].turnNumber
+                                                                        // If the stop landed before any real answer text arrived, the bubble
+                                                                        // still holds a transient status line ("Formulating a reply...") or the
+                                                                        // nbsp placeholder. Freezing that reads as "still working," which is
+                                                                        // untrue. Replace it with an honest line in Hal's own first-person
+                                                                        // voice (cf. "I don't have enough memory to process this turn."); the
+                                                                        // red glyph + popover carry the rest. A stop mid-answer keeps its real
+                                                                        // partial text as-is.
+                                                                        if !keptRealContent {
+                                                                            messages[i].content = "You stopped me before I could reply."
+                                                                        }
+                                                                    }
+                                                                    if let u = messages.lastIndex(where: { $0.isFromUser }) {
+                                                                        messages[u].wasStopped = true
+                                                                    }
+                                                                    // The user message was written to conversation_artifacts at turn start
+                                                                    // (before generation). Delete it now so a stopped turn leaves nothing
+                                                                    // persisted — matching its exclusion from RAG and the live history.
+                                                                    // Synchronous + immediate, before any next turn reuses this turn number.
+                                                                    if let turn = stoppedTurnNumber {
+                                                                        memoryStore.deleteConversationTurnArtifacts(conversationId: conversationId, turnNumber: turn)
+                                                                    }
                                                                 }
 
                                                                 /// Send a chat turn through the full pipeline. Reads the bound
@@ -12783,6 +12900,7 @@ class ChatViewModel: ObservableObject {
                                                                     let trimmed = currentMessage.trimmingCharacters(in: .whitespacesAndNewlines)
                                                                     guard !trimmed.isEmpty else { return }
 
+                                                                    stopRequested = false
                                                                     isAIResponding = true
                                                                     thinkingStart = Date()
                                                                     isSendingMessage = true
@@ -12962,7 +13080,7 @@ class ChatViewModel: ObservableObject {
                                                                                 #endif
                                                                                 let reasonStream = llmService.generateChatResponseStream(messages: chatMessages, temperature: turnTemp, maxTokens: reasonBudget)
                                                                                 for try await chunk in reasonStream {
-                                                                                    if Task.isCancelled { break }
+                                                                                    if Task.isCancelled || stopRequested { break }
                                                                                     reasoningRaw = chunk
                                                                                     if let i = messages.firstIndex(where: { $0.id == pid }) {
                                                                                         messages[i].thinking = HalReasoning.stripThinkTags(chunk)
@@ -12989,12 +13107,18 @@ class ChatViewModel: ObservableObject {
                                                                                 #if DEBUG
                                                                                 let p2Start = Date()   // RoboRunner per-phase probe (DEBUG only)
                                                                                 #endif
-                                                                                let answerStream = llmService.generateChatResponseStream(messages: concludeMessages, temperature: turnTemp)
-                                                                                for try await chunk in answerStream {
-                                                                                    if Task.isCancelled { break }
-                                                                                    finalText = chunk
-                                                                                    if let i = messages.firstIndex(where: { $0.id == pid }) {
-                                                                                        messages[i].content = chunk
+                                                                                // If the user stopped during phase 1 (reasoning), don't even open
+                                                                                // phase 2 — skip straight to the completion-path stop guard below,
+                                                                                // rather than spinning up an answer stream just to break on its
+                                                                                // first check (which would cost an extra snapshot-wait on AFM).
+                                                                                if !Task.isCancelled && !stopRequested {
+                                                                                    let answerStream = llmService.generateChatResponseStream(messages: concludeMessages, temperature: turnTemp)
+                                                                                    for try await chunk in answerStream {
+                                                                                        if Task.isCancelled || stopRequested { break }
+                                                                                        finalText = chunk
+                                                                                        if let i = messages.firstIndex(where: { $0.id == pid }) {
+                                                                                            messages[i].content = chunk
+                                                                                        }
                                                                                     }
                                                                                 }
                                                                                 #if DEBUG
@@ -13004,7 +13128,7 @@ class ChatViewModel: ObservableObject {
                                                                                 // ===== SINGLE PASS (brain off) — the normal path =====
                                                                                 let stream = llmService.generateChatResponseStream(messages: chatMessages, temperature: turnTemp)
                                                                                 for try await chunk in stream {
-                                                                                    if Task.isCancelled { break }
+                                                                                    if Task.isCancelled || stopRequested { break }
                                                                                     finalText = chunk
                                                                                     if let i = messages.firstIndex(where: { $0.id == pid }) {
                                                                                         messages[i].content = chunk
@@ -13036,6 +13160,25 @@ class ChatViewModel: ObservableObject {
                                                                         }
                                                                         modelTime = Date().timeIntervalSince(t0)
                                                                         halLog("HALDEBUG-LLM: Streaming generation complete. Length: \(finalText.count), elapsed: \(String(format: "%.2f", modelTime))s")
+
+                                                                        // User STOP that surfaced as a clean loop break (the top-of-loop
+                                                                        // stopRequested/isCancelled check won the race with the producer's
+                                                                        // thrown cancellation — the antenna path always lands here, since it
+                                                                        // has no Task to cancel). Mirror the thrown-cancel catch below: keep
+                                                                        // the partial answer in the bubble, do NOT persist it to memory/RAG
+                                                                        // (an interrupted half-thought shouldn't become identity), reset the
+                                                                        // flags so the button reverts to send, and return before the store.
+                                                                        if Task.isCancelled || stopRequested {
+                                                                            let hadContent = !finalText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                                                                            await MainActor.run {
+                                                                                self.markTurnStopped(partialID: pid, keptRealContent: hadContent)
+                                                                                self.isAIResponding = false
+                                                                                self.thinkingStart = nil
+                                                                                self.isSendingMessage = false
+                                                                            }
+                                                                            halLog("HALDEBUG-STOP: turn stopped (clean break) — partial kept on screen, excluded from context, not persisted")
+                                                                            return
+                                                                        }
 
                                                                         usedCtx = fullRAGContext.isEmpty ? nil : fullRAGContext
                                                                         if let ctx = usedCtx {
@@ -13239,17 +13382,17 @@ class ChatViewModel: ObservableObject {
                                                                     } catch {
                                                                         if Task.isCancelled {
                                                                             // User stop that surfaced as a thrown cancellation: keep the partial answer
-                                                                            // exactly as streamed (no error), finalize it, and reset the flags so the
-                                                                            // button reverts to send.
+                                                                            // exactly as streamed (no error), mark the turn stopped (kept on screen,
+                                                                            // excluded from context + memory), and reset the flags so the button
+                                                                            // reverts to send.
+                                                                            let hadContent = !finalText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
                                                                             await MainActor.run {
-                                                                                if let i = self.messages.firstIndex(where: { $0.id == pid }) {
-                                                                                    self.messages[i].isPartial = false
-                                                                                }
+                                                                                self.markTurnStopped(partialID: pid, keptRealContent: hadContent)
                                                                                 self.isAIResponding = false
                                                                                 self.thinkingStart = nil
                                                                                 self.isSendingMessage = false
                                                                             }
-                                                                            halLog("HALDEBUG-STOP: turn cancelled (thrown) — partial answer kept")
+                                                                            halLog("HALDEBUG-STOP: turn cancelled (thrown) — partial kept on screen, excluded from context, not persisted")
                                                                         } else {
                                                                             await MainActor.run {
                                                                                 if let i = self.messages.firstIndex(where: { $0.id == pid }) {
