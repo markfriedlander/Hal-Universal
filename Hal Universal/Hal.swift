@@ -7791,6 +7791,11 @@ func modelStatusDot(
 // and always present. The detail card adapts (no tok/s, no download size,
 // no license) and the action button is just Select/Active.
 struct ModelLibraryView: View {
+    // Dual-role view: pushed as a drill-down from Settings (system back chevron, correct) AND
+    // presented as a modal sheet from the API/chat path. Only the modal needs an explicit "Done"
+    // dismiss; the drill-down must NOT add one (it would double up with the system back). Defaults
+    // to false so the drill-down call site is unchanged; the modal call site passes isModal: true.
+    var isModal: Bool = false
     @Environment(\.dismiss) var dismiss
     @EnvironmentObject var chatViewModel: ChatViewModel
     @EnvironmentObject var mlxDownloader: MLXModelDownloader
@@ -7960,6 +7965,15 @@ struct ModelLibraryView: View {
             }
             .navigationTitle("Model Library")
             .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                // Only when presented as a modal (house standard: dismiss on the leading/left).
+                // As a drill-down the system back chevron handles this, so no item is added.
+                if isModal {
+                    ToolbarItem(placement: .cancellationAction) {
+                        Button("Done") { dismiss() }
+                    }
+                }
+            }
             .task {
                 await chatViewModel.refreshModelCatalog()
                 ModelCatalogService.shared.refreshDownloadStates()
@@ -9551,7 +9565,8 @@ struct WidgetTestView: View {
                 .navigationTitle("Hal's Self Model")
                 .navigationBarTitleDisplayMode(.inline)
                 .toolbar {
-                    ToolbarItem(placement: .navigationBarTrailing) {
+                    // House standard: a modal's dismiss ("Done") lives on the leading/left side.
+                    ToolbarItem(placement: .cancellationAction) {
                         Button("Done") {
                             dismiss()
                         }

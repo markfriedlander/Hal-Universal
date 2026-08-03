@@ -386,7 +386,7 @@ struct iOSChatView: View {
             }
             .sheet(isPresented: $chatViewModel.apiNavModelLibrary) {
                 NavigationView {
-                    ModelLibraryView()
+                    ModelLibraryView(isModal: true)
                         .environmentObject(chatViewModel)
                         .environmentObject(MLXModelDownloader.shared)
                 }

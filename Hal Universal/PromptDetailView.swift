@@ -494,7 +494,12 @@ struct PromptDetailView: View {
             .navigationTitle("Prompt Details")
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
-                ToolbarItem(placement: .navigationBarLeading) {
+                // House standard: dismiss ("Done") on the leading/left; the action
+                // ("Copy as Text") on the trailing/right.
+                ToolbarItem(placement: .cancellationAction) {
+                    Button("Done") { dismiss() }
+                }
+                ToolbarItem(placement: .navigationBarTrailing) {
                     Button("Copy as Text") {
                         UIPasteboard.general.string = buildPromptDetailExportText(
                             message: message,
@@ -502,9 +507,6 @@ struct PromptDetailView: View {
                             recentHistory: recentHistory
                         )
                     }
-                }
-                ToolbarItem(placement: .navigationBarTrailing) {
-                    Button("Done") { dismiss() }
                 }
             }
         }
