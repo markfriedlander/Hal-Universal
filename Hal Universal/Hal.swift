@@ -125,6 +125,9 @@
 //  SpeechService.swift
 //   64  SpeechService (Text-to-Speech Read-Aloud)
 //
+//  VoicePickerView.swift
+//   65  VoicePickerView (Read-Aloud Voice Selection)
+//
 import SwiftUI
 import SharedModelStoreKit
 import Foundation
@@ -13222,6 +13225,12 @@ class ChatViewModel: ObservableObject {
                                                                                 self.messages[i].fullPromptUsed = prompt
                                                                                 self.messages[i].usedContextSnippets = usedCtx
                                                                                 self.messages[i].tokenBreakdown = tokenBreakdown
+                                                                            }
+                                                                            // Auto-read (Read-Aloud setting): when enabled, speak the finished
+                                                                            // answer aloud. Fires on every completed single-model turn, once the
+                                                                            // text has settled (the "read when done" behavior).
+                                                                            if SpeechService.shared.autoReadEnabled {
+                                                                                SpeechService.shared.speak(text, messageID: pid.uuidString)
                                                                             }
 
                                                                             // NOTE: pendingAutoInject is intentionally NOT cleared here.

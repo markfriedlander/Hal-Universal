@@ -33,6 +33,7 @@ import Foundation
 import SwiftUI
 import Combine
 import UniformTypeIdentifiers  // file picker UTType references
+import AVFoundation  // Read-Aloud: voice list + speech-rate constants
 
 // ==== LEGO START: 48 Main Settings (ActionsView) ====
 
@@ -69,6 +70,12 @@ struct ActionsView: View {
     @State private var showingMaintenance = false   // Maintenance & Reset page
     @State private var initialSettingsSnapshot: [String: Any] = [:]
     @State private var skipComparisonOnDismiss = false
+    // Read-Aloud (TTS) preferences. Same UserDefaults keys SpeechService reads at speak() time,
+    // so a change here takes effect on the next spoken response: auto-read on/off, the chosen
+    // voice, and the speaking speed.
+    @AppStorage(SpeechService.autoReadKey) private var ttsAutoRead: Bool = false
+    @AppStorage(SpeechService.voiceIDKey) private var ttsVoiceID: String = ""
+    @AppStorage(SpeechService.rateKey) private var ttsRate: Double = Double(AVSpeechUtteranceDefaultSpeechRate)
     // Chat display appearance (opt-in). Defaults reproduce today's look. Read live by
     // ChatBubbleView / MarkdownView, so the conversation updates the moment these change.
     @AppStorage(ChatTextSize.storageKey) private var chatTextSizePt: Int = ChatTextSize.defaultValue.rawValue
@@ -80,6 +87,8 @@ struct ActionsView: View {
             Form {
                 personalitySection
                     .id("personality")
+                readAloudSection
+                    .id("readaloud")
                 chatDisplaySection
                     .id("chatdisplay")
                 importExportSection
@@ -462,8 +471,64 @@ struct ActionsView: View {
         }
     }
     
+    // MARK: - Read-Aloud (TTS)
+    //
+    // Auto-read toggle, a voice picker (VoicePickerView), and a speaking-speed slider. These are
+    // GLOBAL read-aloud preferences (not per-model), so unlike the tuning controls above they are
+    // NOT gated on Salon or Help — you can set your voice/speed anytime. All three bind to the
+    // same UserDefaults keys SpeechService reads at speak() time, so changes take effect on the
+    // next spoken response.
+    private var readAloudSection: some View {
+        Section {
+            VStack(alignment: .leading, spacing: 16) {
+                SectionHeaderText(text: "READ-ALOUD")
+
+                Toggle("Read responses aloud", isOn: $ttsAutoRead)
+                Text("When on, Hal speaks each reply automatically once it's finished. You can also tap the speaker under any reply to hear it.")
+                    .font(.caption)
+                    .foregroundColor(.secondary)
+
+                Divider()
+
+                NavigationLink {
+                    VoicePickerView(selectedIdentifier: $ttsVoiceID)
+                } label: {
+                    HStack {
+                        Text("Voice")
+                        Spacer()
+                        Text(currentVoiceName).foregroundColor(.secondary)
+                    }
+                }
+                .foregroundColor(.primary)
+
+                Divider()
+
+                LabeledSliderControl(
+                    label: "Speaking Speed",
+                    value: $ttsRate,
+                    range: 0.15...1.0,
+                    step: 0.05,
+                    valueFormatter: { String(format: "%.1f×", $0 / Double(AVSpeechUtteranceDefaultSpeechRate)) },
+                    minLabel: "Slower",
+                    maxLabel: "Faster",
+                    helperText: "How fast Hal speaks when reading aloud. A preview plays when you let go.",
+                    onEditingChanged: { editing in if !editing { SpeechService.shared.speakSample() } },
+                    isModified: abs(ttsRate - Double(AVSpeechUtteranceDefaultSpeechRate)) > 0.001
+                )
+            }
+        }
+    }
+
+    /// The display name of the currently selected read-aloud voice, for the picker row's trailing text.
+    private var currentVoiceName: String {
+        guard !ttsVoiceID.isEmpty,
+              let v = AVSpeechSynthesisVoice.speechVoices().first(where: { $0.identifier == ttsVoiceID })
+        else { return "Automatic" }
+        return v.name
+    }
+
     // MARK: - Import/Export Section
-    
+
     // Chat Display — user-facing, opt-in control over how the conversation reads.
     // Text Size sets the message font; Density adjusts spacing and margins. The defaults
     // (Large + Comfortable) reproduce Hal's historical look exactly, so nothing changes

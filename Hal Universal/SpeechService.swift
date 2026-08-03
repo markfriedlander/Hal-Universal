@@ -25,6 +25,33 @@ final class SpeechService: NSObject, ObservableObject {
 
     private let synth = AVSpeechSynthesizer()
 
+    // Persisted read-aloud preferences. Stored in UserDefaults so the Settings UI can bind to
+    // the SAME keys via @AppStorage while this service reads them at speak() time — no extra
+    // plumbing. An empty voice id means "Automatic (best available)", the prior behavior.
+    static let voiceIDKey = "ttsVoiceIdentifier"
+    static let rateKey = "ttsSpeechRate"
+    /// When true, Hal speaks each completed response automatically (read on finish).
+    static let autoReadKey = "ttsAutoRead"
+
+    /// Whether auto-read is on. Read at the completion of a turn to decide whether to speak.
+    var autoReadEnabled: Bool { UserDefaults.standard.bool(forKey: Self.autoReadKey) }
+
+    /// The voice to speak with: the user's explicit pick if set and still installed, else the
+    /// best-quality voice for the language (the original automatic behavior).
+    private var preferredVoice: AVSpeechSynthesisVoice? {
+        let id = UserDefaults.standard.string(forKey: Self.voiceIDKey) ?? ""
+        if !id.isEmpty, let v = AVSpeechSynthesisVoice.speechVoices().first(where: { $0.identifier == id }) {
+            return v
+        }
+        return Self.bestVoice()
+    }
+
+    /// The speaking rate: the user's chosen speed, else the system default.
+    private var preferredRate: Float {
+        if let r = UserDefaults.standard.object(forKey: Self.rateKey) as? Double { return Float(r) }
+        return AVSpeechUtteranceDefaultSpeechRate
+    }
+
     private override init() {
         super.init()
         synth.delegate = self
@@ -39,11 +66,11 @@ final class SpeechService: NSObject, ObservableObject {
         if synth.isSpeaking { synth.stopSpeaking(at: .immediate) }
         configureAudioSession()
         let utterance = AVSpeechUtterance(string: clean)
-        utterance.rate = AVSpeechUtteranceDefaultSpeechRate
-        // Best-quality voice available for the current language — premium/enhanced (the
-        // "Siri-quality" voices) when the user has them downloaded, else the default compact
-        // voice. A manual voice picker (adapt Posey's VoicePickerView) is a later nicety.
-        utterance.voice = Self.bestVoice()
+        utterance.rate = preferredRate
+        // The user's chosen voice (Settings › Read-Aloud › Voice), or the best-quality voice
+        // available for the language when set to Automatic. Premium/enhanced are the natural
+        // "Siri-quality" voices, present only if the user has downloaded them.
+        utterance.voice = preferredVoice
         speakingMessageID = messageID
         isSpeaking = true
         synth.speak(utterance)
@@ -122,6 +149,13 @@ final class SpeechService: NSObject, ObservableObject {
         case .enhanced: return 2
         default:        return 1   // .default (compact)
         }
+    }
+
+    /// Speak a short sample in the CURRENT voice + speed selection — the picker's live preview
+    /// and the speed slider's on-release preview both call this. (The voice list + grouping for
+    /// the picker live in VoicePickerView, adapted from Posey.)
+    func speakSample() {
+        speak("Hi, I'm Hal. This is how I sound.")
     }
 
     /// Diagnostic: the voice `speak()` would use right now, plus how many premium/enhanced voices
