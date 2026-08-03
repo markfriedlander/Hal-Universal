@@ -280,6 +280,17 @@ struct ActionsView: View {
         chatViewModel.salonConfig.isEnabled
     }
 
+    /// Help Mode B(b): a help topic being active locks the behavior-tuning controls the
+    /// same way Salon Mode does (Hal is set aside, working only from his docs, so these
+    /// don't apply). `tuningLocked` is the combined condition used by every control that
+    /// was already gated on Salon.
+    private var helpActive: Bool {
+        chatViewModel.helpTopic != nil
+    }
+    private var tuningLocked: Bool {
+        isSalonActive || helpActive
+    }
+
     // MARK: - Developer / Lab
 
     /// Entry to The Lab: Hal's developer / power-user tools (RoboRunner + the local API and
@@ -363,8 +374,8 @@ struct ActionsView: View {
                 }
             }
             .foregroundColor(.primary)
-            .disabled(isSalonActive)
-            .opacity(isSalonActive ? 0.45 : 1.0)
+            .disabled(tuningLocked)
+            .opacity(tuningLocked ? 0.45 : 1.0)
 
             Button {
                 showingSystemPromptEditor = true
@@ -382,8 +393,8 @@ struct ActionsView: View {
             // the per-model settings the salon banner says are locked.
             // Was visually un-dimmed in salon mode, which contradicted
             // the banner. Now matches Model framing + Temperature.
-            .disabled(isSalonActive)
-            .opacity(isSalonActive ? 0.45 : 1.0)
+            .disabled(tuningLocked)
+            .opacity(tuningLocked ? 0.45 : 1.0)
 
             VStack(alignment: .leading, spacing: 8) {
                 Toggle("Self-Knowledge", isOn: Binding(
@@ -441,8 +452,8 @@ struct ActionsView: View {
                     .font(.caption)
                     .foregroundColor(.secondary)
             }
-            .disabled(isSalonActive)
-            .opacity(isSalonActive ? 0.45 : 1.0)
+            .disabled(tuningLocked)
+            .opacity(tuningLocked ? 0.45 : 1.0)
         } header: {
             Label("Personality", systemImage: "theatermasks")
         } footer: {
@@ -682,6 +693,22 @@ struct ActionsView: View {
                         }
                         .padding(.top, 4)
                     }
+
+                    // Help Mode B(b): same lock, different reason — while a help topic is
+                    // active Hal is working only from his docs, so these tuning controls
+                    // don't apply. Say so next to them, mirroring the Salon banner.
+                    if helpActive {
+                        HStack(alignment: .top, spacing: 6) {
+                            Image(systemName: "lifepreserver")
+                                .foregroundColor(.orange)
+                                .imageScale(.small)
+                            Text("These settings are paused while Help Mode is active, so Hal is answering only from his own documentation. Leave Help Mode (the life ring in chat) to adjust them.")
+                                .font(.caption)
+                                .foregroundColor(.secondary)
+                                .fixedSize(horizontal: false, vertical: true)
+                        }
+                        .padding(.top, 4)
+                    }
                 }
             }
 
@@ -763,12 +790,36 @@ struct PowerUserView: View {
     private var isSalonActive: Bool {
         chatViewModel.salonConfig.isEnabled
     }
-    
+
+    /// Help Mode B(b): while a help topic is active, Hal has set himself aside and is
+    /// working only from his own documentation, so these behavior-tuning controls
+    /// don't apply. Gray them out (disabled + dimmed) and say why, rather than
+    /// showing live-looking controls that do nothing — mirroring the Salon lock.
+    private var helpActive: Bool {
+        chatViewModel.helpTopic != nil
+    }
+
     var body: some View {
         NavigationView {
             Form {
-                memorySection
-                thinkingSection
+                if helpActive {
+                    Section {
+                        HStack(alignment: .top, spacing: 6) {
+                            Image(systemName: "lifepreserver")
+                                .foregroundColor(.orange)
+                                .imageScale(.small)
+                            Text("Help Mode is active, so Hal is answering only from his own documentation. These settings don't apply here. Leave Help Mode (the life ring in chat) to adjust them.")
+                                .font(.caption)
+                                .foregroundColor(.secondary)
+                        }
+                    }
+                }
+                Group {
+                    memorySection
+                    thinkingSection
+                }
+                .disabled(helpActive)
+                .opacity(helpActive ? 0.45 : 1.0)
                 #if DEBUG
                 // Pipeline Test Console: superseded dev scaffolding (a file-based input.txt/
                 // output.json harness). The antenna + hal CLI + RoboRunner replace it, so it is
