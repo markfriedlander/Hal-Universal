@@ -34922,6 +34922,8 @@ struct RoboEditorView: View {
     @State private var generatingDraft = false
     @State private var preDraftText: String? = nil
     @State private var undoFromDraft = false
+    // Confirm before the wand clobbers text that already looks like a real script (see draftFromField).
+    @State private var showingDraftOverwriteConfirm = false
     // Drives the keyboard toolbar's Done (dismiss the keyboard without closing the whole sheet).
     @FocusState private var editorFocused: Bool
 
@@ -34968,11 +34970,16 @@ struct RoboEditorView: View {
                     .disabled(robo.isRunning || generatingDraft)
                     .opacity((robo.isRunning || generatingDraft) ? 0.6 : 1.0)
 
-                statusBar
-                    .font(.caption)
-                    .padding(.horizontal, 12)
-                    .padding(.bottom, 8)
-                    .frame(maxWidth: .infinity, alignment: .leading)
+                // Hidden while the keyboard is up: the keyboard toolbar (Clear/Done) occupies that
+                // space, and showing the status bar too made them visually collide. The validation
+                // feedback returns the moment the keyboard is dismissed.
+                if !editorFocused {
+                    statusBar
+                        .font(.caption)
+                        .padding(.horizontal, 12)
+                        .padding(.bottom, 8)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                }
             }
             .navigationTitle("RoboRunner")
             .navigationBarTitleDisplayMode(.inline)
@@ -35028,6 +35035,12 @@ struct RoboEditorView: View {
             .sheet(isPresented: $showingHelp) { RoboHelpView(onInsert: { appendToScript($0) }) }
             .sheet(isPresented: $showingResults) { RoboResultsView() }
             .sheet(isPresented: $showingIssues) { RoboIssuesView(issues: liveIssues) }
+            .alert("This already looks like a script", isPresented: $showingDraftOverwriteConfirm) {
+                Button("Draft anyway") { performDraft() }
+                Button("Cancel", role: .cancel) { }
+            } message: {
+                Text("The wand treats the editor text as a description and replaces it. Draft a new one from it anyway?")
+            }
         }
     }
 
@@ -35080,12 +35093,25 @@ struct RoboEditorView: View {
     private func draftFromField() {
         let desc = script.trimmingCharacters(in: .whitespaces)
         guard !desc.isEmpty, !generatingDraft, !robo.isRunning else { return }
+        // Light guard: if the field already holds a CLEAN, multi-step script, the wand would treat
+        // that script as a description and produce nonsense. Confirm before clobbering it. A single
+        // line (a typical description) or anything that doesn't validate drafts directly.
+        if liveErrorCount == 0 && stepCount >= 2 {
+            showingDraftOverwriteConfirm = true
+            return
+        }
+        performDraft()
+    }
+
+    /// The actual draft: generate a script from the field text and replace it in place, stashing the
+    /// previous text for Undo. Called directly for a description, or from the overwrite confirm.
+    private func performDraft() {
         let previous = script
         let vm = chatViewModel
         generatingDraft = true
         Task { @MainActor in
             let draft = await RoboScriptGenerator.draft(
-                from: desc,
+                from: script.trimmingCharacters(in: .whitespaces),
                 knownModelIDs: RoboRunner.currentKnownModelIDs()
             ) { system, user in
                 try await vm.llmService.generateChatResponse(
@@ -35113,6 +35139,9 @@ struct RoboEditorView: View {
         preDraftText = script
         undoFromDraft = false
         script = ""
+        // Drop the keyboard so the "Cleared. Tap Undo to restore." status + Undo button are
+        // immediately visible (otherwise the keyboard hides them and Clear looks un-undoable).
+        editorFocused = false
     }
 
     /// Append an inserted command usage or template to the END of the script, keeping exactly one
