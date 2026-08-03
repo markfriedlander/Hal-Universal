@@ -651,6 +651,40 @@ class HalTestConsole: ObservableObject {
             }.joined(separator: ",")
             return "{\"status\":\"ok\",\"command\":\"ROBO_GENERATE\",\"valid\":\(draft.isValid),\"attempts\":\(draft.attempts),\"script\":\"\(jsonStringEscape(draft.script))\",\"issues\":[\(items)]}"
 
+        } else if trimmed.hasPrefix("SET_ROBO_SCRIPT:") {
+            // Set the RoboRunner editor's text (the @AppStorage "lab.roboScript" the editor binds).
+            // If the editor is open it updates live. Lets the antenna drive the editor's content —
+            // e.g. put a plain-language description in, then fire ROBO_DRAFT_FROM_FIELD.
+            let text = String(trimmed.dropFirst("SET_ROBO_SCRIPT:".count))
+            UserDefaults.standard.set(text, forKey: "lab.roboScript")
+            return "{\"status\":\"ok\",\"command\":\"SET_ROBO_SCRIPT\",\"chars\":\(text.count)}"
+
+        } else if trimmed == "GET_ROBO_SCRIPT" {
+            let text = UserDefaults.standard.string(forKey: "lab.roboScript") ?? ""
+            return "{\"status\":\"ok\",\"command\":\"GET_ROBO_SCRIPT\",\"chars\":\(text.count),\"script\":\"\(jsonStringEscape(text))\"}"
+
+        } else if trimmed == "ROBO_DRAFT_FROM_FIELD" {
+            // Fire the editor's wand ACTION directly (not a button tap — SwiftUI buttons aren't
+            // tappable in-process): draft a script FROM the current editor text (as a description)
+            // and replace it in place, exactly as the wand does. Reads/writes the same
+            // "lab.roboScript" the editor binds, so an open editor updates live. Undo is a UI-only
+            // affordance and isn't reproduced here.
+            let desc = (UserDefaults.standard.string(forKey: "lab.roboScript") ?? "")
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !desc.isEmpty else {
+                return "{\"status\":\"error\",\"message\":\"ROBO_DRAFT_FROM_FIELD: the editor is empty; SET_ROBO_SCRIPT a description first\"}"
+            }
+            let ids = RoboRunner.currentKnownModelIDs()
+            let draft = await RoboScriptGenerator.draft(from: desc, knownModelIDs: ids) { system, user in
+                try await vm.llmService.generateChatResponse(
+                    messages: [.system(system), .user(user)], temperature: 0.2)
+            }
+            UserDefaults.standard.set(draft.script, forKey: "lab.roboScript")
+            let items = draft.issues.map {
+                "{\"severity\":\"\($0.isError ? "error" : "warning")\",\"line\":\($0.line),\"message\":\"\(jsonStringEscape($0.message))\"}"
+            }.joined(separator: ",")
+            return "{\"status\":\"ok\",\"command\":\"ROBO_DRAFT_FROM_FIELD\",\"valid\":\(draft.isValid),\"attempts\":\(draft.attempts),\"script\":\"\(jsonStringEscape(draft.script))\",\"issues\":[\(items)]}"
+
         } else if trimmed == "ROBO_STATUS" {
             let r = RoboRunner.shared
             return "{\"status\":\"ok\",\"running\":\(r.busy),\"progress\":\"\(r.progress)\",\"resultsPath\":\"\(r.lastResultsPath ?? "")\",\"error\":\"\(r.lastError ?? "")\"}"

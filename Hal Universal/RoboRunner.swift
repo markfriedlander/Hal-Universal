@@ -688,6 +688,9 @@ nonisolated enum CommandCatalog {
         CommandDescriptor(verb: "ROBO_RUN", args: "<script>", summary: "Run an on-device RoboRunner script. Advanced, a script can issue any verb, including destructive ones.", category: .automation, destructive: true),
         CommandDescriptor(verb: "ROBO_CHECK", args: "<script>", summary: "Validate a RoboRunner script WITHOUT running it (the coach): returns errors + warnings with line numbers. Runs nothing.", category: .automation, destructive: false),
         CommandDescriptor(verb: "ROBO_GENERATE", args: "<description>", summary: "Draft a RoboRunner script from a natural-language description (Hal's model + the validator repair loop). Returns a validated script; runs nothing.", category: .automation, destructive: false),
+        CommandDescriptor(verb: "GET_ROBO_SCRIPT", args: nil, summary: "Read the RoboRunner editor's current text.", category: .automation, destructive: false),
+        CommandDescriptor(verb: "SET_ROBO_SCRIPT", args: "<text>", summary: "Set the RoboRunner editor's text (updates a live editor). Put a description here, then ROBO_DRAFT_FROM_FIELD.", category: .automation, destructive: false),
+        CommandDescriptor(verb: "ROBO_DRAFT_FROM_FIELD", args: nil, summary: "Fire the editor's wand: draft a script FROM the current editor text and replace it in place (the wand action, drivable without a button tap).", category: .automation, destructive: false),
         CommandDescriptor(verb: "TTS_SPEAK", args: "<text?>", summary: "Read text aloud (or the last Hal turn if no text). Strips markdown first.", category: .ui, destructive: false),
         CommandDescriptor(verb: "TTS_STOP", args: nil, summary: "Stop read-aloud.", category: .ui, destructive: false),
         CommandDescriptor(verb: "TTS_STATE", args: nil, summary: "Report read-aloud state (isSpeaking + message id).", category: .ui, destructive: false),
@@ -1130,10 +1133,14 @@ struct RoboEditorView: View {
     @State private var showingResults = false
     @State private var showingIssues = false
     // Wand-in-field: draft a script FROM the editor's own text (your description), replacing it in
-    // place — replaces the old separate Draft sheet. `preDraftText` stashes the pre-wand text so a
-    // single Undo restores it (the wand can never silently eat a script you'd written).
+    // place — replaces the old separate Draft sheet. `preDraftText` stashes the pre-change text so a
+    // single Undo restores it — used by BOTH the wand and Clear, so neither can silently eat your
+    // work. `undoFromDraft` distinguishes the two so the status line says the right thing.
     @State private var generatingDraft = false
     @State private var preDraftText: String? = nil
+    @State private var undoFromDraft = false
+    // Drives the keyboard toolbar's Done (dismiss the keyboard without closing the whole sheet).
+    @FocusState private var editorFocused: Bool
 
     static let sampleScript = """
     # RoboRunner script. Most lines are antenna verbs, passed straight through.
@@ -1174,6 +1181,7 @@ struct RoboEditorView: View {
                 TextEditor(text: $script)
                     .font(.system(.callout, design: .monospaced))
                     .padding(8)
+                    .focused($editorFocused)
                     .disabled(robo.isRunning || generatingDraft)
                     .opacity((robo.isRunning || generatingDraft) ? 0.6 : 1.0)
 
@@ -1224,6 +1232,15 @@ struct RoboEditorView: View {
                     // from earlier sessions even before anything runs this session.
                     Button { showingResults = true } label: { Label("Results", systemImage: "doc.text.magnifyingglass") }
                 }
+                // Editing tools, shown above the keyboard while typing: Clear (empties the editor,
+                // undoable via the same stash) and Done (dismiss the keyboard WITHOUT closing the
+                // sheet — the fix for swipe-down closing all of RoboRunner).
+                ToolbarItemGroup(placement: .keyboard) {
+                    Button("Clear") { clearField() }
+                        .disabled(script.isEmpty)
+                    Spacer()
+                    Button("Done") { editorFocused = false }
+                }
             }
             .sheet(isPresented: $showingHelp) { RoboHelpView(onInsert: { appendToScript($0) }) }
             .sheet(isPresented: $showingResults) { RoboResultsView() }
@@ -1248,7 +1265,7 @@ struct RoboEditorView: View {
         if generatingDraft {
             HStack(spacing: 6) {
                 ProgressView().controlSize(.small)
-                Text("Drafting from your description…").foregroundColor(.secondary)
+                Text("I'm drafting this for you…").foregroundColor(.secondary)
             }
         } else if robo.isRunning {
             HStack(spacing: 6) {
@@ -1263,8 +1280,11 @@ struct RoboEditorView: View {
         } else if liveWarningCount > 0 {
             Label("\(stepCount) step\(stepCount == 1 ? "" : "s"), \(liveWarningCount) warning\(liveWarningCount == 1 ? "" : "s")",
                   systemImage: "exclamationmark.triangle").foregroundColor(.orange)
+        } else if preDraftText != nil && undoFromDraft {
+            Label("I drafted this for you. Edit or run it when you're ready.", systemImage: "wand.and.stars")
+                .foregroundColor(.secondary)
         } else if preDraftText != nil {
-            Label("Drafted — edit, run, or Undo", systemImage: "wand.and.stars").foregroundColor(.secondary)
+            Label("Cleared. Tap Undo to restore.", systemImage: "trash").foregroundColor(.secondary)
         } else {
             Label("\(stepCount) step\(stepCount == 1 ? "" : "s") ready", systemImage: "checkmark.seal")
                 .foregroundColor(.secondary)
@@ -1289,16 +1309,27 @@ struct RoboEditorView: View {
                     messages: [.system(system), .user(user)], temperature: 0.2)
             }
             preDraftText = previous
+            undoFromDraft = true
             script = draft.script
             generatingDraft = false
         }
     }
 
-    /// Restore the text the wand replaced, and clear the stash.
+    /// Restore the text the last change (wand draft OR Clear) replaced, and clear the stash.
     private func undoDraft() {
         guard let previous = preDraftText else { return }
         script = previous
         preDraftText = nil
+        undoFromDraft = false
+    }
+
+    /// Empty the editor, stashing the current text so Undo can restore it (Clear can't eat your
+    /// work either). Marked not-a-draft so the status line reads "Cleared" rather than "I drafted…".
+    private func clearField() {
+        guard !script.isEmpty else { return }
+        preDraftText = script
+        undoFromDraft = false
+        script = ""
     }
 
     /// Append an inserted command usage or template to the END of the script, keeping exactly one
