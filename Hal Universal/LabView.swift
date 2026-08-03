@@ -65,6 +65,13 @@ struct LabView: View {
             RoboEditorView()
                 .environmentObject(chatViewModel)
         }
+        // Antenna bridge: SET_UI_STATE:roboeditor drives apiNavRoboEditor, which opens/closes the
+        // RoboRunner editor sheet here (local @State can't be reached directly from the API).
+        .onChange(of: chatViewModel.apiNavRoboEditor) { _, open in showingRoboEditor = open }
+        .onChange(of: showingRoboEditor) { _, open in
+            // Keep the flag in sync when the user dismisses by hand, so a later API open still fires.
+            if !open { chatViewModel.apiNavRoboEditor = false }
+        }
         .onAppear {
             if !dragonsAcknowledged { showDragons = true }
         }

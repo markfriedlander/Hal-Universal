@@ -1187,11 +1187,17 @@ struct RoboEditorView: View {
                 }
                 ToolbarItem(placement: .confirmationAction) {
                     if robo.isRunning {
-                        Button("Stop", role: .destructive) { robo.requestStop() }
+                        Button(role: .destructive) { robo.requestStop() } label: {
+                            Image(systemName: "stop.fill")
+                        }
+                        .accessibilityLabel("Stop")
                     } else {
                         // Disabled while the script has hard errors — the coach won't let a
                         // known-bad script run. (run() also refuses, so this is belt-and-braces.)
-                        Button("Run", action: runScript).fontWeight(.semibold).disabled(liveErrorCount > 0)
+                        // A play glyph: universal "run" affordance, on the trailing (take-action) side.
+                        Button(action: runScript) { Image(systemName: "play.fill") }
+                            .disabled(liveErrorCount > 0)
+                            .accessibilityLabel("Run")
                     }
                 }
                 ToolbarItemGroup(placement: .bottomBar) {
@@ -1303,7 +1309,7 @@ struct RoboIssuesView: View {
             }
             .navigationTitle("Script Check")
             .navigationBarTitleDisplayMode(.inline)
-            .toolbar { ToolbarItem(placement: .confirmationAction) { Button("Done") { dismiss() } } }
+            .toolbar { ToolbarItem(placement: .cancellationAction) { Button("Done") { dismiss() } } }
         }
     }
 
@@ -1488,7 +1494,7 @@ struct RoboHelpView: View {
             .navigationTitle("Commands")
             .navigationBarTitleDisplayMode(.inline)
             .safeAreaInset(edge: .top) { addedBanner }
-            .toolbar { ToolbarItem(placement: .confirmationAction) { Button("Done") { dismiss() } } }
+            .toolbar { ToolbarItem(placement: .cancellationAction) { Button("Done") { dismiss() } } }
         }
     }
 
@@ -1596,7 +1602,7 @@ struct RoboResultsView: View {
             }
             .navigationTitle("Past Runs")
             .navigationBarTitleDisplayMode(.inline)
-            .toolbar { ToolbarItem(placement: .confirmationAction) { Button("Done") { dismiss() } } }
+            .toolbar { ToolbarItem(placement: .cancellationAction) { Button("Done") { dismiss() } } }
             .onAppear { runs = RoboRunner.shared.pastRuns() }
         }
     }

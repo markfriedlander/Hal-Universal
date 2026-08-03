@@ -1379,6 +1379,12 @@ class HalTestConsole: ObservableObject {
             case "lab":
                 if value { vm.showingSettings = false }
                 vm.apiNavLab = value
+            case "roboeditor":
+                // Nested inside the Lab sheet: open the Lab first, then this. LabView bridges
+                // apiNavRoboEditor -> its local showingRoboEditor. Lets the antenna screenshot /
+                // verify the RoboRunner editor without a human tapping through to it.
+                if value { vm.apiNavLab = true }
+                vm.apiNavRoboEditor = value
             case "selfmodelshowprivate":
                 // Mirror the @AppStorage key flipped by the SelfReflectionView
                 // toggle. Driving it via UserDefaults lets the API set it
