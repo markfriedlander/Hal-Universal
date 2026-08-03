@@ -34906,20 +34906,136 @@ nonisolated enum RoboScriptGenerator {
 // Reached from a "Developer" row in Settings (ActionsView). Ships as a user-facing opt-in.
 // v1 persists a single script via @AppStorage; multi-file save/load is a follow-up.
 
+/// The line-number gutter that rides alongside `GutterTextView`. It is a passive subview: it draws
+/// nothing but numbers and a hairline separator, forwards no touches, and reads everything it needs
+/// from the text view it points at. Numbers are placed from the layoutManager's line-fragment rects,
+/// so a number appears ONLY at the first visual row of a real (newline-delimited) line — a soft-wrapped
+/// continuation row gets no number. That absence is the "wrap clarity": a line that spills onto two
+/// rows visibly owns both rows under one number, so you can always tell a wrap from a new line.
+final class LineNumberGutter: UIView {
+    weak var textView: UITextView?
+    var gutterWidth: CGFloat = 0
+    var numberFont: UIFont = .monospacedSystemFont(ofSize: 12, weight: .regular)
+
+    override func draw(_ rect: CGRect) {
+        guard let tv = textView else { return }
+        let lm = tv.layoutManager
+        let insetTop = tv.textContainerInset.top
+        let offsetY = tv.contentOffset.y
+        let attrs: [NSAttributedString.Key: Any] = [
+            .font: numberFont, .foregroundColor: UIColor.secondaryLabel,
+        ]
+        let s = (tv.text ?? "") as NSString
+
+        // Draw one right-aligned number for the visual row whose top (in container space) is `cy`.
+        func drawNumber(_ n: Int, atContainerY cy: CGFloat, rowHeight: CGFloat) {
+            let str = String(n) as NSString
+            let size = str.size(withAttributes: attrs)
+            let y = cy + insetTop - offsetY + (rowHeight - size.height) / 2
+            let x = gutterWidth - 6 - size.width
+            str.draw(at: CGPoint(x: x, y: y), withAttributes: attrs)
+        }
+
+        if s.length == 0 {
+            drawNumber(1, atContainerY: 0, rowHeight: numberFont.lineHeight)
+        } else {
+            var lineNo = 1
+            s.enumerateSubstrings(in: NSRange(location: 0, length: s.length),
+                                  options: [.byParagraphs, .substringNotRequired]) { _, paraRange, _, _ in
+                let gr = lm.glyphRange(forCharacterRange: paraRange, actualCharacterRange: nil)
+                var eff = NSRange()
+                let frag = lm.lineFragmentRect(forGlyphAt: gr.location, effectiveRange: &eff)
+                drawNumber(lineNo, atContainerY: frag.minY, rowHeight: frag.height)
+                lineNo += 1
+            }
+            // A trailing newline means an empty final line the enumeration doesn't emit; the
+            // layoutManager tracks it as the "extra" fragment. Number it so a script ending in a
+            // blank line still shows that line's number (matching how the cursor sits there).
+            if s.hasSuffix("\n") {
+                let extra = lm.extraLineFragmentRect
+                drawNumber(lineNo, atContainerY: extra.minY,
+                           rowHeight: extra.height > 0 ? extra.height : numberFont.lineHeight)
+            }
+        }
+
+        // Hairline separating the gutter from the text, on the gutter's right edge.
+        if let ctx = UIGraphicsGetCurrentContext() {
+            ctx.setStrokeColor(UIColor.separator.cgColor)
+            ctx.setLineWidth(1.0 / (window?.screen.scale ?? 2))
+            ctx.move(to: CGPoint(x: gutterWidth - 0.5, y: 0))
+            ctx.addLine(to: CGPoint(x: gutterWidth - 0.5, y: bounds.height))
+            ctx.strokePath()
+        }
+    }
+}
+
+/// A UITextView subclass that carries a `LineNumberGutter` glued to its left edge. The gutter is a
+/// subview kept pinned to the visible area (its frame origin tracks `contentOffset`) and redrawn on
+/// every layout pass — which UIScrollView triggers on scroll — so the numbers scroll perfectly with
+/// the text. The gutter's width grows with the line count (2 digits minimum, wider at 100+ lines),
+/// and the text is inset to the right of it via `textContainerInset.left`.
+final class GutterTextView: UITextView {
+    private let gutter = LineNumberGutter()
+    private var lastGutterWidth: CGFloat = -1
+
+    override init(frame: CGRect, textContainer: NSTextContainer?) {
+        super.init(frame: frame, textContainer: textContainer)
+        gutter.textView = self
+        gutter.backgroundColor = .clear
+        gutter.isUserInteractionEnabled = false
+        gutter.contentMode = .redraw
+        addSubview(gutter)
+    }
+    required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
+
+    private var gutterFont: UIFont {
+        UIFont.monospacedSystemFont(ofSize: (font?.pointSize ?? 15) * 0.85, weight: .regular)
+    }
+
+    private func computeGutterWidth() -> CGFloat {
+        let s = text ?? ""
+        let lineCount = s.isEmpty ? 1 : s.reduce(1) { $1 == "\n" ? $0 + 1 : $0 }
+        let digits = max(2, String(lineCount).count)
+        let charW = ("0" as NSString).size(withAttributes: [.font: gutterFont]).width
+        return ceil(CGFloat(digits) * charW) + 12  // ~6pt padding on each side of the digits
+    }
+
+    override func layoutSubviews() {
+        // Set the text inset BEFORE super so the layoutManager positions text for the new width.
+        // Guarded so it only changes when the digit count actually changes — otherwise every scroll
+        // would dirty layout and loop.
+        let w = computeGutterWidth()
+        if w != lastGutterWidth {
+            lastGutterWidth = w
+            textContainerInset.left = w + 4
+        }
+        super.layoutSubviews()
+        gutter.gutterWidth = w
+        gutter.numberFont = gutterFont
+        gutter.frame = CGRect(x: contentOffset.x, y: contentOffset.y, width: w, height: bounds.height)
+        gutter.setNeedsDisplay()
+    }
+
+    /// Force a gutter refresh after a text change that may not itself trigger layout (e.g. an edit
+    /// that doesn't change content size). Cheap: schedules one layout pass.
+    func refreshGutter() { setNeedsLayout() }
+}
+
 /// A UITextView-backed editor for RoboRunner scripts. It replaces SwiftUI's TextEditor so we can
 /// (Stage 2) add a line-number gutter and red error-line highlighting — things TextEditor cannot do.
-/// Stage 1 is a behavior-preserving drop-in: two-way text binding, monospaced font, dim-when-disabled,
+/// Stage 1 was a behavior-preserving drop-in: two-way text binding, monospaced font, dim-when-disabled,
 /// a focus binding (replacing @FocusState), and a UIKit input-accessory toolbar carrying Clear + Done
 /// (a SwiftUI `.keyboard` toolbar won't attach to a UITextView). Smart dashes/quotes are OFF so the
-/// keyboard can't turn "--" into an em dash or "" into curly quotes inside a script.
+/// keyboard can't turn "--" into an em dash or "" into curly quotes inside a script. Stage 2a adds the
+/// line-number gutter via the `GutterTextView` subclass (2b will tint error lines red).
 struct RoboScriptEditor: UIViewRepresentable {
     @Binding var text: String
     @Binding var focused: Bool
     var isEditable: Bool
     var onClear: () -> Void
 
-    func makeUIView(context: Context) -> UITextView {
-        let tv = UITextView()
+    func makeUIView(context: Context) -> GutterTextView {
+        let tv = GutterTextView(frame: .zero, textContainer: nil)
         tv.delegate = context.coordinator
         tv.font = UIFont.monospacedSystemFont(
             ofSize: UIFont.preferredFont(forTextStyle: .callout).pointSize, weight: .regular)
@@ -34936,9 +35052,9 @@ struct RoboScriptEditor: UIViewRepresentable {
         return tv
     }
 
-    func updateUIView(_ tv: UITextView, context: Context) {
+    func updateUIView(_ tv: GutterTextView, context: Context) {
         context.coordinator.parent = self
-        if tv.text != text { tv.text = text }
+        if tv.text != text { tv.text = text; tv.refreshGutter() }
         tv.isEditable = isEditable
         tv.alpha = isEditable ? 1.0 : 0.6
         if focused, isEditable, !tv.isFirstResponder { tv.becomeFirstResponder() }
@@ -34968,7 +35084,10 @@ struct RoboScriptEditor: UIViewRepresentable {
         @objc private func clearTapped() { parent.onClear() }
         @objc private func doneTapped() { parent.focused = false }
 
-        func textViewDidChange(_ tv: UITextView) { parent.text = tv.text }
+        func textViewDidChange(_ tv: UITextView) {
+            parent.text = tv.text
+            (tv as? GutterTextView)?.refreshGutter()
+        }
         func textViewDidBeginEditing(_ tv: UITextView) { parent.focused = true }
         func textViewDidEndEditing(_ tv: UITextView) { parent.focused = false }
     }
