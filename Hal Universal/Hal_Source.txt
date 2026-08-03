@@ -32452,13 +32452,29 @@ struct MarkdownView: View {
                     .foregroundColor(.primary)
             }
         case .codeBlock(let code):
-            Text(code)
-                .font(.system(.caption, design: .monospaced))
-                .foregroundColor(.primary)
-                .padding(10)
-                .frame(maxWidth: .infinity, alignment: .leading)
-                .background(Color(.systemGray6))
-                .cornerRadius(6)
+            // Render fenced code as a distinct block, not "just small type":
+            //  - a readable monospaced size that scales with the chosen body size
+            //    (was .caption, which read as tiny),
+            //  - a systemGray5 fill that stays visibly distinct in BOTH light and
+            //    dark (systemGray6 was ~invisible against the dark chat background),
+            //  - a hairline border so the box reads as a box regardless of contrast,
+            //  - horizontal scroll so long lines keep their formatting instead of
+            //    wrapping mid-token,
+            //  - selectable text so the user can copy a snippet.
+            ScrollView(.horizontal, showsIndicators: false) {
+                Text(code)
+                    .font(.system(size: max(13, bodyPointSize * 0.82), design: .monospaced))
+                    .foregroundColor(.primary)
+                    .textSelection(.enabled)
+                    .padding(12)
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .background(Color(.systemGray5))
+            .clipShape(RoundedRectangle(cornerRadius: 8))
+            .overlay(
+                RoundedRectangle(cornerRadius: 8)
+                    .stroke(Color.primary.opacity(0.15), lineWidth: 1)
+            )
         }
     }
 
@@ -32478,10 +32494,19 @@ struct MarkdownView: View {
 
     // Render a string with inline markdown (bold, italic, inline code, links).
     private func inlineText(_ s: String) -> Text {
-        if let attr = try? AttributedString(
+        if var attr = try? AttributedString(
             markdown: s,
             options: AttributedString.MarkdownParsingOptions(interpretedSyntax: .inlineOnlyPreservingWhitespace)
         ) {
+            // Give inline code spans (`like this`) a distinct look instead of
+            // leaving them as ordinary prose: a monospaced font sized to sit with
+            // the surrounding text, and a faint theme-aware highlight behind the
+            // glyphs so `code` reads as code mid-sentence. AttributedString parses
+            // backticks into an `.code` inline intent; we restyle those runs.
+            for run in attr.runs where run.inlinePresentationIntent?.contains(.code) == true {
+                attr[run.range].font = .system(size: bodyPointSize * 0.92, design: .monospaced)
+                attr[run.range].backgroundColor = Color.primary.opacity(0.12)
+            }
             return Text(attr)
         }
         return Text(s)
