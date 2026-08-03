@@ -13232,6 +13232,17 @@ class ChatViewModel: ObservableObject {
                                                                             // correct sites: line ~8535 (when summary is actually injected into a prompt)
                                                                             // and line ~10057 (conversation reset).
 
+                                                                            // Help Mode (B-a): a help session is MEMORY-EXEMPT. The answer is
+                                                                            // already shown on screen (settled in the MainActor.run above); return
+                                                                            // here so this turn skips ALL persistence and derived self-knowledge —
+                                                                            // storeTurn/RAG, the artifacts, reflection, consolidation, and the
+                                                                            // auto-summary — leaving no trace in memory. It stays visible for the
+                                                                            // session only (like the entry/exit narration, it is not stored).
+                                                                            if let ht = self.helpTopic {
+                                                                                halLog("HALDEBUG-HELP: help-mode turn (\(ht.rawValue)) — not persisted to memory")
+                                                                                return
+                                                                            }
+
                                                                             // CHANGE 1: Calculate turn from database (source of truth), not messages array
                                                                             let dbUserMessages = self.memoryStore.getConversationMessages(conversationId: self.conversationId).filter { $0.isFromUser }.count
                                                                             let turn = skipUserMessage ? dbUserMessages : (dbUserMessages + 1)
@@ -13449,18 +13460,22 @@ class ChatViewModel: ObservableObject {
                                                                     let dbUserMessages = memoryStore.getConversationMessages(conversationId: conversationId).filter { $0.isFromUser }.count
                                                                     let salonTurnNumber = dbUserMessages + 1
                                                                     halLog("HALDEBUG-SALON: Storing user message for turn \(salonTurnNumber) (DB has \(dbUserMessages) user messages)")
-                                                                    memoryStore.storeTurn(
-                                                                        conversationId: conversationId,
-                                                                        userMessage: userInput,
-                                                                        assistantMessage: "",  // Will be filled by seats
-                                                                        systemPrompt: systemPrompt,
-                                                                        turnNumber: salonTurnNumber,
-                                                                        halFullPrompt: nil,
-                                                                        halUsedContext: nil,
-                                                                        thinkingDuration: nil,
-                                                                        recordedByModel: "user"
-                                                                        // skipUserMessage defaults to false, so user IS stored
-                                                                    )
+                                                                    // Help Mode (B-a): a help session is memory-exempt — skip the salon
+                                                                    // user-message store so a help exchange leaves no trace in memory.
+                                                                    if helpTopic == nil {
+                                                                        memoryStore.storeTurn(
+                                                                            conversationId: conversationId,
+                                                                            userMessage: userInput,
+                                                                            assistantMessage: "",  // Will be filled by seats
+                                                                            systemPrompt: systemPrompt,
+                                                                            turnNumber: salonTurnNumber,
+                                                                            halFullPrompt: nil,
+                                                                            halUsedContext: nil,
+                                                                            thinkingDuration: nil,
+                                                                            recordedByModel: "user"
+                                                                            // skipUserMessage defaults to false, so user IS stored
+                                                                        )
+                                                                    }
                                                                     
                                                                     // Store user message as artifact for Salon turn
                                                                     memoryStore.storeConversationArtifact(
@@ -13748,18 +13763,22 @@ class ChatViewModel: ObservableObject {
                                                                             let dbUserMessages = self.memoryStore.getConversationMessages(conversationId: self.conversationId).filter { $0.isFromUser }.count
                                                                             let turn = dbUserMessages  // skipUserMessage is always true for Salon seats
                                                                             print("HALDEBUG-SALON: Storing context-aware turn \(turn) (DB has \(dbUserMessages) user messages)")
-                                                                            self.memoryStore.storeTurn(
-                                                                                conversationId: self.conversationId,
-                                                                                userMessage: userInput,
-                                                                                assistantMessage: text,
-                                                                                systemPrompt: self.systemPrompt,
-                                                                                turnNumber: turn,
-                                                                                halFullPrompt: prompt,
-                                                                                halUsedContext: nil,
-                                                                                thinkingDuration: thinking,
-                                                                                recordedByModel: self.selectedModel.id,
-                                                                                skipUserMessage: true  // User already stored in runSalonTurn
-                                                                            )
+                                                                            // Help Mode (B-a): a help session is memory-exempt — skip the salon
+                                                                            // seat store so a help exchange leaves no trace in memory.
+                                                                            if self.helpTopic == nil {
+                                                                                self.memoryStore.storeTurn(
+                                                                                    conversationId: self.conversationId,
+                                                                                    userMessage: userInput,
+                                                                                    assistantMessage: text,
+                                                                                    systemPrompt: self.systemPrompt,
+                                                                                    turnNumber: turn,
+                                                                                    halFullPrompt: prompt,
+                                                                                    halUsedContext: nil,
+                                                                                    thinkingDuration: thinking,
+                                                                                    recordedByModel: self.selectedModel.id,
+                                                                                    skipUserMessage: true  // User already stored in runSalonTurn
+                                                                                )
+                                                                            }
                                                                             
                                                                             // Store Context-Aware deliberation as artifact for Session-Scope analysis
                                                                             self.memoryStore.storeConversationArtifact(
