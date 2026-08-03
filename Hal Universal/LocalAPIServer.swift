@@ -1466,6 +1466,34 @@ class HalTestConsole: ObservableObject {
                 : "down"
             return scrollFrontmostJSON(direction: dir)
 
+        } else if trimmed == "UI_TREE" || trimmed.hasPrefix("UI_TREE:") {
+            // General "what's on screen" read — the accessibility tree of every visible window,
+            // each leaf with role/label/id and its on-screen frame (points, same space as
+            // SCREENSHOT). The belt-and-suspenders companion to the bespoke SET_UI_STATE hooks:
+            // preferred is always a semantic verb, but this reaches ANY exposed control when no
+            // specific hook exists. UI_TREE lists everything; UI_TREE:controls only interactive.
+            let arg = trimmed.contains(":")
+                ? String(trimmed.dropFirst("UI_TREE:".count)).trimmingCharacters(in: .whitespaces).lowercased()
+                : ""
+            return buildUITreeJSON(controlsOnly: arg == "controls")
+
+        } else if trimmed.hasPrefix("TAP_LABEL:") {
+            // General tap-by-name: activate the visible element whose accessibility label matches
+            // (exact case-insensitive, else contains; topmost window wins). Uses the supported
+            // accessibilityActivate() path, so it drives SwiftUI buttons too — not synthetic
+            // touches (which iOS blocks into your own app).
+            return tapByLabelJSON(String(trimmed.dropFirst("TAP_LABEL:".count)))
+
+        } else if trimmed.hasPrefix("TAP:") {
+            // General tap-by-point: activate the most specific element at a screen point (points,
+            // matching UI_TREE / SCREENSHOT coordinates). TAP:<x>,<y>.
+            let body = String(trimmed.dropFirst("TAP:".count))
+            let parts = body.split(separator: ",").map { $0.trimmingCharacters(in: .whitespaces) }
+            guard parts.count == 2, let x = Double(parts[0]), let y = Double(parts[1]) else {
+                return "{\"status\":\"error\",\"message\":\"Expected TAP:<x>,<y> (screen points)\"}"
+            }
+            return tapAtPointJSON(x: CGFloat(x), y: CGFloat(y))
+
         } else if trimmed == "GET_RENDERED_MESSAGES" {
             // Full content by DEFAULT (2026-07-29). Use :preview for the cheap cap.
             return buildRenderedMessagesJSON(vm: vm)
@@ -2551,6 +2579,149 @@ class HalTestConsole: ObservableObject {
         sv.setContentOffset(CGPoint(x: sv.contentOffset.x, y: y), animated: false)
         let moved = abs(y - beforeY) > 0.5
         return "{\"status\":\"ok\",\"command\":\"SCROLL\",\"direction\":\"\(jsonStringEscape(direction))\",\"moved\":\(moved),\"offsetY\":\(Int(y)),\"beforeY\":\(Int(beforeY)),\"maxY\":\(Int(maxY)),\"viewportH\":\(Int(sv.bounds.height))}"
+    }
+
+    // MARK: - General UI primitives (read the screen / tap anything)
+    //
+    // The belt-and-suspenders layer beside the bespoke SET_UI_STATE hooks: a named semantic verb
+    // is always preferred for a real capability (it's what powers the CLI / API / RoboRunner), but
+    // these general primitives reach ANY control the accessibility system exposes when no specific
+    // hook exists, so verification and UI parity are never blocked on a missing bespoke hook.
+
+    /// One on-screen accessibility leaf: what a person sees and can act on. `element` is the real
+    /// UIView or UIAccessibilityElement, kept so a tap can call `accessibilityActivate()` on it.
+    /// `frame` is in SCREEN coordinates (points), matching SCREENSHOT's reported point space.
+    private struct A11yNode {
+        let element: NSObject
+        let role: String
+        let label: String
+        let id: String
+        let frame: CGRect
+        let level: CGFloat   // owning window level; topmost wins ties (a sheet beats content beneath)
+    }
+
+    /// Human-readable role from accessibility traits (button/link/header/…); "element" otherwise.
+    private func a11yRole(_ t: UIAccessibilityTraits) -> String {
+        if t.contains(.button) { return "button" }
+        if t.contains(.link) { return "link" }
+        if t.contains(.header) { return "header" }
+        if t.contains(.searchField) { return "searchField" }
+        if t.contains(.adjustable) { return "adjustable" }
+        if t.contains(.image) { return "image" }
+        if t.contains(.staticText) { return "text" }
+        return "element"
+    }
+
+    /// Walk the accessibility tree of every visible window and collect the leaf elements. Handles
+    /// BOTH accessibility-container styles (the `accessibilityElements` array AND the
+    /// `accessibilityElementCount()`/`accessibilityElement(at:)` methods — SwiftUI commonly uses
+    /// the latter and returns nil for the array), falling back to the raw UIView subtree. Returns
+    /// the nodes plus a diagnostic count of how many objects were visited.
+    @MainActor
+    private func collectA11yNodes() -> (nodes: [A11yNode], walked: Int, classes: [String: Int]) {
+        let scenes = UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }
+        let windows = scenes.flatMap { $0.windows }
+            .filter { !$0.isHidden && $0.alpha > 0.01 }
+            .sorted { $0.windowLevel.rawValue < $1.windowLevel.rawValue }
+        var out: [A11yNode] = []
+        var walked = 0
+        var classCounts: [String: Int] = [:]
+        func record(_ node: NSObject, level: CGFloat) {
+            let frame = node.accessibilityFrame
+            guard frame.width > 0.5, frame.height > 0.5 else { return }
+            let label = (node.accessibilityLabel ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+            let id = (node as? UIAccessibilityIdentification)?.accessibilityIdentifier ?? ""
+            out.append(A11yNode(element: node, role: a11yRole(node.accessibilityTraits),
+                                label: label, id: id, frame: frame, level: level))
+        }
+        func walk(_ node: NSObject, level: CGFloat) {
+            walked += 1
+            classCounts[String(describing: type(of: node)), default: 0] += 1
+            if node.isAccessibilityElement {
+                record(node, level: level)
+                return
+            }
+            var descended = false
+            // Container style 1: the array property.
+            if let els = node.accessibilityElements as? [NSObject], !els.isEmpty {
+                for e in els { walk(e, level: level); descended = true }
+            }
+            // Container style 2: the count/at: methods (SwiftUI's usual form).
+            if !descended {
+                let count = node.accessibilityElementCount()
+                if count > 0 && count != NSNotFound {
+                    for i in 0..<count {
+                        if let e = node.accessibilityElement(at: i) as? NSObject { walk(e, level: level); descended = true }
+                    }
+                }
+            }
+            // If no accessibility children were actually yielded, descend the raw view subtree —
+            // a container that CLAIMS elements but hands back none must not prune the real tree.
+            if !descended, let view = node as? UIView {
+                for sub in view.subviews where !sub.isHidden && sub.alpha > 0.01 {
+                    walk(sub, level: level)
+                }
+            }
+        }
+        for w in windows { walk(w, level: w.windowLevel.rawValue) }
+        return (out, walked, classCounts)
+    }
+
+    /// UI_TREE: the on-screen accessibility elements as JSON, in visual reading order (top-to-
+    /// bottom, then left-to-right). `controlsOnly` keeps just the interactive roles.
+    @MainActor
+    func buildUITreeJSON(controlsOnly: Bool) -> String {
+        let (all, walked, classes) = collectA11yNodes()
+        var nodes = all
+        if controlsOnly {
+            let interactive: Set<String> = ["button", "link", "searchField", "adjustable"]
+            nodes = nodes.filter { interactive.contains($0.role) }
+        }
+        nodes.sort { a, b in
+            abs(a.frame.minY - b.frame.minY) > 5 ? a.frame.minY < b.frame.minY : a.frame.minX < b.frame.minX
+        }
+        let items = nodes.enumerated().map { (i, n) in
+            "{\"ref\":\(i + 1),\"role\":\"\(n.role)\",\"label\":\"\(jsonStringEscape(n.label))\",\"id\":\"\(jsonStringEscape(n.id))\",\"x\":\(Int(n.frame.minX)),\"y\":\(Int(n.frame.minY)),\"w\":\(Int(n.frame.width)),\"h\":\(Int(n.frame.height))}"
+        }.joined(separator: ",")
+        // Diagnostic: the top view classes visited during the walk, so a 0-element result can be
+        // debugged (where does the tree bottom out?). Trimmed to the busiest classes.
+        let topClasses = classes.sorted { $0.value > $1.value }.prefix(16)
+            .map { "{\"class\":\"\(jsonStringEscape($0.key))\",\"n\":\($0.value)}" }.joined(separator: ",")
+        return "{\"status\":\"ok\",\"command\":\"UI_TREE\",\"count\":\(nodes.count),\"walked\":\(walked),\"classes\":[\(topClasses)],\"elements\":[\(items)]}"
+    }
+
+    /// TAP_LABEL: activate the visible element whose accessibility label matches `query` — exact
+    /// (case-insensitive) preferred, else a contains match; the topmost window wins ties. Reports
+    /// whether a match was found, how many matched, and whether activation succeeded.
+    @MainActor
+    func tapByLabelJSON(_ query: String) -> String {
+        let q = query.trimmingCharacters(in: .whitespaces)
+        guard !q.isEmpty else { return "{\"status\":\"error\",\"message\":\"TAP_LABEL needs a label\"}" }
+        let nodes = collectA11yNodes().nodes
+        let exact = nodes.filter { $0.label.compare(q, options: .caseInsensitive) == .orderedSame }
+        let contains = nodes.filter { $0.label.range(of: q, options: .caseInsensitive) != nil }
+        let candidates = !exact.isEmpty ? exact : contains
+        guard let pick = candidates.max(by: { $0.level < $1.level }) else {
+            return "{\"status\":\"ok\",\"command\":\"TAP_LABEL\",\"matched\":false,\"message\":\"no visible element with label \(jsonStringEscape(q))\"}"
+        }
+        let ok = pick.element.accessibilityActivate()
+        return "{\"status\":\"ok\",\"command\":\"TAP_LABEL\",\"matched\":true,\"activated\":\(ok),\"label\":\"\(jsonStringEscape(pick.label))\",\"role\":\"\(pick.role)\",\"matchCount\":\(candidates.count),\"x\":\(Int(pick.frame.midX)),\"y\":\(Int(pick.frame.midY))}"
+    }
+
+    /// TAP: activate the most specific element at a screen point (smallest area containing it,
+    /// topmost window preferred). Point is in screen coordinates (points), same space as UI_TREE.
+    @MainActor
+    func tapAtPointJSON(x: CGFloat, y: CGFloat) -> String {
+        let p = CGPoint(x: x, y: y)
+        let matches = collectA11yNodes().nodes.filter { $0.frame.contains(p) }
+        guard let topLevel = matches.map({ $0.level }).max() else {
+            return "{\"status\":\"ok\",\"command\":\"TAP\",\"matched\":false,\"message\":\"no element at (\(Int(x)),\(Int(y)))\"}"
+        }
+        let pick = matches
+            .filter { $0.level == topLevel }
+            .min { ($0.frame.width * $0.frame.height) < ($1.frame.width * $1.frame.height) }!
+        let ok = pick.element.accessibilityActivate()
+        return "{\"status\":\"ok\",\"command\":\"TAP\",\"matched\":true,\"activated\":\(ok),\"label\":\"\(jsonStringEscape(pick.label))\",\"role\":\"\(pick.role)\",\"x\":\(Int(x)),\"y\":\(Int(y))}"
     }
 
     // Returns the most recent log entries captured by RuntimeLog. Useful for

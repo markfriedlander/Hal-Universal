@@ -679,6 +679,10 @@ nonisolated enum CommandCatalog {
         CommandDescriptor(verb: "SET_UI_STATE", args: "<state>", summary: "Drive the UI to a semantic state, for example open settings or the model library.", category: .ui, destructive: false),
         CommandDescriptor(verb: "SET_CHAT_DISPLAY", args: "<pt>:<density>", summary: "Set the chat text size and density, for testing the display controls.", category: .ui, destructive: false, debugOnly: true),
         CommandDescriptor(verb: "SCREENSHOT", args: nil, summary: "Capture the current key window as a PNG. View render only, does not show live camera or video.", category: .ui, destructive: false),
+        CommandDescriptor(verb: "SCROLL", args: "<down|up|top|bottom|pagedown|pageup>", summary: "Scroll the frontmost scroll view — general parity with a human swipe on any scrollable screen.", category: .ui, destructive: false),
+        CommandDescriptor(verb: "UI_TREE", args: "<controls?>", summary: "List on-screen accessibility elements (role, label, id, frame in points) — the general 'what's on screen' read. Add :controls for interactive elements only.", category: .ui, destructive: false),
+        CommandDescriptor(verb: "TAP_LABEL", args: "<label>", summary: "Activate the visible element whose accessibility label matches (general tap-by-name; works on SwiftUI controls). A fallback for when no bespoke verb exists.", category: .ui, destructive: false),
+        CommandDescriptor(verb: "TAP", args: "<x>,<y>", summary: "Activate the most specific element at a screen point (points, matching UI_TREE and SCREENSHOT coordinates).", category: .ui, destructive: false),
 
         // RoboRunner Automation
         CommandDescriptor(verb: "ROBO_RUN", args: "<script>", summary: "Run an on-device RoboRunner script. Advanced, a script can issue any verb, including destructive ones.", category: .automation, destructive: true),
@@ -1209,7 +1213,7 @@ struct RoboEditorView: View {
                     Button { showingResults = true } label: { Label("Results", systemImage: "doc.text.magnifyingglass") }
                 }
             }
-            .sheet(isPresented: $showingHelp) { RoboHelpView() }
+            .sheet(isPresented: $showingHelp) { RoboHelpView(onInsert: { appendToScript($0) }) }
             .sheet(isPresented: $showingResults) { RoboResultsView() }
             .sheet(isPresented: $showingIssues) { RoboIssuesView(issues: liveIssues) }
             .sheet(isPresented: $showingDraft) { RoboDraftView(onInsert: { script = $0 }) }
@@ -1233,6 +1237,21 @@ struct RoboEditorView: View {
         } else {
             Label("\(stepCount) step\(stepCount == 1 ? "" : "s") ready", systemImage: "checkmark.seal")
                 .foregroundColor(.secondary)
+        }
+    }
+
+    /// Append an inserted command usage or template to the END of the script, keeping exactly one
+    /// newline between steps. Append-at-end is the MVP: SwiftUI's TextEditor exposes no caret
+    /// position, so cursor-accurate insertion waits for the future UITextView editor (the same
+    /// lift the planned as-you-type autocomplete needs). The user can still drag the inserted
+    /// line where they want it in the editor.
+    private func appendToScript(_ snippet: String) {
+        if script.isEmpty {
+            script = snippet
+        } else if script.hasSuffix("\n") {
+            script += snippet
+        } else {
+            script += "\n" + snippet
         }
     }
 
@@ -1394,10 +1413,42 @@ struct RoboHelpView: View {
     @Environment(\.dismiss) private var dismiss
     @State private var search = ""
 
+    /// When set, each row gets an Add (+) button that inserts that command's usage (or a
+    /// template's text) into the editor's script. nil = pure read-only reference. The editor is
+    /// the only caller today and always passes this, so insertion is the normal mode.
+    var onInsert: ((String) -> Void)? = nil
+
+    /// Lightweight running feedback. The Commands sheet is full-screen, so building a script from
+    /// it would otherwise be blind — this strip confirms each insert landed and counts them.
+    @State private var lastInserted: String? = nil
+    @State private var insertedCount = 0
+
+    /// Multi-line scaffolds for the structures people get wrong (an unbalanced FOR/END was the
+    /// motivating bug). Insert-only — meaningless as reference — so shown only when onInsert is
+    /// set. Each is chosen to validate CLEAN on insert (real verbs, valid values, balanced
+    /// FOR/END) so a fresh insert never lands with an immediate error.
+    private static let templates: [(title: String, snippet: String)] = [
+        ("Sweep (FOR … END)", """
+        FOR TEMP IN 0.2, 0.6, 1.0
+            SET_TEMPERATURE:{TEMP}
+            ASK In one sentence, what is a good name for a pet fox?
+        END
+        """),
+        ("Ask a question", "ASK <your question here>"),
+        ("Compare models", """
+        FOR MODEL IN apple-foundation-models
+            SWITCH_MODEL:{MODEL}
+            ASK In one sentence, introduce yourself.
+        END
+        """),
+    ]
+
     /// Categories that have at least one matching verb, each with its filtered, sorted verbs.
+    /// Sourced from `visible` (not `all`) so a release build never offers a developer-only verb
+    /// to insert into a script the shipped interpreter wouldn't advertise.
     private var sections: [(CommandCategory, [CommandDescriptor])] {
         CommandCategory.allCases.compactMap { category in
-            let items = CommandCatalog.all
+            let items = CommandCatalog.visible
                 .filter { $0.category == category }
                 .filter { d in
                     search.isEmpty
@@ -1409,9 +1460,23 @@ struct RoboHelpView: View {
         }
     }
 
+    private var filteredTemplates: [(title: String, snippet: String)] {
+        guard onInsert != nil else { return [] }
+        guard !search.isEmpty else { return Self.templates }
+        return Self.templates.filter {
+            $0.title.localizedCaseInsensitiveContains(search)
+                || $0.snippet.localizedCaseInsensitiveContains(search)
+        }
+    }
+
     var body: some View {
         NavigationView {
             List {
+                if !filteredTemplates.isEmpty {
+                    Section("Templates") {
+                        ForEach(filteredTemplates, id: \.title) { t in templateRow(t) }
+                    }
+                }
                 ForEach(sections, id: \.0) { category, items in
                     Section(category.rawValue) {
                         ForEach(items) { d in commandRow(d) }
@@ -1422,31 +1487,85 @@ struct RoboHelpView: View {
             .searchable(text: $search, prompt: "Search commands")
             .navigationTitle("Commands")
             .navigationBarTitleDisplayMode(.inline)
+            .safeAreaInset(edge: .top) { addedBanner }
             .toolbar { ToolbarItem(placement: .confirmationAction) { Button("Done") { dismiss() } } }
         }
     }
 
-    @ViewBuilder private func commandRow(_ d: CommandDescriptor) -> some View {
-        VStack(alignment: .leading, spacing: 3) {
+    /// Transient "Added VERB — N inserted" strip, shown once something has been inserted, so the
+    /// full-screen sheet stays honest about what's accumulating in the script behind it.
+    @ViewBuilder private var addedBanner: some View {
+        if let last = lastInserted {
             HStack(spacing: 6) {
-                Text(d.verb)
-                    .font(.system(.subheadline, design: .monospaced)).fontWeight(.semibold)
-                if let args = d.args {
-                    Text(args)
-                        .font(.system(.caption, design: .monospaced)).foregroundColor(.secondary)
-                        .lineLimit(1)
-                }
-                if d.destructive {
-                    Text("!")
-                        .font(.caption2).fontWeight(.bold).foregroundColor(.white)
-                        .padding(.horizontal, 5).padding(.vertical, 1)
-                        .background(Capsule().fill(Color.red))
-                }
+                Image(systemName: "checkmark.circle.fill").foregroundColor(.green)
+                Text("Added \(last)").fontWeight(.medium)
+                Spacer()
+                Text("\(insertedCount) inserted").foregroundColor(.secondary)
             }
-            Text(d.summary).font(.caption).foregroundColor(.secondary)
+            .font(.caption)
+            .padding(.horizontal, 14).padding(.vertical, 8)
+            .background(.thinMaterial)
+        }
+    }
+
+    private func insert(_ snippet: String, label: String) {
+        onInsert?(snippet)
+        lastInserted = label
+        insertedCount += 1
+    }
+
+    @ViewBuilder private func templateRow(_ t: (title: String, snippet: String)) -> some View {
+        HStack(alignment: .top, spacing: 10) {
+            VStack(alignment: .leading, spacing: 3) {
+                Text(t.title).font(.subheadline).fontWeight(.semibold)
+                Text(t.snippet)
+                    .font(.system(.caption2, design: .monospaced)).foregroundColor(.secondary)
+                    .lineLimit(5)
+            }
+            Spacer(minLength: 0)
+            addButton { insert(t.snippet, label: t.title) }
         }
         .padding(.vertical, 2)
-        .textSelection(.enabled)
+    }
+
+    @ViewBuilder private func commandRow(_ d: CommandDescriptor) -> some View {
+        HStack(alignment: .top, spacing: 10) {
+            VStack(alignment: .leading, spacing: 3) {
+                HStack(spacing: 6) {
+                    Text(d.verb)
+                        .font(.system(.subheadline, design: .monospaced)).fontWeight(.semibold)
+                    if let args = d.args {
+                        Text(args)
+                            .font(.system(.caption, design: .monospaced)).foregroundColor(.secondary)
+                            .lineLimit(1)
+                    }
+                    if d.destructive {
+                        Text("!")
+                            .font(.caption2).fontWeight(.bold).foregroundColor(.white)
+                            .padding(.horizontal, 5).padding(.vertical, 1)
+                            .background(Capsule().fill(Color.red))
+                    }
+                }
+                Text(d.summary).font(.caption).foregroundColor(.secondary)
+            }
+            .textSelection(.enabled)
+            Spacer(minLength: 0)
+            if onInsert != nil { addButton { insert(d.usage, label: d.verb) } }
+        }
+        .padding(.vertical, 2)
+    }
+
+    /// The explicit insert affordance — a filled "+" so "add this to my script" reads distinctly
+    /// from selecting/copying the row text. `.borderless` so the tap hits only the button, not
+    /// the whole List row.
+    @ViewBuilder private func addButton(_ action: @escaping () -> Void) -> some View {
+        Button(action: action) {
+            Image(systemName: "plus.circle.fill")
+                .font(.title3)
+                .foregroundColor(.accentColor)
+        }
+        .buttonStyle(.borderless)
+        .accessibilityLabel("Add to script")
     }
 }
 
