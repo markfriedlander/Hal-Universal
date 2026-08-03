@@ -34908,54 +34908,34 @@ nonisolated enum RoboScriptGenerator {
 
 /// The line-number gutter that rides alongside `GutterTextView`. It is a passive subview: it draws
 /// nothing but numbers and a hairline separator, forwards no touches, and reads everything it needs
-/// from the text view it points at. Numbers are placed from the layoutManager's line-fragment rects,
-/// so a number appears ONLY at the first visual row of a real (newline-delimited) line — a soft-wrapped
-/// continuation row gets no number. That absence is the "wrap clarity": a line that spills onto two
-/// rows visibly owns both rows under one number, so you can always tell a wrap from a new line.
+/// from the text view it points at (via the shared `forEachLineRect` walk). Numbers are placed from
+/// the layoutManager's line-fragment rects, so a number appears ONLY at the first visual row of a real
+/// (newline-delimited) line — a soft-wrapped continuation row gets no number. That absence is the "wrap
+/// clarity": a line that spills onto two rows visibly owns both rows under one number, so you can always
+/// tell a wrap from a new line. Stage 2b: a line the coach flags is drawn in red (error) or orange
+/// (warning) instead of the usual secondary gray, matching the `LineHighlightView` band behind it.
 final class LineNumberGutter: UIView {
-    weak var textView: UITextView?
+    weak var textView: GutterTextView?
     var gutterWidth: CGFloat = 0
     var numberFont: UIFont = .monospacedSystemFont(ofSize: 12, weight: .regular)
 
     override func draw(_ rect: CGRect) {
         guard let tv = textView else { return }
-        let lm = tv.layoutManager
         let insetTop = tv.textContainerInset.top
         let offsetY = tv.contentOffset.y
-        let attrs: [NSAttributedString.Key: Any] = [
-            .font: numberFont, .foregroundColor: UIColor.secondaryLabel,
-        ]
-        let s = (tv.text ?? "") as NSString
+        let errors = tv.errorLines
+        let warnings = tv.warningLines
 
-        // Draw one right-aligned number for the visual row whose top (in container space) is `cy`.
-        func drawNumber(_ n: Int, atContainerY cy: CGFloat, rowHeight: CGFloat) {
+        // One right-aligned number per real line, colored by the coach's verdict for that line.
+        tv.forEachLineRect { n, firstFrag, _ in
+            let color: UIColor = errors.contains(n) ? .systemRed
+                : (warnings.contains(n) ? .systemOrange : .secondaryLabel)
+            let attrs: [NSAttributedString.Key: Any] = [.font: self.numberFont, .foregroundColor: color]
             let str = String(n) as NSString
             let size = str.size(withAttributes: attrs)
-            let y = cy + insetTop - offsetY + (rowHeight - size.height) / 2
-            let x = gutterWidth - 6 - size.width
+            let y = firstFrag.minY + insetTop - offsetY + (firstFrag.height - size.height) / 2
+            let x = self.gutterWidth - 6 - size.width
             str.draw(at: CGPoint(x: x, y: y), withAttributes: attrs)
-        }
-
-        if s.length == 0 {
-            drawNumber(1, atContainerY: 0, rowHeight: numberFont.lineHeight)
-        } else {
-            var lineNo = 1
-            s.enumerateSubstrings(in: NSRange(location: 0, length: s.length),
-                                  options: [.byParagraphs, .substringNotRequired]) { _, paraRange, _, _ in
-                let gr = lm.glyphRange(forCharacterRange: paraRange, actualCharacterRange: nil)
-                var eff = NSRange()
-                let frag = lm.lineFragmentRect(forGlyphAt: gr.location, effectiveRange: &eff)
-                drawNumber(lineNo, atContainerY: frag.minY, rowHeight: frag.height)
-                lineNo += 1
-            }
-            // A trailing newline means an empty final line the enumeration doesn't emit; the
-            // layoutManager tracks it as the "extra" fragment. Number it so a script ending in a
-            // blank line still shows that line's number (matching how the cursor sits there).
-            if s.hasSuffix("\n") {
-                let extra = lm.extraLineFragmentRect
-                drawNumber(lineNo, atContainerY: extra.minY,
-                           rowHeight: extra.height > 0 ? extra.height : numberFont.lineHeight)
-            }
         }
 
         // Hairline separating the gutter from the text, on the gutter's right edge.
@@ -34969,6 +34949,37 @@ final class LineNumberGutter: UIView {
     }
 }
 
+/// A faint full-width band drawn BEHIND the text on any line the coach flags (red for an error, orange
+/// for a warning). It is a passive subview inserted below the text container (with a negative
+/// `zPosition` so it always renders behind the glyphs) and pinned to the visible area like the gutter.
+/// Unlike the gutter's per-line number, the band uses the line's FULL bounding rect, so a flagged line
+/// that soft-wraps onto several rows is tinted across all of them. Draws nothing when the coach is clean.
+final class LineHighlightView: UIView {
+    weak var textView: GutterTextView?
+
+    override func draw(_ rect: CGRect) {
+        guard let tv = textView, let ctx = UIGraphicsGetCurrentContext() else { return }
+        let errors = tv.errorLines
+        let warnings = tv.warningLines
+        if errors.isEmpty && warnings.isEmpty { return }
+        let insetTop = tv.textContainerInset.top
+        let offsetY = tv.contentOffset.y
+
+        tv.forEachLineRect { n, firstFrag, fullBounds in
+            let fill: UIColor
+            if errors.contains(n) { fill = UIColor.systemRed.withAlphaComponent(0.14) }
+            else if warnings.contains(n) { fill = UIColor.systemOrange.withAlphaComponent(0.12) }
+            else { return }
+            // Cover every wrapped row of the line; fall back to the first fragment if the bounding
+            // rect is empty (e.g. a flagged blank line has no glyphs to bound).
+            let band = fullBounds.height > 0 ? fullBounds : firstFrag
+            let y = band.minY + insetTop - offsetY
+            ctx.setFillColor(fill.cgColor)
+            ctx.fill(CGRect(x: 0, y: y, width: self.bounds.width, height: band.height))
+        }
+    }
+}
+
 /// A UITextView subclass that carries a `LineNumberGutter` glued to its left edge. The gutter is a
 /// subview kept pinned to the visible area (its frame origin tracks `contentOffset`) and redrawn on
 /// every layout pass — which UIScrollView triggers on scroll — so the numbers scroll perfectly with
@@ -34976,14 +34987,30 @@ final class LineNumberGutter: UIView {
 /// and the text is inset to the right of it via `textContainerInset.left`.
 final class GutterTextView: UITextView {
     private let gutter = LineNumberGutter()
+    private let highlight = LineHighlightView()
     private var lastGutterWidth: CGFloat = -1
+
+    /// 1-based line numbers the coach flags, set by `RoboScriptEditor` from the live validator output.
+    /// The gutter colors these numbers and the highlight bands them; both read from here.
+    private(set) var errorLines: Set<Int> = []
+    private(set) var warningLines: Set<Int> = []
 
     override init(frame: CGRect, textContainer: NSTextContainer?) {
         super.init(frame: frame, textContainer: textContainer)
+        // Band goes behind the text (negative zPosition guarantees it regardless of subview order);
+        // gutter numbers ride on top.
+        highlight.textView = self
+        highlight.backgroundColor = .clear
+        highlight.isUserInteractionEnabled = false
+        highlight.contentMode = .redraw
+        highlight.layer.zPosition = -1
+        insertSubview(highlight, at: 0)
+
         gutter.textView = self
         gutter.backgroundColor = .clear
         gutter.isUserInteractionEnabled = false
         gutter.contentMode = .redraw
+        gutter.layer.zPosition = 1
         addSubview(gutter)
     }
     required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
@@ -35000,6 +35027,48 @@ final class GutterTextView: UITextView {
         return ceil(CGFloat(digits) * charW) + 12  // ~6pt padding on each side of the digits
     }
 
+    /// Enumerate every real line as (1-based number, first-fragment rect, full bounding rect) in
+    /// text-container space. The gutter uses the first fragment to place a number at the line's top
+    /// row; the highlight uses the full bounding rect so a band covers all rows of a wrapped line.
+    /// Shared so the two subviews can never disagree on where a line sits. A trailing blank line is
+    /// emitted from the layoutManager's "extra" fragment (paragraph enumeration doesn't yield it).
+    func forEachLineRect(_ body: @escaping (Int, CGRect, CGRect) -> Void) {
+        let lm = layoutManager
+        let tc = textContainer
+        let s = (text ?? "") as NSString
+        if s.length == 0 {
+            let r = CGRect(x: 0, y: 0, width: 0, height: gutterFont.lineHeight)
+            body(1, r, r)
+            return
+        }
+        var lineNo = 1
+        s.enumerateSubstrings(in: NSRange(location: 0, length: s.length),
+                              options: [.byParagraphs, .substringNotRequired]) { _, paraRange, _, _ in
+            let gr = lm.glyphRange(forCharacterRange: paraRange, actualCharacterRange: nil)
+            var eff = NSRange()
+            let frag = lm.lineFragmentRect(forGlyphAt: gr.location, effectiveRange: &eff)
+            let full = lm.boundingRect(forGlyphRange: gr, in: tc)
+            body(lineNo, frag, full)
+            lineNo += 1
+        }
+        if s.hasSuffix("\n") {
+            let extra = lm.extraLineFragmentRect
+            let h = extra.height > 0 ? extra.height : gutterFont.lineHeight
+            let r = CGRect(x: extra.minX, y: extra.minY, width: extra.width, height: h)
+            body(lineNo, r, r)
+        }
+    }
+
+    /// Update the flagged-line sets and redraw the gutter + band only if they actually changed.
+    /// Positions don't move, so this is a repaint (setNeedsDisplay), not a relayout.
+    func setIssueLines(errors: Set<Int>, warnings: Set<Int>) {
+        guard errors != errorLines || warnings != warningLines else { return }
+        errorLines = errors
+        warningLines = warnings
+        gutter.setNeedsDisplay()
+        highlight.setNeedsDisplay()
+    }
+
     override func layoutSubviews() {
         // Set the text inset BEFORE super so the layoutManager positions text for the new width.
         // Guarded so it only changes when the digit count actually changes — otherwise every scroll
@@ -35010,14 +35079,17 @@ final class GutterTextView: UITextView {
             textContainerInset.left = w + 4
         }
         super.layoutSubviews()
+        // Both overlays are pinned to the visible area and redraw with the current scroll offset.
+        highlight.frame = CGRect(x: contentOffset.x, y: contentOffset.y, width: bounds.width, height: bounds.height)
+        highlight.setNeedsDisplay()
         gutter.gutterWidth = w
         gutter.numberFont = gutterFont
         gutter.frame = CGRect(x: contentOffset.x, y: contentOffset.y, width: w, height: bounds.height)
         gutter.setNeedsDisplay()
     }
 
-    /// Force a gutter refresh after a text change that may not itself trigger layout (e.g. an edit
-    /// that doesn't change content size). Cheap: schedules one layout pass.
+    /// Force a gutter/band refresh after a text change that may not itself trigger layout (e.g. an
+    /// edit that doesn't change content size). Cheap: schedules one layout pass.
     func refreshGutter() { setNeedsLayout() }
 }
 
@@ -35026,12 +35098,15 @@ final class GutterTextView: UITextView {
 /// Stage 1 was a behavior-preserving drop-in: two-way text binding, monospaced font, dim-when-disabled,
 /// a focus binding (replacing @FocusState), and a UIKit input-accessory toolbar carrying Clear + Done
 /// (a SwiftUI `.keyboard` toolbar won't attach to a UITextView). Smart dashes/quotes are OFF so the
-/// keyboard can't turn "--" into an em dash or "" into curly quotes inside a script. Stage 2a adds the
-/// line-number gutter via the `GutterTextView` subclass (2b will tint error lines red).
+/// keyboard can't turn "--" into an em dash or "" into curly quotes inside a script. Stage 2a added the
+/// line-number gutter via the `GutterTextView` subclass; Stage 2b feeds it the coach's flagged lines so
+/// error lines show red (warnings orange) in the gutter with a faint band behind them.
 struct RoboScriptEditor: UIViewRepresentable {
     @Binding var text: String
     @Binding var focused: Bool
     var isEditable: Bool
+    var errorLines: Set<Int>
+    var warningLines: Set<Int>
     var onClear: () -> Void
 
     func makeUIView(context: Context) -> GutterTextView {
@@ -35049,6 +35124,7 @@ struct RoboScriptEditor: UIViewRepresentable {
         tv.smartInsertDeleteType = .no
         tv.inputAccessoryView = context.coordinator.accessory
         tv.text = text
+        tv.setIssueLines(errors: errorLines, warnings: warningLines)
         return tv
     }
 
@@ -35057,6 +35133,7 @@ struct RoboScriptEditor: UIViewRepresentable {
         if tv.text != text { tv.text = text; tv.refreshGutter() }
         tv.isEditable = isEditable
         tv.alpha = isEditable ? 1.0 : 0.6
+        tv.setIssueLines(errors: errorLines, warnings: warningLines)
         if focused, isEditable, !tv.isFirstResponder { tv.becomeFirstResponder() }
         if !focused, tv.isFirstResponder { tv.resignFirstResponder() }
         context.coordinator.setClearEnabled(!text.isEmpty)
@@ -35074,7 +35151,8 @@ struct RoboScriptEditor: UIViewRepresentable {
             super.init()
             clearItem = UIBarButtonItem(title: "Clear", style: .plain, target: self, action: #selector(clearTapped))
             let flex = UIBarButtonItem(barButtonSystemItem: .flexibleSpace, target: nil, action: nil)
-            let doneItem = UIBarButtonItem(title: "Done", style: .done, target: self, action: #selector(doneTapped))
+            // .prominent is the iOS 26 rename of the old .done style (bold dismiss affordance).
+            let doneItem = UIBarButtonItem(title: "Done", style: .prominent, target: self, action: #selector(doneTapped))
             accessory.items = [clearItem, flex, doneItem]
             accessory.sizeToFit()
         }
@@ -35149,6 +35227,14 @@ struct RoboEditorView: View {
     private var liveErrorCount: Int { liveIssues.filter { $0.isError }.count }
     private var liveWarningCount: Int { liveIssues.count - liveErrorCount }
 
+    // The coach's flagged lines, fed to the editor's gutter (red = error, orange = warning). Only
+    // line-specific issues highlight; whole-script issues (line 0) still surface in the Check sheet.
+    // Error wins if a line has both, so warnings never mask an error line's red.
+    private var errorLines: Set<Int> { Set(liveIssues.filter { $0.isError && $0.line > 0 }.map { $0.line }) }
+    private var warningLines: Set<Int> {
+        Set(liveIssues.filter { !$0.isError && $0.line > 0 }.map { $0.line }).subtracting(errorLines)
+    }
+
     var body: some View {
         NavigationView {
             VStack(spacing: 0) {
@@ -35156,6 +35242,8 @@ struct RoboEditorView: View {
                     text: $script,
                     focused: $editorFocused,
                     isEditable: !(robo.isRunning || generatingDraft),
+                    errorLines: errorLines,
+                    warningLines: warningLines,
                     onClear: { clearField() }
                 )
 
