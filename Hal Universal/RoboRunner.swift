@@ -1933,7 +1933,7 @@ struct RoboExample: Identifiable {
             blurb: "A sweep repeats the block once per value, filling in {{TEMP}} each pass. Watch a higher temperature make the answer more varied.",
             script: """
             # {{TEMP}} is a placeholder the FOR fills in each pass.
-            FOR TEMP IN 0.2, 0.7, 1.2
+            FOR TEMP IN 0.2, 0.6, 1.0
                 SET_TEMPERATURE:{{TEMP}}
                 ASK In one short sentence, describe a city at night.
             END

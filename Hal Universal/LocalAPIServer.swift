@@ -167,7 +167,7 @@ extension DocumentImportManager {
 //    Full response + diagnostics written to output_latest.json.
 //
 // 2. HTTP CHANNEL (LocalAPIServer): POST /chat, POST /command, GET /state
-//    Bearer token auth. Enable in Settings > Power User > Developer API.
+//    Bearer token auth. Enable in Settings > The Lab > Developer API.
 //    Both channels share the same executeCommand() dispatch function.
 //
 // Enable via Power User settings. Runs until stopped or app quits.
@@ -3106,7 +3106,7 @@ class HalTestConsole: ObservableObject {
 //   Info:             GET_STATE, CURRENT_MODEL, LIST_MODELS, MODEL_STATUS:<id>,
 //                     GET_THERMAL_STATE (nominal/fair/serious/critical + level)
 //
-// Enable: Settings → Power User → Developer API toggle (default OFF).
+// Enable: Settings → The Lab → Developer API toggle (default OFF).
 // Setup:  python3 tests/hal_test.py setup <ip> 8766 <token>
 // Port:   8766 (see apiPort comment below — per-app port family).
 

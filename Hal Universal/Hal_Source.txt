@@ -10588,20 +10588,26 @@ class ChatViewModel: ObservableObject {
 
     // MARK: - Local API Server (Developer API)
     // HTTP server for automated testing — see Block 32 LocalAPIServer.
-    // Controlled by toggle in Settings > Power User > Developer API.
+    // Controlled by the Developer API toggle in Settings > The Lab.
     //
-    // SHIP_BLOCKER (2026-05-26): `kLocalAPIEnabledOnLaunch` below is the
-    // single source of truth for whether each launch boots with the
-    // local API antenna live. We keep this ON during development so
-    // device-side test tooling (tests/hal_test.py) works on every fresh
-    // install without Mark having to flip the in-app toggle by hand. The
-    // value is force-applied to UserDefaults in init() so it overrides
-    // whatever was persisted from a prior session/build. Before any App
-    // Store archive, flip kLocalAPIEnabledOnLaunch to false (one-line
-    // change) so production users boot with the API off, matching
-    // historical behavior. The user can still flip it on at runtime via
-    // Settings > Power User > Developer API.
+    // The local API antenna is a security surface (an open local HTTP port plus a
+    // bearer token), so by default it boots OFF every launch and must be switched on by
+    // hand. Two things modify that launch policy:
+    //   - DEBUG builds boot it ON so device test tooling (tests/hal_test.py) connects on
+    //     every fresh install without a manual flip.
+    //   - A user can OPT IN to persistence ("keep the API on after I quit") behind a
+    //     one-time danger notice. Once consented (localAPIStickyEnabled), a Release
+    //     launch honors whatever the API was set to last session instead of clobbering
+    //     it. Without that consent, Release always boots OFF. See init() STEP 0 and the
+    //     Lab's Developer API section (DeveloperAPISectionView).
     @AppStorage("localAPIEnabled") var localAPIEnabled: Bool = true
+
+    /// User consent to keep the developer API on across launches — opt-in, gated behind a
+    /// danger notice in the Lab (DeveloperAPISectionView). Default false → Release boots
+    /// the antenna OFF every launch. True → the persisted `localAPIEnabled` is honored on
+    /// launch. Not consulted in DEBUG, which always boots ON for the test harness.
+    @AppStorage("localAPIStickyEnabled") var localAPIStickyEnabled: Bool = false
+
     var localAPIServer: LocalAPIServer = LocalAPIServer()
 
     func startLocalAPI() {
@@ -10614,27 +10620,28 @@ class ChatViewModel: ObservableObject {
         localAPIServer.stop()
     }
 
-    /// SHIP_BLOCKER (2026-05-26): set to `false` before any App Store
-    /// archive. See note on `localAPIEnabled` AppStorage above. Forcing
-    /// this in init() means every launch overrides whatever was
-    /// persisted previously, so a fresh install/reinstall always boots
-    /// with the antenna in the dev-friendly default state.
-    // Build-gated so it can NEVER ship on: DEBUG (every dev/device install) boots
-    // with the antenna ON so the test harness always connects; the Release /
-    // App Store build compiles the `false` branch. No manual revert, ever.
+    // Launch-time default for the antenna. DEBUG boots ON for the harness; Release boots
+    // OFF (opt-in via the Lab). Applied in init() STEP 0, where the Release branch is
+    // additionally bypassed when the user has consented to sticky persistence.
     #if DEBUG
     private static let kLocalAPIEnabledOnLaunch: Bool = true
     #else
-    private static let kLocalAPIEnabledOnLaunch: Bool = false  // Release: antenna OFF at launch (opt-in via Settings).
+    private static let kLocalAPIEnabledOnLaunch: Bool = false  // Release: antenna OFF at launch (opt-in via the Lab).
     #endif
 
     init() {
-        // STEP 0: Apply launch-time default for the Local API antenna.
-        // See SHIP_BLOCKER notes on kLocalAPIEnabledOnLaunch /
-        // localAPIEnabled. This intentionally clobbers any prior
-        // persisted value so device test tooling works on every fresh
-        // install without requiring a manual toggle flip.
+        // STEP 0: Apply the launch-time policy for the Local API antenna. The antenna is
+        // a security surface, so persistence is opt-in and consented only. DEBUG always
+        // boots ON (test harness). Release boots OFF by clobbering any persisted value —
+        // UNLESS the user has consented to keep it sticky (localAPIStickyEnabled), in
+        // which case we leave the persisted localAPIEnabled alone and honor last session.
+        #if DEBUG
         UserDefaults.standard.set(Self.kLocalAPIEnabledOnLaunch, forKey: "localAPIEnabled")
+        #else
+        if !UserDefaults.standard.bool(forKey: "localAPIStickyEnabled") {
+            UserDefaults.standard.set(Self.kLocalAPIEnabledOnLaunch, forKey: "localAPIEnabled")
+        }
+        #endif
 
         // STEP 1: Check for legacy LLMType and migrate to ModelConfiguration
         if let oldTypeRaw = UserDefaults.standard.string(forKey: "selectedLLMType") {
@@ -10803,7 +10810,9 @@ class ChatViewModel: ObservableObject {
         // Connect test console to this view model
         testConsole.configure(chatViewModel: self)
 
-        // Auto-start Local API server if user had it enabled last session
+        // Auto-start the Local API server if it is enabled. After STEP 0 this reflects
+        // last session ONLY when sticky persistence was consented (else it was reset to
+        // the launch default: OFF in Release, ON in DEBUG).
         if localAPIEnabled {
             localAPIServer.start(chatViewModel: self)
         }
@@ -25320,7 +25329,7 @@ extension DocumentImportManager {
 //    Full response + diagnostics written to output_latest.json.
 //
 // 2. HTTP CHANNEL (LocalAPIServer): POST /chat, POST /command, GET /state
-//    Bearer token auth. Enable in Settings > Power User > Developer API.
+//    Bearer token auth. Enable in Settings > The Lab > Developer API.
 //    Both channels share the same executeCommand() dispatch function.
 //
 // Enable via Power User settings. Runs until stopped or app quits.
@@ -28259,7 +28268,7 @@ class HalTestConsole: ObservableObject {
 //   Info:             GET_STATE, CURRENT_MODEL, LIST_MODELS, MODEL_STATUS:<id>,
 //                     GET_THERMAL_STATE (nominal/fair/serious/critical + level)
 //
-// Enable: Settings → Power User → Developer API toggle (default OFF).
+// Enable: Settings → The Lab → Developer API toggle (default OFF).
 // Setup:  python3 tests/hal_test.py setup <ip> 8766 <token>
 // Port:   8766 (see apiPort comment below — per-app port family).
 
@@ -35882,7 +35891,7 @@ struct RoboExample: Identifiable {
             blurb: "A sweep repeats the block once per value, filling in {{TEMP}} each pass. Watch a higher temperature make the answer more varied.",
             script: """
             # {{TEMP}} is a placeholder the FOR fills in each pass.
-            FOR TEMP IN 0.2, 0.7, 1.2
+            FOR TEMP IN 0.2, 0.6, 1.0
                 SET_TEMPERATURE:{{TEMP}}
                 ASK In one short sentence, describe a city at night.
             END
@@ -36221,6 +36230,8 @@ struct LabView: View {
 struct DeveloperAPISectionView: View {
     @ObservedObject var viewModel: ChatViewModel
     @State private var copiedField: String? = nil
+    // Gates the one-time danger notice before the API is allowed to persist across launches.
+    @State private var showingStickyConsent = false
 
     var body: some View {
         // Box 1, the API: the door. A local HTTP server any app can connect to.
@@ -36257,6 +36268,25 @@ struct DeveloperAPISectionView: View {
                                 font: .system(.caption2, design: .monospaced))
                 }
                 .padding(.vertical, 4)
+
+                // Persistence is opt-in and consented. By default the API turns itself
+                // off every launch (a security surface should not linger silently); this
+                // lets someone who trusts the device keep it on across restarts. Flipping
+                // it ON routes through a one-time danger notice; OFF is free.
+                Toggle(isOn: Binding(
+                    get: { viewModel.localAPIStickyEnabled },
+                    set: { on in
+                        if on { showingStickyConsent = true }
+                        else  { viewModel.localAPIStickyEnabled = false }
+                    }
+                )) {
+                    Label {
+                        Text("Keep on after I quit")
+                    } icon: {
+                        Image(systemName: "clock.arrow.circlepath")
+                            .foregroundStyle(.primary)
+                    }
+                }
             }
         } header: {
             Label("Developer API", systemImage: "antenna.radiowaves.left.and.right")
@@ -36265,6 +36295,12 @@ struct DeveloperAPISectionView: View {
                 ? "Tap any value to copy it. With the API on, apps can reach Hal over HTTP at this address."
                 : "Turn on a local HTTP API so apps can reach Hal over HTTP. Off by default.")
                 .font(.caption2)
+        }
+        .alert("Keep the API on after you quit?", isPresented: $showingStickyConsent) {
+            Button("Keep It On", role: .destructive) { viewModel.localAPIStickyEnabled = true }
+            Button("Cancel", role: .cancel) { }
+        } message: {
+            Text("Normally the developer API turns itself off whenever you quit Hal, so it is never listening unless you just switched it on. Turn this on and Hal will reopen the API automatically on launch whenever you left it on. That is handy for development, but it means a local network port stays reachable with your token across restarts. Only do this on a device you trust, and turn the API off when you are done.")
         }
 
         // Box 2, the Hal CLI: ONE client of that door, for the Mac terminal. It needs the API

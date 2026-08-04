@@ -87,6 +87,8 @@ struct LabView: View {
 struct DeveloperAPISectionView: View {
     @ObservedObject var viewModel: ChatViewModel
     @State private var copiedField: String? = nil
+    // Gates the one-time danger notice before the API is allowed to persist across launches.
+    @State private var showingStickyConsent = false
 
     var body: some View {
         // Box 1, the API: the door. A local HTTP server any app can connect to.
@@ -123,6 +125,25 @@ struct DeveloperAPISectionView: View {
                                 font: .system(.caption2, design: .monospaced))
                 }
                 .padding(.vertical, 4)
+
+                // Persistence is opt-in and consented. By default the API turns itself
+                // off every launch (a security surface should not linger silently); this
+                // lets someone who trusts the device keep it on across restarts. Flipping
+                // it ON routes through a one-time danger notice; OFF is free.
+                Toggle(isOn: Binding(
+                    get: { viewModel.localAPIStickyEnabled },
+                    set: { on in
+                        if on { showingStickyConsent = true }
+                        else  { viewModel.localAPIStickyEnabled = false }
+                    }
+                )) {
+                    Label {
+                        Text("Keep on after I quit")
+                    } icon: {
+                        Image(systemName: "clock.arrow.circlepath")
+                            .foregroundStyle(.primary)
+                    }
+                }
             }
         } header: {
             Label("Developer API", systemImage: "antenna.radiowaves.left.and.right")
@@ -131,6 +152,12 @@ struct DeveloperAPISectionView: View {
                 ? "Tap any value to copy it. With the API on, apps can reach Hal over HTTP at this address."
                 : "Turn on a local HTTP API so apps can reach Hal over HTTP. Off by default.")
                 .font(.caption2)
+        }
+        .alert("Keep the API on after you quit?", isPresented: $showingStickyConsent) {
+            Button("Keep It On", role: .destructive) { viewModel.localAPIStickyEnabled = true }
+            Button("Cancel", role: .cancel) { }
+        } message: {
+            Text("Normally the developer API turns itself off whenever you quit Hal, so it is never listening unless you just switched it on. Turn this on and Hal will reopen the API automatically on launch whenever you left it on. That is handy for development, but it means a local network port stays reachable with your token across restarts. Only do this on a device you trust, and turn the API off when you are done.")
         }
 
         // Box 2, the Hal CLI: ONE client of that door, for the Mac terminal. It needs the API

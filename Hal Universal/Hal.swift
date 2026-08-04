@@ -10587,20 +10587,26 @@ class ChatViewModel: ObservableObject {
 
     // MARK: - Local API Server (Developer API)
     // HTTP server for automated testing — see Block 32 LocalAPIServer.
-    // Controlled by toggle in Settings > Power User > Developer API.
+    // Controlled by the Developer API toggle in Settings > The Lab.
     //
-    // SHIP_BLOCKER (2026-05-26): `kLocalAPIEnabledOnLaunch` below is the
-    // single source of truth for whether each launch boots with the
-    // local API antenna live. We keep this ON during development so
-    // device-side test tooling (tests/hal_test.py) works on every fresh
-    // install without Mark having to flip the in-app toggle by hand. The
-    // value is force-applied to UserDefaults in init() so it overrides
-    // whatever was persisted from a prior session/build. Before any App
-    // Store archive, flip kLocalAPIEnabledOnLaunch to false (one-line
-    // change) so production users boot with the API off, matching
-    // historical behavior. The user can still flip it on at runtime via
-    // Settings > Power User > Developer API.
+    // The local API antenna is a security surface (an open local HTTP port plus a
+    // bearer token), so by default it boots OFF every launch and must be switched on by
+    // hand. Two things modify that launch policy:
+    //   - DEBUG builds boot it ON so device test tooling (tests/hal_test.py) connects on
+    //     every fresh install without a manual flip.
+    //   - A user can OPT IN to persistence ("keep the API on after I quit") behind a
+    //     one-time danger notice. Once consented (localAPIStickyEnabled), a Release
+    //     launch honors whatever the API was set to last session instead of clobbering
+    //     it. Without that consent, Release always boots OFF. See init() STEP 0 and the
+    //     Lab's Developer API section (DeveloperAPISectionView).
     @AppStorage("localAPIEnabled") var localAPIEnabled: Bool = true
+
+    /// User consent to keep the developer API on across launches — opt-in, gated behind a
+    /// danger notice in the Lab (DeveloperAPISectionView). Default false → Release boots
+    /// the antenna OFF every launch. True → the persisted `localAPIEnabled` is honored on
+    /// launch. Not consulted in DEBUG, which always boots ON for the test harness.
+    @AppStorage("localAPIStickyEnabled") var localAPIStickyEnabled: Bool = false
+
     var localAPIServer: LocalAPIServer = LocalAPIServer()
 
     func startLocalAPI() {
@@ -10613,27 +10619,28 @@ class ChatViewModel: ObservableObject {
         localAPIServer.stop()
     }
 
-    /// SHIP_BLOCKER (2026-05-26): set to `false` before any App Store
-    /// archive. See note on `localAPIEnabled` AppStorage above. Forcing
-    /// this in init() means every launch overrides whatever was
-    /// persisted previously, so a fresh install/reinstall always boots
-    /// with the antenna in the dev-friendly default state.
-    // Build-gated so it can NEVER ship on: DEBUG (every dev/device install) boots
-    // with the antenna ON so the test harness always connects; the Release /
-    // App Store build compiles the `false` branch. No manual revert, ever.
+    // Launch-time default for the antenna. DEBUG boots ON for the harness; Release boots
+    // OFF (opt-in via the Lab). Applied in init() STEP 0, where the Release branch is
+    // additionally bypassed when the user has consented to sticky persistence.
     #if DEBUG
     private static let kLocalAPIEnabledOnLaunch: Bool = true
     #else
-    private static let kLocalAPIEnabledOnLaunch: Bool = false  // Release: antenna OFF at launch (opt-in via Settings).
+    private static let kLocalAPIEnabledOnLaunch: Bool = false  // Release: antenna OFF at launch (opt-in via the Lab).
     #endif
 
     init() {
-        // STEP 0: Apply launch-time default for the Local API antenna.
-        // See SHIP_BLOCKER notes on kLocalAPIEnabledOnLaunch /
-        // localAPIEnabled. This intentionally clobbers any prior
-        // persisted value so device test tooling works on every fresh
-        // install without requiring a manual toggle flip.
+        // STEP 0: Apply the launch-time policy for the Local API antenna. The antenna is
+        // a security surface, so persistence is opt-in and consented only. DEBUG always
+        // boots ON (test harness). Release boots OFF by clobbering any persisted value —
+        // UNLESS the user has consented to keep it sticky (localAPIStickyEnabled), in
+        // which case we leave the persisted localAPIEnabled alone and honor last session.
+        #if DEBUG
         UserDefaults.standard.set(Self.kLocalAPIEnabledOnLaunch, forKey: "localAPIEnabled")
+        #else
+        if !UserDefaults.standard.bool(forKey: "localAPIStickyEnabled") {
+            UserDefaults.standard.set(Self.kLocalAPIEnabledOnLaunch, forKey: "localAPIEnabled")
+        }
+        #endif
 
         // STEP 1: Check for legacy LLMType and migrate to ModelConfiguration
         if let oldTypeRaw = UserDefaults.standard.string(forKey: "selectedLLMType") {
@@ -10802,7 +10809,9 @@ class ChatViewModel: ObservableObject {
         // Connect test console to this view model
         testConsole.configure(chatViewModel: self)
 
-        // Auto-start Local API server if user had it enabled last session
+        // Auto-start the Local API server if it is enabled. After STEP 0 this reflects
+        // last session ONLY when sticky persistence was consented (else it was reset to
+        // the launch default: OFF in Release, ON in DEBUG).
         if localAPIEnabled {
             localAPIServer.start(chatViewModel: self)
         }
