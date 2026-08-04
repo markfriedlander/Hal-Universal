@@ -431,6 +431,12 @@ struct iOSChatView: View {
                 LabView()
                     .environmentObject(chatViewModel)
             }
+            // The in-app Guide reader — last item on the Help (life-ring) menu, and
+            // driven by the antenna via SET_UI_STATE:guidereader for screenshot/verify.
+            .sheet(isPresented: $chatViewModel.apiNavGuideReader) {
+                GuideReaderView()
+                    .environmentObject(chatViewModel)
+            }
             // One-time model-storage migration notice (Layer 2). Shown once at launch
             // to users who had pre-version model copies; both buttons mark it handled
             // so it never returns. See ModelStorageMigrationNotice.
@@ -589,6 +595,15 @@ struct iOSChatView: View {
                     } label: {
                         Label("Leave Help Mode", systemImage: "xmark.circle")
                     }
+                }
+                // Last item on the menu: open the full guide in the in-app reader.
+                // Distinct from the topic entries above (those tune Hal's answers);
+                // this just lets you read the document yourself.
+                Divider()
+                Button {
+                    chatViewModel.apiNavGuideReader = true
+                } label: {
+                    Label("Read the Guide", systemImage: "book")
                 }
             } label: {
                 Image(systemName: "lifepreserver")
@@ -1927,6 +1942,8 @@ private enum MDBlock {
     case unorderedItem(String)
     case orderedItem(String, number: Int)
     case codeBlock(String)
+    case table(header: [String], rows: [[String]])
+    case rule
 }
 
 struct MarkdownView: View {
@@ -1936,7 +1953,26 @@ struct MarkdownView: View {
     // body via `sizeRatio` so their proportions hold at any chosen text size.
     var bodyPointSize: CGFloat = 20
     var lineSpacing: CGFloat = 6
+    // Optional find-in-page term. When non-empty, every case-insensitive occurrence
+    // in rendered prose, table cells, and code gets a highlight background so search
+    // matches stand out. Empty = no highlighting (the normal chat path). Used by the
+    // in-app Guide reader; chat passes nothing and is unaffected.
+    var highlight: String = ""
     private var sizeRatio: CGFloat { bodyPointSize / 20.0 }
+
+    /// Apply a highlight background to every case-insensitive occurrence of `highlight`
+    /// in an already-built AttributedString. No-op when `highlight` is empty. Shared by
+    /// the prose (`inlineText`) and code paths so what's counted and what's lit agree.
+    private func applyHighlight(_ attr: inout AttributedString) {
+        let needle = highlight.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !needle.isEmpty else { return }
+        var searchStart = attr.startIndex
+        while searchStart < attr.endIndex,
+              let r = attr[searchStart...].range(of: needle, options: .caseInsensitive) {
+            attr[r].backgroundColor = Color.yellow.opacity(0.45)
+            searchStart = r.upperBound
+        }
+    }
 
     var body: some View {
         let blocks = parseBlocks(text)
@@ -2001,7 +2037,7 @@ struct MarkdownView: View {
             //    wrapping mid-token,
             //  - selectable text so the user can copy a snippet.
             ScrollView(.horizontal, showsIndicators: false) {
-                Text(code)
+                codeText(code)
                     .font(.system(size: max(13, bodyPointSize * 0.82), design: .monospaced))
                     .foregroundColor(.primary)
                     .textSelection(.enabled)
@@ -2014,7 +2050,59 @@ struct MarkdownView: View {
                 RoundedRectangle(cornerRadius: 8)
                     .stroke(Color.primary.opacity(0.15), lineWidth: 1)
             )
+        case .table(let header, let rows):
+            tableView(header: header, rows: rows)
+        case .rule:
+            Divider().padding(.vertical, 2)
         }
+    }
+
+    // Fenced-code text with optional find-in-page highlighting. Plain (no inline
+    // markdown), so backticks/asterisks in code stay literal; the monospaced font
+    // is applied by the caller's .font modifier.
+    private func codeText(_ code: String) -> Text {
+        var attr = AttributedString(code)
+        applyHighlight(&attr)
+        return Text(attr)
+    }
+
+    // Render a GFM table as an aligned Grid inside a horizontal scroll (wide tables,
+    // like the Command Reference, scroll rather than crush their columns). Header row
+    // is semibold; a hairline separates it from the body. Cells go through inlineText
+    // so inline code / bold and search highlighting work inside a table too.
+    @ViewBuilder
+    private func tableView(header: [String], rows: [[String]]) -> some View {
+        let cols = max(header.count, rows.map(\.count).max() ?? 0)
+        ScrollView(.horizontal, showsIndicators: false) {
+            Grid(alignment: .topLeading, horizontalSpacing: 14, verticalSpacing: 8) {
+                GridRow {
+                    ForEach(0..<max(cols, 1), id: \.self) { c in
+                        inlineText(c < header.count ? header[c] : "")
+                            .font(.system(size: bodyPointSize * 0.88, weight: .semibold))
+                            .foregroundColor(.primary)
+                    }
+                }
+                Divider().gridCellColumns(max(cols, 1))
+                ForEach(Array(rows.enumerated()), id: \.offset) { _, row in
+                    GridRow {
+                        ForEach(0..<max(cols, 1), id: \.self) { c in
+                            inlineText(c < row.count ? row[c] : "")
+                                .font(.system(size: bodyPointSize * 0.88))
+                                .foregroundColor(.primary)
+                                .lineSpacing(lineSpacing * 0.5)
+                        }
+                    }
+                }
+            }
+            .padding(12)
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(Color(.systemGray6))
+        .clipShape(RoundedRectangle(cornerRadius: 8))
+        .overlay(
+            RoundedRectangle(cornerRadius: 8)
+                .stroke(Color.primary.opacity(0.12), lineWidth: 1)
+        )
     }
 
     @ViewBuilder
@@ -2046,9 +2134,12 @@ struct MarkdownView: View {
                 attr[run.range].font = .system(size: bodyPointSize * 0.92, design: .monospaced)
                 attr[run.range].backgroundColor = Color.primary.opacity(0.12)
             }
+            applyHighlight(&attr)
             return Text(attr)
         }
-        return Text(s)
+        var plain = AttributedString(s)
+        applyHighlight(&plain)
+        return Text(plain)
     }
 
     // Parse a markdown string into an ordered sequence of typed blocks.
@@ -2056,7 +2147,28 @@ struct MarkdownView: View {
         var blocks: [MDBlock] = []
         var codeAccum: [String]? = nil
 
-        for line in source.components(separatedBy: "\n") {
+        // Split a "| a | b |" line into trimmed cells, dropping the edge pipes.
+        func tableCells(_ s: String) -> [String] {
+            var line = s.trimmingCharacters(in: .whitespaces)
+            if line.hasPrefix("|") { line.removeFirst() }
+            if line.hasSuffix("|") { line.removeLast() }
+            return line.components(separatedBy: "|").map { $0.trimmingCharacters(in: .whitespaces) }
+        }
+        // A GFM separator row: every cell is only dashes/colons/spaces and has a dash.
+        func isSeparatorRow(_ s: String) -> Bool {
+            let cells = tableCells(s)
+            guard !cells.isEmpty else { return false }
+            return cells.allSatisfy { cell in
+                !cell.isEmpty && cell.contains("-") && cell.allSatisfy { $0 == "-" || $0 == ":" || $0 == " " }
+            }
+        }
+
+        // Index-based so a table can look ahead one line for its separator row.
+        let lines = source.components(separatedBy: "\n")
+        var i = 0
+        while i < lines.count {
+            let line = lines[i]
+
             // Code fence toggle
             if line.hasPrefix("```") {
                 if let acc = codeAccum {
@@ -2065,29 +2177,53 @@ struct MarkdownView: View {
                 } else {
                     codeAccum = []
                 }
-                continue
+                i += 1; continue
             }
             // Accumulate inside a code block
             if codeAccum != nil {
                 codeAccum!.append(line)
-                continue
+                i += 1; continue
             }
 
             let t = line.trimmingCharacters(in: .whitespaces)
-            guard !t.isEmpty else { continue }
+            if t.isEmpty { i += 1; continue }
 
             // Headings: count leading # characters
             if t.first == "#" {
                 let level = t.prefix(while: { $0 == "#" }).count
                 let body = String(t.dropFirst(level)).trimmingCharacters(in: .whitespaces)
                 blocks.append(.heading(body, level: min(level, 4)))
-                continue
+                i += 1; continue
+            }
+
+            // GFM table: a "|"-bearing row immediately followed by a separator row.
+            // Consume the header + separator + every following pipe row (until a blank
+            // or non-pipe line). A "|" line without a separator underneath falls through
+            // and renders as an ordinary paragraph (raw pipes), never lost.
+            if t.contains("|"), i + 1 < lines.count, isSeparatorRow(lines[i + 1]) {
+                let header = tableCells(t)
+                var rows: [[String]] = []
+                var j = i + 2
+                while j < lines.count {
+                    let rt = lines[j].trimmingCharacters(in: .whitespaces)
+                    if rt.isEmpty || !rt.contains("|") { break }
+                    rows.append(tableCells(rt))
+                    j += 1
+                }
+                blocks.append(.table(header: header, rows: rows))
+                i = j; continue
+            }
+
+            // Horizontal rule: a line of 3+ identical -, *, or _ and nothing else.
+            if t.count >= 3, let f = t.first, f == "-" || f == "*" || f == "_", t.allSatisfy({ $0 == f }) {
+                blocks.append(.rule)
+                i += 1; continue
             }
 
             // Unordered list: starts with "- " or "* "
             if t.hasPrefix("- ") || t.hasPrefix("* ") {
                 blocks.append(.unorderedItem(String(t.dropFirst(2))))
-                continue
+                i += 1; continue
             }
 
             // Ordered list: starts with one or more digits followed by ". "
@@ -2098,7 +2234,7 @@ struct MarkdownView: View {
                     let number = Int(String(leadingDigits)) ?? 1
                     let body = String(afterDigits.dropFirst(2))
                     blocks.append(.orderedItem(body, number: number))
-                    continue
+                    i += 1; continue
                 }
             }
 
@@ -2108,6 +2244,7 @@ struct MarkdownView: View {
             } else {
                 blocks.append(.paragraph(t))
             }
+            i += 1
         }
 
         // Flush unclosed code block

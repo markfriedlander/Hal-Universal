@@ -128,6 +128,9 @@
 //  VoicePickerView.swift
 //   65  VoicePickerView (Read-Aloud Voice Selection)
 //
+//  GuideReaderView.swift
+//   66  GuideReaderView (In-App Guide Reader)
+//
 import SwiftUI
 import SharedModelStoreKit
 import Foundation
@@ -10066,6 +10069,14 @@ class ChatViewModel: ObservableObject {
     @Published var apiNavModelLibrary: Bool = false
     @Published var apiNavMaintenance: Bool = false
     @Published var apiNavLab: Bool = false
+    // Presents the in-app Guide reader (GuideReaderView) — the last item on the Help
+    // (life-ring) menu. Bridged from SET_UI_STATE:guidereader so the antenna can open
+    // and screenshot the reader for verification without a human tapping the menu.
+    @Published var apiNavGuideReader: Bool = false
+    // The Guide reader's find-in-page query, held on the VM so the antenna can drive
+    // search (SET_GUIDE_QUERY) and screenshot the highlight/jump, not just a human
+    // typing. Reset to empty when the reader closes. GuideReaderView binds to this.
+    @Published var guideReaderQuery: String = ""
     // Nested one level deeper: opens RoboRunner's editor from inside the Lab sheet. Bridged to
     // LabView's local showingRoboEditor via onChange, so the antenna can drive the RoboRunner UI
     // (screenshot/verify) without a human tapping through Settings -> Lab -> RoboRunner.

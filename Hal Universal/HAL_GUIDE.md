@@ -10,12 +10,12 @@ This guide is generated alongside Hal's own source code, and its command referen
 
 ## How this guide is organized
 
-1. **Screens and settings**: a tour of everything you can see and touch in the app, the top bar, the composer, the signals on each reply, and every settings screen.
-2. **RoboRunner**: the on-device automation language and runner in the Lab.
-3. **Command API**: the local HTTP server that lets another app or script drive Hal.
-4. **Command line**: the `hal` terminal command, a thin client for that same API.
-5. **Command reference**: every command verb, generated from the app's catalog.
-6. **Architecture**: how Hal works inside, memory, models, prompt building, thinking, and thermal pacing.
+1. **[Screens and settings](#screens-and-settings)**: a tour of everything you can see and touch in the app, the top bar, the composer, the signals on each reply, and every settings screen.
+2. **[RoboRunner](#roborunner)**: the on-device automation language and runner in the Lab.
+3. **[Command API](#command-api)**: the local HTTP server that lets another app or script drive Hal.
+4. **[Command line](#command-line)**: the `hal` terminal command, a thin client for that same API.
+5. **[Command reference](#command-reference)**: every command verb, generated from the app's catalog.
+6. **[Architecture](#architecture)**: how Hal works inside, memory, models, prompt building, thinking, and thermal pacing.
 
 ---
 

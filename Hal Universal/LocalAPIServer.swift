@@ -901,6 +901,16 @@ class HalTestConsole: ObservableObject {
             writeStateJSON(vm: vm)
             return "{\"status\":\"ok\",\"helpTopic\":\(topic.map { "\"\($0.rawValue)\"" } ?? "null")}"
 
+        } else if trimmed.hasPrefix("SET_GUIDE_QUERY:") {
+            // Test hook for the Guide reader's find-in-page. Opens the reader if it isn't
+            // already up, then sets its search query, so CC can screenshot the highlight
+            // and match readout without a human typing. Empty clears the search.
+            let term = String(trimmed.dropFirst("SET_GUIDE_QUERY:".count)).trimmingCharacters(in: .whitespaces)
+            if !vm.apiNavGuideReader { vm.apiNavGuideReader = true }
+            vm.guideReaderQuery = term
+            let esc = term.replacingOccurrences(of: "\\", with: "\\\\").replacingOccurrences(of: "\"", with: "\\\"")
+            return "{\"status\":\"ok\",\"command\":\"SET_GUIDE_QUERY\",\"query\":\"\(esc)\"}"
+
         } else if trimmed.hasPrefix("FTS_PROBE:") {
             // DEBUG (2026-07-30): FTS_PROBE:<source_type>|<word> — ground truth on why a
             // lexical self-knowledge search misses. Reports whether the stored content
@@ -1451,6 +1461,10 @@ class HalTestConsole: ObservableObject {
                 // apiNavRoboLibrary -> its local showingLibrary.
                 if value { vm.apiNavLab = true; vm.apiNavRoboEditor = true }
                 vm.apiNavRoboLibrary = value
+            case "guidereader":
+                // Top-level sheet (not nested): the in-app Guide reader, reached from the
+                // Help menu's last item. Lets the antenna open + screenshot the reader.
+                vm.apiNavGuideReader = value
             case "selfmodelshowprivate":
                 // Mirror the @AppStorage key flipped by the SelfReflectionView
                 // toggle. Driving it via UserDefaults lets the API set it

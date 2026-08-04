@@ -45,6 +45,7 @@ FILES=(
   "Hal Universal/MaintenanceView.swift"
   "Hal Universal/SpeechService.swift"
   "Hal Universal/VoicePickerView.swift"
+  "Hal Universal/GuideReaderView.swift"
 )
 
 OUT="Hal Universal/Hal_Source.txt"
