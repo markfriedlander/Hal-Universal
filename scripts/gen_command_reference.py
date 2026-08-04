@@ -87,7 +87,7 @@ def render(cat_order, cat_name, verbs):
     visible = [v for v in verbs if not v["debugOnly"]]
     hidden = len(verbs) - len(visible)
     lines = []
-    lines.append("<!-- BEGIN GENERATED COMMAND REFERENCE — do not edit by hand.")
+    lines.append("<!-- BEGIN GENERATED COMMAND REFERENCE. Do not edit by hand.")
     lines.append("     Regenerate with scripts/sync_command_reference.sh (reads CommandCatalog.all). -->")
     lines.append("")
     lines.append(f"*{len(visible)} commands. Generated from the app's command catalog, so this list always "

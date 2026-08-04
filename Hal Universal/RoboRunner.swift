@@ -2,17 +2,21 @@
 //  RoboRunner.swift
 //  Hal Universal
 //
-//  On-device script runner for reasoning/thermal experiments. Ships as a user-facing
-//  opt-in Lab tool (graduated out of DEBUG 2026-07-28); a handful of pure test-scaffolding
-//  verbs stay DEBUG-only via CommandDescriptor.debugOnly.
+//  On-device script runner for comparing models on the device itself, most pointedly
+//  how Apple Foundation Models answers with no network (so no Private Cloud Compute)
+//  versus the local MLX models. Ships as a user-facing opt-in Lab tool (graduated out
+//  of DEBUG 2026-07-28); a handful of pure test-scaffolding verbs stay DEBUG-only via
+//  CommandDescriptor.debugOnly.
 //
 //  WHY THIS EXISTS
-//  The Python harness (tests/) drives Hal over the network antenna, one command
-//  per HTTP round-trip. That is fine for single commands, but for a reasoning
-//  sweep it has three problems the test plan called out: it cannot read the
-//  device's own thermalState, it ties up the phone's composer with continuous
-//  remote-driven turns, and (for Apple Foundation Models) it forces Wi-Fi to be
-//  ON, so an AFM answer might be Private Cloud Compute rather than on-device.
+//  The goal is comparing models on the device itself: most pointedly, how Apple
+//  Foundation Models answers when the device genuinely cannot reach the network
+//  (so nothing can route to Private Cloud Compute), measured against the local MLX
+//  models. The Python harness (tests/) drives Hal over the network antenna, one
+//  command per HTTP round-trip, which is fine for single commands but cannot do that
+//  comparison for a sweep: it forces Wi-Fi ON (so an AFM answer might be Private Cloud
+//  Compute rather than on-device), it ties up the phone's composer with continuous
+//  remote-driven turns, and it cannot read the device's own thermalState.
 //
 //  RoboRunner moves the LOOP onto the device. A script (a plain list of steps)
 //  is handed to it once; it then runs autonomously ON the phone, pacing itself
@@ -680,8 +684,8 @@ nonisolated enum CommandCatalog {
         CommandDescriptor(verb: "SET_UI_STATE", args: "<state>", summary: "Drive the UI to a semantic state, for example open settings or the model library.", category: .ui, destructive: false),
         CommandDescriptor(verb: "SET_CHAT_DISPLAY", args: "<pt>:<density>", summary: "Set the chat text size and density, for testing the display controls.", category: .ui, destructive: false, debugOnly: true),
         CommandDescriptor(verb: "SCREENSHOT", args: nil, summary: "Capture the current key window as a PNG. View render only, does not show live camera or video.", category: .ui, destructive: false),
-        CommandDescriptor(verb: "SCROLL", args: "<down|up|top|bottom|pagedown|pageup>", summary: "Scroll the frontmost scroll view — general parity with a human swipe on any scrollable screen.", category: .ui, destructive: false),
-        CommandDescriptor(verb: "UI_TREE", args: "<controls?>", summary: "List on-screen accessibility elements (role, label, id, frame in points) — the general 'what's on screen' read. Add :controls for interactive elements only.", category: .ui, destructive: false),
+        CommandDescriptor(verb: "SCROLL", args: "<down|up|top|bottom|pagedown|pageup>", summary: "Scroll the frontmost scroll view (general parity with a human swipe on any scrollable screen).", category: .ui, destructive: false),
+        CommandDescriptor(verb: "UI_TREE", args: "<controls?>", summary: "List on-screen accessibility elements (role, label, id, frame in points): the general 'what's on screen' read. Add :controls for interactive elements only.", category: .ui, destructive: false),
         CommandDescriptor(verb: "TAP_LABEL", args: "<label>", summary: "Activate the visible element whose accessibility label matches (general tap-by-name; works on SwiftUI controls). A fallback for when no bespoke verb exists.", category: .ui, destructive: false),
         CommandDescriptor(verb: "TAP", args: "<x>,<y>", summary: "Activate the most specific element at a screen point (points, matching UI_TREE and SCREENSHOT coordinates).", category: .ui, destructive: false),
 

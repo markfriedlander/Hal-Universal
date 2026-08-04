@@ -63,3 +63,13 @@ OUT="Hal Universal/Hal_Source.txt"
 
 lines=$(wc -l < "$OUT")
 echo "sync_hal_source.sh: wrote $OUT ($lines lines, ${#FILES[@]} files)"
+
+# Keep the public HAL_GUIDE.md command reference in lockstep with the catalog.
+# The catalog (CommandCatalog.all in RoboRunner.swift) is the single source of
+# truth for verbs; regenerating here means the guide's command table can never
+# drift from the code, the same contract as Hal_Source.txt above.
+if [[ -x "$SCRIPT_DIR/sync_command_reference.sh" ]]; then
+  "$SCRIPT_DIR/sync_command_reference.sh"
+else
+  echo "sync_hal_source.sh: note: sync_command_reference.sh not found; skipped command-reference refresh" >&2
+fi
