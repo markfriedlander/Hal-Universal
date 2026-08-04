@@ -1,0 +1,282 @@
+#!/usr/bin/env python3
+"""hal - talk to and command a running Hal from the terminal.
+
+Part of the Lab (Hal's developer tooling). This is a THIN client: it forwards
+your input to the running Hal app's local API (the antenna) over HTTP and prints
+what comes back. The app holds the brain; this is just a doorway. Standard library
+only, so it runs on any Mac with no pip installs.
+
+USAGE
+  hal                      Interactive chat (a REPL). Plain lines are chat;
+                           lines starting with '/' are commands.
+  hal <text...>            One-shot chat: send the text, print Hal's reply.
+  hal /VERB[:args]         One-shot command, e.g.  hal /SWITCH_MODEL:qwen3.5
+  hal help                 Show Hal's command catalog (the HELP verb).
+  hal --help | -h          Show THIS usage.
+
+PIPING
+  cat notes.txt | hal "summarize this"      stdin is appended to the message.
+  hal /GET_STATE | jq .                      command output is plain JSON.
+
+CONFIG (host / port / token), resolved in this order:
+  1. env vars: HAL_HOST, HAL_PORT, HAL_TOKEN
+  2. ~/.config/hal/config.json          {"host":..., "port":..., "token":...}
+  3. a repo dev config if present:      <repo>/tests/.hal_api_config.json
+  4. defaults: host 127.0.0.1, port 8766  (a token is still required from 1-3)
+
+The talk-vs-command split is deliberate and consistent: plain text is always
+chat, a leading '/' always marks a command. Nothing is ever guessed.
+"""
+
+import json
+import os
+import sys
+import urllib.request
+import urllib.error
+
+DEFAULT_HOST = "127.0.0.1"
+DEFAULT_PORT = 8766
+
+
+# --- configuration -----------------------------------------------------------
+
+def _repo_dev_config_path():
+    """tests/.hal_api_config.json relative to this script, when run from a checkout."""
+    here = os.path.dirname(os.path.abspath(__file__))
+    return os.path.join(os.path.dirname(here), "tests", ".hal_api_config.json")
+
+
+def load_config():
+    """Resolve {host, port, token}. Env wins, then ~/.config/hal, then repo dev config."""
+    host = os.environ.get("HAL_HOST")
+    port = os.environ.get("HAL_PORT")
+    token = os.environ.get("HAL_TOKEN")
+
+    file_cfg = {}
+    for path in (os.path.expanduser("~/.config/hal/config.json"), _repo_dev_config_path()):
+        if os.path.exists(path):
+            try:
+                with open(path) as f:
+                    file_cfg = json.load(f)
+                break
+            except Exception:
+                pass
+
+    host = host or file_cfg.get("host") or DEFAULT_HOST
+    port = int(port or file_cfg.get("port") or DEFAULT_PORT)
+    token = token or file_cfg.get("token")
+    return {"host": host, "port": port, "token": token}
+
+
+def _require_token(cfg):
+    if not cfg.get("token"):
+        _die(
+            "No API token found. Set one of:\n"
+            "  export HAL_TOKEN=<token>\n"
+            "  ~/.config/hal/config.json  ->  {\"host\":..., \"port\":..., \"token\":...}\n"
+            "The token is shown in the Lab settings of the running Hal app."
+        )
+
+
+# --- transport ---------------------------------------------------------------
+
+def _url(cfg, path):
+    return f"http://{cfg['host']}:{cfg['port']}{path}"
+
+
+def _friendly_conn_error(cfg, err):
+    return (
+        f"Cannot reach Hal at {_url(cfg, '')} ({err}).\n"
+        "Is the Hal app running with the Lab API turned on? "
+        "(The API is off by default; enable it in the Lab settings.)"
+    )
+
+
+def http_post(cfg, path, payload, timeout=300):
+    req = urllib.request.Request(
+        _url(cfg, path),
+        data=json.dumps(payload).encode(),
+        headers={
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {cfg['token']}",
+        },
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return json.loads(resp.read().decode())
+    except urllib.error.HTTPError as e:
+        body = e.read().decode()
+        try:
+            return json.loads(body)
+        except Exception:
+            return {"error": f"HTTP {e.code}: {body}"}
+    except urllib.error.URLError as e:
+        return {"error": _friendly_conn_error(cfg, e.reason)}
+    except Exception as e:  # noqa: BLE001 - surface anything else plainly
+        return {"error": str(e)}
+
+
+def send_chat(cfg, message):
+    return http_post(cfg, "/chat", {"message": message})
+
+
+def send_command(cfg, command):
+    return http_post(cfg, "/command", {"command": command})
+
+
+# --- rendering ---------------------------------------------------------------
+
+def _print_chat(result, prefix=""):
+    if "error" in result:
+        print(f"{prefix}error: {result['error']}", file=sys.stderr)
+        return 1
+    resp = result.get("response")
+    if resp is None:
+        # Not the shape we expected; show what we got rather than lie about it.
+        print(f"{prefix}{json.dumps(result)}")
+        return 0
+    print(f"{prefix}{resp}")
+    return 0
+
+
+def _print_command(result):
+    if "error" in result:
+        print(f"error: {result['error']}", file=sys.stderr)
+        return 1
+    print(json.dumps(result, indent=2))
+    return 0
+
+
+def _run_command_with_confirm(cfg, verb):
+    """Send a command; if the safety layer blocks a confirmable (Advanced-mode) destructive
+    command, show why and offer to retry with the confirm marker. Used by the interactive REPL.
+    (In one-shot mode you just append ' --yes' yourself; the marker travels to the interpreter.)"""
+    result = send_command(cfg, verb)
+    if isinstance(result, dict) and result.get("blocked") == "safety":
+        msg = result.get("message", "blocked by the safety layer")
+        print(f"  {msg}")
+        confirmable = ("--yes" in msg) or ("Re-send" in msg)
+        if confirmable:
+            try:
+                ans = input("  Are you sure? [y/N] ").strip().lower()
+            except (EOFError, KeyboardInterrupt):
+                print()
+                ans = ""
+            if ans in ("y", "yes"):
+                return _print_command(send_command(cfg, verb + " --yes"))
+        return 1
+    return _print_command(result)
+
+
+def _print_help_catalog(result):
+    """Pretty-print the HELP verb's catalog (grouped by category, [!] = destructive)."""
+    if "error" in result:
+        print(f"error: {result['error']}", file=sys.stderr)
+        return 1
+    cmds = result.get("commands")
+    if not isinstance(cmds, list):
+        # Older build or unexpected shape: fall back to raw JSON.
+        print(json.dumps(result, indent=2))
+        return 0
+    total = result.get("total", len(cmds))
+    shown = result.get("count", len(cmds))
+    print(f"Hal command catalog: {shown} of {total} verbs. [!] marks destructive.\n")
+    by_cat = {}
+    for c in cmds:
+        by_cat.setdefault(c.get("category", "Other"), []).append(c)
+    for cat in by_cat:  # preserve server order (already grouped/sorted server-side)
+        print(cat)
+        for c in by_cat[cat]:
+            flag = " [!]" if c.get("destructive") else ""
+            print(f"  {c.get('usage', c.get('verb',''))}{flag}")
+            summary = c.get("summary")
+            if summary:
+                print(f"      {summary}")
+        print()
+    print("In the terminal: `hal /VERB[:args]` runs a command, plain text chats, "
+          "`hal help` shows this list.")
+    return 0
+
+
+# --- interactive REPL --------------------------------------------------------
+
+def repl(cfg):
+    print("Hal interactive. Type to chat. '/VERB' runs a command, '/help' lists them, "
+          "'/quit' or Ctrl-D exits.")
+    while True:
+        try:
+            line = input("hal> ").strip()
+        except (EOFError, KeyboardInterrupt):
+            print()
+            return 0
+        if not line:
+            continue
+        if line in ("/quit", "/exit", "/q"):
+            return 0
+        if line.startswith("/"):
+            verb = line[1:].strip()
+            if verb.lower() in ("help", "commands"):
+                _print_help_catalog(send_command(cfg, "HELP"))
+            else:
+                _run_command_with_confirm(cfg, verb)
+        else:
+            _print_chat(send_chat(cfg, line), prefix="  ")
+
+
+# --- entry -------------------------------------------------------------------
+
+def _stdin_text():
+    """Return piped stdin (stripped) if stdin is not a terminal, else ''."""
+    if sys.stdin is not None and not sys.stdin.isatty():
+        return sys.stdin.read().strip()
+    return ""
+
+
+def _die(msg, code=2):
+    print(msg, file=sys.stderr)
+    sys.exit(code)
+
+
+def main(argv):
+    if argv and argv[0] in ("--help", "-h"):
+        print(__doc__.strip())
+        return 0
+
+    cfg = load_config()
+
+    # `hal help` -> the Hal command catalog (distinct from `--help`, the CLI usage).
+    if argv and argv[0].lower() in ("help", "commands") and len(argv) == 1:
+        _require_token(cfg)
+        return _print_help_catalog(send_command(cfg, "HELP"))
+
+    piped = _stdin_text()
+
+    # No args: REPL if interactive, else treat piped stdin as a one-shot chat.
+    if not argv:
+        if piped:
+            _require_token(cfg)
+            return _print_chat(send_chat(cfg, piped))
+        return repl(cfg)
+
+    # One-shot command: first token starts with '/'.
+    if argv[0].startswith("/"):
+        _require_token(cfg)
+        verb = " ".join(argv)[1:].strip()
+        if verb.lower() in ("help", "commands"):
+            return _print_help_catalog(send_command(cfg, "HELP"))
+        return _print_command(send_command(cfg, verb))
+
+    # One-shot chat: join args, append piped stdin if any.
+    _require_token(cfg)
+    message = " ".join(argv)
+    if piped:
+        message = f"{message}\n\n{piped}"
+    return _print_chat(send_chat(cfg, message))
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main(sys.argv[1:]))
+    except KeyboardInterrupt:
+        sys.exit(130)
