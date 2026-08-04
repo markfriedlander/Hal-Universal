@@ -1424,6 +1424,11 @@ class HalTestConsole: ObservableObject {
                 // verify the coach's problem list without a human tapping Check.
                 if value { vm.apiNavLab = true; vm.apiNavRoboEditor = true }
                 vm.apiNavRoboIssues = value
+            case "robolibrary":
+                // Same nesting for the Library sheet (examples + past runs). RoboEditorView bridges
+                // apiNavRoboLibrary -> its local showingLibrary.
+                if value { vm.apiNavLab = true; vm.apiNavRoboEditor = true }
+                vm.apiNavRoboLibrary = value
             case "selfmodelshowprivate":
                 // Mirror the @AppStorage key flipped by the SelfReflectionView
                 // toggle. Driving it via UserDefaults lets the API set it

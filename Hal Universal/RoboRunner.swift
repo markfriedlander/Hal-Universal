@@ -1404,15 +1404,17 @@ struct RoboEditorView: View {
     @ObservedObject private var robo = RoboRunner.shared
     @AppStorage("lab.roboScript") private var script: String = RoboEditorView.sampleScript
     @State private var showingHelp = false
-    @State private var showingResults = false
+    @State private var showingLibrary = false
     @State private var showingIssues = false
     // Wand-in-field: draft a script FROM the editor's own text (your description), replacing it in
     // place — replaces the old separate Draft sheet. `preDraftText` stashes the pre-change text so a
-    // single Undo restores it — used by BOTH the wand and Clear, so neither can silently eat your
-    // work. `undoFromDraft` distinguishes the two so the status line says the right thing.
+    // single Undo restores it — used by the wand, Clear, AND loading from the Library, so none of them
+    // can silently eat your work. `stashKind` distinguishes them so the status line says the right thing.
+    enum StashKind { case drafted, cleared, loaded }
     @State private var generatingDraft = false
     @State private var preDraftText: String? = nil
-    @State private var undoFromDraft = false
+    @State private var stashKind: StashKind = .cleared
+    @State private var loadedTitle: String = ""
     // Confirm before the wand clobbers text that already looks like a real script (see draftFromField).
     @State private var showingDraftOverwriteConfirm = false
     // Editor focus — drives the input-accessory Done (dismiss the keyboard without closing the
@@ -1516,21 +1518,33 @@ struct RoboEditorView: View {
                               : "checkmark.seal")
                     }
                     Spacer()
-                    // Always enabled: the Results sheet is the run HISTORY, which can hold runs
-                    // from earlier sessions even before anything runs this session.
-                    Button { showingResults = true } label: { Label("Results", systemImage: "doc.text.magnifyingglass") }
+                    // The Library: bundled example scripts to learn from, plus this device's run
+                    // HISTORY. Always enabled — examples are there from the first launch, and past runs
+                    // can hold runs from earlier sessions. Either can be loaded back into the editor.
+                    Button { showingLibrary = true } label: { Label("Library", systemImage: "doc.text.magnifyingglass") }
                 }
                 // Clear/Done now live in RoboScriptEditor's input-accessory toolbar (above the
                 // keyboard), because a SwiftUI .keyboard toolbar won't attach to a UITextView.
             }
             .sheet(isPresented: $showingHelp) { RoboHelpView(onInsert: { appendToScript($0) }) }
-            .sheet(isPresented: $showingResults) { RoboResultsView() }
+            .sheet(isPresented: $showingLibrary) {
+                // Load replaces the editor text (stashed for one-tap Undo) and closes the Library.
+                RoboLibraryView(onLoad: { text, title in
+                    loadScript(text, title: title)
+                    showingLibrary = false
+                })
+            }
             .sheet(isPresented: $showingIssues) { RoboIssuesView(issues: liveIssues) }
             // Antenna bridge: SET_UI_STATE:roboissues drives apiNavRoboIssues -> the Check sheet, so
             // the coach's problem list can be screenshot/verified without a human tapping Check.
             .onChange(of: chatViewModel.apiNavRoboIssues) { _, open in showingIssues = open }
             .onChange(of: showingIssues) { _, open in
                 if !open { chatViewModel.apiNavRoboIssues = false }
+            }
+            // Same bridge for the Library (examples + past runs): SET_UI_STATE:robolibrary.
+            .onChange(of: chatViewModel.apiNavRoboLibrary) { _, open in showingLibrary = open }
+            .onChange(of: showingLibrary) { _, open in
+                if !open { chatViewModel.apiNavRoboLibrary = false }
             }
             .alert("This already looks like a script", isPresented: $showingDraftOverwriteConfirm) {
                 Button("Draft anyway") { performDraft() }
@@ -1570,9 +1584,12 @@ struct RoboEditorView: View {
         } else if liveIssueCount > 0 {
             Label("\(liveIssueCount) problem\(liveIssueCount == 1 ? "" : "s") — tap Check to see them",
                   systemImage: "exclamationmark.triangle.fill").foregroundColor(.red)
-        } else if preDraftText != nil && undoFromDraft {
+        } else if preDraftText != nil && stashKind == .drafted {
             Label("I drafted this for you. Edit or run it when you're ready.", systemImage: "wand.and.stars")
                 .foregroundColor(.secondary)
+        } else if preDraftText != nil && stashKind == .loaded {
+            Label("Loaded \(loadedTitle.isEmpty ? "script" : "“\(loadedTitle)”"). Tap Undo to restore.",
+                  systemImage: "square.and.arrow.down").foregroundColor(.secondary)
         } else if preDraftText != nil {
             Label("Cleared. Tap Undo to restore.", systemImage: "trash").foregroundColor(.secondary)
         } else {
@@ -1612,29 +1629,41 @@ struct RoboEditorView: View {
                     messages: [.system(system), .user(user)], temperature: 0.2)
             }
             preDraftText = previous
-            undoFromDraft = true
+            stashKind = .drafted
             script = draft.script
             generatingDraft = false
         }
     }
 
-    /// Restore the text the last change (wand draft OR Clear) replaced, and clear the stash.
+    /// Restore the text the last change (wand draft, Clear, OR a Library load) replaced, clearing the stash.
     private func undoDraft() {
         guard let previous = preDraftText else { return }
         script = previous
         preDraftText = nil
-        undoFromDraft = false
+        stashKind = .cleared
+        loadedTitle = ""
     }
 
     /// Empty the editor, stashing the current text so Undo can restore it (Clear can't eat your
-    /// work either). Marked not-a-draft so the status line reads "Cleared" rather than "I drafted…".
+    /// work either). Marked as a clear so the status line reads "Cleared" rather than "I drafted…".
     private func clearField() {
         guard !script.isEmpty else { return }
         preDraftText = script
-        undoFromDraft = false
+        stashKind = .cleared
         script = ""
         // Drop the keyboard so the "Cleared. Tap Undo to restore." status + Undo button are
         // immediately visible (otherwise the keyboard hides them and Clear looks un-undoable).
+        editorFocused = false
+    }
+
+    /// Load a script from the Library (a bundled example or a past run) into the editor, replacing the
+    /// current text but stashing it first so a single Undo restores what you had — same "can't eat your
+    /// work" contract as the wand and Clear. Drops the keyboard so the Undo affordance is visible.
+    private func loadScript(_ text: String, title: String) {
+        preDraftText = script
+        stashKind = .loaded
+        loadedTitle = title
+        script = text
         editorFocused = false
     }
 
@@ -1872,32 +1901,120 @@ struct RoboHelpView: View {
     }
 }
 
-/// The run history: a list of past runs (newest first), each opening a detail view with a
-/// card / raw-JSON toggle and a Share button. Reads the robo_results_*.json files on appear.
-struct RoboResultsView: View {
+/// A bundled, read-only example script that teaches one RoboRunner concept. Shipped in the Library so
+/// a new user learns the language by reading (and loading) real scripts instead of facing a blank page.
+/// Each `script` validates clean and runs in Safe mode. The set is intentionally small and progressive.
+struct RoboExample: Identifiable {
+    let id = UUID()
+    let title: String
+    let blurb: String
+    let script: String
+
+    static let bundled: [RoboExample] = [
+        RoboExample(
+            title: "Your first script",
+            blurb: "The simplest script: one ASK. It runs a real turn and captures the answer in the Library.",
+            script: """
+            # Your first RoboRunner script.
+            # ASK runs one real turn; its answer is saved under Your runs.
+            ASK In one sentence, what makes a good cup of coffee?
+            """),
+        RoboExample(
+            title: "Take your time",
+            blurb: "Steps run top to bottom. WAIT pauses between them (longer automatically when the device is warm).",
+            script: """
+            # Several steps in a row, with a pause between them.
+            ASK Name a color. One word.
+            WAIT 3
+            ASK Now name a fruit of that color. One word.
+            """),
+        RoboExample(
+            title: "Temperature spread",
+            blurb: "A sweep repeats the block once per value, filling in {{TEMP}} each pass. Watch a higher temperature make the answer more varied.",
+            script: """
+            # {{TEMP}} is a placeholder the FOR fills in each pass.
+            FOR TEMP IN 0.2, 0.7, 1.2
+                SET_TEMPERATURE:{{TEMP}}
+                ASK In one short sentence, describe a city at night.
+            END
+            """),
+        RoboExample(
+            title: "Same question, different framing",
+            blurb: "The system prompt shapes HOW the model answers. Ask one question two ways and compare. Ends by clearing the override so your chat goes back to normal.",
+            script: """
+            # Same question, two framings, side by side.
+            SET_SYSTEM_PROMPT:You are terse. Answer in one short sentence.
+            ASK What is the ocean?
+            SET_SYSTEM_PROMPT:You are a poet. Answer with a vivid metaphor.
+            ASK What is the ocean?
+            # Restore the default framing when done.
+            CLEAR_SYSTEM_PROMPT
+            """),
+        RoboExample(
+            title: "Compare models",
+            blurb: "Ask the same question to different models. Add another model id from the Model Library to the list to compare more.",
+            script: """
+            # {{MODEL}} is filled in each pass. Add more ids to the list to compare.
+            FOR MODEL IN apple-foundation-models
+                SWITCH_MODEL:{{MODEL}}
+                ASK In one sentence, introduce yourself.
+            END
+            """),
+        RoboExample(
+            title: "Watch it think",
+            blurb: "Two-phase thinking: the model reasons first, then answers. The reasoning prompt uses a {question} placeholder — note the single braces, a different thing than a sweep's {{VAR}}.",
+            script: """
+            # Turn on two-phase thinking and customize the reasoning step.
+            SET_REASONING:true
+            SET_REASONING_PROMPT:Think step by step about {question}, then give a final answer.
+            ASK A train leaves at 2pm going 60mph. How far has it gone by 3:30pm?
+            """),
+    ]
+}
+
+/// The Library: this device's run history plus bundled example scripts to learn from. Two sections so
+/// the read-only examples can never be confused with (or accidentally swiped away alongside) the user's
+/// own runs. "Your runs" comes first so an experienced builder — who opens the Library mostly to reload
+/// a past run — isn't scrolling past the examples every time; a newcomer has few/no runs, so the
+/// examples are still right there under a short list. Either kind loads into the editor via `onLoad`,
+/// which stashes the current text for one-tap Undo. Reads the robo_results_*.json files on appear.
+struct RoboLibraryView: View {
     @Environment(\.dismiss) private var dismiss
+    let onLoad: (_ script: String, _ title: String) -> Void
     @State private var runs: [RoboRunSummary] = []
 
     var body: some View {
         NavigationView {
-            Group {
-                if runs.isEmpty {
-                    ContentUnavailableView(
-                        "No runs yet",
-                        systemImage: "doc.text.magnifyingglass",
-                        description: Text("Run a script and its results are saved here."))
-                } else {
-                    List(runs) { run in
-                        NavigationLink { RoboRunDetailView(run: run) } label: {
+            List {
+                Section("Your runs") {
+                    if runs.isEmpty {
+                        Text("No runs yet. Run a script and it's saved here.")
+                            .font(.caption).foregroundColor(.secondary)
+                    } else {
+                        ForEach(runs) { run in
+                            NavigationLink { RoboRunDetailView(run: run, onLoad: onLoad) } label: {
+                                VStack(alignment: .leading, spacing: 3) {
+                                    Text(run.title).font(.subheadline).fontWeight(.medium).lineLimit(2)
+                                    Text(subtitle(run)).font(.caption).foregroundColor(.secondary)
+                                }
+                            }
+                        }
+                    }
+                }
+                Section("Examples") {
+                    ForEach(RoboExample.bundled) { example in
+                        NavigationLink {
+                            RoboExampleDetailView(example: example, onLoad: onLoad)
+                        } label: {
                             VStack(alignment: .leading, spacing: 3) {
-                                Text(run.title).font(.subheadline).fontWeight(.medium).lineLimit(2)
-                                Text(subtitle(run)).font(.caption).foregroundColor(.secondary)
+                                Text(example.title).font(.subheadline).fontWeight(.medium)
+                                Text(example.blurb).font(.caption).foregroundColor(.secondary).lineLimit(2)
                             }
                         }
                     }
                 }
             }
-            .navigationTitle("Past Runs")
+            .navigationTitle("Library")
             .navigationBarTitleDisplayMode(.inline)
             .toolbar { ToolbarItem(placement: .cancellationAction) { Button("Done") { dismiss() } } }
             .onAppear { runs = RoboRunner.shared.pastRuns() }
@@ -1910,11 +2027,47 @@ struct RoboResultsView: View {
     }
 }
 
+/// A bundled example in detail: what it teaches, the script itself, and a "Load into editor" button.
+struct RoboExampleDetailView: View {
+    let example: RoboExample
+    let onLoad: (_ script: String, _ title: String) -> Void
+
+    var body: some View {
+        ScrollView {
+            VStack(alignment: .leading, spacing: 14) {
+                Text(example.blurb).font(.callout).foregroundColor(.secondary)
+                VStack(alignment: .leading, spacing: 4) {
+                    Text("SCRIPT").font(.caption2).fontWeight(.semibold).foregroundColor(.secondary)
+                    Text(example.script)
+                        .font(.system(.caption, design: .monospaced))
+                        .textSelection(.enabled)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .padding(10)
+                        .background(Color.secondary.opacity(0.12))
+                        .clipShape(RoundedRectangle(cornerRadius: 8))
+                }
+                Button {
+                    onLoad(example.script, example.title)
+                } label: {
+                    Label("Load into editor", systemImage: "square.and.arrow.down")
+                        .frame(maxWidth: .infinity)
+                }
+                .buttonStyle(.borderedProminent)
+            }
+            .padding()
+        }
+        .navigationTitle(example.title)
+        .navigationBarTitleDisplayMode(.inline)
+    }
+}
+
 /// One run in detail: the script at the top, then a card per captured turn (question, thinking,
 /// answer, and the timing / thermal metrics), with a toggle to the raw JSON and a Share button
 /// that hands the run's .json file to the iOS share sheet.
 struct RoboRunDetailView: View {
     let run: RoboRunSummary
+    // Present when reached from the Library: load this run's script back into the editor (reuse/edit).
+    var onLoad: ((_ script: String, _ title: String) -> Void)? = nil
     @State private var showRawJSON = false
     @State private var showingShare = false
 
@@ -1943,6 +2096,11 @@ struct RoboRunDetailView: View {
         .toolbar {
             ToolbarItem(placement: .primaryAction) {
                 Menu {
+                    if let onLoad, !run.run.script.isEmpty {
+                        Button { onLoad(run.run.script, run.title) } label: {
+                            Label("Load into editor", systemImage: "square.and.arrow.down")
+                        }
+                    }
                     Toggle(isOn: $showRawJSON) { Label("Raw JSON", systemImage: "curlybraces") }
                     Button { showingShare = true } label: { Label("Share", systemImage: "square.and.arrow.up") }
                 } label: { Image(systemName: "ellipsis.circle") }
