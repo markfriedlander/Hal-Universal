@@ -34410,7 +34410,7 @@ nonisolated enum CommandCatalog {
         CommandDescriptor(verb: "CLEAR_SYSTEM_PROMPT", args: nil, summary: "Clear the system-prompt override and restore the default.", category: .persona, destructive: false),
 
         // Sampling & Generation
-        CommandDescriptor(verb: "SET_TEMPERATURE", args: "<0.0-2.0>", summary: "Set the model's sampling temperature.", category: .sampling, destructive: false),
+        CommandDescriptor(verb: "SET_TEMPERATURE", args: "<0.0-1.0>", summary: "Set the model's sampling temperature.", category: .sampling, destructive: false),
         CommandDescriptor(verb: "SET_REPETITION_PENALTY", args: "<value>", summary: "Set the repetition penalty.", category: .sampling, destructive: false),
         CommandDescriptor(verb: "SET_TOP_P", args: "<0.0-1.0>", summary: "Set nucleus sampling top-p.", category: .sampling, destructive: false),
         CommandDescriptor(verb: "SET_TOP_K", args: "<int>", summary: "Set top-k sampling.", category: .sampling, destructive: false),
