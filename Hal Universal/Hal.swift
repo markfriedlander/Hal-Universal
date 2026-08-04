@@ -10064,6 +10064,9 @@ class ChatViewModel: ObservableObject {
     // LabView's local showingRoboEditor via onChange, so the antenna can drive the RoboRunner UI
     // (screenshot/verify) without a human tapping through Settings -> Lab -> RoboRunner.
     @Published var apiNavRoboEditor: Bool = false
+    // Nested one deeper still: opens RoboRunner's Check (Script Check) sheet from inside the editor,
+    // so the antenna can screenshot/verify the coach's problem list without a human tapping Check.
+    @Published var apiNavRoboIssues: Bool = false
 
     // API-driven scroll inside the open Settings sheet. Set to "personality",
     // "importexport", or "ai" via SET_UI_STATE; the ActionsView observes and

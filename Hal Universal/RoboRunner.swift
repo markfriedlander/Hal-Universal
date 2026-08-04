@@ -1526,6 +1526,12 @@ struct RoboEditorView: View {
             .sheet(isPresented: $showingHelp) { RoboHelpView(onInsert: { appendToScript($0) }) }
             .sheet(isPresented: $showingResults) { RoboResultsView() }
             .sheet(isPresented: $showingIssues) { RoboIssuesView(issues: liveIssues) }
+            // Antenna bridge: SET_UI_STATE:roboissues drives apiNavRoboIssues -> the Check sheet, so
+            // the coach's problem list can be screenshot/verified without a human tapping Check.
+            .onChange(of: chatViewModel.apiNavRoboIssues) { _, open in showingIssues = open }
+            .onChange(of: showingIssues) { _, open in
+                if !open { chatViewModel.apiNavRoboIssues = false }
+            }
             .alert("This already looks like a script", isPresented: $showingDraftOverwriteConfirm) {
                 Button("Draft anyway") { performDraft() }
                 Button("Cancel", role: .cancel) { }
