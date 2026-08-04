@@ -52,6 +52,38 @@ enum PowerUserMode: String, CaseIterable {
     case multi = "Multi LLM (Salon)"
 }
 
+// The drill-in Settings sub-screens, expressed as a navigation path (2026-08-05 nav migration).
+// These six screens used to be modal `.sheet`s; they are now PUSHES inside the Settings
+// NavigationStack, so they read as "a place inside Settings" (chevron in, back out) rather than
+// a separate task — and, on the Mac, they inherit the Settings window rather than opening at a
+// fixed sheet size. The antenna drives them the same way a human does: open Settings, then
+// append a destination to `chatViewModel.settingsPath`. System Prompt and Export stay modal
+// (commit-abandon editor and OS share handoff), so they are NOT in this enum.
+enum SettingsDestination: Hashable {
+    case powerUser
+    case salon
+    case modelFraming
+    case selfModel
+    case lab
+    case maintenance
+    case modelLibrary
+
+    /// Stable string the antenna uses for this screen, matching the SET_UI_STATE target verbs
+    /// (SET_UI_STATE:poweruser, :salonsettings, ...). Exposed in GET_UI_STATE's `settingsPath`
+    /// so nav state is verifiable programmatically (the Mac screenshot pull is TCC-blocked).
+    var antennaName: String {
+        switch self {
+        case .powerUser:    return "poweruser"
+        case .salon:        return "salonsettings"
+        case .modelFraming: return "modelframing"
+        case .selfModel:    return "selfmodel"
+        case .lab:          return "lab"
+        case .maintenance:  return "maintenance"
+        case .modelLibrary: return "modellibrary"
+        }
+    }
+}
+
 struct ActionsView: View {
     @Environment(\.dismiss) var dismiss
     @EnvironmentObject var chatViewModel: ChatViewModel
@@ -60,14 +92,11 @@ struct ActionsView: View {
 
     @Binding var showingDocumentPicker: Bool
     @State private var showingExportSheet = false
-    @State private var showingPowerUserSheet = false
-    @State private var showingSalonModeSheet = false
     @State private var powerUserMode: PowerUserMode = .single
+    // System Prompt stays modal (Cancel/Save discard path). The other former sub-sheets
+    // (Power User, Salon, Model Framing, Self Model, Lab, Maintenance) are now pushes driven
+    // by chatViewModel.settingsPath — see SettingsDestination.
     @State private var showingSystemPromptEditor = false
-    @State private var showingModelFramingDetail = false
-    @State private var showingSelfReflectionViewer = false
-    @State private var showingLab = false   // The Lab (developer / power-user tools)
-    @State private var showingMaintenance = false   // Maintenance & Reset page
     @State private var initialSettingsSnapshot: [String: Any] = [:]
     @State private var skipComparisonOnDismiss = false
     // Read-Aloud (TTS) preferences. Same UserDefaults keys SpeechService reads at speak() time,
@@ -82,7 +111,7 @@ struct ActionsView: View {
     @AppStorage(ChatDensity.storageKey) private var chatDensityRaw: String = ChatDensity.defaultValue.rawValue
 
     var body: some View {
-        NavigationView {
+        NavigationStack(path: $chatViewModel.settingsPath) {
             ScrollViewReader { proxy in
             Form {
                 personalitySection
@@ -126,6 +155,40 @@ struct ActionsView: View {
                     Button("Done") { dismiss() }
                 }
             }
+            // Drill-in sub-screens (2026-08-05 nav migration). Each destination returns the same
+            // view the old modal `.sheet` presented, with the same environment objects, so the
+            // screens are unchanged — only their presentation (push vs sheet) differs. Whether a
+            // human taps the row (NavigationLink) or the antenna appends to settingsPath, the same
+            // push happens.
+            .navigationDestination(for: SettingsDestination.self) { destination in
+                switch destination {
+                case .powerUser:
+                    PowerUserView()
+                        .environmentObject(chatViewModel)
+                        .environmentObject(mlxDownloader)
+                case .salon:
+                    SalonModeView()
+                        .environmentObject(chatViewModel)
+                        .environmentObject(mlxDownloader)
+                case .modelFraming:
+                    ModelFramingDetailView()
+                        .environmentObject(chatViewModel)
+                case .selfModel:
+                    SelfReflectionView()
+                        .environmentObject(chatViewModel)
+                case .lab:
+                    LabView()
+                        .environmentObject(chatViewModel)
+                case .maintenance:
+                    MaintenanceView()
+                        .environmentObject(chatViewModel)
+                        .environmentObject(mlxDownloader)
+                case .modelLibrary:
+                    ModelLibraryView()
+                        .environmentObject(chatViewModel)
+                        .environmentObject(mlxDownloader)
+                }
+            }
             .onChange(of: chatViewModel.apiScrollSettingsTarget) { _, newTarget in
                 guard !newTarget.isEmpty else { return }
                 withAnimation { proxy.scrollTo(newTarget, anchor: .top) }
@@ -153,32 +216,29 @@ struct ActionsView: View {
         .sheet(isPresented: $showingExportSheet) {
             ShareSheet(activityItems: [chatViewModel.exportChatHistory()])
         }
-        .sheet(isPresented: $showingPowerUserSheet) {
-            PowerUserView()
-                .environmentObject(chatViewModel)
-                .environmentObject(mlxDownloader)
-        }
-        .sheet(isPresented: $showingSalonModeSheet) {
-            SalonModeView()
-                .environmentObject(chatViewModel)
-                .environmentObject(mlxDownloader)
-        }
-        .sheet(isPresented: $showingSystemPromptEditor) {
+        // System Prompt stays a modal: it's a Cancel/Save editor, and the discard path is the
+        // whole point (a half-typed prompt must be abandonable). Antenna routing follows the real
+        // user path — the LocalAPIServer opens Settings and sets apiNavSystemPrompt; we present
+        // the editor from here, from inside Settings, rather than as a top-level bypass. On Mac it
+        // presents as a window-filling cover (resizable) stacked over Settings; the discard path is
+        // unaffected because it lives in the editor's own Cancel/Save toolbar, not swipe-to-dismiss.
+        .macResizablePresentation(isPresented: $showingSystemPromptEditor) {
             SystemPromptEditorView()
                 .environmentObject(chatViewModel)
         }
-        .sheet(isPresented: $showingLab) {
-            LabView()
-                .environmentObject(chatViewModel)
+        .onChange(of: chatViewModel.apiNavSystemPrompt) { _, on in
+            if on {
+                showingSystemPromptEditor = true
+                chatViewModel.apiNavSystemPrompt = false
+            }
         }
-        .sheet(isPresented: $showingMaintenance) {
-            MaintenanceView()
-                .environmentObject(chatViewModel)
-                .environmentObject(mlxDownloader)
-        }
-        .sheet(isPresented: $showingModelFramingDetail) {
-            ModelFramingDetailView()
-                .environmentObject(chatViewModel)
+        .onAppear {
+            // Covers the case where Settings was opened *by* the System Prompt antenna call, so
+            // apiNavSystemPrompt is already true before onChange can observe it.
+            if chatViewModel.apiNavSystemPrompt {
+                showingSystemPromptEditor = true
+                chatViewModel.apiNavSystemPrompt = false
+            }
         }
         .onAppear {
             chatViewModel.isInSettingsFlow = true
@@ -307,14 +367,8 @@ struct ActionsView: View {
     /// 2026-07-28; ships as a user-facing opt-in.
     private var labSection: some View {
         Section {
-            Button {
-                showingLab = true
-            } label: {
-                HStack {
-                    Label("The Lab", systemImage: "flask")
-                    Spacer()
-                    Image(systemName: "chevron.right").font(.caption).foregroundColor(.secondary)
-                }
+            NavigationLink(value: SettingsDestination.lab) {
+                Label("The Lab", systemImage: "flask")
             }
             .foregroundColor(.primary)
         } header: {
@@ -328,14 +382,8 @@ struct ActionsView: View {
     /// (Reset Defaults, Clear Hal's Models, Nuclear Reset). See MaintenanceView (block 63).
     private var maintenanceSection: some View {
         Section {
-            Button {
-                showingMaintenance = true
-            } label: {
-                HStack {
-                    Label("Maintenance & Reset", systemImage: "arrow.triangle.2.circlepath")
-                    Spacer()
-                    Image(systemName: "chevron.right").font(.caption).foregroundColor(.secondary)
-                }
+            NavigationLink(value: SettingsDestination.maintenance) {
+                Label("Maintenance & Reset", systemImage: "arrow.triangle.2.circlepath")
             }
             .foregroundColor(.primary)
         } footer: {
@@ -371,30 +419,21 @@ struct ActionsView: View {
             // sheet explains the empty case inline ("No model-specific
             // framing for X — this model follows only the universal
             // System Prompt"). Discoverability > short-term cleanliness.
-            Button {
-                showingModelFramingDetail = true
-            } label: {
-                HStack {
-                    Text("Model framing")
-                    Spacer()
-                    Image(systemName: "chevron.right")
-                        .font(.caption)
-                        .foregroundColor(.secondary)
-                }
+            NavigationLink(value: SettingsDestination.modelFraming) {
+                Text("Model framing")
             }
             .foregroundColor(.primary)
             .disabled(tuningLocked)
             .opacity(tuningLocked ? 0.45 : 1.0)
 
+            // System Prompt stays a modal Button (Cancel/Save editor), so it keeps a plain row —
+            // no chevron, because a chevron reads as "drill into a place" and this opens an editor.
             Button {
                 showingSystemPromptEditor = true
             } label: {
                 HStack {
                     Text("System Prompt")
                     Spacer()
-                    Image(systemName: "chevron.right")
-                        .font(.caption)
-                        .foregroundColor(.secondary)
                 }
             }
             .foregroundColor(.primary)
@@ -419,9 +458,7 @@ struct ActionsView: View {
                 
                 // Button to view Hal's shareable reflections and self-knowledge
                 if chatViewModel.enableSelfKnowledge {
-                    Button(action: {
-                        showingSelfReflectionViewer = true
-                    }) {
+                    NavigationLink(value: SettingsDestination.selfModel) {
                         HStack {
                             Image(systemName: "book.pages")
                                 .foregroundColor(.blue)
@@ -430,9 +467,6 @@ struct ActionsView: View {
                                 .foregroundColor(.blue)
                         }
                         .padding(.vertical, 6)
-                    }
-                    .sheet(isPresented: $showingSelfReflectionViewer) {
-                        SelfReflectionView()
                     }
                 }
             }
@@ -639,9 +673,7 @@ struct ActionsView: View {
                 .frame(minHeight: 28)
             }
 
-            NavigationLink(destination: ModelLibraryView()
-                .environmentObject(chatViewModel)
-                .environmentObject(mlxDownloader)) {
+            NavigationLink(value: SettingsDestination.modelLibrary) {
                 HStack {
                     Image(systemName: "square.grid.2x2")
                     Text("Browse Model Library")
@@ -777,21 +809,13 @@ struct ActionsView: View {
                 }
             }
 
-            // Settings button — in v1.x, always opens Single LLM Settings.
-            Button {
-                if Self.salonModeExposedInUI && chatViewModel.salonConfig.isEnabled {
-                    showingSalonModeSheet = true
-                } else {
-                    showingPowerUserSheet = true
-                }
-            } label: {
+            // Settings row — drills into Single LLM Settings, or Salon Mode Settings when Salon
+            // is active. A push (chevron in, back out), same as the other Settings sub-screens.
+            NavigationLink(value: (Self.salonModeExposedInUI && chatViewModel.salonConfig.isEnabled) ? SettingsDestination.salon : SettingsDestination.powerUser) {
                 HStack {
                     Image(systemName: (Self.salonModeExposedInUI && chatViewModel.salonConfig.isEnabled) ? "person.3" : "wrench.and.screwdriver")
                     Text((Self.salonModeExposedInUI && chatViewModel.salonConfig.isEnabled) ? "Salon Mode Settings" : "Single LLM Settings")
                     Spacer()
-                    Image(systemName: "chevron.right")
-                        .font(.caption)
-                        .foregroundColor(.secondary)
                 }
             }
             .foregroundColor(.primary)
@@ -865,8 +889,9 @@ struct PowerUserView: View {
     }
 
     var body: some View {
-        NavigationView {
-            Form {
+        // Pushed inside the Settings NavigationStack (2026-08-05 nav migration): no own
+        // NavigationView / Done — the parent stack owns the bar and the back chevron.
+        Form {
                 if helpActive {
                     Section {
                         HStack(alignment: .top, spacing: 6) {
@@ -895,12 +920,6 @@ struct PowerUserView: View {
                 #endif
             }
             .navigationTitle("Single LLM Settings")
-            .toolbar {
-                ToolbarItem(placement: .cancellationAction) {
-                    Button("Done") { dismiss() }
-                }
-            }
-        }
     }
 
 
@@ -1382,8 +1401,9 @@ struct ModelFramingDetailView: View {
     }
 
     var body: some View {
-        NavigationView {
-            Form {
+        // Pushed inside the Settings NavigationStack (2026-08-05 nav migration): no own
+        // NavigationView / Done — the parent stack owns the bar and the back chevron.
+        Form {
                 Section {
                     Toggle("Apply this framing", isOn: framingEnabled)
                         .disabled(layerOneText.isEmpty)
@@ -1417,12 +1437,6 @@ struct ModelFramingDetailView: View {
                 }
             }
             .navigationTitle("Model Framing")
-            .toolbar {
-                ToolbarItem(placement: .cancellationAction) {
-                    Button("Done") { dismiss() }
-                }
-            }
-        }
     }
 }
 
@@ -1447,8 +1461,9 @@ struct SalonModeView: View {
     static let exposeSeatsThreeAndFour: Bool = true
 
     var body: some View {
-        NavigationView {
-            Form {
+        // Pushed inside the Settings NavigationStack (2026-08-05 nav migration): no own
+        // NavigationView / Done — the parent stack owns the bar and the back chevron.
+        Form {
                 // Section 1: Active Seats
                 Section {
                     // Seat pickers route through `setSalonSeat` so clearing
@@ -1553,14 +1568,6 @@ struct SalonModeView: View {
                 }
             }
             .navigationTitle("Salon Mode Settings")
-            .toolbar {
-                ToolbarItem(placement: .cancellationAction) {
-                    Button("Done") {
-                        dismiss()
-                    }
-                }
-            }
-        }
     }
 }
 

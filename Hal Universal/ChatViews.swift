@@ -203,6 +203,28 @@ private struct HelpNudgePulse: ViewModifier {
     }
 }
 
+extension View {
+    /// Presents `content` as a sheet on iPhone/iPad, but as a window-filling full-screen cover on a
+    /// "Designed for iPad" Mac (2026-08-05 Mac resizability). On Mac a `.sheet` is a fixed-size
+    /// floating card that ignores the window; a `.fullScreenCover` fills the window and resizes
+    /// with it, giving a modal container the same resizability as the main window. The
+    /// isiOSAppOnMac value is constant for the process, so this `if` picks one presentation once at
+    /// view-build time and never flips — the presentation identity stays stable. Same binding and
+    /// onDismiss in both cases; each container keeps its own dismiss control (Done, or Cancel/Save).
+    @ViewBuilder
+    func macResizablePresentation<PresentedContent: View>(
+        isPresented: Binding<Bool>,
+        onDismiss: (() -> Void)? = nil,
+        @ViewBuilder content: @escaping () -> PresentedContent
+    ) -> some View {
+        if ProcessInfo.processInfo.isiOSAppOnMac {
+            self.fullScreenCover(isPresented: isPresented, onDismiss: onDismiss, content: content)
+        } else {
+            self.sheet(isPresented: isPresented, onDismiss: onDismiss, content: content)
+        }
+    }
+}
+
 struct iOSChatView: View {
     @EnvironmentObject var chatViewModel: ChatViewModel
     // Help Mode D nudge honors Reduce Motion: the life-ring pulses with a scale
@@ -254,6 +276,15 @@ struct iOSChatView: View {
     // logic, and bottom-follow fallbacks. All removed. This is simpler
     // and matches the ChatGPT/Claude.ai web pattern: scrollTo(userMessage,
     // anchor: .top) on send, then nothing.
+
+    // Settings content, shared by both presentation styles (see macResizablePresentation, which
+    // gives the Mac a window-filling resizable cover and iPhone/iPad the swipe-dismiss sheet).
+    @ViewBuilder private var settingsContent: some View {
+        ActionsView(showingDocumentPicker: $chatViewModel.showingDocumentPicker)
+            .environmentObject(chatViewModel)
+            .environmentObject(DocumentImportManager.shared)
+            .environmentObject(MLXModelDownloader.shared)
+    }
 
     var body: some View {
         NavigationStack {
@@ -373,12 +404,15 @@ struct iOSChatView: View {
                     .environmentObject(chatViewModel)
             }
 
-            // Unified Settings sheet
-            .sheet(isPresented: $chatViewModel.showingSettings) {
-                ActionsView(showingDocumentPicker: $chatViewModel.showingDocumentPicker)
-                    .environmentObject(chatViewModel)
-                    .environmentObject(DocumentImportManager.shared)
-                    .environmentObject(MLXModelDownloader.shared)
+            // Unified Settings presentation. Reset settingsPath on dismiss so the next open starts
+            // at the Settings root — otherwise a stale destination (from a human drill-in or an
+            // antenna SET_UI_STATE) would re-push the moment Settings reopens (2026-08-05 nav
+            // migration). macResizablePresentation gives iPhone/iPad the sheet and the Mac a
+            // window-filling, resizable full-screen cover.
+            .macResizablePresentation(isPresented: $chatViewModel.showingSettings, onDismiss: {
+                chatViewModel.settingsPath = []
+            }) {
+                settingsContent
             }
 
             // Document picker sheet
@@ -388,52 +422,17 @@ struct iOSChatView: View {
                     .environmentObject(DocumentImportManager.shared)
             }
 
-            // API-driven sub-sheet navigation (root-level so SET_UI_STATE
-            // can present these without Settings being open).
-            .sheet(isPresented: $chatViewModel.apiNavSystemPrompt) {
-                SystemPromptEditorView()
-                    .environmentObject(chatViewModel)
-            }
-            .sheet(isPresented: $chatViewModel.apiNavModelFraming) {
-                ModelFramingDetailView()
-                    .environmentObject(chatViewModel)
-            }
-            .sheet(isPresented: $chatViewModel.apiNavSelfModel) {
-                SelfReflectionView()
-                    .environmentObject(chatViewModel)
-            }
-            .sheet(isPresented: $chatViewModel.apiNavPowerUser) {
-                PowerUserView()
-                    .environmentObject(chatViewModel)
-                    .environmentObject(MLXModelDownloader.shared)
-            }
-            .sheet(isPresented: $chatViewModel.apiNavSalonSettings) {
-                SalonModeView()
-                    .environmentObject(chatViewModel)
-            }
-            .sheet(isPresented: $chatViewModel.apiNavModelLibrary) {
-                NavigationView {
-                    ModelLibraryView(isModal: true)
-                        .environmentObject(chatViewModel)
-                        .environmentObject(MLXModelDownloader.shared)
-                }
-            }
-            // Antenna-driven nav to the reorg's two sub-screens (Lab #7), so screenshot
-            // automation can reach them without the settings-button routing (which sends
-            // Salon users to SalonModeView). Presenting these directly also lets us verify
-            // the Salon-grayed Thinking Cap, which the normal path can't reach.
-            .sheet(isPresented: $chatViewModel.apiNavMaintenance) {
-                MaintenanceView()
-                    .environmentObject(chatViewModel)
-                    .environmentObject(MLXModelDownloader.shared)
-            }
-            .sheet(isPresented: $chatViewModel.apiNavLab) {
-                LabView()
-                    .environmentObject(chatViewModel)
-            }
-            // The in-app Guide reader — last item on the Help (life-ring) menu, and
-            // driven by the antenna via SET_UI_STATE:guidereader for screenshot/verify.
-            .sheet(isPresented: $chatViewModel.apiNavGuideReader) {
+            // The six Settings sub-screens (Power User, Salon, Model Framing, Self Model, Lab,
+            // Maintenance) and Model Library are no longer top-level sheets. As of the 2026-08-05
+            // nav migration they are PUSHES inside Settings, and the antenna reaches them the same
+            // way a human does — open Settings, then append to settingsPath (see LocalAPIServer's
+            // SET_UI_STATE). System Prompt is still a modal but is presented from inside Settings.
+            // Only the Guide reader remains a genuine top-level sheet (it opens from the Help menu
+            // in chat, not from Settings).
+            // The in-app Guide reader — last item on the Help (life-ring) menu, and driven by the
+            // antenna via SET_UI_STATE:guidereader for screenshot/verify. Mac gets a resizable
+            // window-filling cover; iPhone/iPad keep the sheet (macResizablePresentation).
+            .macResizablePresentation(isPresented: $chatViewModel.apiNavGuideReader) {
                 GuideReaderView()
                     .environmentObject(chatViewModel)
             }
@@ -629,7 +628,10 @@ struct iOSChatView: View {
                 .onDisappear {
                     if pendingModelLibraryNav {
                         pendingModelLibraryNav = false
-                        chatViewModel.apiNavModelLibrary = true
+                        // Route to Model Library through its real home (Settings) rather than a
+                        // top-level modal — consistent with the 2026-08-05 nav migration.
+                        chatViewModel.showingSettings = true
+                        chatViewModel.settingsPath = [.modelLibrary]
                     }
                 }
             }

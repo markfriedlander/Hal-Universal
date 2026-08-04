@@ -325,6 +325,21 @@ class HalTestConsole: ObservableObject {
     // MARK: - Shared Command Dispatch
     // Used by both the file watcher and LocalAPIServer. Returns JSON result string.
 
+    /// Drives a Settings drill-in sub-screen through the real user path (2026-08-05 nav migration):
+    /// opens the Settings sheet and sets its NavigationStack path so the screen pushes in, exactly
+    /// as a human tapping the row would — no top-level modal bypass. Passing nil pops back to the
+    /// Settings root (the inverse of a push); it does NOT close Settings — use
+    /// SET_UI_STATE:settings:false or :none for that.
+    private func setSettingsPush(_ vm: ChatViewModel, _ destination: SettingsDestination?) {
+        if let destination {
+            vm.showingSettings = true
+            vm.showingThreadPanel = false
+            vm.settingsPath = [destination]
+        } else {
+            vm.settingsPath = []
+        }
+    }
+
     @discardableResult
     func executeCommand(_ cmd: String, vm: ChatViewModel) async -> String {
         let rawTrimmed = cmd.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -1415,51 +1430,46 @@ class HalTestConsole: ObservableObject {
                 vm.showingThreadPanel = value
                 if value { vm.showingSettings = false }
             case "systemprompt":
-                // Sub-sheets can't co-exist with the Settings sheet —
-                // SwiftUI only presents one .sheet at a time from a given
-                // view. When activating a sub-sheet, dismiss Settings
-                // first; reverse on deactivation isn't needed because
-                // the sub-sheet dismissal just leaves the underlying
-                // chat view visible.
-                if value { vm.showingSettings = false }
-                vm.apiNavSystemPrompt = value
+                // System Prompt stays a MODAL (Cancel/Save editor). Follow the real user path:
+                // open Settings, then set the flag ActionsView observes to present the editor
+                // from inside Settings (2026-08-05 nav migration). `:false` just lowers the flag.
+                if value {
+                    vm.showingSettings = true
+                    vm.showingThreadPanel = false
+                    vm.apiNavSystemPrompt = true
+                } else {
+                    vm.apiNavSystemPrompt = false
+                }
             case "modelframing":
-                if value { vm.showingSettings = false }
-                vm.apiNavModelFraming = value
+                setSettingsPush(vm, value ? .modelFraming : nil)
             case "selfmodel":
-                if value { vm.showingSettings = false }
-                vm.apiNavSelfModel = value
+                setSettingsPush(vm, value ? .selfModel : nil)
             case "poweruser":
-                if value { vm.showingSettings = false }
-                vm.apiNavPowerUser = value
+                setSettingsPush(vm, value ? .powerUser : nil)
             case "salonsettings":
-                if value { vm.showingSettings = false }
-                vm.apiNavSalonSettings = value
+                setSettingsPush(vm, value ? .salon : nil)
             case "modellibrary":
-                if value { vm.showingSettings = false }
-                vm.apiNavModelLibrary = value
+                setSettingsPush(vm, value ? .modelLibrary : nil)
             case "maintenance":
-                if value { vm.showingSettings = false }
-                vm.apiNavMaintenance = value
+                setSettingsPush(vm, value ? .maintenance : nil)
             case "lab":
-                if value { vm.showingSettings = false }
-                vm.apiNavLab = value
+                setSettingsPush(vm, value ? .lab : nil)
             case "roboeditor":
-                // Nested inside the Lab sheet: open the Lab first, then this. LabView bridges
-                // apiNavRoboEditor -> its local showingRoboEditor. Lets the antenna screenshot /
-                // verify the RoboRunner editor without a human tapping through to it.
-                if value { vm.apiNavLab = true }
+                // Nested inside the Lab screen: push the Lab first (real path), then this. LabView
+                // bridges apiNavRoboEditor -> its local showingRoboEditor. Lets the antenna
+                // screenshot / verify the RoboRunner editor without a human tapping through to it.
+                // (Full nested-path timing on a freshly-pushed Lab is a tracked follow-up.)
+                if value { setSettingsPush(vm, .lab) }
                 vm.apiNavRoboEditor = value
             case "roboissues":
-                // Nested one deeper: open Lab + editor, then the editor's Check sheet. RoboEditorView
-                // bridges apiNavRoboIssues -> its local showingIssues. Lets the antenna screenshot /
-                // verify the coach's problem list without a human tapping Check.
-                if value { vm.apiNavLab = true; vm.apiNavRoboEditor = true }
+                // Nested one deeper: push Lab + open editor, then the editor's Check sheet.
+                // RoboEditorView bridges apiNavRoboIssues -> its local showingIssues.
+                if value { setSettingsPush(vm, .lab); vm.apiNavRoboEditor = true }
                 vm.apiNavRoboIssues = value
             case "robolibrary":
                 // Same nesting for the Library sheet (examples + past runs). RoboEditorView bridges
                 // apiNavRoboLibrary -> its local showingLibrary.
-                if value { vm.apiNavLab = true; vm.apiNavRoboEditor = true }
+                if value { setSettingsPush(vm, .lab); vm.apiNavRoboEditor = true }
                 vm.apiNavRoboLibrary = value
             case "guidereader":
                 // Top-level sheet (not nested): the in-app Guide reader, reached from the
@@ -1507,12 +1517,8 @@ class HalTestConsole: ObservableObject {
             case "none":
                 vm.showingSettings = false
                 vm.showingThreadPanel = false
+                vm.settingsPath = []
                 vm.apiNavSystemPrompt = false
-                vm.apiNavModelFraming = false
-                vm.apiNavSelfModel = false
-                vm.apiNavPowerUser = false
-                vm.apiNavSalonSettings = false
-                vm.apiNavModelLibrary = false
                 vm.apiExpandRowID = ""
                 vm.apiPromptDetailMessageID = ""
             default:
@@ -2549,6 +2555,11 @@ class HalTestConsole: ObservableObject {
         let mlxLoadingMessage = jsonStringEscape(vm.llmService.mlxWrapper.loadingMessage)
         let mlxIsLoaded = vm.llmService.mlxWrapper.isModelLoaded
 
+        // Settings NavigationStack path, exposed so the antenna can verify a drill-in actually
+        // pushed (2026-08-05 nav migration) without a screenshot — empty when at the Settings
+        // root or Settings is closed. e.g. ["poweruser"].
+        let settingsPathJSON = "[" + vm.settingsPath.map { "\"\($0.antennaName)\"" }.joined(separator: ",") + "]"
+
         return """
         {
           "status": "ok",
@@ -2564,6 +2575,7 @@ class HalTestConsole: ObservableObject {
           "isModelSwitching": \(vm.isModelSwitching),
           "errorMessage": \(errorMsg.map { "\"\($0)\"" } ?? "null"),
           "showingSettings": \(vm.showingSettings),
+          "settingsPath": \(settingsPathJSON),
           "showingThreadPanel": \(vm.showingThreadPanel),
           "showingDocumentPicker": \(vm.showingDocumentPicker),
           "selectedModelID": "\(jsonStringEscape(vm.selectedModelID))",

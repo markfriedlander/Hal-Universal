@@ -9364,8 +9364,10 @@ struct WidgetTestView: View {
         }
 
         var body: some View {
-            NavigationView {
-                ScrollView {
+            // Pushed screen inside the Settings NavigationStack (2026-08-05 nav migration):
+            // no own NavigationView or Done button — the parent stack supplies the nav bar and
+            // the back chevron, so this drills in and out the way a human expects.
+            ScrollView {
                     VStack(alignment: .leading, spacing: 20) {
                         // Phase 4c: "Show private" toggle at the top of the
                         // viewer. Visible (not buried in settings) so the
@@ -9573,14 +9575,6 @@ struct WidgetTestView: View {
                 }
                 .navigationTitle("Hal's Self Model")
                 .navigationBarTitleDisplayMode(.inline)
-                .toolbar {
-                    // House standard: a modal's dismiss ("Done") lives on the leading/left side.
-                    ToolbarItem(placement: .cancellationAction) {
-                        Button("Done") {
-                            dismiss()
-                        }
-                    }
-                }
                 .onAppear {
                     loadData()
                 }
@@ -9601,7 +9595,6 @@ struct WidgetTestView: View {
                 } message: {
                     Text("These are reflections Hal chose to keep private. He marked them this way because they touch on his own uncertainty or internal experience. You're welcome to read them. Hal will continue marking new reflections private as he sees fit.")
                 }
-            }
         }
 
         // Load data from MemoryStore. Phase 4c: pull the full corpus
@@ -10057,18 +10050,18 @@ class ChatViewModel: ObservableObject {
     @Published var showingThreadPanel: Bool = false
     @Published var showingDocumentPicker: Bool = false
 
-    // Sub-sheet navigation hoisted onto ChatViewModel so the LocalAPIServer
-    // can present them via SET_UI_STATE without going through SettingsView.
-    // Root iOSChatView presents these as top-level sheets, so they work
-    // whether Settings is open or not.
+    // Settings sub-screen navigation. As of the 2026-08-05 navigation migration these six
+    // drill-in screens are PUSHES inside the Settings NavigationStack (not top-level sheets),
+    // so the antenna drives them the same way a human does: open Settings, then walk the path.
+    // `settingsPath` is the NavigationStack path bound in ActionsView; the LocalAPIServer sets
+    // showingSettings = true and appends a destination to reach a screen (SET_UI_STATE:poweruser
+    // etc.). Reset to [] when the Settings sheet closes (ChatViews onDismiss) so a later open
+    // doesn't re-push a stale destination.
+    @Published var settingsPath: [SettingsDestination] = []
+    // System Prompt stays a MODAL (Cancel/Save commit-abandon editor — the discard path must be
+    // preserved), so it keeps a flag rather than a path entry. ActionsView observes this and
+    // presents its sheet; the antenna sets showingSettings = true + apiNavSystemPrompt = true.
     @Published var apiNavSystemPrompt: Bool = false
-    @Published var apiNavModelFraming: Bool = false
-    @Published var apiNavSelfModel: Bool = false
-    @Published var apiNavPowerUser: Bool = false
-    @Published var apiNavSalonSettings: Bool = false
-    @Published var apiNavModelLibrary: Bool = false
-    @Published var apiNavMaintenance: Bool = false
-    @Published var apiNavLab: Bool = false
     // Presents the in-app Guide reader (GuideReaderView) — the last item on the Help
     // (life-ring) menu. Bridged from SET_UI_STATE:guidereader so the antenna can open
     // and screenshot the reader for verification without a human tapping the menu.

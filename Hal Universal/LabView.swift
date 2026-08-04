@@ -31,8 +31,9 @@ struct LabView: View {
     @State private var showDragons = false
 
     var body: some View {
-        NavigationView {
-            Form {
+        // Pushed inside the Settings NavigationStack (2026-08-05 nav migration): no own
+        // NavigationView / Done — the parent stack owns the bar and the back chevron.
+        Form {
                 Section {
                     Button {
                         showingRoboEditor = true
@@ -55,12 +56,6 @@ struct LabView: View {
                 DeveloperAPISectionView(viewModel: chatViewModel)
             }
             .navigationTitle("The Lab")
-            .toolbar {
-                ToolbarItem(placement: .cancellationAction) {
-                    Button("Done") { dismiss() }
-                }
-            }
-        }
         .sheet(isPresented: $showingRoboEditor) {
             RoboEditorView()
                 .environmentObject(chatViewModel)

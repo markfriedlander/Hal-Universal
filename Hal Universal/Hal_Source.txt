@@ -9365,8 +9365,10 @@ struct WidgetTestView: View {
         }
 
         var body: some View {
-            NavigationView {
-                ScrollView {
+            // Pushed screen inside the Settings NavigationStack (2026-08-05 nav migration):
+            // no own NavigationView or Done button — the parent stack supplies the nav bar and
+            // the back chevron, so this drills in and out the way a human expects.
+            ScrollView {
                     VStack(alignment: .leading, spacing: 20) {
                         // Phase 4c: "Show private" toggle at the top of the
                         // viewer. Visible (not buried in settings) so the
@@ -9574,14 +9576,6 @@ struct WidgetTestView: View {
                 }
                 .navigationTitle("Hal's Self Model")
                 .navigationBarTitleDisplayMode(.inline)
-                .toolbar {
-                    // House standard: a modal's dismiss ("Done") lives on the leading/left side.
-                    ToolbarItem(placement: .cancellationAction) {
-                        Button("Done") {
-                            dismiss()
-                        }
-                    }
-                }
                 .onAppear {
                     loadData()
                 }
@@ -9602,7 +9596,6 @@ struct WidgetTestView: View {
                 } message: {
                     Text("These are reflections Hal chose to keep private. He marked them this way because they touch on his own uncertainty or internal experience. You're welcome to read them. Hal will continue marking new reflections private as he sees fit.")
                 }
-            }
         }
 
         // Load data from MemoryStore. Phase 4c: pull the full corpus
@@ -10058,18 +10051,18 @@ class ChatViewModel: ObservableObject {
     @Published var showingThreadPanel: Bool = false
     @Published var showingDocumentPicker: Bool = false
 
-    // Sub-sheet navigation hoisted onto ChatViewModel so the LocalAPIServer
-    // can present them via SET_UI_STATE without going through SettingsView.
-    // Root iOSChatView presents these as top-level sheets, so they work
-    // whether Settings is open or not.
+    // Settings sub-screen navigation. As of the 2026-08-05 navigation migration these six
+    // drill-in screens are PUSHES inside the Settings NavigationStack (not top-level sheets),
+    // so the antenna drives them the same way a human does: open Settings, then walk the path.
+    // `settingsPath` is the NavigationStack path bound in ActionsView; the LocalAPIServer sets
+    // showingSettings = true and appends a destination to reach a screen (SET_UI_STATE:poweruser
+    // etc.). Reset to [] when the Settings sheet closes (ChatViews onDismiss) so a later open
+    // doesn't re-push a stale destination.
+    @Published var settingsPath: [SettingsDestination] = []
+    // System Prompt stays a MODAL (Cancel/Save commit-abandon editor — the discard path must be
+    // preserved), so it keeps a flag rather than a path entry. ActionsView observes this and
+    // presents its sheet; the antenna sets showingSettings = true + apiNavSystemPrompt = true.
     @Published var apiNavSystemPrompt: Bool = false
-    @Published var apiNavModelFraming: Bool = false
-    @Published var apiNavSelfModel: Bool = false
-    @Published var apiNavPowerUser: Bool = false
-    @Published var apiNavSalonSettings: Bool = false
-    @Published var apiNavModelLibrary: Bool = false
-    @Published var apiNavMaintenance: Bool = false
-    @Published var apiNavLab: Bool = false
     // Presents the in-app Guide reader (GuideReaderView) — the last item on the Help
     // (life-ring) menu. Bridged from SET_UI_STATE:guidereader so the antenna can open
     // and screenshot the reader for verification without a human tapping the menu.
@@ -16441,8 +16434,11 @@ enum PromptDetailSegmentKind: Sendable {
     case userMessage           // The user input that triggered this turn
     case other                 // Unclassified context
 
-    /// Display label for the section header.
-    var displayName: String {
+    /// Display label for the section header. `nonisolated` so the nonisolated export builder
+    /// (`buildPromptDetailExportText`) can read it: this enum is @MainActor-isolated by the
+    /// project default, but displayName is a pure switch over string literals with no actor
+    /// state, so nonisolated is correct and safe (same reasoning as `promptTokenTotals` above).
+    nonisolated var displayName: String {
         switch self {
         case .systemPrompt:        return "System Prompt"
         case .temporal:            return "Temporal Context"
@@ -25504,6 +25500,21 @@ class HalTestConsole: ObservableObject {
     // MARK: - Shared Command Dispatch
     // Used by both the file watcher and LocalAPIServer. Returns JSON result string.
 
+    /// Drives a Settings drill-in sub-screen through the real user path (2026-08-05 nav migration):
+    /// opens the Settings sheet and sets its NavigationStack path so the screen pushes in, exactly
+    /// as a human tapping the row would — no top-level modal bypass. Passing nil pops back to the
+    /// Settings root (the inverse of a push); it does NOT close Settings — use
+    /// SET_UI_STATE:settings:false or :none for that.
+    private func setSettingsPush(_ vm: ChatViewModel, _ destination: SettingsDestination?) {
+        if let destination {
+            vm.showingSettings = true
+            vm.showingThreadPanel = false
+            vm.settingsPath = [destination]
+        } else {
+            vm.settingsPath = []
+        }
+    }
+
     @discardableResult
     func executeCommand(_ cmd: String, vm: ChatViewModel) async -> String {
         let rawTrimmed = cmd.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -26594,51 +26605,46 @@ class HalTestConsole: ObservableObject {
                 vm.showingThreadPanel = value
                 if value { vm.showingSettings = false }
             case "systemprompt":
-                // Sub-sheets can't co-exist with the Settings sheet —
-                // SwiftUI only presents one .sheet at a time from a given
-                // view. When activating a sub-sheet, dismiss Settings
-                // first; reverse on deactivation isn't needed because
-                // the sub-sheet dismissal just leaves the underlying
-                // chat view visible.
-                if value { vm.showingSettings = false }
-                vm.apiNavSystemPrompt = value
+                // System Prompt stays a MODAL (Cancel/Save editor). Follow the real user path:
+                // open Settings, then set the flag ActionsView observes to present the editor
+                // from inside Settings (2026-08-05 nav migration). `:false` just lowers the flag.
+                if value {
+                    vm.showingSettings = true
+                    vm.showingThreadPanel = false
+                    vm.apiNavSystemPrompt = true
+                } else {
+                    vm.apiNavSystemPrompt = false
+                }
             case "modelframing":
-                if value { vm.showingSettings = false }
-                vm.apiNavModelFraming = value
+                setSettingsPush(vm, value ? .modelFraming : nil)
             case "selfmodel":
-                if value { vm.showingSettings = false }
-                vm.apiNavSelfModel = value
+                setSettingsPush(vm, value ? .selfModel : nil)
             case "poweruser":
-                if value { vm.showingSettings = false }
-                vm.apiNavPowerUser = value
+                setSettingsPush(vm, value ? .powerUser : nil)
             case "salonsettings":
-                if value { vm.showingSettings = false }
-                vm.apiNavSalonSettings = value
+                setSettingsPush(vm, value ? .salon : nil)
             case "modellibrary":
-                if value { vm.showingSettings = false }
-                vm.apiNavModelLibrary = value
+                setSettingsPush(vm, value ? .modelLibrary : nil)
             case "maintenance":
-                if value { vm.showingSettings = false }
-                vm.apiNavMaintenance = value
+                setSettingsPush(vm, value ? .maintenance : nil)
             case "lab":
-                if value { vm.showingSettings = false }
-                vm.apiNavLab = value
+                setSettingsPush(vm, value ? .lab : nil)
             case "roboeditor":
-                // Nested inside the Lab sheet: open the Lab first, then this. LabView bridges
-                // apiNavRoboEditor -> its local showingRoboEditor. Lets the antenna screenshot /
-                // verify the RoboRunner editor without a human tapping through to it.
-                if value { vm.apiNavLab = true }
+                // Nested inside the Lab screen: push the Lab first (real path), then this. LabView
+                // bridges apiNavRoboEditor -> its local showingRoboEditor. Lets the antenna
+                // screenshot / verify the RoboRunner editor without a human tapping through to it.
+                // (Full nested-path timing on a freshly-pushed Lab is a tracked follow-up.)
+                if value { setSettingsPush(vm, .lab) }
                 vm.apiNavRoboEditor = value
             case "roboissues":
-                // Nested one deeper: open Lab + editor, then the editor's Check sheet. RoboEditorView
-                // bridges apiNavRoboIssues -> its local showingIssues. Lets the antenna screenshot /
-                // verify the coach's problem list without a human tapping Check.
-                if value { vm.apiNavLab = true; vm.apiNavRoboEditor = true }
+                // Nested one deeper: push Lab + open editor, then the editor's Check sheet.
+                // RoboEditorView bridges apiNavRoboIssues -> its local showingIssues.
+                if value { setSettingsPush(vm, .lab); vm.apiNavRoboEditor = true }
                 vm.apiNavRoboIssues = value
             case "robolibrary":
                 // Same nesting for the Library sheet (examples + past runs). RoboEditorView bridges
                 // apiNavRoboLibrary -> its local showingLibrary.
-                if value { vm.apiNavLab = true; vm.apiNavRoboEditor = true }
+                if value { setSettingsPush(vm, .lab); vm.apiNavRoboEditor = true }
                 vm.apiNavRoboLibrary = value
             case "guidereader":
                 // Top-level sheet (not nested): the in-app Guide reader, reached from the
@@ -26686,12 +26692,8 @@ class HalTestConsole: ObservableObject {
             case "none":
                 vm.showingSettings = false
                 vm.showingThreadPanel = false
+                vm.settingsPath = []
                 vm.apiNavSystemPrompt = false
-                vm.apiNavModelFraming = false
-                vm.apiNavSelfModel = false
-                vm.apiNavPowerUser = false
-                vm.apiNavSalonSettings = false
-                vm.apiNavModelLibrary = false
                 vm.apiExpandRowID = ""
                 vm.apiPromptDetailMessageID = ""
             default:
@@ -27728,6 +27730,11 @@ class HalTestConsole: ObservableObject {
         let mlxLoadingMessage = jsonStringEscape(vm.llmService.mlxWrapper.loadingMessage)
         let mlxIsLoaded = vm.llmService.mlxWrapper.isModelLoaded
 
+        // Settings NavigationStack path, exposed so the antenna can verify a drill-in actually
+        // pushed (2026-08-05 nav migration) without a screenshot — empty when at the Settings
+        // root or Settings is closed. e.g. ["poweruser"].
+        let settingsPathJSON = "[" + vm.settingsPath.map { "\"\($0.antennaName)\"" }.joined(separator: ",") + "]"
+
         return """
         {
           "status": "ok",
@@ -27743,6 +27750,7 @@ class HalTestConsole: ObservableObject {
           "isModelSwitching": \(vm.isModelSwitching),
           "errorMessage": \(errorMsg.map { "\"\($0)\"" } ?? "null"),
           "showingSettings": \(vm.showingSettings),
+          "settingsPath": \(settingsPathJSON),
           "showingThreadPanel": \(vm.showingThreadPanel),
           "showingDocumentPicker": \(vm.showingDocumentPicker),
           "selectedModelID": "\(jsonStringEscape(vm.selectedModelID))",
@@ -29591,6 +29599,38 @@ enum PowerUserMode: String, CaseIterable {
     case multi = "Multi LLM (Salon)"
 }
 
+// The drill-in Settings sub-screens, expressed as a navigation path (2026-08-05 nav migration).
+// These six screens used to be modal `.sheet`s; they are now PUSHES inside the Settings
+// NavigationStack, so they read as "a place inside Settings" (chevron in, back out) rather than
+// a separate task — and, on the Mac, they inherit the Settings window rather than opening at a
+// fixed sheet size. The antenna drives them the same way a human does: open Settings, then
+// append a destination to `chatViewModel.settingsPath`. System Prompt and Export stay modal
+// (commit-abandon editor and OS share handoff), so they are NOT in this enum.
+enum SettingsDestination: Hashable {
+    case powerUser
+    case salon
+    case modelFraming
+    case selfModel
+    case lab
+    case maintenance
+    case modelLibrary
+
+    /// Stable string the antenna uses for this screen, matching the SET_UI_STATE target verbs
+    /// (SET_UI_STATE:poweruser, :salonsettings, ...). Exposed in GET_UI_STATE's `settingsPath`
+    /// so nav state is verifiable programmatically (the Mac screenshot pull is TCC-blocked).
+    var antennaName: String {
+        switch self {
+        case .powerUser:    return "poweruser"
+        case .salon:        return "salonsettings"
+        case .modelFraming: return "modelframing"
+        case .selfModel:    return "selfmodel"
+        case .lab:          return "lab"
+        case .maintenance:  return "maintenance"
+        case .modelLibrary: return "modellibrary"
+        }
+    }
+}
+
 struct ActionsView: View {
     @Environment(\.dismiss) var dismiss
     @EnvironmentObject var chatViewModel: ChatViewModel
@@ -29599,14 +29639,11 @@ struct ActionsView: View {
 
     @Binding var showingDocumentPicker: Bool
     @State private var showingExportSheet = false
-    @State private var showingPowerUserSheet = false
-    @State private var showingSalonModeSheet = false
     @State private var powerUserMode: PowerUserMode = .single
+    // System Prompt stays modal (Cancel/Save discard path). The other former sub-sheets
+    // (Power User, Salon, Model Framing, Self Model, Lab, Maintenance) are now pushes driven
+    // by chatViewModel.settingsPath — see SettingsDestination.
     @State private var showingSystemPromptEditor = false
-    @State private var showingModelFramingDetail = false
-    @State private var showingSelfReflectionViewer = false
-    @State private var showingLab = false   // The Lab (developer / power-user tools)
-    @State private var showingMaintenance = false   // Maintenance & Reset page
     @State private var initialSettingsSnapshot: [String: Any] = [:]
     @State private var skipComparisonOnDismiss = false
     // Read-Aloud (TTS) preferences. Same UserDefaults keys SpeechService reads at speak() time,
@@ -29621,7 +29658,7 @@ struct ActionsView: View {
     @AppStorage(ChatDensity.storageKey) private var chatDensityRaw: String = ChatDensity.defaultValue.rawValue
 
     var body: some View {
-        NavigationView {
+        NavigationStack(path: $chatViewModel.settingsPath) {
             ScrollViewReader { proxy in
             Form {
                 personalitySection
@@ -29665,6 +29702,40 @@ struct ActionsView: View {
                     Button("Done") { dismiss() }
                 }
             }
+            // Drill-in sub-screens (2026-08-05 nav migration). Each destination returns the same
+            // view the old modal `.sheet` presented, with the same environment objects, so the
+            // screens are unchanged — only their presentation (push vs sheet) differs. Whether a
+            // human taps the row (NavigationLink) or the antenna appends to settingsPath, the same
+            // push happens.
+            .navigationDestination(for: SettingsDestination.self) { destination in
+                switch destination {
+                case .powerUser:
+                    PowerUserView()
+                        .environmentObject(chatViewModel)
+                        .environmentObject(mlxDownloader)
+                case .salon:
+                    SalonModeView()
+                        .environmentObject(chatViewModel)
+                        .environmentObject(mlxDownloader)
+                case .modelFraming:
+                    ModelFramingDetailView()
+                        .environmentObject(chatViewModel)
+                case .selfModel:
+                    SelfReflectionView()
+                        .environmentObject(chatViewModel)
+                case .lab:
+                    LabView()
+                        .environmentObject(chatViewModel)
+                case .maintenance:
+                    MaintenanceView()
+                        .environmentObject(chatViewModel)
+                        .environmentObject(mlxDownloader)
+                case .modelLibrary:
+                    ModelLibraryView()
+                        .environmentObject(chatViewModel)
+                        .environmentObject(mlxDownloader)
+                }
+            }
             .onChange(of: chatViewModel.apiScrollSettingsTarget) { _, newTarget in
                 guard !newTarget.isEmpty else { return }
                 withAnimation { proxy.scrollTo(newTarget, anchor: .top) }
@@ -29692,32 +29763,29 @@ struct ActionsView: View {
         .sheet(isPresented: $showingExportSheet) {
             ShareSheet(activityItems: [chatViewModel.exportChatHistory()])
         }
-        .sheet(isPresented: $showingPowerUserSheet) {
-            PowerUserView()
-                .environmentObject(chatViewModel)
-                .environmentObject(mlxDownloader)
-        }
-        .sheet(isPresented: $showingSalonModeSheet) {
-            SalonModeView()
-                .environmentObject(chatViewModel)
-                .environmentObject(mlxDownloader)
-        }
-        .sheet(isPresented: $showingSystemPromptEditor) {
+        // System Prompt stays a modal: it's a Cancel/Save editor, and the discard path is the
+        // whole point (a half-typed prompt must be abandonable). Antenna routing follows the real
+        // user path — the LocalAPIServer opens Settings and sets apiNavSystemPrompt; we present
+        // the editor from here, from inside Settings, rather than as a top-level bypass. On Mac it
+        // presents as a window-filling cover (resizable) stacked over Settings; the discard path is
+        // unaffected because it lives in the editor's own Cancel/Save toolbar, not swipe-to-dismiss.
+        .macResizablePresentation(isPresented: $showingSystemPromptEditor) {
             SystemPromptEditorView()
                 .environmentObject(chatViewModel)
         }
-        .sheet(isPresented: $showingLab) {
-            LabView()
-                .environmentObject(chatViewModel)
+        .onChange(of: chatViewModel.apiNavSystemPrompt) { _, on in
+            if on {
+                showingSystemPromptEditor = true
+                chatViewModel.apiNavSystemPrompt = false
+            }
         }
-        .sheet(isPresented: $showingMaintenance) {
-            MaintenanceView()
-                .environmentObject(chatViewModel)
-                .environmentObject(mlxDownloader)
-        }
-        .sheet(isPresented: $showingModelFramingDetail) {
-            ModelFramingDetailView()
-                .environmentObject(chatViewModel)
+        .onAppear {
+            // Covers the case where Settings was opened *by* the System Prompt antenna call, so
+            // apiNavSystemPrompt is already true before onChange can observe it.
+            if chatViewModel.apiNavSystemPrompt {
+                showingSystemPromptEditor = true
+                chatViewModel.apiNavSystemPrompt = false
+            }
         }
         .onAppear {
             chatViewModel.isInSettingsFlow = true
@@ -29846,14 +29914,8 @@ struct ActionsView: View {
     /// 2026-07-28; ships as a user-facing opt-in.
     private var labSection: some View {
         Section {
-            Button {
-                showingLab = true
-            } label: {
-                HStack {
-                    Label("The Lab", systemImage: "flask")
-                    Spacer()
-                    Image(systemName: "chevron.right").font(.caption).foregroundColor(.secondary)
-                }
+            NavigationLink(value: SettingsDestination.lab) {
+                Label("The Lab", systemImage: "flask")
             }
             .foregroundColor(.primary)
         } header: {
@@ -29867,14 +29929,8 @@ struct ActionsView: View {
     /// (Reset Defaults, Clear Hal's Models, Nuclear Reset). See MaintenanceView (block 63).
     private var maintenanceSection: some View {
         Section {
-            Button {
-                showingMaintenance = true
-            } label: {
-                HStack {
-                    Label("Maintenance & Reset", systemImage: "arrow.triangle.2.circlepath")
-                    Spacer()
-                    Image(systemName: "chevron.right").font(.caption).foregroundColor(.secondary)
-                }
+            NavigationLink(value: SettingsDestination.maintenance) {
+                Label("Maintenance & Reset", systemImage: "arrow.triangle.2.circlepath")
             }
             .foregroundColor(.primary)
         } footer: {
@@ -29910,30 +29966,21 @@ struct ActionsView: View {
             // sheet explains the empty case inline ("No model-specific
             // framing for X — this model follows only the universal
             // System Prompt"). Discoverability > short-term cleanliness.
-            Button {
-                showingModelFramingDetail = true
-            } label: {
-                HStack {
-                    Text("Model framing")
-                    Spacer()
-                    Image(systemName: "chevron.right")
-                        .font(.caption)
-                        .foregroundColor(.secondary)
-                }
+            NavigationLink(value: SettingsDestination.modelFraming) {
+                Text("Model framing")
             }
             .foregroundColor(.primary)
             .disabled(tuningLocked)
             .opacity(tuningLocked ? 0.45 : 1.0)
 
+            // System Prompt stays a modal Button (Cancel/Save editor), so it keeps a plain row —
+            // no chevron, because a chevron reads as "drill into a place" and this opens an editor.
             Button {
                 showingSystemPromptEditor = true
             } label: {
                 HStack {
                     Text("System Prompt")
                     Spacer()
-                    Image(systemName: "chevron.right")
-                        .font(.caption)
-                        .foregroundColor(.secondary)
                 }
             }
             .foregroundColor(.primary)
@@ -29958,9 +30005,7 @@ struct ActionsView: View {
                 
                 // Button to view Hal's shareable reflections and self-knowledge
                 if chatViewModel.enableSelfKnowledge {
-                    Button(action: {
-                        showingSelfReflectionViewer = true
-                    }) {
+                    NavigationLink(value: SettingsDestination.selfModel) {
                         HStack {
                             Image(systemName: "book.pages")
                                 .foregroundColor(.blue)
@@ -29969,9 +30014,6 @@ struct ActionsView: View {
                                 .foregroundColor(.blue)
                         }
                         .padding(.vertical, 6)
-                    }
-                    .sheet(isPresented: $showingSelfReflectionViewer) {
-                        SelfReflectionView()
                     }
                 }
             }
@@ -30178,9 +30220,7 @@ struct ActionsView: View {
                 .frame(minHeight: 28)
             }
 
-            NavigationLink(destination: ModelLibraryView()
-                .environmentObject(chatViewModel)
-                .environmentObject(mlxDownloader)) {
+            NavigationLink(value: SettingsDestination.modelLibrary) {
                 HStack {
                     Image(systemName: "square.grid.2x2")
                     Text("Browse Model Library")
@@ -30316,21 +30356,13 @@ struct ActionsView: View {
                 }
             }
 
-            // Settings button — in v1.x, always opens Single LLM Settings.
-            Button {
-                if Self.salonModeExposedInUI && chatViewModel.salonConfig.isEnabled {
-                    showingSalonModeSheet = true
-                } else {
-                    showingPowerUserSheet = true
-                }
-            } label: {
+            // Settings row — drills into Single LLM Settings, or Salon Mode Settings when Salon
+            // is active. A push (chevron in, back out), same as the other Settings sub-screens.
+            NavigationLink(value: (Self.salonModeExposedInUI && chatViewModel.salonConfig.isEnabled) ? SettingsDestination.salon : SettingsDestination.powerUser) {
                 HStack {
                     Image(systemName: (Self.salonModeExposedInUI && chatViewModel.salonConfig.isEnabled) ? "person.3" : "wrench.and.screwdriver")
                     Text((Self.salonModeExposedInUI && chatViewModel.salonConfig.isEnabled) ? "Salon Mode Settings" : "Single LLM Settings")
                     Spacer()
-                    Image(systemName: "chevron.right")
-                        .font(.caption)
-                        .foregroundColor(.secondary)
                 }
             }
             .foregroundColor(.primary)
@@ -30404,8 +30436,9 @@ struct PowerUserView: View {
     }
 
     var body: some View {
-        NavigationView {
-            Form {
+        // Pushed inside the Settings NavigationStack (2026-08-05 nav migration): no own
+        // NavigationView / Done — the parent stack owns the bar and the back chevron.
+        Form {
                 if helpActive {
                     Section {
                         HStack(alignment: .top, spacing: 6) {
@@ -30434,12 +30467,6 @@ struct PowerUserView: View {
                 #endif
             }
             .navigationTitle("Single LLM Settings")
-            .toolbar {
-                ToolbarItem(placement: .cancellationAction) {
-                    Button("Done") { dismiss() }
-                }
-            }
-        }
     }
 
 
@@ -30921,8 +30948,9 @@ struct ModelFramingDetailView: View {
     }
 
     var body: some View {
-        NavigationView {
-            Form {
+        // Pushed inside the Settings NavigationStack (2026-08-05 nav migration): no own
+        // NavigationView / Done — the parent stack owns the bar and the back chevron.
+        Form {
                 Section {
                     Toggle("Apply this framing", isOn: framingEnabled)
                         .disabled(layerOneText.isEmpty)
@@ -30956,12 +30984,6 @@ struct ModelFramingDetailView: View {
                 }
             }
             .navigationTitle("Model Framing")
-            .toolbar {
-                ToolbarItem(placement: .cancellationAction) {
-                    Button("Done") { dismiss() }
-                }
-            }
-        }
     }
 }
 
@@ -30986,8 +31008,9 @@ struct SalonModeView: View {
     static let exposeSeatsThreeAndFour: Bool = true
 
     var body: some View {
-        NavigationView {
-            Form {
+        // Pushed inside the Settings NavigationStack (2026-08-05 nav migration): no own
+        // NavigationView / Done — the parent stack owns the bar and the back chevron.
+        Form {
                 // Section 1: Active Seats
                 Section {
                     // Seat pickers route through `setSalonSeat` so clearing
@@ -31092,14 +31115,6 @@ struct SalonModeView: View {
                 }
             }
             .navigationTitle("Salon Mode Settings")
-            .toolbar {
-                ToolbarItem(placement: .cancellationAction) {
-                    Button("Done") {
-                        dismiss()
-                    }
-                }
-            }
-        }
     }
 }
 
@@ -31311,6 +31326,28 @@ private struct HelpNudgePulse: ViewModifier {
     }
 }
 
+extension View {
+    /// Presents `content` as a sheet on iPhone/iPad, but as a window-filling full-screen cover on a
+    /// "Designed for iPad" Mac (2026-08-05 Mac resizability). On Mac a `.sheet` is a fixed-size
+    /// floating card that ignores the window; a `.fullScreenCover` fills the window and resizes
+    /// with it, giving a modal container the same resizability as the main window. The
+    /// isiOSAppOnMac value is constant for the process, so this `if` picks one presentation once at
+    /// view-build time and never flips — the presentation identity stays stable. Same binding and
+    /// onDismiss in both cases; each container keeps its own dismiss control (Done, or Cancel/Save).
+    @ViewBuilder
+    func macResizablePresentation<PresentedContent: View>(
+        isPresented: Binding<Bool>,
+        onDismiss: (() -> Void)? = nil,
+        @ViewBuilder content: @escaping () -> PresentedContent
+    ) -> some View {
+        if ProcessInfo.processInfo.isiOSAppOnMac {
+            self.fullScreenCover(isPresented: isPresented, onDismiss: onDismiss, content: content)
+        } else {
+            self.sheet(isPresented: isPresented, onDismiss: onDismiss, content: content)
+        }
+    }
+}
+
 struct iOSChatView: View {
     @EnvironmentObject var chatViewModel: ChatViewModel
     // Help Mode D nudge honors Reduce Motion: the life-ring pulses with a scale
@@ -31362,6 +31399,15 @@ struct iOSChatView: View {
     // logic, and bottom-follow fallbacks. All removed. This is simpler
     // and matches the ChatGPT/Claude.ai web pattern: scrollTo(userMessage,
     // anchor: .top) on send, then nothing.
+
+    // Settings content, shared by both presentation styles (see macResizablePresentation, which
+    // gives the Mac a window-filling resizable cover and iPhone/iPad the swipe-dismiss sheet).
+    @ViewBuilder private var settingsContent: some View {
+        ActionsView(showingDocumentPicker: $chatViewModel.showingDocumentPicker)
+            .environmentObject(chatViewModel)
+            .environmentObject(DocumentImportManager.shared)
+            .environmentObject(MLXModelDownloader.shared)
+    }
 
     var body: some View {
         NavigationStack {
@@ -31481,12 +31527,15 @@ struct iOSChatView: View {
                     .environmentObject(chatViewModel)
             }
 
-            // Unified Settings sheet
-            .sheet(isPresented: $chatViewModel.showingSettings) {
-                ActionsView(showingDocumentPicker: $chatViewModel.showingDocumentPicker)
-                    .environmentObject(chatViewModel)
-                    .environmentObject(DocumentImportManager.shared)
-                    .environmentObject(MLXModelDownloader.shared)
+            // Unified Settings presentation. Reset settingsPath on dismiss so the next open starts
+            // at the Settings root — otherwise a stale destination (from a human drill-in or an
+            // antenna SET_UI_STATE) would re-push the moment Settings reopens (2026-08-05 nav
+            // migration). macResizablePresentation gives iPhone/iPad the sheet and the Mac a
+            // window-filling, resizable full-screen cover.
+            .macResizablePresentation(isPresented: $chatViewModel.showingSettings, onDismiss: {
+                chatViewModel.settingsPath = []
+            }) {
+                settingsContent
             }
 
             // Document picker sheet
@@ -31496,52 +31545,17 @@ struct iOSChatView: View {
                     .environmentObject(DocumentImportManager.shared)
             }
 
-            // API-driven sub-sheet navigation (root-level so SET_UI_STATE
-            // can present these without Settings being open).
-            .sheet(isPresented: $chatViewModel.apiNavSystemPrompt) {
-                SystemPromptEditorView()
-                    .environmentObject(chatViewModel)
-            }
-            .sheet(isPresented: $chatViewModel.apiNavModelFraming) {
-                ModelFramingDetailView()
-                    .environmentObject(chatViewModel)
-            }
-            .sheet(isPresented: $chatViewModel.apiNavSelfModel) {
-                SelfReflectionView()
-                    .environmentObject(chatViewModel)
-            }
-            .sheet(isPresented: $chatViewModel.apiNavPowerUser) {
-                PowerUserView()
-                    .environmentObject(chatViewModel)
-                    .environmentObject(MLXModelDownloader.shared)
-            }
-            .sheet(isPresented: $chatViewModel.apiNavSalonSettings) {
-                SalonModeView()
-                    .environmentObject(chatViewModel)
-            }
-            .sheet(isPresented: $chatViewModel.apiNavModelLibrary) {
-                NavigationView {
-                    ModelLibraryView(isModal: true)
-                        .environmentObject(chatViewModel)
-                        .environmentObject(MLXModelDownloader.shared)
-                }
-            }
-            // Antenna-driven nav to the reorg's two sub-screens (Lab #7), so screenshot
-            // automation can reach them without the settings-button routing (which sends
-            // Salon users to SalonModeView). Presenting these directly also lets us verify
-            // the Salon-grayed Thinking Cap, which the normal path can't reach.
-            .sheet(isPresented: $chatViewModel.apiNavMaintenance) {
-                MaintenanceView()
-                    .environmentObject(chatViewModel)
-                    .environmentObject(MLXModelDownloader.shared)
-            }
-            .sheet(isPresented: $chatViewModel.apiNavLab) {
-                LabView()
-                    .environmentObject(chatViewModel)
-            }
-            // The in-app Guide reader — last item on the Help (life-ring) menu, and
-            // driven by the antenna via SET_UI_STATE:guidereader for screenshot/verify.
-            .sheet(isPresented: $chatViewModel.apiNavGuideReader) {
+            // The six Settings sub-screens (Power User, Salon, Model Framing, Self Model, Lab,
+            // Maintenance) and Model Library are no longer top-level sheets. As of the 2026-08-05
+            // nav migration they are PUSHES inside Settings, and the antenna reaches them the same
+            // way a human does — open Settings, then append to settingsPath (see LocalAPIServer's
+            // SET_UI_STATE). System Prompt is still a modal but is presented from inside Settings.
+            // Only the Guide reader remains a genuine top-level sheet (it opens from the Help menu
+            // in chat, not from Settings).
+            // The in-app Guide reader — last item on the Help (life-ring) menu, and driven by the
+            // antenna via SET_UI_STATE:guidereader for screenshot/verify. Mac gets a resizable
+            // window-filling cover; iPhone/iPad keep the sheet (macResizablePresentation).
+            .macResizablePresentation(isPresented: $chatViewModel.apiNavGuideReader) {
                 GuideReaderView()
                     .environmentObject(chatViewModel)
             }
@@ -31737,7 +31751,10 @@ struct iOSChatView: View {
                 .onDisappear {
                     if pendingModelLibraryNav {
                         pendingModelLibraryNav = false
-                        chatViewModel.apiNavModelLibrary = true
+                        // Route to Model Library through its real home (Settings) rather than a
+                        // top-level modal — consistent with the 2026-08-05 nav migration.
+                        chatViewModel.showingSettings = true
+                        chatViewModel.settingsPath = [.modelLibrary]
                     }
                 }
             }
@@ -36346,8 +36363,9 @@ struct LabView: View {
     @State private var showDragons = false
 
     var body: some View {
-        NavigationView {
-            Form {
+        // Pushed inside the Settings NavigationStack (2026-08-05 nav migration): no own
+        // NavigationView / Done — the parent stack owns the bar and the back chevron.
+        Form {
                 Section {
                     Button {
                         showingRoboEditor = true
@@ -36370,12 +36388,6 @@ struct LabView: View {
                 DeveloperAPISectionView(viewModel: chatViewModel)
             }
             .navigationTitle("The Lab")
-            .toolbar {
-                ToolbarItem(placement: .cancellationAction) {
-                    Button("Done") { dismiss() }
-                }
-            }
-        }
         .sheet(isPresented: $showingRoboEditor) {
             RoboEditorView()
                 .environmentObject(chatViewModel)
@@ -36636,24 +36648,19 @@ struct MaintenanceView: View {
     @State private var lastFreedOldBytes: Int64 = 0
 
     var body: some View {
-        NavigationView {
-            Form {
+        // Pushed inside the Settings NavigationStack (2026-08-05 nav migration): no own
+        // NavigationView / Done — the parent stack owns the bar and the back chevron.
+        Form {
                 settingsResetSection
                 cacheManagementSection
                 dataManagementSection
             }
             .navigationTitle("Maintenance & Reset")
-            .toolbar {
-                ToolbarItem(placement: .cancellationAction) {
-                    Button("Done") { dismiss() }
-                }
-            }
             .onAppear {
                 // Cheap dry run (a few directory checks + a manifest read) so the
                 // "Free up old model files" row shows an honest, up-to-date picture.
                 oldModelsPlan = MaintenanceTasks.previewFreeOldModelFiles()
             }
-        }
         .alert("Confirm Nuclear Reset", isPresented: $showingNuclearResetConfirmationAlert) {
             Button("Nuclear Reset", role: .destructive) {
                 chatViewModel.resetAllData()

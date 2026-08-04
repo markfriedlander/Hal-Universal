@@ -38,24 +38,19 @@ struct MaintenanceView: View {
     @State private var lastFreedOldBytes: Int64 = 0
 
     var body: some View {
-        NavigationView {
-            Form {
+        // Pushed inside the Settings NavigationStack (2026-08-05 nav migration): no own
+        // NavigationView / Done — the parent stack owns the bar and the back chevron.
+        Form {
                 settingsResetSection
                 cacheManagementSection
                 dataManagementSection
             }
             .navigationTitle("Maintenance & Reset")
-            .toolbar {
-                ToolbarItem(placement: .cancellationAction) {
-                    Button("Done") { dismiss() }
-                }
-            }
             .onAppear {
                 // Cheap dry run (a few directory checks + a manifest read) so the
                 // "Free up old model files" row shows an honest, up-to-date picture.
                 oldModelsPlan = MaintenanceTasks.previewFreeOldModelFiles()
             }
-        }
         .alert("Confirm Nuclear Reset", isPresented: $showingNuclearResetConfirmationAlert) {
             Button("Nuclear Reset", role: .destructive) {
                 chatViewModel.resetAllData()

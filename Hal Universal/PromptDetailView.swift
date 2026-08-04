@@ -31,8 +31,11 @@ enum PromptDetailSegmentKind: Sendable {
     case userMessage           // The user input that triggered this turn
     case other                 // Unclassified context
 
-    /// Display label for the section header.
-    var displayName: String {
+    /// Display label for the section header. `nonisolated` so the nonisolated export builder
+    /// (`buildPromptDetailExportText`) can read it: this enum is @MainActor-isolated by the
+    /// project default, but displayName is a pure switch over string literals with no actor
+    /// state, so nonisolated is correct and safe (same reasoning as `promptTokenTotals` above).
+    nonisolated var displayName: String {
         switch self {
         case .systemPrompt:        return "System Prompt"
         case .temporal:            return "Temporal Context"
