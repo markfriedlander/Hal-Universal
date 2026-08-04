@@ -633,6 +633,17 @@ class HalTestConsole: ObservableObject {
             let ms = Int(Date().timeIntervalSince(t0) * 1000)
             return "{\"status\":\"ok\",\"command\":\"CLASSIFY_SELFREF\",\"selfReferential\":\(isSelfRef),\"modelID\":\"\(jsonStringEscape(vm.llmService.activeModelID))\",\"ms\":\(ms),\"question\":\"\(jsonStringEscape(q))\"}"
 
+        } else if trimmed.hasPrefix("NUDGE_PROBE:") {
+            // Read-only probe of the Help Mode D tooling-nudge heuristic. Runs the SAME
+            // deterministic keyword detector a normal turn uses on <question> and returns
+            // which Help topic it would offer (roboRunner|api|cli) or "none". Fires no
+            // turn, changes no state, and does NOT consult nudgedTopics (a pure detector
+            // view), so it can be swept over many questions to verify the tight vocabulary
+            // before we trust it in the turn flow. Model-independent by construction.
+            let q = String(trimmed.dropFirst("NUDGE_PROBE:".count))
+            let topic = vm.toolingNudgeTopic(for: q)
+            return "{\"status\":\"ok\",\"command\":\"NUDGE_PROBE\",\"topic\":\"\(topic?.rawValue ?? "none")\",\"question\":\"\(jsonStringEscape(q))\"}"
+
         } else if trimmed.hasPrefix("ROBO_CHECK:") {
             // Validate a RoboRunner script WITHOUT running it — the antenna equivalent of the
             // editor's Check button (RoboValidator). Returns every problem with its line number, so

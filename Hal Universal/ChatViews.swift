@@ -179,8 +179,35 @@ struct Hal10000App: App {
 // MARK: - Primary chat surface with unified settings
 import SwiftUI
 
+// Help Mode D — the life-ring pulse (2026-08-05). When ChatViewModel.helpNudgePulse
+// changes, run a SELF-EXTINGUISHING pulse to draw the eye to the Help door and teach
+// where it is. `.phaseAnimator(_:trigger:)` runs its phase sequence once per trigger
+// change and does nothing on first appearance, so the glyph is quiet until a nudge
+// actually fires. FIVE beats back to rest (~3.4s): long and large enough to catch the
+// eye on a busy Mac screen where the glyph is easy to miss (Mark, 2026-08-05), still
+// short enough to never nag. Honors Reduce Motion: a scale pulse normally, a gentler
+// opacity pulse when motion is reduced.
+private struct HelpNudgePulse: ViewModifier {
+    let token: Int
+    let reduceMotion: Bool
+    func body(content: Content) -> some View {
+        if reduceMotion {
+            content.phaseAnimator([1.0, 0.3, 1.0, 0.3, 1.0, 0.3, 1.0, 0.3, 1.0, 0.3, 1.0], trigger: token) { view, opacity in
+                view.opacity(opacity)
+            } animation: { _ in .easeInOut(duration: 0.42) }
+        } else {
+            content.phaseAnimator([1.0, 1.35, 1.0, 1.35, 1.0, 1.35, 1.0, 1.35, 1.0, 1.35, 1.0], trigger: token) { view, scale in
+                view.scaleEffect(scale)
+            } animation: { _ in .easeInOut(duration: 0.34) }
+        }
+    }
+}
+
 struct iOSChatView: View {
     @EnvironmentObject var chatViewModel: ChatViewModel
+    // Help Mode D nudge honors Reduce Motion: the life-ring pulses with a scale
+    // animation normally, or a gentler opacity pulse when motion is reduced.
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
     // Privacy lock indicator: the shared network monitor (started at launch)
     // plus the tap-popover flag. The lock glyph is computed live in
     // `isPrivacyLocked` from the active model + this monitor + the salon config.
@@ -566,6 +593,7 @@ struct iOSChatView: View {
             } label: {
                 Image(systemName: "lifepreserver")
                     .foregroundStyle(chatViewModel.helpTopic != nil ? Color.primary : Color.secondary)
+                    .modifier(HelpNudgePulse(token: chatViewModel.helpNudgePulse, reduceMotion: reduceMotion))
             }
             // Privacy lock.
             Button {

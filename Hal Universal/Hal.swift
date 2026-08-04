@@ -10464,6 +10464,74 @@ class ChatViewModel: ObservableObject {
         messages.append(ChatMessage(content: halMsg, isFromUser: false, recordedByModel: selectedModel.id, turnNumber: currentTurn))
     }
 
+    // MARK: - Help Mode D — notice-and-offer nudge (2026-08-05)
+    //
+    // In NORMAL mode, when a question plainly NAMES one of Hal's tools, Hal offers
+    // to switch into the matching Help topic instead of answering off the cuff (and
+    // risking confabulation — RAG-over-source gives him an implementer's view, not a
+    // user's guide). The offer REPLACES the answer for that one turn; the life-ring
+    // glyph pulses to teach where the Help door is (see chromeIconRow).
+    //
+    // The trigger is a DELIBERATELY TIGHT, deterministic keyword match — never the
+    // LLM self-reference classifier. A 2026-08-05 multi-model sweep proved that
+    // classifier is reliable only on big models (Qwen-2B even judged "are you
+    // conscious?" as a docs question). A keyword match is model-independent and
+    // cannot mis-fire on identity. Architecture is EXCLUDED on purpose: those
+    // questions are usually identity/philosophy (the heart of the app), so they stay
+    // on the normal path; the user can still choose Architecture Help by hand.
+
+    /// Topics already nudged in this thread, so the offer fires at most ONCE per
+    /// topic per thread. Reset on new/loaded conversation. A re-ask of the same topic
+    /// (the user chose not to tap) falls through to a normal answer — anti-nag by
+    /// construction. Not @Published: read only inside the turn flow, never rendered.
+    var nudgedTopics: Set<HelpTopic> = []
+
+    /// Bumped to ask the chrome row to pulse the life-ring glyph a few times. The view
+    /// watches this value and self-extinguishes (a fixed phase sequence), so it is just
+    /// a trigger token, not a running-state flag.
+    @Published var helpNudgePulse: Int = 0
+
+    /// Ask the chrome row to pulse the life-ring glyph (Help Mode D nudge).
+    func triggerHelpNudgePulse() { helpNudgePulse += 1 }
+
+    /// The Help topic a normal-mode question is plainly ABOUT, or nil. TIGHT by design
+    /// (Mark's call, 2026-08-05): it fires only on unambiguous tool NAMES, never on bare
+    /// words like "api"/"script"/"command" that pepper ordinary language, because a false
+    /// fire replaces a real answer with an offer. Widen only on evidence. Whole-word /
+    /// phrase matching over a lowercased, punctuation-normalized copy, so "RoboRunner"
+    /// hits but "a therapist" never matches "api" and "click" never matches "cli".
+    func toolingNudgeTopic(for input: String) -> HelpTopic? {
+        // Fold every non-alphanumeric char to a space, collapse runs, pad the ends — now
+        // a keyword surrounded by spaces matches only on whole-word boundaries.
+        let folded = String(input.lowercased().map { ($0.isLetter || $0.isNumber) ? $0 : " " })
+        let padded = " " + folded.split(separator: " ").joined(separator: " ") + " "
+        func hits(_ keywords: [String]) -> Bool {
+            keywords.contains { padded.contains(" \($0) ") }
+        }
+        // Fixed priority so a question naming two doors is deterministic; a wrong guess
+        // costs nothing (the Help menu still lets them pick another topic).
+        if hits(["roborunner", "robo runner"]) { return .roboRunner }
+        if hits(["command api", "developer api", "antenna"]) { return .api }
+        if hits(["command line", "cli", "hal cli", "hal command"]) { return .cli }
+        return nil   // architecture is intentionally never nudged
+    }
+
+    /// The authored, first-person offer Hal shows instead of answering. Deterministic
+    /// (not model-generated, so it can't confabulate); names the likely topic to guide
+    /// the tap. No em dashes (user-facing copy rule).
+    func toolingNudgeOffer(for topic: HelpTopic) -> String {
+        switch topic {
+        case .roboRunner:
+            return "That's really a RoboRunner question, and I can answer it more reliably in Help Mode than off the top of my head. Tap the pulsing life ring up top, choose RoboRunner, then ask me again. In there I work straight from my own RoboRunner documentation instead of guessing."
+        case .api:
+            return "That's a question about my command API, and I answer those more reliably in Help Mode. Tap the pulsing life ring up top, choose Command API, then ask me again. In there I work straight from my own API documentation instead of guessing."
+        case .cli:
+            return "That's a command line question, and I answer those more reliably in Help Mode. Tap the pulsing life ring up top, choose Command Line, then ask me again. In there I work straight from my own command line documentation instead of guessing."
+        case .architecture:
+            return ""   // never reached — toolingNudgeTopic never returns .architecture
+        }
+    }
+
     // NEW: Self-knowledge toggle (enables/disables temporal, self-awareness, self-knowledge context)
     @AppStorage("enableSelfKnowledge") var enableSelfKnowledge: Bool = true
 
@@ -10746,7 +10814,8 @@ class ChatViewModel: ObservableObject {
     
     func loadConversation() {
         print("HALDEBUG-PERSISTENCE: Loading conversation with ID: \(conversationId)")
-        
+        nudgedTopics.removeAll()   // per-thread nudge state resets on thread switch (Help Mode D)
+
         let loadedMessages = memoryStore.getConversationMessages(conversationId: conversationId)
         
         if loadedMessages.isEmpty {
@@ -12974,6 +13043,29 @@ class ChatViewModel: ObservableObject {
                                                                     UIApplication.shared.sendAction(#selector(UIResponder.resignFirstResponder), to: nil, from: nil, for: nil)
                                                                     #endif
 
+                                                                    // Help Mode D — notice-and-offer nudge (2026-08-05). Before spending a
+                                                                    // turn, check whether the user plainly NAMED one of Hal's tools while in
+                                                                    // normal mode (not already in explicit Help, not routing to Salon). If so,
+                                                                    // and we haven't already nudged that topic in this thread, Hal's whole reply
+                                                                    // is the authored offer to switch into the scoped Help door — no inference,
+                                                                    // so nothing to confabulate — and the life-ring pulses to teach the tap.
+                                                                    // Ephemeral like the setHelpTopic mode narration (appended to `messages`, not
+                                                                    // persisted): a signpost, not content. Fires at most once per topic per
+                                                                    // thread; a re-ask falls through to a real answer (anti-nag by construction).
+                                                                    let routingToSalon = salonConfig.isEnabled && !salonConfig.activeSeats.isEmpty
+                                                                    if helpTopic == nil, !routingToSalon,
+                                                                       let nudgeTopic = toolingNudgeTopic(for: trimmed),
+                                                                       !nudgedTopics.contains(nudgeTopic) {
+                                                                        nudgedTopics.insert(nudgeTopic)
+                                                                        messages.append(ChatMessage(content: toolingNudgeOffer(for: nudgeTopic), isFromUser: false, recordedByModel: selectedModel.id, turnNumber: currentTurn))
+                                                                        triggerHelpNudgePulse()
+                                                                        halLog("HALDEBUG-HELP: Tooling nudge fired for \(nudgeTopic.rawValue); offered Help door instead of answering")
+                                                                        isAIResponding = false
+                                                                        thinkingStart = nil
+                                                                        isSendingMessage = false
+                                                                        return
+                                                                    }
+
                                                                     // Branch based on Salon Mode.
                                                                     // Guard: Salon "enabled but no seats" is a degenerate
                                                                     // state (reachable when a user enables Salon then clears
@@ -14337,6 +14429,7 @@ class ChatViewModel: ObservableObject {
     // Clear all messages and reset conversation state
     func startNewConversation() {
         messages.removeAll()
+        nudgedTopics.removeAll()   // per-thread nudge state (Help Mode D)
         injectedSummary = ""
         pendingAutoInject = false
 
