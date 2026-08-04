@@ -2461,54 +2461,46 @@ class MemoryStore: ObservableObject {
                                     // it is small + usage-worded, RAG surfaces it over the 33k-line source blob on
                                     // "how do I use…" questions. Hash-gated like the source ingestion.
                                     nonisolated private func enableLabReferenceAccess() {
-                                        // FOUR PILES (2026-07-30). The guide is authored in labelled SECTIONS,
-                                        // each ingested under its OWN source_type, so an explicit Help topic funnels
-                                        // ONLY its door: RoboRunner Help never surfaces the API/CLI door text, etc.
-                                        // The command VERBS are the same across all three doors, so the COMMAND
-                                        // CATALOG is one shared pile that every tool topic also draws from (a
-                                        // RoboRunner script still needs to know what verbs exist). `general` (the
-                                        // three-doors overview) is auto-path only. Scopes: see HelpTopic.sourceTypes.
-                                        let intro = """
-                                        THE LAB: HOW TO USE HAL'S DEVELOPER TOOLS
+                                        // ONE SOURCE: the bundled HAL_GUIDE.md (the public user + developer guide) IS
+                                        // Hal's self-knowledge of his own tools and architecture — the exact file the
+                                        // in-app reader shows and the open-source repo ships, so there is no second
+                                        // hand-written copy to drift. We split it on its top-level (## ) headings and
+                                        // ingest each section under its OWN source_type, so an explicit Help topic
+                                        // funnels ONLY its door (RoboRunner Help never surfaces the API/CLI section).
+                                        // The COMMAND CATALOG stays a separate SHARED pile built from the live
+                                        // CommandCatalog (the verb list is identical across all three doors and the
+                                        // runtime catalog is always exact), so every tool topic can also draw on it.
+                                        // `general`, `screens`, and `architecture` are auto-path only (see
+                                        // HelpTopic.sourceTypes for the explicit-topic scopes).
+                                        guard let guidePath = Bundle.main.path(forResource: "HAL_GUIDE", ofType: "md"),
+                                              let guideRaw = try? String(contentsOfFile: guidePath, encoding: .utf8) else {
+                                            print("HALDEBUG-SELFKNOWLEDGE: ERROR: HAL_GUIDE.md not bundled — cannot ingest Lab reference (hash left unset, will retry next launch)")
+                                            return
+                                        }
 
-                                        This is a USAGE guide (how to operate the tools), not source code. When a user asks how to use \
-                                        the API, RoboRunner, or the hal CLI, answer from here, do NOT show Swift implementation.
+                                        // Split the guide into its top-level (## ) sections. Lines before the first
+                                        // heading (the title + intro) collect under "__preamble__". A "### " subsection
+                                        // heading is NOT a section break (hasPrefix("## ") is false for "### ").
+                                        var guideSection: [String: String] = [:]
+                                        var currentKey = "__preamble__"
+                                        for line in guideRaw.components(separatedBy: "\n") {
+                                            if line.hasPrefix("## ") {
+                                                currentKey = String(line.dropFirst(3)).trimmingCharacters(in: .whitespaces)
+                                            }
+                                            guideSection[currentKey, default: ""] += line + "\n"
+                                        }
+                                        func part(_ heading: String) -> String {
+                                            (guideSection[heading] ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+                                        }
 
-                                        Hal's Lab has three doors into ONE command interpreter, and the SAME command verbs work in all three: \
-                                        the Developer API (a local HTTP server), RoboRunner (an in-app script editor), and the hal CLI \
-                                        (the Mac Terminal). Each door has its own section below, and every verb is in the COMMAND CATALOG.
-                                        """
-
-                                        let apiSection = """
-                                        DEVELOPER API (the "antenna"): a local HTTP server on the device.
-                                        Turn it on in Settings > The Lab > Developer API (off by default). It shows the address, port, and a bearer token.
-                                        Send a command: POST http://<address>:<port>/command with JSON {"command":"VERB..."} and header Authorization: Bearer <token>.
-                                        Full conversation turn: POST /chat with {"message":"..."}.
-                                        It answers only while Hal is the foreground app.
-                                        """
-
-                                        let roboSection = """
-                                        ROBORUNNER: an in-app script editor (Settings > The Lab). One command per line. The grammar is tiny:
-                                        - Any command verb on its own line runs that verb (for example SWITCH_MODEL:..., SET_REASONING:true, NEW_THREAD).
-                                        - ASK <prompt>          runs one real conversation turn with that prompt.
-                                        - WAIT <seconds>        pauses (longer if the device is warm).
-                                        - FOR <VAR> IN a, b, c  repeats the block below once per value, substituting {VAR} each pass; close it with END.
-                                          ... END               It only sweeps a written list; it cannot branch or loop forever.
-                                        - # comment             a line starting with # is a comment.
-                                        Example, ask the same prompt three times, each in a fresh thread:
-                                          FOR N IN 1, 2, 3
-                                          NEW_THREAD
-                                          ASK Tell me something interesting (try {N})
-                                          END
-                                        """
-
-                                        let cliSection = """
-                                        HAL CLI (Mac only): talk to Hal from the Terminal.
-                                        Install it from Settings > The Lab > Hal CLI (shown when Hal runs on a Mac with the API on). Then:
-                                          hal "your message"               one conversation turn.
-                                          cat notes.txt | hal "summarize"   pipe input in.
-                                        Quote any message containing shell characters like ? so the shell does not expand them.
-                                        """
+                                        // The "general" pile is the orientation matter: the title/intro plus the two
+                                        // framing sections (how the guide is organized, and the three-doors + Safe/
+                                        // Advanced idea).
+                                        let generalText = [
+                                            part("__preamble__"),
+                                            part("How this guide is organized"),
+                                            part("The one idea behind the three doors")
+                                        ].joined(separator: "\n\n")
 
                                         let catalogSection = """
                                         SAFETY: the interpreter starts in Safe mode and refuses destructive verbs. Switch with SET_SAFETY:advanced; \
@@ -2517,18 +2509,32 @@ class MemoryStore: ObservableObject {
                                         COMMAND CATALOG (every verb, its usage, and what it does). These verbs work in all three doors (API, RoboRunner, CLI):
                                         """ + "\n" + CommandCatalog.helpText()
 
+                                        // One pile per section. Six are the guide's own sections (ingested verbatim,
+                                        // so Hal reads exactly what a person reads); the catalog is the live shared pile.
                                         let sections: [(type: String, name: String, label: String, text: String)] = [
-                                            ("lab_reference_general",    "The Lab - Overview",        "Hal Lab overview",        intro),
-                                            ("lab_reference_api",        "The Lab - Developer API",   "Hal Developer API guide", apiSection),
-                                            ("lab_reference_roborunner", "The Lab - RoboRunner",      "Hal RoboRunner guide",    roboSection),
-                                            ("lab_reference_cli",        "The Lab - Hal CLI",         "Hal CLI guide",           cliSection),
-                                            ("lab_reference_catalog",    "The Lab - Command Catalog", "Hal command catalog",     catalogSection),
+                                            ("lab_reference_general",      "Hal Guide - Overview",           "Hal Guide overview",           generalText),
+                                            ("lab_reference_screens",      "Hal Guide - Screens & Settings", "Hal screens & settings guide", part("Screens and settings")),
+                                            ("lab_reference_roborunner",   "Hal Guide - RoboRunner",         "Hal RoboRunner guide",         part("RoboRunner")),
+                                            ("lab_reference_api",          "Hal Guide - Command API",        "Hal Developer API guide",      part("Command API")),
+                                            ("lab_reference_cli",          "Hal Guide - Command Line",       "Hal CLI guide",                part("Command line")),
+                                            ("lab_reference_architecture", "Hal Guide - Architecture",       "Hal architecture guide",       part("Architecture")),
+                                            ("lab_reference_catalog",      "The Lab - Command Catalog",      "Hal command catalog",          catalogSection),
                                         ]
 
+                                        // Fail loud if a guide-derived section came back empty — a renamed heading in
+                                        // HAL_GUIDE.md would otherwise silently drop a whole door. Catalog is exempt.
+                                        for s in sections where s.type != "lab_reference_catalog" {
+                                            if s.text.isEmpty {
+                                                print("HALDEBUG-SELFKNOWLEDGE: ERROR: guide section for \(s.type) is empty (heading renamed in HAL_GUIDE.md?) — hash left unset, will retry")
+                                                return
+                                            }
+                                        }
+
                                         // Hash over every section's type+text, versioned so a change to the SPLIT
-                                        // scheme (not just the text) forces a re-ingest. v2 = the four-piles split.
+                                        // scheme (not just the text) forces a re-ingest. v3 = guide-sourced (six guide
+                                        // sections + the live catalog), replacing the old inline four-piles blurbs.
                                         let combined = sections.map { $0.type + "\u{1}" + $0.text }.joined(separator: "\u{2}")
-                                        let currentHash = (combined + "#labchunk-v2").hash
+                                        let currentHash = (combined + "#labchunk-v3-guide").hash
                                         let storedHash = UserDefaults.standard.integer(forKey: "hal_lab_reference_hash")
                                         var existsStmt: OpaquePointer?
                                         var rowCount = 0
@@ -2540,7 +2546,7 @@ class MemoryStore: ObservableObject {
                                             print("HALDEBUG-SELFKNOWLEDGE: Lab reference unchanged, current")
                                             return
                                         }
-                                        print("HALDEBUG-SELFKNOWLEDGE: (re)ingesting Lab usage reference (four piles)...")
+                                        print("HALDEBUG-SELFKNOWLEDGE: (re)ingesting Lab usage reference from HAL_GUIDE.md (guide sections + live catalog)...")
 
                                         // Clear the whole lab_reference* family (old single 'lab_reference' rows and
                                         // any prior sub-pile rows) so a scheme change never leaves orphans. FTS stays
@@ -6689,14 +6695,14 @@ enum HelpTopic: String, CaseIterable, Identifiable {
     /// pulls ITS door section first, then the shared command catalog (the verb list
     /// is the same across all three doors, so it isn't partitioned). This removes the
     /// Layer-1 coarseness where RoboRunner Help also surfaced the API/CLI door text.
-    /// Architecture is Hal's own source. The catalog is intentionally shared — a
+    /// Architecture draws on the guide's architecture prose plus Hal's own source. The catalog is intentionally shared — a
     /// RoboRunner script still needs to know what verbs exist.
     var sourceTypes: [String] {
         switch self {
         case .roboRunner:   return ["lab_reference_roborunner", "lab_reference_catalog"]
         case .api:          return ["lab_reference_api", "lab_reference_catalog"]
         case .cli:          return ["lab_reference_cli", "lab_reference_catalog"]
-        case .architecture: return ["source_code"]
+        case .architecture: return ["lab_reference_architecture", "source_code"]
         }
     }
 }

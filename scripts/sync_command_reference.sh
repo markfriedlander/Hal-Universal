@@ -6,7 +6,7 @@
 # guide's command tables can never drift from the code (same idea as Hal_Source.txt).
 set -e
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-GUIDE="$ROOT/HAL_GUIDE.md"
+GUIDE="$ROOT/Hal Universal/HAL_GUIDE.md"
 GEN="$ROOT/scripts/gen_command_reference.py"
 
 python3 "$GEN" --check   # sanity guard: bail if the catalog parse looks wrong
