@@ -21,6 +21,7 @@
 		858DA32C2EA956AC00A44B2F /* Hub in Frameworks */ = {isa = PBXBuildFile; productRef = 858DA32A2EA956AC00A44B2F /* Hub */; };
 		858DA32D2EA956AC00A44B2F /* Tokenizers in Frameworks */ = {isa = PBXBuildFile; productRef = 858DA32B2EA956AC00A44B2F /* Tokenizers */; };
 		858DA32E2EA956AC00A44B2F /* MLXHuggingFace in Frameworks */ = {isa = PBXBuildFile; productRef = 858DA32F2EA956AC00A44B2F /* MLXHuggingFace */; };
+		859637833021B5B100E19289 /* hal in Resources */ = {isa = PBXBuildFile; fileRef = 859637823021B5B100E19289 /* hal */; };
 		85C74A1B2EC6EC4600C52EF5 /* README.md in Resources */ = {isa = PBXBuildFile; fileRef = 85C74A1A2EC6EC4500C52EF5 /* README.md */; };
 		85ED7E1A2EA956AC00B40000 /* MLXEmbedders in Frameworks */ = {isa = PBXBuildFile; productRef = 85ED7E192EA956AC00B40000 /* MLXEmbedders */; };
 		85ED7E212EA956AC00B40000 /* Embeddings in Frameworks */ = {isa = PBXBuildFile; productRef = 85ED7E222EA956AC00B40000 /* Embeddings */; };
@@ -34,6 +35,7 @@
 		855E38612EA94A730029C420 /* NaturalLanguage.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = NaturalLanguage.framework; path = System/Library/Frameworks/NaturalLanguage.framework; sourceTree = SDKROOT; };
 		855E38632EA94AE60029C420 /* libsqlite3.tbd */ = {isa = PBXFileReference; lastKnownFileType = "sourcecode.text-based-dylib-definition"; name = libsqlite3.tbd; path = usr/lib/libsqlite3.tbd; sourceTree = SDKROOT; };
 		855E38652EA94C630029C420 /* libcompression.tbd */ = {isa = PBXFileReference; lastKnownFileType = "sourcecode.text-based-dylib-definition"; name = libcompression.tbd; path = usr/lib/libcompression.tbd; sourceTree = SDKROOT; };
+		859637823021B5B100E19289 /* hal */ = {isa = PBXFileReference; lastKnownFileType = text; name = hal; path = cli/hal; sourceTree = "<group>"; };
 		85B3C57D2EA943560060BCEC /* Hal Universal.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = "Hal Universal.app"; sourceTree = BUILT_PRODUCTS_DIR; };
 		85C74A1A2EC6EC4500C52EF5 /* README.md */ = {isa = PBXFileReference; lastKnownFileType = net.daringfireball.markdown; path = README.md; sourceTree = "<group>"; };
 /* End PBXFileReference section */
@@ -90,6 +92,7 @@
 		85B3C5742EA943560060BCEC = {
 			isa = PBXGroup;
 			children = (
+				859637823021B5B100E19289 /* hal */,
 				85C74A1A2EC6EC4500C52EF5 /* README.md */,
 				85B3C57F2EA943560060BCEC /* Hal Universal */,
 				855E385E2EA94A620029C420 /* Frameworks */,
@@ -191,6 +194,7 @@
 			buildActionMask = 2147483647;
 			files = (
 				85C74A1B2EC6EC4600C52EF5 /* README.md in Resources */,
+				859637833021B5B100E19289 /* hal in Resources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
