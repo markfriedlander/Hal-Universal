@@ -622,6 +622,17 @@ class HalTestConsole: ObservableObject {
             Task { @MainActor in _ = await RoboRunner.shared.run(script: script, vm: vm, console: console) }
             return "{\"status\":\"ok\",\"command\":\"ROBO_RUN\",\"started\":true}"
 
+        } else if trimmed.hasPrefix("CLASSIFY_SELFREF:") {
+            // Read-only probe of the self-reference gate (Help Mode D groundwork): run the SAME
+            // classifier a normal turn uses on <question>, return its yes/no + the active model + timing.
+            // Fires no turn, changes no state. Lets us measure how cleanly the gate separates tooling /
+            // architecture / identity / chit-chat across models before investing in refining it.
+            let q = String(trimmed.dropFirst("CLASSIFY_SELFREF:".count))
+            let t0 = Date()
+            let isSelfRef = await vm.classifySelfReferential(q)
+            let ms = Int(Date().timeIntervalSince(t0) * 1000)
+            return "{\"status\":\"ok\",\"command\":\"CLASSIFY_SELFREF\",\"selfReferential\":\(isSelfRef),\"modelID\":\"\(jsonStringEscape(vm.llmService.activeModelID))\",\"ms\":\(ms),\"question\":\"\(jsonStringEscape(q))\"}"
+
         } else if trimmed.hasPrefix("ROBO_CHECK:") {
             // Validate a RoboRunner script WITHOUT running it — the antenna equivalent of the
             // editor's Check button (RoboValidator). Returns every problem with its line number, so

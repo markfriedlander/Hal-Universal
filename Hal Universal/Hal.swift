@@ -11718,6 +11718,13 @@ class ChatViewModel: ObservableObject {
                                                                             }
                                                                         }
 
+    /// Test-only, read-only wrapper around the self-reference gate, so the antenna can probe the
+    /// classifier's decision on a batch of questions (Help Mode D groundwork) without firing a full
+    /// turn. Runs the SAME classifier a normal turn uses, on the currently active model.
+    func classifySelfReferential(_ question: String) async -> Bool {
+        await isSelfReferentialQuestion(userInput: question)
+    }
+
                                                                         /// Executes the selected tools based on decision
                                                                         /// Compound-query decomposition (May 13, 2026, post-RAG-investigation).
                                                                         ///
