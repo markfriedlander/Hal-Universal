@@ -25671,16 +25671,15 @@ class HalTestConsole: ObservableObject {
 
         } else if trimmed.hasPrefix("ROBO_CHECK:") {
             // Validate a RoboRunner script WITHOUT running it — the antenna equivalent of the
-            // editor's Check button (RoboValidator). Returns every issue (errors + warnings) with
-            // line numbers, so the coach can be driven and verified over the antenna. Runs nothing,
-            // touches no state; safe (non-destructive) even though ROBO_RUN is destructive.
+            // editor's Check button (RoboValidator). Returns every problem with its line number, so
+            // the coach can be driven and verified over the antenna. There is a single severity now
+            // (every problem blocks the run). Runs nothing, touches no state; safe (non-destructive).
             let script = String(trimmed.dropFirst("ROBO_CHECK:".count))
             let issues = RoboValidator.validate(script, knownModelIDs: RoboRunner.currentKnownModelIDs())
-            let errorCount = issues.filter { $0.isError }.count
             let items = issues.map {
-                "{\"severity\":\"\($0.isError ? "error" : "warning")\",\"line\":\($0.line),\"message\":\"\(jsonStringEscape($0.message))\"}"
+                "{\"line\":\($0.line),\"message\":\"\(jsonStringEscape($0.message))\"}"
             }.joined(separator: ",")
-            return "{\"status\":\"ok\",\"command\":\"ROBO_CHECK\",\"errorCount\":\(errorCount),\"warningCount\":\(issues.count - errorCount),\"issues\":[\(items)]}"
+            return "{\"status\":\"ok\",\"command\":\"ROBO_CHECK\",\"problemCount\":\(issues.count),\"issues\":[\(items)]}"
 
         } else if trimmed.hasPrefix("ROBO_GENERATE:") {
             // Draft a RoboRunner script from a natural-language description using Hal's own model,
@@ -25694,7 +25693,7 @@ class HalTestConsole: ObservableObject {
                     messages: [.system(system), .user(user)], temperature: 0.2)
             }
             let items = draft.issues.map {
-                "{\"severity\":\"\($0.isError ? "error" : "warning")\",\"line\":\($0.line),\"message\":\"\(jsonStringEscape($0.message))\"}"
+                "{\"line\":\($0.line),\"message\":\"\(jsonStringEscape($0.message))\"}"
             }.joined(separator: ",")
             return "{\"status\":\"ok\",\"command\":\"ROBO_GENERATE\",\"valid\":\(draft.isValid),\"attempts\":\(draft.attempts),\"script\":\"\(jsonStringEscape(draft.script))\",\"issues\":[\(items)]}"
 
@@ -25728,7 +25727,7 @@ class HalTestConsole: ObservableObject {
             }
             UserDefaults.standard.set(draft.script, forKey: "lab.roboScript")
             let items = draft.issues.map {
-                "{\"severity\":\"\($0.isError ? "error" : "warning")\",\"line\":\($0.line),\"message\":\"\(jsonStringEscape($0.message))\"}"
+                "{\"line\":\($0.line),\"message\":\"\(jsonStringEscape($0.message))\"}"
             }.joined(separator: ",")
             return "{\"status\":\"ok\",\"command\":\"ROBO_DRAFT_FROM_FIELD\",\"valid\":\(draft.isValid),\"attempts\":\(draft.attempts),\"script\":\"\(jsonStringEscape(draft.script))\",\"issues\":[\(items)]}"
 
@@ -33811,7 +33810,7 @@ actor ThermalGovernor {
 //  model cannot express them: ASK (run one real turn and capture BOTH phases plus
 //  thermal), WAIT (pause, holding longer if the phone is hot), and a bounded sweep
 //  FOR <VAR> IN a, b, c … END that repeats its block once per value, substituting
-//  {VAR} each pass (e.g. sweep temperature or model over the same question). The
+//  {{VAR}} each pass (e.g. sweep temperature or model over the same question). The
 //  sweep is deliberately condition-free — it repeats a written block over a written
 //  list, it cannot branch or loop open-endedly. Comments start with '#'. That is the
 //  whole language.
@@ -33941,11 +33940,10 @@ final class RoboRunner: ObservableObject {
 
         // Pre-flight: refuse to run an invalid script BEFORE touching state or executing a
         // single verb. This is the enforcement half of the coach — the editor surfaces these
-        // same issues live; here a hard error stops the run so a typo'd verb, an unbalanced
-        // FOR/END, an unbound {VAR}, or a bogus model ID can never fire real turns (the
-        // "protect it from invalid scripts / invalid models" guard). Warnings don't block.
-        let preflight = RoboValidator.validate(script, knownModelIDs: RoboRunner.currentKnownModelIDs())
-        let hardErrors = preflight.filter { $0.isError }
+        // same issues live; here any problem stops the run so a typo'd verb, an unbalanced
+        // FOR/END, an unbound {{VAR}}, or a bogus model ID can never fire real turns (the
+        // "protect it from invalid scripts / invalid models" guard).
+        let hardErrors = RoboValidator.validate(script, knownModelIDs: RoboRunner.currentKnownModelIDs())
         if !hardErrors.isEmpty {
             let shown = hardErrors.prefix(8).map { $0.line > 0 ? "line \($0.line): \($0.message)" : $0.message }
             let more = hardErrors.count > 8 ? " (+\(hardErrors.count - 8) more)" : ""
@@ -34029,7 +34027,7 @@ final class RoboRunner: ObservableObject {
     /// a main-actor hop — it's a compile-time constant, so there's nothing to isolate.
     nonisolated static let maxExpandedSteps = 2000
 
-    /// Expand `FOR <VAR> IN a, b, c` / `END` blocks into a flat step list, substituting `{VAR}`
+    /// Expand `FOR <VAR> IN a, b, c` / `END` blocks into a flat step list, substituting `{{VAR}}`
     /// with each value in turn. Bounded ON PURPOSE: it repeats a written block over a written
     /// list, with no conditions and no open-ended looping, so a script can neither run away nor
     /// branch (that keeps the Lab's "fixed verbs, not arbitrary code" posture). Nesting works via
@@ -34083,9 +34081,11 @@ final class RoboRunner: ObservableObject {
         return (varName, values)
     }
 
-    /// Replace `{VAR}` (case-insensitive on the name, braces literal) with `value`.
+    /// Replace `{{VAR}}` (case-insensitive on the name) with `value`. Placeholders are DOUBLED braces
+    /// so a single brace is never special — it's always literal text passed straight to the model, which
+    /// keeps prompts that naturally contain `{` or `}` (JSON, code, shell) deterministic and unflagged.
     nonisolated static func substitute(_ line: String, varName: String, value: String) -> String {
-        line.replacingOccurrences(of: "{\(varName)}", with: value, options: [.caseInsensitive])
+        line.replacingOccurrences(of: "{{\(varName)}}", with: value, options: [.caseInsensitive])
     }
 
     // MARK: - The two special steps
@@ -34626,19 +34626,18 @@ nonisolated enum CommandCatalog {
 /// One problem found in a RoboRunner script before it runs. `line` is 1-based into the
 /// ORIGINAL script text so the editor's coach can point at the offending line; `line == 0`
 /// marks a whole-script issue with no single home (e.g. a bad model value produced by a
-/// FOR sweep, or the expanded-step cap).
+/// FOR sweep, or the expanded-step cap). There is a single severity: every issue is a
+/// problem that blocks Run. (We removed the earlier error/warning split — its only warning,
+/// unbalanced braces, went away when placeholders became unambiguous doubled `{{VAR}}`.)
 nonisolated struct RoboIssue: Identifiable {
-    enum Severity { case error, warning }
     let line: Int
-    let severity: Severity
     let message: String
     var id: String { "\(line)|\(message)" }
-    var isError: Bool { severity == .error }
 }
 
 /// Static, pure pre-flight check for RoboRunner scripts — "the coach". It catches the
 /// mistakes that previously only surfaced mid-run (or silently produced junk): unbalanced
-/// FOR/END, malformed FOR headers, unknown verbs, unbound `{VAR}` placeholders, unknown
+/// FOR/END, malformed FOR headers, unknown verbs, unbound `{{VAR}}` placeholders, unknown
 /// model IDs, and sweeps that blow past the step cap. `RoboRunner.run()` refuses to execute
 /// a script with any `.error`; the editor shows every issue (errors + warnings) live and on
 /// demand. Verbs come from `CommandCatalog` (the single source of truth, nonisolated); the
@@ -34677,7 +34676,7 @@ nonisolated enum RoboValidator {
                 if let header = RoboRunner.parseForHeader(text) {
                     forStack.append((header.0.uppercased(), no, false))
                 } else {
-                    issues.append(RoboIssue(line: no, severity: .error,
+                    issues.append(RoboIssue(line: no,
                         message: "Malformed FOR. Expected: FOR <VAR> IN value1, value2, value3"))
                     forStack.append(("?", no, true))   // still push so a later END balances
                 }
@@ -34685,7 +34684,7 @@ nonisolated enum RoboValidator {
             }
             if upper == "END" {
                 if forStack.isEmpty {
-                    issues.append(RoboIssue(line: no, severity: .error,
+                    issues.append(RoboIssue(line: no,
                         message: "END with no matching FOR."))
                 } else {
                     forStack.removeLast()
@@ -34693,37 +34692,35 @@ nonisolated enum RoboValidator {
                 continue
             }
 
-            // {VAR} placeholders must be defined by an enclosing FOR.
+            // {{VAR}} placeholders must be defined by an enclosing FOR. Single braces are literal
+            // prose and never checked, so ordinary prompts containing `{` or `}` pass through clean.
             let inScope = Set(forStack.map { $0.name })
             for name in bracedNames(in: text) where !inScope.contains(name.uppercased()) {
-                issues.append(RoboIssue(line: no, severity: .error,
-                    message: "{\(name)} is not defined by any enclosing FOR."))
-            }
-            if text.filter({ $0 == "{" }).count != text.filter({ $0 == "}" }).count {
-                issues.append(RoboIssue(line: no, severity: .warning, message: "Unbalanced { } braces."))
+                issues.append(RoboIssue(line: no,
+                    message: "{{\(name)}} is not defined by any enclosing FOR."))
             }
 
             // Verb check (ASK/WAIT are keywords and pass straight through).
             let verb = verbToken(text)
             if keywords.contains(verb) { continue }
             if !knownVerbs.contains(verb) {
-                issues.append(RoboIssue(line: no, severity: .error,
+                issues.append(RoboIssue(line: no,
                     message: "Unknown command '\(verb)'. Open Commands for the full list."))
             }
         }
         for open in forStack where !open.malformed {
-            issues.append(RoboIssue(line: open.line, severity: .error,
+            issues.append(RoboIssue(line: open.line,
                 message: "FOR block never closed with END."))
         }
 
         // --- Expanded pass: model IDs (literal + sweep values) and the step cap ---
-        // Expanding resolves {VAR} to real values, so a sweep like `FOR M IN afm, bogus`
+        // Expanding resolves {{VAR}} to real values, so a sweep like `FOR M IN afm, bogus`
         // gets each model checked. Reuses the SAME expander run() uses, so validation and
         // execution can never disagree about what the script becomes.
         var expanded: [String] = []
         RoboRunner.expandLoops(numbered.map { $0.text }, into: &expanded)
         if expanded.count >= RoboRunner.maxExpandedSteps {
-            issues.append(RoboIssue(line: 0, severity: .error,
+            issues.append(RoboIssue(line: 0,
                 message: "Script expands to \(expanded.count)+ steps, over the \(RoboRunner.maxExpandedSteps)-step cap. Shorten the sweep."))
         }
         if let ids = knownModelIDs {
@@ -34732,10 +34729,10 @@ nonisolated enum RoboValidator {
                 let verb = verbToken(step)
                 guard modelVerbs.contains(verb) else { continue }
                 let arg = argAfterColon(step)
-                // Skip empties and any still-unresolved {VAR} (already flagged above).
+                // Skip empties and any still-unresolved {{VAR}} (already flagged above).
                 if arg.isEmpty || arg.contains("{") || ids.contains(arg) || reported.contains(arg) { continue }
                 reported.insert(arg)
-                issues.append(RoboIssue(line: 0, severity: .error,
+                issues.append(RoboIssue(line: 0,
                     message: "Unknown model '\(arg)'. Not in the catalog — check the ID in Model Library or CURRENT_MODEL."))
             }
         }
@@ -34762,14 +34759,31 @@ nonisolated enum RoboValidator {
         return String(line[r.upperBound...]).trimmingCharacters(in: .whitespaces)
     }
 
-    /// The names inside `{ }` on a line (empty braces ignored). `SET_TEMPERATURE:{TEMP}` -> ["TEMP"].
+    /// Names referenced as `{{NAME}}` placeholders in a line (e.g. `SET_TEMPERATURE:{{TEMP}}` -> ["TEMP"];
+    /// empty `{{}}` ignored). Only DOUBLED braces count — a single
+    /// brace is never a placeholder — so literal braces in prose are never mistaken for a variable.
+    /// The inner text is taken verbatim (no trimming) so this stays in lockstep with `substitute`,
+    /// which matches `{{name}}` exactly: e.g. `{{ TEMP }}` reads as the name " TEMP " and won't match
+    /// a `FOR TEMP`, exactly as it wouldn't be substituted at run time.
     static func bracedNames(in line: String) -> [String] {
         var names: [String] = []
-        var current: String? = nil
-        for ch in line {
-            if ch == "{" { current = "" }
-            else if ch == "}" { if let c = current, !c.isEmpty { names.append(c) }; current = nil }
-            else if current != nil { current?.append(ch) }
+        let chars = Array(line)
+        var i = 0
+        while i + 1 < chars.count {
+            guard chars[i] == "{", chars[i + 1] == "{" else { i += 1; continue }
+            var j = i + 2
+            var name = ""
+            var closed = false
+            while j + 1 < chars.count {
+                if chars[j] == "}", chars[j + 1] == "}" { closed = true; break }
+                name.append(chars[j]); j += 1
+            }
+            if closed {
+                if !name.isEmpty { names.append(name) }
+                i = j + 2
+            } else {
+                break  // no closing `}}` — nothing more to find
+            }
         }
         return names
     }
@@ -34787,7 +34801,7 @@ nonisolated enum RoboScriptGenerator {
         let script: String
         let issues: [RoboIssue]   // remaining issues after the last attempt (empty on success)
         let attempts: Int
-        var isValid: Bool { !issues.contains { $0.isError } }
+        var isValid: Bool { issues.isEmpty }
     }
 
     /// Draft → validate → repair loop. Returns the first valid, NON-EMPTY script, or the best
@@ -34805,19 +34819,19 @@ nonisolated enum RoboScriptGenerator {
         for attempt in 1...max(1, maxAttempts) {
             let user = (attempt == 1)
                 ? "Write a RoboRunner script that does this, then output ONLY the script:\n\(description)"
-                : repairRequest(description: description, script: script, errors: issues.filter { $0.isError })
+                : repairRequest(description: description, script: script, errors: issues)
             let raw = (try? await generate(system, user)) ?? ""
             script = extractScript(raw)
             // Empty-guard: a blank / comments-only result is NOT success — an empty script has no
             // validation errors, which previously counted as "valid" and returned nothing. Treat
             // it as a failure so we retry, and (if still empty at the end) report it honestly.
             if !hasExecutableLine(script) {
-                issues = [RoboIssue(line: 0, severity: .error,
+                issues = [RoboIssue(line: 0,
                                     message: "The model returned an empty script. Try rephrasing the request.")]
                 continue
             }
             issues = RoboValidator.validate(script, knownModelIDs: knownModelIDs)
-            if !issues.contains(where: { $0.isError }) {
+            if issues.isEmpty {
                 return Draft(script: script, issues: issues, attempts: attempt)
             }
         }
@@ -34838,9 +34852,11 @@ nonisolated enum RoboScriptGenerator {
     - ASK <question>          run one real turn and capture it
     - WAIT <seconds>          pause (longer if the device is hot)
     - # comment               a comment line
-    - FOR <VAR> IN a, b, c    repeat the lines below once per value, substituting {VAR} each pass
+    - FOR <VAR> IN a, b, c    repeat the lines below once per value, substituting {{VAR}} each pass
       END                     close the FOR
     - any other line is a verb, e.g. SWITCH_MODEL:<id> or SET_TEMPERATURE:0.7
+    Placeholders use DOUBLE braces: write {{VAR}} to reference a FOR variable. A single brace is
+    literal text, so only use {{ }} for placeholders and never a single { or } for a variable.
     """
 
     private static let verbCheatsheet = """
@@ -34912,8 +34928,8 @@ nonisolated enum RoboScriptGenerator {
 /// the layoutManager's line-fragment rects, so a number appears ONLY at the first visual row of a real
 /// (newline-delimited) line — a soft-wrapped continuation row gets no number. That absence is the "wrap
 /// clarity": a line that spills onto two rows visibly owns both rows under one number, so you can always
-/// tell a wrap from a new line. Stage 2b: a line the coach flags is drawn in red (error) or orange
-/// (warning) instead of the usual secondary gray, matching the `LineHighlightView` band behind it.
+/// tell a wrap from a new line. Stage 2b: a line the coach flags as a problem is drawn in red instead
+/// of the usual secondary gray, matching the `LineHighlightView` band behind it.
 final class LineNumberGutter: UIView {
     weak var textView: GutterTextView?
     var gutterWidth: CGFloat = 0
@@ -34923,13 +34939,11 @@ final class LineNumberGutter: UIView {
         guard let tv = textView else { return }
         let insetTop = tv.textContainerInset.top
         let offsetY = tv.contentOffset.y
-        let errors = tv.errorLines
-        let warnings = tv.warningLines
+        let issues = tv.issueLines
 
-        // One right-aligned number per real line, colored by the coach's verdict for that line.
+        // One right-aligned number per real line, red where the coach flags a problem.
         tv.forEachLineRect { n, firstFrag, _ in
-            let color: UIColor = errors.contains(n) ? .systemRed
-                : (warnings.contains(n) ? .systemOrange : .secondaryLabel)
+            let color: UIColor = issues.contains(n) ? .systemRed : .secondaryLabel
             let attrs: [NSAttributedString.Key: Any] = [.font: self.numberFont, .foregroundColor: color]
             let str = String(n) as NSString
             let size = str.size(withAttributes: attrs)
@@ -34949,27 +34963,24 @@ final class LineNumberGutter: UIView {
     }
 }
 
-/// A faint full-width band drawn BEHIND the text on any line the coach flags (red for an error, orange
-/// for a warning). It is a passive subview inserted below the text container (with a negative
-/// `zPosition` so it always renders behind the glyphs) and pinned to the visible area like the gutter.
-/// Unlike the gutter's per-line number, the band uses the line's FULL bounding rect, so a flagged line
-/// that soft-wraps onto several rows is tinted across all of them. Draws nothing when the coach is clean.
+/// A faint red full-width band drawn BEHIND the text on any line the coach flags as a problem. It is a
+/// passive subview inserted below the text container (with a negative `zPosition` so it always renders
+/// behind the glyphs) and pinned to the visible area like the gutter. Unlike the gutter's per-line
+/// number, the band uses the line's FULL bounding rect, so a flagged line that soft-wraps onto several
+/// rows is tinted across all of them. Draws nothing when the coach is clean.
 final class LineHighlightView: UIView {
     weak var textView: GutterTextView?
 
     override func draw(_ rect: CGRect) {
         guard let tv = textView, let ctx = UIGraphicsGetCurrentContext() else { return }
-        let errors = tv.errorLines
-        let warnings = tv.warningLines
-        if errors.isEmpty && warnings.isEmpty { return }
+        let issues = tv.issueLines
+        if issues.isEmpty { return }
         let insetTop = tv.textContainerInset.top
         let offsetY = tv.contentOffset.y
 
         tv.forEachLineRect { n, firstFrag, fullBounds in
-            let fill: UIColor
-            if errors.contains(n) { fill = UIColor.systemRed.withAlphaComponent(0.14) }
-            else if warnings.contains(n) { fill = UIColor.systemOrange.withAlphaComponent(0.12) }
-            else { return }
+            guard issues.contains(n) else { return }
+            let fill = UIColor.systemRed.withAlphaComponent(0.14)
             // Cover every wrapped row of the line; fall back to the first fragment if the bounding
             // rect is empty (e.g. a flagged blank line has no glyphs to bound).
             let band = fullBounds.height > 0 ? fullBounds : firstFrag
@@ -34990,10 +35001,9 @@ final class GutterTextView: UITextView {
     private let highlight = LineHighlightView()
     private var lastGutterWidth: CGFloat = -1
 
-    /// 1-based line numbers the coach flags, set by `RoboScriptEditor` from the live validator output.
-    /// The gutter colors these numbers and the highlight bands them; both read from here.
-    private(set) var errorLines: Set<Int> = []
-    private(set) var warningLines: Set<Int> = []
+    /// 1-based line numbers the coach flags as problems, set by `RoboScriptEditor` from the live
+    /// validator output. The gutter colors these numbers red and the highlight bands them; both read here.
+    private(set) var issueLines: Set<Int> = []
 
     override init(frame: CGRect, textContainer: NSTextContainer?) {
         super.init(frame: frame, textContainer: textContainer)
@@ -35059,12 +35069,11 @@ final class GutterTextView: UITextView {
         }
     }
 
-    /// Update the flagged-line sets and redraw the gutter + band only if they actually changed.
+    /// Update the flagged-line set and redraw the gutter + band only if it actually changed.
     /// Positions don't move, so this is a repaint (setNeedsDisplay), not a relayout.
-    func setIssueLines(errors: Set<Int>, warnings: Set<Int>) {
-        guard errors != errorLines || warnings != warningLines else { return }
-        errorLines = errors
-        warningLines = warnings
+    func setIssueLines(_ lines: Set<Int>) {
+        guard lines != issueLines else { return }
+        issueLines = lines
         gutter.setNeedsDisplay()
         highlight.setNeedsDisplay()
     }
@@ -35094,19 +35103,18 @@ final class GutterTextView: UITextView {
 }
 
 /// A UITextView-backed editor for RoboRunner scripts. It replaces SwiftUI's TextEditor so we can
-/// (Stage 2) add a line-number gutter and red error-line highlighting — things TextEditor cannot do.
+/// (Stage 2) add a line-number gutter and error-line highlighting — things TextEditor cannot do.
 /// Stage 1 was a behavior-preserving drop-in: two-way text binding, monospaced font, dim-when-disabled,
 /// a focus binding (replacing @FocusState), and a UIKit input-accessory toolbar carrying Clear + Done
 /// (a SwiftUI `.keyboard` toolbar won't attach to a UITextView). Smart dashes/quotes are OFF so the
 /// keyboard can't turn "--" into an em dash or "" into curly quotes inside a script. Stage 2a added the
 /// line-number gutter via the `GutterTextView` subclass; Stage 2b feeds it the coach's flagged lines so
-/// error lines show red (warnings orange) in the gutter with a faint band behind them.
+/// problem lines show red in the gutter with a faint band behind them.
 struct RoboScriptEditor: UIViewRepresentable {
     @Binding var text: String
     @Binding var focused: Bool
     var isEditable: Bool
-    var errorLines: Set<Int>
-    var warningLines: Set<Int>
+    var issueLines: Set<Int>
     var onClear: () -> Void
 
     func makeUIView(context: Context) -> GutterTextView {
@@ -35124,7 +35132,7 @@ struct RoboScriptEditor: UIViewRepresentable {
         tv.smartInsertDeleteType = .no
         tv.inputAccessoryView = context.coordinator.accessory
         tv.text = text
-        tv.setIssueLines(errors: errorLines, warnings: warningLines)
+        tv.setIssueLines(issueLines)
         return tv
     }
 
@@ -35133,7 +35141,7 @@ struct RoboScriptEditor: UIViewRepresentable {
         if tv.text != text { tv.text = text; tv.refreshGutter() }
         tv.isEditable = isEditable
         tv.alpha = isEditable ? 1.0 : 0.6
-        tv.setIssueLines(errors: errorLines, warnings: warningLines)
+        tv.setIssueLines(issueLines)
         if focused, isEditable, !tv.isFirstResponder { tv.becomeFirstResponder() }
         if !focused, tv.isFirstResponder { tv.resignFirstResponder() }
         context.coordinator.setClearEnabled(!text.isEmpty)
@@ -35203,10 +35211,11 @@ struct RoboEditorView: View {
     WAIT 5
     ASK Name a primary color. One word.
 
-    # Sweep: repeat a block once per value, substituting {VAR} each pass.
+    # Sweep: repeat a block once per value, substituting {{VAR}} each pass.
+    # (Double braces = a placeholder; a single brace is just literal text.)
     # Uncomment to see the same question at three temperatures, compared:
     # FOR TEMP IN 0.2, 0.6, 1.0
-    #     SET_TEMPERATURE:{TEMP}
+    #     SET_TEMPERATURE:{{TEMP}}
     #     ASK In one sentence, what is a good name for a pet fox?
     # END
     """
@@ -35224,16 +35233,11 @@ struct RoboEditorView: View {
     private var liveIssues: [RoboIssue] {
         RoboValidator.validate(script, knownModelIDs: RoboRunner.currentKnownModelIDs())
     }
-    private var liveErrorCount: Int { liveIssues.filter { $0.isError }.count }
-    private var liveWarningCount: Int { liveIssues.count - liveErrorCount }
+    private var liveIssueCount: Int { liveIssues.count }
 
-    // The coach's flagged lines, fed to the editor's gutter (red = error, orange = warning). Only
-    // line-specific issues highlight; whole-script issues (line 0) still surface in the Check sheet.
-    // Error wins if a line has both, so warnings never mask an error line's red.
-    private var errorLines: Set<Int> { Set(liveIssues.filter { $0.isError && $0.line > 0 }.map { $0.line }) }
-    private var warningLines: Set<Int> {
-        Set(liveIssues.filter { !$0.isError && $0.line > 0 }.map { $0.line }).subtracting(errorLines)
-    }
+    // The coach's flagged lines, fed to the editor's gutter (drawn red). Only line-specific issues
+    // highlight; whole-script issues (line 0) still surface in the Check sheet.
+    private var issueLines: Set<Int> { Set(liveIssues.filter { $0.line > 0 }.map { $0.line }) }
 
     var body: some View {
         NavigationView {
@@ -35242,8 +35246,7 @@ struct RoboEditorView: View {
                     text: $script,
                     focused: $editorFocused,
                     isEditable: !(robo.isRunning || generatingDraft),
-                    errorLines: errorLines,
-                    warningLines: warningLines,
+                    issueLines: issueLines,
                     onClear: { clearField() }
                 )
 
@@ -35271,11 +35274,11 @@ struct RoboEditorView: View {
                         }
                         .accessibilityLabel("Stop")
                     } else {
-                        // Disabled while the script has hard errors — the coach won't let a
+                        // Disabled while the script has any problem — the coach won't let a
                         // known-bad script run. (run() also refuses, so this is belt-and-braces.)
                         // A play glyph: universal "run" affordance, on the trailing (take-action) side.
                         Button(action: runScript) { Image(systemName: "play.fill") }
-                            .disabled(liveErrorCount > 0)
+                            .disabled(liveIssueCount > 0)
                             .accessibilityLabel("Run")
                     }
                 }
@@ -35291,8 +35294,8 @@ struct RoboEditorView: View {
                     // The coach: validate WITHOUT running. Icon reflects the live state so a
                     // glance tells you if the script is clean before you ever hit Run.
                     Button { showingIssues = true } label: {
-                        Label("Check", systemImage: liveErrorCount > 0 ? "exclamationmark.triangle.fill"
-                              : (liveWarningCount > 0 ? "exclamationmark.triangle" : "checkmark.seal"))
+                        Label("Check", systemImage: liveIssueCount > 0 ? "exclamationmark.triangle.fill"
+                              : "checkmark.seal")
                     }
                     Spacer()
                     // Always enabled: the Results sheet is the run HISTORY, which can hold runs
@@ -35340,12 +35343,9 @@ struct RoboEditorView: View {
             }
         } else if let err = robo.lastError, !err.isEmpty {
             Label(err, systemImage: "exclamationmark.triangle").foregroundColor(.orange)
-        } else if liveErrorCount > 0 {
-            Label("\(liveErrorCount) problem\(liveErrorCount == 1 ? "" : "s") — tap Check to see them",
+        } else if liveIssueCount > 0 {
+            Label("\(liveIssueCount) problem\(liveIssueCount == 1 ? "" : "s") — tap Check to see them",
                   systemImage: "exclamationmark.triangle.fill").foregroundColor(.red)
-        } else if liveWarningCount > 0 {
-            Label("\(stepCount) step\(stepCount == 1 ? "" : "s"), \(liveWarningCount) warning\(liveWarningCount == 1 ? "" : "s")",
-                  systemImage: "exclamationmark.triangle").foregroundColor(.orange)
         } else if preDraftText != nil && undoFromDraft {
             Label("I drafted this for you. Edit or run it when you're ready.", systemImage: "wand.and.stars")
                 .foregroundColor(.secondary)
@@ -35366,7 +35366,7 @@ struct RoboEditorView: View {
         // Light guard: if the field already holds a CLEAN, multi-step script, the wand would treat
         // that script as a description and produce nonsense. Confirm before clobbering it. A single
         // line (a typical description) or anything that doesn't validate drafts directly.
-        if liveErrorCount == 0 && stepCount >= 2 {
+        if liveIssueCount == 0 && stepCount >= 2 {
             showingDraftOverwriteConfirm = true
             return
         }
@@ -35438,16 +35438,13 @@ struct RoboEditorView: View {
     }
 }
 
-/// The coach's report card: every problem the validator found, errors first, each with its
-/// source line. Read-only (the fix happens back in the editor), reachable any time from the
-/// editor's Check button so a script can be validated WITHOUT running it — the whole point of
-/// "help people write scripts and validate them before they run."
+/// The coach's report card: every problem the validator found, each with its source line. Read-only
+/// (the fix happens back in the editor), reachable any time from the editor's Check button so a script
+/// can be validated WITHOUT running it — the whole point of "help people write scripts and validate
+/// them before they run." Every problem blocks the run; there is no error/warning distinction.
 struct RoboIssuesView: View {
     @Environment(\.dismiss) private var dismiss
     let issues: [RoboIssue]
-
-    private var errors: [RoboIssue] { issues.filter { $0.isError } }
-    private var warnings: [RoboIssue] { issues.filter { !$0.isError } }
 
     var body: some View {
         NavigationView {
@@ -35456,21 +35453,14 @@ struct RoboIssuesView: View {
                     VStack(spacing: 12) {
                         Image(systemName: "checkmark.seal.fill").font(.largeTitle).foregroundColor(.green)
                         Text("No problems found").font(.headline)
-                        Text("Balanced FOR/END, known verbs, valid model IDs, and every {VAR} bound to a FOR. Safe to run.")
+                        Text("Balanced FOR/END, known verbs, valid model IDs, and every {{VAR}} bound to a FOR. Safe to run.")
                             .font(.callout).foregroundColor(.secondary).multilineTextAlignment(.center)
                     }
                     .padding()
                 } else {
                     List {
-                        if !errors.isEmpty {
-                            Section("Errors — the script won't run until these are fixed") {
-                                ForEach(errors) { issueRow($0) }
-                            }
-                        }
-                        if !warnings.isEmpty {
-                            Section("Warnings — allowed, but worth a look") {
-                                ForEach(warnings) { issueRow($0) }
-                            }
+                        Section("Problems — the script won't run until these are fixed") {
+                            ForEach(issues) { issueRow($0) }
                         }
                     }
                 }
@@ -35483,8 +35473,8 @@ struct RoboIssuesView: View {
 
     @ViewBuilder private func issueRow(_ issue: RoboIssue) -> some View {
         HStack(alignment: .top, spacing: 10) {
-            Image(systemName: issue.isError ? "xmark.octagon.fill" : "exclamationmark.triangle.fill")
-                .foregroundColor(issue.isError ? .red : .orange)
+            Image(systemName: "xmark.octagon.fill")
+                .foregroundColor(.red)
             VStack(alignment: .leading, spacing: 2) {
                 Text(issue.message).font(.callout)
                 Text(issue.line > 0 ? "Line \(issue.line)" : "Whole script")
@@ -35519,14 +35509,14 @@ struct RoboHelpView: View {
     private static let templates: [(title: String, snippet: String)] = [
         ("Sweep (FOR … END)", """
         FOR TEMP IN 0.2, 0.6, 1.0
-            SET_TEMPERATURE:{TEMP}
+            SET_TEMPERATURE:{{TEMP}}
             ASK In one sentence, what is a good name for a pet fox?
         END
         """),
         ("Ask a question", "ASK <your question here>"),
         ("Compare models", """
         FOR MODEL IN apple-foundation-models
-            SWITCH_MODEL:{MODEL}
+            SWITCH_MODEL:{{MODEL}}
             ASK In one sentence, introduce yourself.
         END
         """),

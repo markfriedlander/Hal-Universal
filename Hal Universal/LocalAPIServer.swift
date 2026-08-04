@@ -624,16 +624,15 @@ class HalTestConsole: ObservableObject {
 
         } else if trimmed.hasPrefix("ROBO_CHECK:") {
             // Validate a RoboRunner script WITHOUT running it — the antenna equivalent of the
-            // editor's Check button (RoboValidator). Returns every issue (errors + warnings) with
-            // line numbers, so the coach can be driven and verified over the antenna. Runs nothing,
-            // touches no state; safe (non-destructive) even though ROBO_RUN is destructive.
+            // editor's Check button (RoboValidator). Returns every problem with its line number, so
+            // the coach can be driven and verified over the antenna. There is a single severity now
+            // (every problem blocks the run). Runs nothing, touches no state; safe (non-destructive).
             let script = String(trimmed.dropFirst("ROBO_CHECK:".count))
             let issues = RoboValidator.validate(script, knownModelIDs: RoboRunner.currentKnownModelIDs())
-            let errorCount = issues.filter { $0.isError }.count
             let items = issues.map {
-                "{\"severity\":\"\($0.isError ? "error" : "warning")\",\"line\":\($0.line),\"message\":\"\(jsonStringEscape($0.message))\"}"
+                "{\"line\":\($0.line),\"message\":\"\(jsonStringEscape($0.message))\"}"
             }.joined(separator: ",")
-            return "{\"status\":\"ok\",\"command\":\"ROBO_CHECK\",\"errorCount\":\(errorCount),\"warningCount\":\(issues.count - errorCount),\"issues\":[\(items)]}"
+            return "{\"status\":\"ok\",\"command\":\"ROBO_CHECK\",\"problemCount\":\(issues.count),\"issues\":[\(items)]}"
 
         } else if trimmed.hasPrefix("ROBO_GENERATE:") {
             // Draft a RoboRunner script from a natural-language description using Hal's own model,
@@ -647,7 +646,7 @@ class HalTestConsole: ObservableObject {
                     messages: [.system(system), .user(user)], temperature: 0.2)
             }
             let items = draft.issues.map {
-                "{\"severity\":\"\($0.isError ? "error" : "warning")\",\"line\":\($0.line),\"message\":\"\(jsonStringEscape($0.message))\"}"
+                "{\"line\":\($0.line),\"message\":\"\(jsonStringEscape($0.message))\"}"
             }.joined(separator: ",")
             return "{\"status\":\"ok\",\"command\":\"ROBO_GENERATE\",\"valid\":\(draft.isValid),\"attempts\":\(draft.attempts),\"script\":\"\(jsonStringEscape(draft.script))\",\"issues\":[\(items)]}"
 
@@ -681,7 +680,7 @@ class HalTestConsole: ObservableObject {
             }
             UserDefaults.standard.set(draft.script, forKey: "lab.roboScript")
             let items = draft.issues.map {
-                "{\"severity\":\"\($0.isError ? "error" : "warning")\",\"line\":\($0.line),\"message\":\"\(jsonStringEscape($0.message))\"}"
+                "{\"line\":\($0.line),\"message\":\"\(jsonStringEscape($0.message))\"}"
             }.joined(separator: ",")
             return "{\"status\":\"ok\",\"command\":\"ROBO_DRAFT_FROM_FIELD\",\"valid\":\(draft.isValid),\"attempts\":\(draft.attempts),\"script\":\"\(jsonStringEscape(draft.script))\",\"issues\":[\(items)]}"
 
