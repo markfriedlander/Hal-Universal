@@ -65,13 +65,13 @@ The header shows the thread title, then a row of icons. From left to right:
 
 - **Threads** (three horizontal lines): opens the slide-out list of all your conversations.
 - **Thermal indicator** (a filling thermometer): appears **only when the device is warm or hot**. When cool it is hidden entirely. Tap it for a plain-language note on how warm things are and what Hal is doing about it.
-- **Thinking** (a brain): turns **thinking mode** on and off. Bright when on, dim when off.
-- **Help** (a life ring): opens **Help Mode**, a menu of focused help topics. Bright when a topic is active, dim when off.
 - **Privacy Lock** (a closed or open padlock): a live indicator of whether your data could leave the device right now. Tap it for the explanation.
+- **Thinking** (a brain): turns **thinking mode** on and off.
+- **Help** (a life ring): opens **Help Mode**, a menu of focused help topics.
 - **Search** (a magnifying glass): opens a find bar to search **within the current thread**. See "Searching your conversations" below.
 - **Settings** (a gear): opens the Settings screen.
 
-The brain and the life ring sit side by side on purpose: brain for thinking, life ring for help. The thermometer, when it appears, always sits to the brain's left, so it never wedges between the two mode toggles.
+The icons are **white by default**. The three that toggle a mode — **Thinking, Help, and Search** — turn **blue** when they're active (Help also gently pulses), so you can tell at a glance what's currently on. The rest (Threads, Privacy Lock, Settings) stay white and simply open things.
 
 ### The composer: sending and stopping
 

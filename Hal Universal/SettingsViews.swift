@@ -144,7 +144,12 @@ struct ActionsView: View {
                     NavigationLink {
                         AboutView.hal(chatViewModel: chatViewModel)
                     } label: {
-                        Label("About Hal Universal", systemImage: "info.circle")
+                        // Explicit icon color so the Form doesn't accent-tint the "i" blue.
+                        Label {
+                            Text("About Hal Universal")
+                        } icon: {
+                            Image(systemName: "info.circle").foregroundStyle(.primary)
+                        }
                     }
                 }
                 .id("about")
@@ -461,10 +466,8 @@ struct ActionsView: View {
                     NavigationLink(value: SettingsDestination.selfModel) {
                         HStack {
                             Image(systemName: "book.pages")
-                                .foregroundColor(.blue)
                             Text("Hal's Self Model")
                                 .font(.subheadline)
-                                .foregroundColor(.blue)
                         }
                         .padding(.vertical, 6)
                     }
@@ -574,14 +577,23 @@ struct ActionsView: View {
                     Text(size.label).tag(size.rawValue)
                 }
             } label: {
-                Label("Text Size", systemImage: "textformat.size")
+                // Explicit icon color so the Form doesn't accent-tint it blue (decorative, not active).
+                Label {
+                    Text("Text Size")
+                } icon: {
+                    Image(systemName: "textformat.size").foregroundStyle(.primary)
+                }
             }
             Picker(selection: $chatDensityRaw) {
                 ForEach(ChatDensity.allCases) { d in
                     Text(d.label).tag(d.rawValue)
                 }
             } label: {
-                Label("Density", systemImage: "arrow.up.and.down.text.horizontal")
+                Label {
+                    Text("Density")
+                } icon: {
+                    Image(systemName: "arrow.up.and.down.text.horizontal").foregroundStyle(.primary)
+                }
             }
         } header: {
             Label("Chat Display", systemImage: "textformat")
@@ -814,7 +826,7 @@ struct ActionsView: View {
             NavigationLink(value: (Self.salonModeExposedInUI && chatViewModel.salonConfig.isEnabled) ? SettingsDestination.salon : SettingsDestination.powerUser) {
                 HStack {
                     Image(systemName: (Self.salonModeExposedInUI && chatViewModel.salonConfig.isEnabled) ? "person.3" : "wrench.and.screwdriver")
-                    Text((Self.salonModeExposedInUI && chatViewModel.salonConfig.isEnabled) ? "Salon Mode Settings" : "Single LLM Settings")
+                    Text((Self.salonModeExposedInUI && chatViewModel.salonConfig.isEnabled) ? "Salon Settings" : "Single LLM Settings")
                     Spacer()
                 }
             }
@@ -1567,7 +1579,7 @@ struct SalonModeView: View {
                         .font(.caption)
                 }
             }
-            .navigationTitle("Salon Mode Settings")
+            .navigationTitle("Salon Settings")
     }
 }
 

@@ -646,6 +646,33 @@ struct iOSChatView: View {
                         .presentationCompactAdaptation(.popover)
                 }
             }
+            // Privacy lock — sits between the thermometer and the brain (Mark 2026-08-05); the
+            // two mode toggles (brain, life ring) and search stay grouped to its right.
+            Button {
+                showingPrivacyPopover = true
+            } label: {
+                Image(systemName: isPrivacyLocked ? "lock" : "lock.open")
+            }
+            .popover(isPresented: $showingPrivacyPopover) {
+                PrivacyLockPopover(
+                    isLocked: isPrivacyLocked
+                ) {
+                    // Record intent + dismiss the popover; the Model Library sheet
+                    // presents from onDisappear once the popover is fully gone.
+                    pendingModelLibraryNav = true
+                    showingPrivacyPopover = false
+                }
+                .presentationCompactAdaptation(.popover)
+                .onDisappear {
+                    if pendingModelLibraryNav {
+                        pendingModelLibraryNav = false
+                        // Route to Model Library through its real home (Settings) rather than a
+                        // top-level modal — consistent with the 2026-08-05 nav migration.
+                        chatViewModel.showingSettings = true
+                        chatViewModel.settingsPath = [.modelLibrary]
+                    }
+                }
+            }
             // Reasoning / thinking toggle — monochrome (bright on / dim off).
             // In Salon Mode thinking is unavailable (single-LLM only): the button
             // stays tappable but dims and, instead of toggling, opens the popover
@@ -671,7 +698,7 @@ struct iOSChatView: View {
                     // Colour tracks the EFFECTIVE state (reasoningActive), so the
                     // glyph reads dim in Salon even if reasoningEnabled is still
                     // stored true. Extra dim signals "unavailable but tappable".
-                    .foregroundStyle(chatViewModel.reasoningActive ? Color.primary : Color.secondary)
+                    .foregroundStyle(chatViewModel.reasoningActive ? Color.accentColor : Color.primary)
                     .opacity(chatViewModel.salonConfig.isEnabled ? 0.45 : 1.0)
             }
             .popover(isPresented: $showingReasoningPopover) {
@@ -721,34 +748,8 @@ struct iOSChatView: View {
                 }
             } label: {
                 Image(systemName: "lifepreserver")
-                    .foregroundStyle(chatViewModel.helpTopic != nil ? Color.primary : Color.secondary)
+                    .foregroundStyle(chatViewModel.helpTopic != nil ? Color.accentColor : Color.primary)
                     .modifier(HelpNudgePulse(token: chatViewModel.helpNudgePulse, reduceMotion: reduceMotion))
-            }
-            // Privacy lock.
-            Button {
-                showingPrivacyPopover = true
-            } label: {
-                Image(systemName: isPrivacyLocked ? "lock" : "lock.open")
-            }
-            .popover(isPresented: $showingPrivacyPopover) {
-                PrivacyLockPopover(
-                    isLocked: isPrivacyLocked
-                ) {
-                    // Record intent + dismiss the popover; the Model Library sheet
-                    // presents from onDisappear once the popover is fully gone.
-                    pendingModelLibraryNav = true
-                    showingPrivacyPopover = false
-                }
-                .presentationCompactAdaptation(.popover)
-                .onDisappear {
-                    if pendingModelLibraryNav {
-                        pendingModelLibraryNav = false
-                        // Route to Model Library through its real home (Settings) rather than a
-                        // top-level modal — consistent with the 2026-08-05 nav migration.
-                        chatViewModel.showingSettings = true
-                        chatViewModel.settingsPath = [.modelLibrary]
-                    }
-                }
             }
             // Search — find-in-page over the CURRENT thread. Toggles the find bar below the icon
             // row (bright while active). Placed just left of the gear so it reads as "act on this
@@ -757,7 +758,7 @@ struct iOSChatView: View {
                 chatViewModel.chatSearchActive.toggle()
             } label: {
                 Image(systemName: "magnifyingglass")
-                    .foregroundStyle(chatViewModel.chatSearchActive ? Color.primary : Color.secondary)
+                    .foregroundStyle(chatViewModel.chatSearchActive ? Color.accentColor : Color.primary)
             }
             // Settings.
             Button {

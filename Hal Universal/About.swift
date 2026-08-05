@@ -94,6 +94,9 @@ struct AboutView: View {
     let ownLicense: String
     let ownCopyright: String
     let sourceURL: String?
+    /// Optional home / copyright link (e.g. the author's site). When set, the Copyright row becomes
+    /// a tappable link out, like Source code. nil = plain copyright text (for other apps copying this).
+    let homeURL: String?
     /// The models actually in use right now — supplied by the app from live selection state,
     /// so this section reflects what's genuinely running, not merely what's on disk. A model
     /// that's installed but not selected isn't being *used*, so it doesn't appear here — and
@@ -138,7 +141,19 @@ struct AboutView: View {
 
             Section {
                 LabeledContent("License", value: ownLicense)
-                LabeledContent("Copyright", value: ownCopyright)
+                if let homeURL, let url = URL(string: homeURL) {
+                    // Copyright links out to the author's site, like Source code below.
+                    Link(destination: url) {
+                        HStack {
+                            Text(ownCopyright)
+                            Spacer()
+                            Image(systemName: "arrow.up.right")
+                                .font(.caption)
+                        }
+                    }
+                } else {
+                    LabeledContent("Copyright", value: ownCopyright)
+                }
                 if let sourceURL, let url = URL(string: sourceURL) {
                     Link(destination: url) {
                         HStack {
@@ -471,6 +486,7 @@ extension AboutView {
             ownLicense: "MIT License",
             ownCopyright: "© 2026 Mark Friedlander",
             sourceURL: "https://github.com/markfriedlander/Hal-Universal",
+            homeURL: "https://markfriedlander.github.io",
             models: halActiveModels(chatViewModel: chatViewModel),
             acknowledgements: halAcknowledgements
         )
