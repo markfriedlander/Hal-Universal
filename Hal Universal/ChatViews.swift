@@ -225,6 +225,13 @@ extension View {
     }
 }
 
+extension Color {
+    /// Shared find-in-page highlight — blue (the accent/slider color), translucent so the
+    /// highlighted text stays readable in light and dark. Used by EVERY search so they match:
+    /// chat find-in-page, the Guide reader, and global thread search (Mark, 2026-08-05).
+    static let searchHighlight = Color.accentColor.opacity(0.4)
+}
+
 struct iOSChatView: View {
     @EnvironmentObject var chatViewModel: ChatViewModel
     // Help Mode D nudge honors Reduce Motion: the life-ring pulses with a scale
@@ -261,6 +268,15 @@ struct iOSChatView: View {
     // Sheet flags moved to ChatViewModel.showingSettings / showingThreadPanel /
     // showingDocumentPicker so the LocalAPIServer can read them via GET_UI_STATE.
     @FocusState private var isInputFocused: Bool // NEW: Track text field focus
+    // Current-thread find-in-page (the magnifying glass). The active flag + live query live on the
+    // ChatViewModel (bubbles read the query to highlight matches; global thread search sets both).
+    // These are the view-local navigation bits: which match is current, plus a nonce + target id
+    // that drive the ScrollViewReader to scroll to it — the nonce guarantees a fresh onChange even
+    // when re-selecting the same match. See chatFindBar and the search onChange handlers.
+    @FocusState private var isSearchFieldFocused: Bool
+    @State private var searchMatchIndex: Int = 0
+    @State private var searchScrollTargetID: UUID? = nil
+    @State private var searchScrollNonce: Int = 0
     // Scroll behavior (2026-05-17, Mark's directive):
     //
     // Single rule: when the user sends a message, that message scrolls
@@ -291,6 +307,16 @@ struct iOSChatView: View {
             VStack(spacing: 0) {
                 // Top chrome — two rows: full-width thread title, then the icon row.
                 chromeHeader
+                    .onChange(of: chatViewModel.chatSearchQuery) { _, _ in
+                        // Typed into the find bar, or set by global thread search: reset to the
+                        // first match and scroll to it.
+                        onSearchQueryChanged()
+                    }
+                    .onChange(of: chatViewModel.chatSearchActive) { _, active in
+                        // Focus the field the moment the find bar opens so the user can just type.
+                        if active { isSearchFieldFocused = true }
+                    }
+                    .animation(.easeInOut(duration: 0.2), value: chatViewModel.chatSearchActive)
                 // Messages
                 ScrollViewReader { proxy in
                     List {
@@ -388,6 +414,14 @@ struct iOSChatView: View {
                             withAnimation(.easeOut(duration: 0.3)) {
                                 proxy.scrollTo(latestUser.id, anchor: .top)
                             }
+                        }
+                    }
+                    .onChange(of: searchScrollNonce) { _, _ in
+                        // Find-in-page: scroll the current match into view. The nonce (not the id)
+                        // is the trigger, so re-selecting the same match still fires the scroll.
+                        guard let target = searchScrollTargetID else { return }
+                        withAnimation(.easeOut(duration: 0.25)) {
+                            proxy.scrollTo(target, anchor: .center)
                         }
                     }
                 }
@@ -505,9 +539,90 @@ struct iOSChatView: View {
                 .padding(.horizontal, 14)
                 .padding(.top, 2)
                 .padding(.bottom, 8)
+            if chatViewModel.chatSearchActive {
+                chatFindBar
+                    .padding(.horizontal, 14)
+                    .padding(.bottom, 8)
+                    .transition(.move(edge: .top).combined(with: .opacity))
+            }
         }
         .background(.bar)
         .overlay(alignment: .bottom) { Divider() }
+    }
+
+    // MARK: - Current-thread find-in-page
+
+    /// Messages in the current thread whose content contains the search term (case-insensitive),
+    /// in display order. Empty when the query is blank. Drives the "N of M" count, the up/down
+    /// stepping, and which message we scroll to.
+    private var searchMatchIDs: [UUID] {
+        let term = chatViewModel.chatSearchQuery.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !term.isEmpty else { return [] }
+        return chatViewModel.messages
+            .filter { $0.content.localizedCaseInsensitiveContains(term) }
+            .map(\.id)
+    }
+
+    /// "3 of 12", "No matches", or "" (blank query). Shown in the find bar.
+    private var searchMatchCountLabel: String {
+        if chatViewModel.chatSearchQuery.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty { return "" }
+        let count = searchMatchIDs.count
+        if count == 0 { return "No matches" }
+        return "\(min(searchMatchIndex + 1, count)) of \(count)"
+    }
+
+    /// The find bar: a text field plus match count and up/down steppers, and a close button.
+    private var chatFindBar: some View {
+        HStack(spacing: 10) {
+            Image(systemName: "magnifyingglass")
+                .font(.footnote)
+                .foregroundColor(.secondary)
+            TextField("Find in this thread", text: $chatViewModel.chatSearchQuery)
+                .textFieldStyle(.plain)
+                .autocorrectionDisabled()
+                .submitLabel(.search)
+                .focused($isSearchFieldFocused)
+                .onSubmit { stepSearch(1) }
+            if !chatViewModel.chatSearchQuery.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                Text(searchMatchCountLabel)
+                    .font(.footnote.monospacedDigit())
+                    .foregroundColor(.secondary)
+                Button { stepSearch(-1) } label: { Image(systemName: "chevron.up") }
+                    .disabled(searchMatchIDs.isEmpty)
+                Button { stepSearch(1) } label: { Image(systemName: "chevron.down") }
+                    .disabled(searchMatchIDs.isEmpty)
+            }
+            Button {
+                chatViewModel.chatSearchActive = false
+                isSearchFieldFocused = false
+            } label: {
+                Image(systemName: "xmark.circle.fill")
+                    .foregroundColor(.secondary)
+            }
+        }
+        .font(.subheadline)
+        .padding(.horizontal, 12)
+        .padding(.vertical, 7)
+        .background(Color(.secondarySystemBackground), in: RoundedRectangle(cornerRadius: 10))
+    }
+
+    /// Move to the next/previous match (dir = +1 / -1), wrapping around, and request a scroll to it.
+    private func stepSearch(_ dir: Int) {
+        let matches = searchMatchIDs
+        guard !matches.isEmpty else { return }
+        searchMatchIndex = ((searchMatchIndex + dir) % matches.count + matches.count) % matches.count
+        searchScrollTargetID = matches[searchMatchIndex]
+        searchScrollNonce += 1
+    }
+
+    /// Called when the query changes (typed, or set by global thread search): reset to the first
+    /// match and scroll to it. Reused so a global-search jump lands on the matching message.
+    private func onSearchQueryChanged() {
+        searchMatchIndex = 0
+        if let first = searchMatchIDs.first {
+            searchScrollTargetID = first
+            searchScrollNonce += 1
+        }
     }
 
     private var chromeIconRow: some View {
@@ -634,6 +749,15 @@ struct iOSChatView: View {
                         chatViewModel.settingsPath = [.modelLibrary]
                     }
                 }
+            }
+            // Search — find-in-page over the CURRENT thread. Toggles the find bar below the icon
+            // row (bright while active). Placed just left of the gear so it reads as "act on this
+            // conversation." Global (all-threads) search lives on the Threads screen.
+            Button {
+                chatViewModel.chatSearchActive.toggle()
+            } label: {
+                Image(systemName: "magnifyingglass")
+                    .foregroundStyle(chatViewModel.chatSearchActive ? Color.primary : Color.secondary)
             }
             // Settings.
             Button {
@@ -842,6 +966,10 @@ struct ThreadPanelView: View {
     @EnvironmentObject var chatViewModel: ChatViewModel
     @State private var threadToDelete: ThreadRecord? = nil
     @State private var showingDeleteConfirmation = false
+    // Global search (across all threads): title + message content, via MemoryStore.searchThreads.
+    // Recomputed on each keystroke (local SQLite, small). Empty query = the normal thread list.
+    // The query lives on the VM (chatViewModel.threadSearchQuery) so the antenna can drive it.
+    @State private var searchResults: [ThreadSearchResult] = []
 
     private let dateFormatter: DateFormatter = {
         let f = DateFormatter()
@@ -850,29 +978,49 @@ struct ThreadPanelView: View {
         return f
     }()
 
+    private var trimmedSearch: String {
+        chatViewModel.threadSearchQuery.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
     var body: some View {
         NavigationStack {
             List {
-                // New Thread button at top
-                Button {
-                    chatViewModel.startNewConversation()
-                    isPresented = false
-                } label: {
-                    Label("New Thread", systemImage: "square.and.pencil")
-                        .foregroundColor(.accentColor)
-                }
-
-                // Thread list, most recent first (already sorted by loadAllThreads)
-                ForEach(chatViewModel.threads) { thread in
-                    threadRow(thread)
+                if trimmedSearch.isEmpty {
+                    // Normal state: New Thread + the full thread list, most recent first.
+                    Button {
+                        chatViewModel.startNewConversation()
+                        isPresented = false
+                    } label: {
+                        Label("New Thread", systemImage: "square.and.pencil")
+                            .foregroundColor(.accentColor)
+                    }
+                    ForEach(chatViewModel.threads) { thread in
+                        threadRow(thread)
+                    }
+                } else if searchResults.isEmpty {
+                    Text("No threads match \u{201C}\(trimmedSearch)\u{201D}")
+                        .foregroundColor(.secondary)
+                        .frame(maxWidth: .infinity, alignment: .center)
+                        .listRowSeparator(.hidden)
+                } else {
+                    // Global search results: title + a content snippet, matches highlighted.
+                    ForEach(searchResults) { result in
+                        searchResultRow(result)
+                    }
                 }
             }
             .listStyle(.plain)
             .navigationTitle("Threads")
             .navigationBarTitleDisplayMode(.inline)
+            .searchable(text: $chatViewModel.threadSearchQuery,
+                        placement: .navigationBarDrawer(displayMode: .always),
+                        prompt: "Search all threads")
             .toolbar {
                 ToolbarItem(placement: .cancellationAction) {
-                    Button("Done") { isPresented = false }
+                    Button("Done") {
+                        chatViewModel.threadSearchQuery = ""
+                        isPresented = false
+                    }
                 }
             }
         }
@@ -884,9 +1032,68 @@ struct ThreadPanelView: View {
         } message: { thread in
             Text("This will permanently delete all messages in \"\(thread.title)\". This cannot be undone.")
         }
+        .onChange(of: chatViewModel.threadSearchQuery) { _, _ in
+            // Content + title search across all threads (see MemoryStore.searchThreads).
+            searchResults = trimmedSearch.isEmpty
+                ? []
+                : chatViewModel.memoryStore.searchThreads(query: trimmedSearch)
+        }
         .onAppear {
             chatViewModel.loadThreads()
+            // Recompute if the antenna pre-seeded a query before the panel opened.
+            if !trimmedSearch.isEmpty {
+                searchResults = chatViewModel.memoryStore.searchThreads(query: trimmedSearch)
+            }
         }
+    }
+
+    /// A global-search result: thread title plus a content snippet, both with the query highlighted
+    /// in blue. Tapping opens that thread and carries the term into its find-in-page so the chat
+    /// lands on the matching message.
+    @ViewBuilder
+    private func searchResultRow(_ result: ThreadSearchResult) -> some View {
+        Button {
+            let term = trimmedSearch
+            chatViewModel.threadSearchQuery = ""
+            chatViewModel.switchToThread(result.threadId)
+            isPresented = false
+            // Let the panel dismiss and the thread's messages render, then open the chat find bar
+            // on the same term — its onChange scrolls to the first match (the jump-to-message).
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.35) {
+                chatViewModel.chatSearchActive = true
+                chatViewModel.chatSearchQuery = term
+            }
+        } label: {
+            VStack(alignment: .leading, spacing: 3) {
+                highlightedResultText(result.title)
+                    .font(.body)
+                    .foregroundColor(.primary)
+                    .lineLimit(1)
+                if !result.snippet.isEmpty {
+                    highlightedResultText(result.snippet)
+                        .font(.caption)
+                        .foregroundColor(.secondary)
+                        .lineLimit(2)
+                }
+            }
+        }
+        .foregroundColor(.primary)
+    }
+
+    /// `text` with case-insensitive matches of the current query highlighted in the shared blue,
+    /// matching the chat and Guide-reader highlight.
+    private func highlightedResultText(_ text: String) -> Text {
+        var attr = AttributedString(text)
+        let needle = trimmedSearch
+        if !needle.isEmpty {
+            var start = attr.startIndex
+            while start < attr.endIndex,
+                  let r = attr[start...].range(of: needle, options: .caseInsensitive) {
+                attr[r].backgroundColor = Color.searchHighlight
+                start = r.upperBound
+            }
+        }
+        return Text(attr)
     }
 
     @ViewBuilder
@@ -1589,12 +1796,32 @@ struct ChatBubbleView: View {
         return lines.joined(separator: "\n")
     }
     
+    /// The user message, markdown-rendered, with find-in-page matches highlighted (blue) when a
+    /// chat search query is active — mirroring MarkdownView's highlight so user and assistant
+    /// bubbles light up identically. Falls back to plain rendered text when there's no query.
+    private func highlightedUserText(_ content: String) -> Text {
+        var attr = (try? AttributedString(
+            markdown: content,
+            options: .init(interpretedSyntax: .inlineOnlyPreservingWhitespace)))
+            ?? AttributedString(content)
+        let needle = chatViewModel.chatSearchQuery.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !needle.isEmpty {
+            var start = attr.startIndex
+            while start < attr.endIndex,
+                  let r = attr[start...].range(of: needle, options: .caseInsensitive) {
+                attr[r].backgroundColor = Color.searchHighlight
+                start = r.upperBound
+            }
+        }
+        return Text(attr)
+    }
+
     var body: some View {
         HStack {
             if message.isFromUser {
                 Spacer()
                 VStack(alignment: .trailing, spacing: 0) {
-                    Text(.init(message.content))
+                    highlightedUserText(message.content)
                         .font(.system(size: chatBodyPt))
                         .textSelection(.enabled)
                         .padding(.vertical, chatDensity.bubbleVPadding)
@@ -1648,7 +1875,8 @@ struct ChatBubbleView: View {
                         } else {
                             MarkdownView(text: message.content,
                                          bodyPointSize: chatBodyPt,
-                                         lineSpacing: chatDensity.lineSpacing)
+                                         lineSpacing: chatDensity.lineSpacing,
+                                         highlight: chatViewModel.chatSearchQuery)
                                 .textSelection(.enabled)
                                 .padding(.vertical, chatDensity.bubbleVPadding)
                                 .padding(.horizontal, chatDensity.assistantHInset)
@@ -1971,7 +2199,7 @@ struct MarkdownView: View {
         var searchStart = attr.startIndex
         while searchStart < attr.endIndex,
               let r = attr[searchStart...].range(of: needle, options: .caseInsensitive) {
-            attr[r].backgroundColor = Color.yellow.opacity(0.45)
+            attr[r].backgroundColor = Color.searchHighlight
             searchStart = r.upperBound
         }
     }

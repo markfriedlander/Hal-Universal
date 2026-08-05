@@ -682,6 +682,9 @@ nonisolated enum CommandCatalog {
         // UI & Display
         CommandDescriptor(verb: "GET_UI_STATE", args: nil, summary: "Report the current UI and navigation state.", category: .ui, destructive: false),
         CommandDescriptor(verb: "SET_UI_STATE", args: "<state>", summary: "Drive the UI to a semantic state, for example open settings or the model library.", category: .ui, destructive: false),
+        CommandDescriptor(verb: "SET_CHAT_SEARCH", args: "<term>", summary: "Open the chat find-in-page and search the current thread for a term. Matches highlight; an empty term clears the search.", category: .ui, destructive: false),
+        CommandDescriptor(verb: "SET_THREAD_SEARCH", args: "<term>", summary: "Open the Threads panel and search across all threads by title and message content.", category: .ui, destructive: false),
+        CommandDescriptor(verb: "SET_GUIDE_QUERY", args: "<term>", summary: "Open the in-app Guide reader and run its find-in-page for a term.", category: .ui, destructive: false),
         CommandDescriptor(verb: "SET_CHAT_DISPLAY", args: "<pt>:<density>", summary: "Set the chat text size and density, for testing the display controls.", category: .ui, destructive: false, debugOnly: true),
         CommandDescriptor(verb: "SCREENSHOT", args: nil, summary: "Capture the current key window as a PNG. View render only, does not show live camera or video.", category: .ui, destructive: false),
         CommandDescriptor(verb: "SCROLL", args: "<down|up|top|bottom|pagedown|pageup>", summary: "Scroll the frontmost scroll view (general parity with a human swipe on any scrollable screen).", category: .ui, destructive: false),

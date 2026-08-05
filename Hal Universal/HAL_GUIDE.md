@@ -68,6 +68,7 @@ The header shows the thread title, then a row of icons. From left to right:
 - **Thinking** (a brain): turns **thinking mode** on and off. Bright when on, dim when off.
 - **Help** (a life ring): opens **Help Mode**, a menu of focused help topics. Bright when a topic is active, dim when off.
 - **Privacy Lock** (a closed or open padlock): a live indicator of whether your data could leave the device right now. Tap it for the explanation.
+- **Search** (a magnifying glass): opens a find bar to search **within the current thread**. See "Searching your conversations" below.
 - **Settings** (a gear): opens the Settings screen.
 
 The brain and the life ring sit side by side on purpose: brain for thinking, life ring for help. The thermometer, when it appears, always sits to the brain's left, so it never wedges between the two mode toggles.
@@ -221,8 +222,18 @@ The **Threads** panel (the three-lines icon, top left) lists all your conversati
 - **New Thread:** start a fresh conversation.
 - **Tap a thread:** switch to it, with its full context restored. The active thread is marked with a checkmark.
 - **Reset or delete a thread:** swipe a row, or tap its trash icon, then confirm. This permanently deletes that thread's messages and cannot be undone.
+- **Search all threads:** the field at the top of the panel searches **every** conversation at once. See "Searching your conversations" below.
 
 Each thread shows its title (seeded from your first message) and the date it was last active.
+
+### Searching your conversations
+
+Hal has two kinds of search, and they share one habit: every match is highlighted in the same blue, so hits are easy to spot at a glance.
+
+- **Within a thread (find-in-page):** tap the **magnifying glass** in the top bar. A find bar drops down. Type a word or phrase and Hal highlights every occurrence in the open conversation, shows a running count such as "3 of 12", and gives you up and down arrows to jump from one match to the next. The close button clears the search and the highlights.
+- **Across every thread (global search):** open the **Threads** panel and type in the **Search all threads** field. This searches all of your conversations at once, by both title and message content, and lists the threads that match, each with a short snippet of the hit. Tap a result and Hal opens that thread and carries your search term into the in-thread find, so you land right on the matching message.
+
+Both searches run entirely on the device against what is already stored. Nothing is sent anywhere in order to search it.
 
 ### Read-aloud (Hal's voice)
 
@@ -897,7 +908,7 @@ The same verbs work through the Developer API, RoboRunner, and the `hal` command
 <!-- BEGIN GENERATED COMMAND REFERENCE. Do not edit by hand.
      Regenerate with scripts/sync_command_reference.sh (reads CommandCatalog.all). -->
 
-*113 commands. Generated from the app's command catalog, so this list always matches the running interpreter. The same verbs work through all three doors (Developer API, RoboRunner, hal CLI). Commands marked **[Advanced]** change or delete data and are refused in Safe mode; switch to Advanced and add a trailing `--yes` (or `CONFIRM`) to run them.*
+*116 commands. Generated from the app's command catalog, so this list always matches the running interpreter. The same verbs work through all three doors (Developer API, RoboRunner, hal CLI). Commands marked **[Advanced]** change or delete data and are refused in Safe mode; switch to Advanced and add a trailing `--yes` (or `CONFIRM`) to run them.*
 
 ### Models & Downloads
 
@@ -1042,6 +1053,9 @@ The same verbs work through the Developer API, RoboRunner, and the `hal` command
 | `GET_UI_STATE` | Report the current UI and navigation state. |
 | `SCREENSHOT` | Capture the current key window as a PNG. View render only, does not show live camera or video. |
 | `SCROLL:<down|up|top|bottom|pagedown|pageup>` | Scroll the frontmost scroll view (general parity with a human swipe on any scrollable screen). |
+| `SET_CHAT_SEARCH:<term>` | Open the chat find-in-page and search the current thread for a term. Matches highlight; an empty term clears the search. |
+| `SET_GUIDE_QUERY:<term>` | Open the in-app Guide reader and run its find-in-page for a term. |
+| `SET_THREAD_SEARCH:<term>` | Open the Threads panel and search across all threads by title and message content. |
 | `SET_TTS_AUTO_READ:<1|0>` | Turn auto-read on/off (read every completed response aloud). |
 | `SET_TTS_RATE:<0.0-1.0>` | Set the read-aloud speaking rate (default 0.5). |
 | `SET_TTS_VOICE:<identifier?>` | Choose the read-aloud voice by identifier (from TTS_VOICE_LIST); empty means Automatic. |

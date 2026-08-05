@@ -926,6 +926,28 @@ class HalTestConsole: ObservableObject {
             let esc = term.replacingOccurrences(of: "\\", with: "\\\\").replacingOccurrences(of: "\"", with: "\\\"")
             return "{\"status\":\"ok\",\"command\":\"SET_GUIDE_QUERY\",\"query\":\"\(esc)\"}"
 
+        } else if trimmed.hasPrefix("SET_CHAT_SEARCH:") {
+            // Test hook for the chat find-in-page (current-thread search). Opens the find bar and
+            // sets the query so CC can screenshot the highlighted matches + jump-to-first-match
+            // without a human typing. Empty term clears the query (highlights vanish) but leaves the
+            // bar open; SET_UI_STATE:chatsearch:false closes it. Next/prev stepping is view-local UI.
+            let term = String(trimmed.dropFirst("SET_CHAT_SEARCH:".count)).trimmingCharacters(in: .whitespaces)
+            vm.chatSearchActive = true
+            vm.chatSearchQuery = term
+            let esc = term.replacingOccurrences(of: "\\", with: "\\\\").replacingOccurrences(of: "\"", with: "\\\"")
+            return "{\"status\":\"ok\",\"command\":\"SET_CHAT_SEARCH\",\"query\":\"\(esc)\"}"
+
+        } else if trimmed.hasPrefix("SET_THREAD_SEARCH:") {
+            // Test hook for GLOBAL thread search (the Threads screen). Opens the thread panel and
+            // sets its search field, so CC can screenshot the results + snippets without typing into
+            // the .searchable field (which isn't reachable headlessly). Empty term clears it.
+            let term = String(trimmed.dropFirst("SET_THREAD_SEARCH:".count)).trimmingCharacters(in: .whitespaces)
+            vm.showingThreadPanel = true
+            vm.showingSettings = false
+            vm.threadSearchQuery = term
+            let esc = term.replacingOccurrences(of: "\\", with: "\\\\").replacingOccurrences(of: "\"", with: "\\\"")
+            return "{\"status\":\"ok\",\"command\":\"SET_THREAD_SEARCH\",\"query\":\"\(esc)\"}"
+
         } else if trimmed.hasPrefix("FTS_PROBE:") {
             // DEBUG (2026-07-30): FTS_PROBE:<source_type>|<word> — ground truth on why a
             // lexical self-knowledge search misses. Reports whether the stored content
@@ -1475,6 +1497,10 @@ class HalTestConsole: ObservableObject {
                 // Top-level sheet (not nested): the in-app Guide reader, reached from the
                 // Help menu's last item. Lets the antenna open + screenshot the reader.
                 vm.apiNavGuideReader = value
+            case "chatsearch":
+                // Open/close the chat find-in-page bar (current-thread search). Set the query with
+                // SET_CHAT_SEARCH:<term>. Closing clears the query via chatSearchActive's didSet.
+                vm.chatSearchActive = value
             case "selfmodelshowprivate":
                 // Mirror the @AppStorage key flipped by the SelfReflectionView
                 // toggle. Driving it via UserDefaults lets the API set it
@@ -2576,6 +2602,8 @@ class HalTestConsole: ObservableObject {
           "errorMessage": \(errorMsg.map { "\"\($0)\"" } ?? "null"),
           "showingSettings": \(vm.showingSettings),
           "settingsPath": \(settingsPathJSON),
+          "chatSearchActive": \(vm.chatSearchActive),
+          "chatSearchQuery": "\(jsonStringEscape(vm.chatSearchQuery))",
           "showingThreadPanel": \(vm.showingThreadPanel),
           "showingDocumentPicker": \(vm.showingDocumentPicker),
           "selectedModelID": "\(jsonStringEscape(vm.selectedModelID))",

@@ -427,6 +427,16 @@ struct ThreadRecord: Identifiable, Equatable {
     var lastActiveAt: Int
 }
 
+/// One hit from global thread search (the Threads screen). A thread whose title or message content
+/// matched, with a short snippet of the content hit (empty for a title-only match). The matching
+/// term is carried into the opened thread's find-in-page, so no per-message id is needed here.
+struct ThreadSearchResult: Identifiable, Equatable {
+    let threadId: String
+    let title: String
+    let snippet: String      // "" for a title-only match
+    var id: String { threadId }
+}
+
 // ==== LEGO END: 1 Imports & App Entry & Environment Wiring ====
 
 
@@ -2324,6 +2334,89 @@ class MemoryStore: ObservableObject {
                                         let topHeader = out.first.map { String($0.prefix(90)).replacingOccurrences(of: "\n", with: " ") } ?? "(none)"
                                         halLog("HALDEBUG-ROUTER: self-knowledge search '\(sanitized.prefix(40))' -> \(guideHits.count) guide + \(codeHits.count) code, top: \(topHeader)")
                                         return out
+                                    }
+
+                                    /// Global thread search for the Threads screen (2026-08-05). Returns threads whose
+                                    /// TITLE or message CONTENT matches `query`, most-relevant/most-recent first, each with a
+                                    /// short snippet of the content hit ("" for a title-only match). Content matches use the
+                                    /// BM25 FTS index over conversation rows; title matches use LIKE so naming a thread still
+                                    /// finds it. Deduped by thread (a thread matching both ways appears once, content hit
+                                    /// preferred). The matched term is carried into the opened thread's find-in-page, so a
+                                    /// display snippet is all that's needed here — no per-message id mapping.
+                                    func searchThreads(query: String, maxResults: Int = 40) -> [ThreadSearchResult] {
+                                        guard ensureHealthyConnection() else { return [] }
+                                        let raw = query.trimmingCharacters(in: .whitespacesAndNewlines)
+                                        guard !raw.isEmpty else { return [] }
+
+                                        var byThread: [String: ThreadSearchResult] = [:]
+                                        var order: [String] = []
+                                        func add(_ threadId: String, _ title: String, _ snippet: String) {
+                                            guard byThread[threadId] == nil else { return }
+                                            byThread[threadId] = ThreadSearchResult(threadId: threadId, title: title, snippet: snippet)
+                                            order.append(threadId)
+                                        }
+
+                                        // 1) CONTENT matches (BM25), conversation rows only, joined to threads for the title.
+                                        let sanitized = sanitizeFTSQuery(raw)
+                                        if !sanitized.isEmpty, sanitized != "\"\"" {
+                                            let sql = """
+                                            SELECT u.source_id, t.title, u.content, -bm25(unified_content_fts) AS score
+                                            FROM unified_content_fts
+                                            JOIN unified_content u ON u.rowid = unified_content_fts.rowid
+                                            JOIN threads t ON t.id = u.source_id
+                                            WHERE unified_content_fts MATCH ? AND u.source_type = 'conversation'
+                                            ORDER BY score DESC
+                                            LIMIT ?;
+                                            """
+                                            var stmt: OpaquePointer?
+                                            if sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK {
+                                                sqlite3_bind_text(stmt, 1, (sanitized as NSString).utf8String, -1, nil)
+                                                sqlite3_bind_int(stmt, 2, Int32(maxResults))
+                                                while sqlite3_step(stmt) == SQLITE_ROW {
+                                                    guard let idC = sqlite3_column_text(stmt, 0),
+                                                          let titleC = sqlite3_column_text(stmt, 1) else { continue }
+                                                    let threadId = String(cString: idC)
+                                                    let title = String(cString: titleC)
+                                                    let content = sqlite3_column_text(stmt, 2).map { String(cString: $0) } ?? ""
+                                                    add(threadId, title, Self.makeThreadSnippet(content, around: raw))
+                                                }
+                                            }
+                                            sqlite3_finalize(stmt)
+                                        }
+
+                                        // 2) TITLE matches (LIKE) — so searching a thread's name works even with no body hit.
+                                        let likeSQL = "SELECT id, title FROM threads WHERE title LIKE ? ORDER BY last_active_at DESC LIMIT ?;"
+                                        var stmt2: OpaquePointer?
+                                        if sqlite3_prepare_v2(db, likeSQL, -1, &stmt2, nil) == SQLITE_OK {
+                                            let pattern = "%\(raw)%"
+                                            sqlite3_bind_text(stmt2, 1, (pattern as NSString).utf8String, -1, nil)
+                                            sqlite3_bind_int(stmt2, 2, Int32(maxResults))
+                                            while sqlite3_step(stmt2) == SQLITE_ROW {
+                                                guard let idC = sqlite3_column_text(stmt2, 0),
+                                                      let titleC = sqlite3_column_text(stmt2, 1) else { continue }
+                                                add(String(cString: idC), String(cString: titleC), "")
+                                            }
+                                        }
+                                        sqlite3_finalize(stmt2)
+
+                                        return order.compactMap { byThread[$0] }
+                                    }
+
+                                    /// A short one-line excerpt of `content` around the first case-insensitive occurrence of
+                                    /// `term`, with ellipses, for a search result row. Falls back to the head of the content
+                                    /// when the term isn't found literally (FTS can match a stem/prefix a substring search won't).
+                                    private static func makeThreadSnippet(_ content: String, around term: String, window: Int = 60) -> String {
+                                        let flat = content.replacingOccurrences(of: "\n", with: " ")
+                                        if let r = flat.range(of: term, options: .caseInsensitive) {
+                                            let start = flat.index(r.lowerBound, offsetBy: -window, limitedBy: flat.startIndex) ?? flat.startIndex
+                                            let end = flat.index(r.upperBound, offsetBy: window, limitedBy: flat.endIndex) ?? flat.endIndex
+                                            var s = String(flat[start..<end]).trimmingCharacters(in: .whitespaces)
+                                            if start != flat.startIndex { s = "…" + s }
+                                            if end != flat.endIndex { s = s + "…" }
+                                            return s
+                                        }
+                                        let head = String(flat.prefix(window * 2)).trimmingCharacters(in: .whitespaces)
+                                        return flat.count > window * 2 ? head + "…" : head
                                     }
 
                                     /// DEBUG probe (2026-07-30): for a source_type and a single word, report (a) whether
@@ -10049,6 +10142,20 @@ class ChatViewModel: ObservableObject {
     @Published var showingSettings: Bool = false
     @Published var showingThreadPanel: Bool = false
     @Published var showingDocumentPicker: Bool = false
+
+    // Chat search — find-in-page over the CURRENT thread (the magnifying glass in the chat chrome).
+    // On the VM (not iOSChatView @State) because two other places touch it: chat bubbles read
+    // `chatSearchQuery` to highlight matches, and global thread search (ThreadPanelView) sets both
+    // when it opens a thread so the in-thread find lands on the matching message. `chatSearchActive`
+    // shows/hides the find bar; clearing it empties the query so highlights disappear.
+    @Published var chatSearchActive: Bool = false {
+        didSet { if !chatSearchActive { chatSearchQuery = "" } }
+    }
+    @Published var chatSearchQuery: String = ""
+    // Global thread search term (the Threads screen's search field). On the VM so the antenna can
+    // drive it for testing (the `.searchable` field can't be typed into headlessly) — ThreadPanelView
+    // binds its search field to this. Reset when the panel closes.
+    @Published var threadSearchQuery: String = ""
 
     // Settings sub-screen navigation. As of the 2026-08-05 navigation migration these six
     // drill-in screens are PUSHES inside the Settings NavigationStack (not top-level sheets),
