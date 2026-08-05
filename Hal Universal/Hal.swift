@@ -10165,10 +10165,6 @@ class ChatViewModel: ObservableObject {
     // etc.). Reset to [] when the Settings sheet closes (ChatViews onDismiss) so a later open
     // doesn't re-push a stale destination.
     @Published var settingsPath: [SettingsDestination] = []
-    // System Prompt stays a MODAL (Cancel/Save commit-abandon editor — the discard path must be
-    // preserved), so it keeps a flag rather than a path entry. ActionsView observes this and
-    // presents its sheet; the antenna sets showingSettings = true + apiNavSystemPrompt = true.
-    @Published var apiNavSystemPrompt: Bool = false
     // Presents the in-app Guide reader (GuideReaderView) — the last item on the Help
     // (life-ring) menu. Bridged from SET_UI_STATE:guidereader so the antenna can open
     // and screenshot the reader for verification without a human tapping the menu.

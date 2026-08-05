@@ -64,6 +64,7 @@ enum SettingsDestination: Hashable {
     case salon
     case modelFraming
     case selfModel
+    case systemPrompt
     case lab
     case maintenance
     case modelLibrary
@@ -77,6 +78,7 @@ enum SettingsDestination: Hashable {
         case .salon:        return "salonsettings"
         case .modelFraming: return "modelframing"
         case .selfModel:    return "selfmodel"
+        case .systemPrompt: return "systemprompt"
         case .lab:          return "lab"
         case .maintenance:  return "maintenance"
         case .modelLibrary: return "modellibrary"
@@ -93,10 +95,6 @@ struct ActionsView: View {
     @Binding var showingDocumentPicker: Bool
     @State private var showingExportSheet = false
     @State private var powerUserMode: PowerUserMode = .single
-    // System Prompt stays modal (Cancel/Save discard path). The other former sub-sheets
-    // (Power User, Salon, Model Framing, Self Model, Lab, Maintenance) are now pushes driven
-    // by chatViewModel.settingsPath — see SettingsDestination.
-    @State private var showingSystemPromptEditor = false
     @State private var initialSettingsSnapshot: [String: Any] = [:]
     @State private var skipComparisonOnDismiss = false
     // Read-Aloud (TTS) preferences. Same UserDefaults keys SpeechService reads at speak() time,
@@ -181,6 +179,9 @@ struct ActionsView: View {
                 case .selfModel:
                     SelfReflectionView()
                         .environmentObject(chatViewModel)
+                case .systemPrompt:
+                    SystemPromptEditorView()
+                        .environmentObject(chatViewModel)
                 case .lab:
                     LabView()
                         .environmentObject(chatViewModel)
@@ -221,30 +222,11 @@ struct ActionsView: View {
         .sheet(isPresented: $showingExportSheet) {
             ShareSheet(activityItems: [chatViewModel.exportChatHistory()])
         }
-        // System Prompt stays a modal: it's a Cancel/Save editor, and the discard path is the
-        // whole point (a half-typed prompt must be abandonable). Antenna routing follows the real
-        // user path — the LocalAPIServer opens Settings and sets apiNavSystemPrompt; we present
-        // the editor from here, from inside Settings, rather than as a top-level bypass. On Mac it
-        // presents as a window-filling cover (resizable) stacked over Settings; the discard path is
-        // unaffected because it lives in the editor's own Cancel/Save toolbar, not swipe-to-dismiss.
-        .macResizablePresentation(isPresented: $showingSystemPromptEditor) {
-            SystemPromptEditorView()
-                .environmentObject(chatViewModel)
-        }
-        .onChange(of: chatViewModel.apiNavSystemPrompt) { _, on in
-            if on {
-                showingSystemPromptEditor = true
-                chatViewModel.apiNavSystemPrompt = false
-            }
-        }
-        .onAppear {
-            // Covers the case where Settings was opened *by* the System Prompt antenna call, so
-            // apiNavSystemPrompt is already true before onChange can observe it.
-            if chatViewModel.apiNavSystemPrompt {
-                showingSystemPromptEditor = true
-                chatViewModel.apiNavSystemPrompt = false
-            }
-        }
+        // System Prompt is now a push (SettingsDestination.systemPrompt), driven the same way as the
+        // other drill-in screens: a human taps the row's NavigationLink, or the antenna appends to
+        // settingsPath. It inherits the Settings container's Mac resizability, so no per-editor
+        // presentation wrapper is needed. The discard path lives in the pushed editor's own
+        // back button (see block 50), not a modal Cancel.
         .onAppear {
             chatViewModel.isInSettingsFlow = true
             initialSettingsSnapshot = [
@@ -431,15 +413,12 @@ struct ActionsView: View {
             .disabled(tuningLocked)
             .opacity(tuningLocked ? 0.45 : 1.0)
 
-            // System Prompt stays a modal Button (Cancel/Save editor), so it keeps a plain row —
-            // no chevron, because a chevron reads as "drill into a place" and this opens an editor.
-            Button {
-                showingSystemPromptEditor = true
-            } label: {
-                HStack {
-                    Text("System Prompt")
-                    Spacer()
-                }
+            // System Prompt is a drill-in push (2026-08-06), matching Model framing: a chevron row
+            // that reads as "go edit this thing." It's still a Save/discard editor, but the discard
+            // path now lives in the pushed screen's back button (a "Discard changes?" confirm fires
+            // only when the prompt has actually been edited), not a modal Cancel.
+            NavigationLink(value: SettingsDestination.systemPrompt) {
+                Text("System Prompt")
             }
             .foregroundColor(.primary)
             // BUG 4 v2 follow-up (2026-05-19): System Prompt is one of
@@ -1228,6 +1207,7 @@ struct SystemPromptEditorView: View {
     @EnvironmentObject var chatViewModel: ChatViewModel
     @State private var editedPrompt: String = ""
     @State private var showingResetAlert = false
+    @State private var showingDiscardConfirm = false
 
     // Hard cap on system prompt size, enforced UI-side per Mark + SC directive
     // (Context Budget Implementation Plan §6a). The cap is global across all
@@ -1302,56 +1282,81 @@ struct SystemPromptEditorView: View {
         )
     }
 
-    var body: some View {
-        NavigationView {
-            VStack(spacing: 0) {
-                TextEditor(text: cappedPromptBinding)
-                    .font(.system(.body, design: .monospaced))
-                    .padding(8)
+    // True once the edit buffer diverges from the saved prompt. Drives the discard-safe back
+    // button: an untouched visit pops freely (system back + swipe-to-go-back), an edited one
+    // intercepts back with a "Discard changes?" confirm and suppresses swipe-back, so a
+    // half-typed prompt can never be lost by an accidental gesture.
+    private var isDirty: Bool { editedPrompt != chatViewModel.systemPrompt }
 
-                // Token counter (three-state) — always visible, lives below the
-                // editor so it's never obscured by the keyboard.
-                Text(counterLabel)
-                    .font(.caption)
-                    .foregroundColor(counterColor)
-                    .padding(.horizontal, 12)
-                    .padding(.bottom, 8)
-                    .frame(maxWidth: .infinity, alignment: .trailing)
-            }
-            .navigationTitle("System Prompt")
-            .toolbar {
-                ToolbarItem(placement: .cancellationAction) {
-                    Button("Cancel") {
-                        dismiss()
-                    }
-                }
-                ToolbarItem(placement: .confirmationAction) {
-                    Button("Save") {
-                        chatViewModel.systemPrompt = editedPrompt
-                        dismiss()
-                    }
-                    .fontWeight(.semibold)
-                    // Disable save if a legacy prompt is over cap. The user
-                    // can still Cancel without saving. Once they delete enough
-                    // to be under the cap, Save re-enables.
-                    .disabled(currentTokens > cap)
-                }
-                ToolbarItem(placement: .bottomBar) {
+    var body: some View {
+        // No NavigationView wrapper: this is pushed inside Settings' NavigationStack (block
+        // SettingsDestination.systemPrompt), so it inherits that bar and the Settings container's
+        // Mac resizability. It was a modal .sheet before the 2026-08-06 push migration.
+        VStack(spacing: 0) {
+            TextEditor(text: cappedPromptBinding)
+                .font(.system(.body, design: .monospaced))
+                .padding(8)
+
+            // Token counter (three-state) — always visible, lives below the
+            // editor so it's never obscured by the keyboard.
+            Text(counterLabel)
+                .font(.caption)
+                .foregroundColor(counterColor)
+                .padding(.horizontal, 12)
+                .padding(.bottom, 8)
+                .frame(maxWidth: .infinity, alignment: .trailing)
+        }
+        .navigationTitle("System Prompt")
+        .navigationBarTitleDisplayMode(.inline)
+        // When edited, take over the back button so we can confirm before discarding. Hiding the
+        // system back button also disables the interactive swipe-back gesture — exactly what we
+        // want here, since a swipe would otherwise drop unsaved edits with no confirmation.
+        .navigationBarBackButtonHidden(isDirty)
+        .toolbar {
+            if isDirty {
+                ToolbarItem(placement: .topBarLeading) {
                     Button {
-                        showingResetAlert = true
+                        showingDiscardConfirm = true
                     } label: {
-                        Label("Restore Factory Settings", systemImage: "arrow.counterclockwise")
+                        HStack(spacing: 4) {
+                            Image(systemName: "chevron.backward")
+                            Text("Settings")
+                        }
                     }
                 }
             }
-            .alert("Restore Factory Settings?", isPresented: $showingResetAlert) {
-                Button("Restore", role: .destructive) {
-                    editedPrompt = ChatViewModel.defaultSystemPrompt
+            ToolbarItem(placement: .confirmationAction) {
+                Button("Save") {
+                    chatViewModel.systemPrompt = editedPrompt
+                    dismiss()
                 }
-                Button("Cancel", role: .cancel) { }
-            } message: {
-                Text("This will restore the factory default system prompt. Your current customizations will be lost.")
+                .fontWeight(.semibold)
+                // Disable save if a legacy prompt is over cap. The user can still
+                // discard via the back button. Once they delete enough to be under
+                // the cap, Save re-enables.
+                .disabled(currentTokens > cap)
             }
+            ToolbarItem(placement: .bottomBar) {
+                Button {
+                    showingResetAlert = true
+                } label: {
+                    Label("Restore Factory Settings", systemImage: "arrow.counterclockwise")
+                }
+            }
+        }
+        .alert("Restore Factory Settings?", isPresented: $showingResetAlert) {
+            Button("Restore", role: .destructive) {
+                editedPrompt = ChatViewModel.defaultSystemPrompt
+            }
+            Button("Cancel", role: .cancel) { }
+        } message: {
+            Text("This will restore the factory default system prompt. Your current customizations will be lost.")
+        }
+        .confirmationDialog("Discard changes?", isPresented: $showingDiscardConfirm, titleVisibility: .visible) {
+            Button("Discard Changes", role: .destructive) { dismiss() }
+            Button("Keep Editing", role: .cancel) { }
+        } message: {
+            Text("Your edits to the system prompt haven't been saved. Discard them?")
         }
         .onAppear {
             editedPrompt = chatViewModel.systemPrompt

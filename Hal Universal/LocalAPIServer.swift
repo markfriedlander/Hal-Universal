@@ -1452,16 +1452,10 @@ class HalTestConsole: ObservableObject {
                 vm.showingThreadPanel = value
                 if value { vm.showingSettings = false }
             case "systemprompt":
-                // System Prompt stays a MODAL (Cancel/Save editor). Follow the real user path:
-                // open Settings, then set the flag ActionsView observes to present the editor
-                // from inside Settings (2026-08-05 nav migration). `:false` just lowers the flag.
-                if value {
-                    vm.showingSettings = true
-                    vm.showingThreadPanel = false
-                    vm.apiNavSystemPrompt = true
-                } else {
-                    vm.apiNavSystemPrompt = false
-                }
+                // System Prompt is a push now (2026-08-06), same as the other drill-in screens:
+                // append the destination to settingsPath (setSettingsPush also opens Settings and
+                // closes the thread panel). `:false` pops back to the Settings root.
+                setSettingsPush(vm, value ? .systemPrompt : nil)
             case "modelframing":
                 setSettingsPush(vm, value ? .modelFraming : nil)
             case "selfmodel":
@@ -1544,7 +1538,6 @@ class HalTestConsole: ObservableObject {
                 vm.showingSettings = false
                 vm.showingThreadPanel = false
                 vm.settingsPath = []
-                vm.apiNavSystemPrompt = false
                 vm.apiExpandRowID = ""
                 vm.apiPromptDetailMessageID = ""
             default:
