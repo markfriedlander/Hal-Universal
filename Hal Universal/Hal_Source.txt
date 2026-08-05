@@ -10173,6 +10173,10 @@ class ChatViewModel: ObservableObject {
     // Sibling of apiNavRoboIssues: opens RoboRunner's Library sheet (examples + past runs) from inside
     // the editor, so the antenna can screenshot/verify it without a human tapping Library.
     @Published var apiNavRoboLibrary: Bool = false
+    // Opens the privacy-lock explainer popover (the lock in the chat top bar). Bridged to ChatView's
+    // local showingPrivacyPopover via onChange, so the antenna can screenshot/verify it without a
+    // human tapping the lock. Added 2026-08-05 (the lock was the one chrome control without a hook).
+    @Published var apiNavPrivacyLock: Bool = false
 
     // API-driven scroll inside the open Settings sheet. Set to "personality",
     // "importexport", or "ai" via SET_UI_STATE; the ActionsView observes and
@@ -26718,6 +26722,12 @@ class HalTestConsole: ObservableObject {
             case "threadpanel":
                 vm.showingThreadPanel = value
                 if value { vm.showingSettings = false }
+            case "privacylock":
+                // The lock explainer popover anchors to the lock in the chat chrome, so the chat must
+                // be visible: close Settings + the thread panel before raising it. ChatView bridges
+                // apiNavPrivacyLock -> its local showingPrivacyPopover.
+                if value { vm.showingSettings = false; vm.showingThreadPanel = false }
+                vm.apiNavPrivacyLock = value
             case "systemprompt":
                 // System Prompt is a push now (2026-08-06), same as the other drill-in screens:
                 // append the destination to settingsPath (setSettingsPush also opens Settings and
@@ -26805,6 +26815,7 @@ class HalTestConsole: ObservableObject {
                 vm.showingSettings = false
                 vm.showingThreadPanel = false
                 vm.settingsPath = []
+                vm.apiNavPrivacyLock = false
                 vm.apiExpandRowID = ""
                 vm.apiPromptDetailMessageID = ""
             default:
@@ -31925,6 +31936,14 @@ struct iOSChatView: View {
                         chatViewModel.settingsPath = [.modelLibrary]
                     }
                 }
+            }
+            // Antenna bridge: SET_UI_STATE:privacylock drives apiNavPrivacyLock, which opens/closes
+            // the privacy-lock popover here (local @State can't be reached directly from the API).
+            // The last chrome control to get a hook — parity with brain/help/search/thermometer.
+            .onChange(of: chatViewModel.apiNavPrivacyLock) { _, open in showingPrivacyPopover = open }
+            .onChange(of: showingPrivacyPopover) { _, open in
+                // Keep the flag in sync when the user dismisses by hand, so a later API open still fires.
+                if !open { chatViewModel.apiNavPrivacyLock = false }
             }
             // Reasoning / thinking toggle — monochrome (bright on / dim off).
             // In Salon Mode thinking is unavailable (single-LLM only): the button

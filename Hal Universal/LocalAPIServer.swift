@@ -1451,6 +1451,12 @@ class HalTestConsole: ObservableObject {
             case "threadpanel":
                 vm.showingThreadPanel = value
                 if value { vm.showingSettings = false }
+            case "privacylock":
+                // The lock explainer popover anchors to the lock in the chat chrome, so the chat must
+                // be visible: close Settings + the thread panel before raising it. ChatView bridges
+                // apiNavPrivacyLock -> its local showingPrivacyPopover.
+                if value { vm.showingSettings = false; vm.showingThreadPanel = false }
+                vm.apiNavPrivacyLock = value
             case "systemprompt":
                 // System Prompt is a push now (2026-08-06), same as the other drill-in screens:
                 // append the destination to settingsPath (setSettingsPush also opens Settings and
@@ -1538,6 +1544,7 @@ class HalTestConsole: ObservableObject {
                 vm.showingSettings = false
                 vm.showingThreadPanel = false
                 vm.settingsPath = []
+                vm.apiNavPrivacyLock = false
                 vm.apiExpandRowID = ""
                 vm.apiPromptDetailMessageID = ""
             default:

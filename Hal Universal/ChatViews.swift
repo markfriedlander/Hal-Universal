@@ -673,6 +673,14 @@ struct iOSChatView: View {
                     }
                 }
             }
+            // Antenna bridge: SET_UI_STATE:privacylock drives apiNavPrivacyLock, which opens/closes
+            // the privacy-lock popover here (local @State can't be reached directly from the API).
+            // The last chrome control to get a hook — parity with brain/help/search/thermometer.
+            .onChange(of: chatViewModel.apiNavPrivacyLock) { _, open in showingPrivacyPopover = open }
+            .onChange(of: showingPrivacyPopover) { _, open in
+                // Keep the flag in sync when the user dismisses by hand, so a later API open still fires.
+                if !open { chatViewModel.apiNavPrivacyLock = false }
+            }
             // Reasoning / thinking toggle — monochrome (bright on / dim off).
             // In Salon Mode thinking is unavailable (single-LLM only): the button
             // stays tappable but dims and, instead of toggling, opens the popover

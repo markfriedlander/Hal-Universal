@@ -10172,6 +10172,10 @@ class ChatViewModel: ObservableObject {
     // Sibling of apiNavRoboIssues: opens RoboRunner's Library sheet (examples + past runs) from inside
     // the editor, so the antenna can screenshot/verify it without a human tapping Library.
     @Published var apiNavRoboLibrary: Bool = false
+    // Opens the privacy-lock explainer popover (the lock in the chat top bar). Bridged to ChatView's
+    // local showingPrivacyPopover via onChange, so the antenna can screenshot/verify it without a
+    // human tapping the lock. Added 2026-08-05 (the lock was the one chrome control without a hook).
+    @Published var apiNavPrivacyLock: Bool = false
 
     // API-driven scroll inside the open Settings sheet. Set to "personality",
     // "importexport", or "ai" via SET_UI_STATE; the ActionsView observes and
