@@ -68,7 +68,17 @@ struct LabView: View {
             if !open { chatViewModel.apiNavRoboEditor = false }
         }
         .onAppear {
-            if !dragonsAcknowledged { showDragons = true }
+            if !dragonsAcknowledged {
+                showDragons = true
+            } else if chatViewModel.apiNavRoboEditor {
+                // Belt to onChange's suspenders (line above): an antenna roboeditor open sets
+                // apiNavRoboEditor in the SAME tick it pushes this freshly-created Lab, so
+                // LabView's onChange never sees the transition — the view didn't exist yet to
+                // observe it. Catch an already-true flag on appear so SET_UI_STATE:roboeditor
+                // works on a not-yet-open Lab, not only an already-open one. Gated on the dragons
+                // ack so a first-ever entry shows the danger notice rather than stacking the sheet.
+                showingRoboEditor = true
+            }
         }
         .alert("Here be dragons", isPresented: $showDragons) {
             Button("Enter the Lab") { dragonsAcknowledged = true }
