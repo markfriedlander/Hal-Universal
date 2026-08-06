@@ -131,6 +131,20 @@
 //  GuideReaderView.swift
 //   66  GuideReaderView (In-App Guide Reader)
 //
+//  DocumentImport/ (module — PDF text+OCR and HTML extraction)
+//
+//  OCRLineReflow.swift
+//   67  OCR Line Reflow (Vision geometry -> structure-preserving text)
+//
+//  PDFTier2VisionExtractor.swift
+//   68  PDF Tier-2 Vision OCR Extractor (render + recognize)
+//
+//  TieredPDFExtractor.swift
+//   69  Tiered PDF Extractor (text layer + OCR fallback orchestration)
+//
+//  HTMLTextExtractor.swift
+//   70  HTML Text Extractor (tag-stripping readable text)
+//
 import SwiftUI
 import SharedModelStoreKit
 import Foundation

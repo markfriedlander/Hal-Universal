@@ -46,6 +46,10 @@ FILES=(
   "Hal Universal/SpeechService.swift"
   "Hal Universal/VoicePickerView.swift"
   "Hal Universal/GuideReaderView.swift"
+  "Hal Universal/DocumentImport/OCRLineReflow.swift"
+  "Hal Universal/DocumentImport/PDFTier2VisionExtractor.swift"
+  "Hal Universal/DocumentImport/TieredPDFExtractor.swift"
+  "Hal Universal/DocumentImport/HTMLTextExtractor.swift"
 )
 
 OUT="Hal Universal/Hal_Source.txt"

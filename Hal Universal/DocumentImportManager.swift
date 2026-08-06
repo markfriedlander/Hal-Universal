@@ -303,20 +303,32 @@ class DocumentImportManager: ObservableObject {
         print("HALDEBUG-IMPORT: Extracting content from \(url.lastPathComponent) (.\(fileExtension))")
 
         switch fileExtension.lowercased() {
-        case "txt", "md", "csv", "json", "xml", "html", "htm":
+        case "txt", "md", "csv", "json", "xml":
             // Plain text files - direct UTF-8 reading
             let content = try String(contentsOf: url, encoding: .utf8)
             print("HALDEBUG-IMPORT: Extracted \(content.count) chars from text file")
             return content
-            
-        case "pdf":
-            // PDF extraction via PDFKit
-            if let content = extractPDFContent(from: url) {
-                print("HALDEBUG-IMPORT: Extracted \(content.count) chars from PDF")
+
+        case "html", "htm":
+            // Real HTML extraction (strip scripts/styles/tags, decode entities) via the
+            // DocumentImport module — instead of dumping raw markup into RAG.
+            if let content = HTMLTextExtractor.extract(from: url) {
+                print("HALDEBUG-IMPORT: Extracted \(content.count) chars from HTML")
                 return content
             } else {
+                throw DocumentProcessingError.noReadableText(url.lastPathComponent)
+            }
+
+        case "pdf":
+            // Tiered extraction: PDFKit text layer first, Vision OCR fallback for scanned /
+            // image-only pages (see TieredPDFExtractor). nil = couldn't open the PDF;
+            // an empty result = opened but no text, which the caller's emptiness guard
+            // turns into the "no readable text" message.
+            guard let content = TieredPDFExtractor.extract(from: url) else {
                 throw DocumentProcessingError.pdfExtractionFailed(url.lastPathComponent)
             }
+            print("HALDEBUG-IMPORT: Extracted \(content.count) chars from PDF")
+            return content
             
         case "rtf":
             // RTF extraction via NSAttributedString (works on iOS)
@@ -358,24 +370,11 @@ class DocumentImportManager: ObservableObject {
         }
     }
 
-    private func extractPDFContent(from url: URL) -> String? {
-        guard let document = PDFDocument(url: url) else {
-            print("HALDEBUG-IMPORT: Failed to load PDF document")
-            return nil
-        }
+    // PDF extraction moved to the DocumentImport module (TieredPDFExtractor: text layer
+    // first, Vision OCR fallback for scanned pages). The old text-layer-only
+    // extractPDFContent was removed 2026-08-06 when that landed.
 
-        var text = ""
-        for pageIndex in 0..<document.pageCount {
-            if let page = document.page(at: pageIndex) {
-                text += page.string ?? ""
-                text += "\n\n"
-            }
-        }
-        let result = text.trimmingCharacters(in: .whitespacesAndNewlines)
-        print("HALDEBUG-IMPORT: PDF: \(result.count) chars from \(document.pageCount) pages")
-        return result.isEmpty ? nil : result
-    }
-    
+
     // NEW: RTF content extraction using NSAttributedString
     private func extractRTFContent(from url: URL) -> String? {
         do {
