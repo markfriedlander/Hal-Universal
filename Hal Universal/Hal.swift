@@ -7860,10 +7860,12 @@ struct TextSummarizer {
 func modelStatusDot(
     for model: ModelConfiguration,
     downloader: MLXModelDownloader,
-    activeModelID: String
+    activeModelIDs: Set<String>
 ) -> some View {
     let isDownloaded = model.source == .appleFoundation || downloader.isModelDownloaded(model.id)
-    let isActive = activeModelID == model.id
+    // Green = in use in the CURRENT mode. In Salon that's every seated model;
+    // in single-model mode it's the one selected model. See ChatViewModel.activeModelIDs.
+    let isActive = activeModelIDs.contains(model.id)
     if isDownloaded {
         Circle()
             .fill(isActive ? Color.green : Color.gray.opacity(0.5))
@@ -7931,7 +7933,7 @@ struct ModelLibraryView: View {
                             model: model,
                             isActive: chatViewModel.selectedModelID == model.id,
                             downloader: mlxDownloader,
-                            activeModelID: chatViewModel.selectedModelID,
+                            activeModelIDs: chatViewModel.activeModelIDs,
                             includeModelCard: true,
                             apiExpandRowID: chatViewModel.apiExpandRowID,
                             onSelect: { selectModel(model) },
@@ -8040,7 +8042,7 @@ struct ModelLibraryView: View {
                                 model: model,
                                 isActive: chatViewModel.selectedModelID == model.id,
                                 downloader: mlxDownloader,
-                                activeModelID: chatViewModel.selectedModelID,
+                                activeModelIDs: chatViewModel.activeModelIDs,
                                 includeModelCard: false,
                                 apiExpandRowID: chatViewModel.apiExpandRowID,
                                 onSelect: { selectModel(model) },
@@ -8308,9 +8310,12 @@ struct ModelLibraryView: View {
 // others — no need for a parent-owned expanded-set or selection state.
 struct ModelLibraryRow: View {
     let model: ModelConfiguration
+    // `isActive` = this is the single selected model (drives the Select/Active
+    // button + delete-guard). Distinct from `activeModelIDs`, which is every
+    // model in use in the current mode (Salon seats included) and drives the dot.
     let isActive: Bool
     @ObservedObject var downloader: MLXModelDownloader
-    let activeModelID: String
+    let activeModelIDs: Set<String>
     let includeModelCard: Bool
     // Mirror of ChatViewModel.apiExpandRowID (test/screenshot automation). When it
     // equals this row's model.id, the row expands; anything else collapses it. The
@@ -8355,7 +8360,7 @@ struct ModelLibraryRow: View {
                             .foregroundColor(.secondary)
                             .monospacedDigit()
                     }
-                    modelStatusDot(for: model, downloader: downloader, activeModelID: activeModelID)
+                    modelStatusDot(for: model, downloader: downloader, activeModelIDs: activeModelIDs)
                     Image(systemName: isExpanded ? "chevron.up" : "chevron.down")
                         .font(.caption2)
                         .foregroundColor(.secondary)
@@ -10206,7 +10211,23 @@ class ChatViewModel: ObservableObject {
         // Look up model from catalog, fallback to Apple Foundation if not found
         return ModelCatalogService.shared.getModel(byID: selectedModelID) ?? ModelConfiguration.appleFoundation
     }
-    
+
+    /// The model IDs currently IN USE for the app's active mode — the single
+    /// source of truth for the Model Library's green status dots and About's
+    /// "Models in use" section. In Salon Mode (enabled with at least one seat)
+    /// that's every seated model; otherwise it's just the one selected model.
+    /// `selectedModelID` is stored independently of Salon, so leaving Salon
+    /// restores "in use" to exactly the model that was running before — it is
+    /// never reset to Apple Intelligence. Reads @Published salonConfig +
+    /// @AppStorage selectedModelID, so any view observing the VM re-renders
+    /// (dots relight) the instant seats or the selected model change.
+    var activeModelIDs: Set<String> {
+        if salonConfig.isEnabled && !salonConfig.activeSeats.isEmpty {
+            return Set(salonConfig.activeSeats.map { $0.modelID })
+        }
+        return [selectedModelID]
+    }
+
     // MARK: - Salon Mode Configuration
     // Persistent storage of Salon Mode settings
     @AppStorage("salonConfigData") private var salonConfigData: Data = Data()
@@ -13691,28 +13712,16 @@ class ChatViewModel: ObservableObject {
                                                                 
                                                                 // Salon Mode turn execution
                                                                 private func runSalonTurn(userInput: String) async {
-                                                                    // Cap to the first 2 active seats while
-                                                                    // SalonModeView.exposeSeatsThreeAndFour is false.
-                                                                    // An iPhone 16 Plus crashed last night during a
-                                                                    // 3-seat salon (AFM + Gemma + Dolphin) when iOS
-                                                                    // OOM-killed Hal during the second MLX-to-MLX
-                                                                    // model swap. The UI hides seats 3/4, but an
-                                                                    // upgrader with persisted seat3/seat4 values
-                                                                    // would still pass them through here without this
-                                                                    // safety. The cap will be removed once option-2's
-                                                                    // smart MLX-swap (explicit unload + GPU cache
-                                                                    // clear + memory-reclaim delay) is verified at
-                                                                    // 3+ seats.
-                                                                    let fullActiveSeats = salonConfig.activeSeats
-                                                                    let activeSeats: [(position: Int, modelID: String)]
-                                                                    if SalonModeView.exposeSeatsThreeAndFour {
-                                                                        activeSeats = fullActiveSeats
-                                                                    } else {
-                                                                        activeSeats = Array(fullActiveSeats.prefix(2))
-                                                                        if fullActiveSeats.count > 2 {
-                                                                            halLog("HALDEBUG-SALON: Capping salon turn from \(fullActiveSeats.count) active seats to 2 (3+ seats temporarily disabled — see SalonModeView.exposeSeatsThreeAndFour)")
-                                                                        }
-                                                                    }
+                                                                    // All configured seats run. Peak memory stays at a single
+                                                                    // MLX model regardless of seat count because setupLLM's
+                                                                    // smart MLX→MLX swap tears the previous model down (unload
+                                                                    // + GPU.clearCache) and waits for iOS to reclaim headroom
+                                                                    // before loading the next — so two large MLX models are
+                                                                    // never resident at once. (A former 2-seat cap guarded an
+                                                                    // OOM from before that swap logic existed; it was retired
+                                                                    // once the swap was verified, and the dead flag was
+                                                                    // removed 2026-08-06.)
+                                                                    let activeSeats = salonConfig.activeSeats
 
                                                                     guard !activeSeats.isEmpty else {
                                                                         halLog("HALDEBUG-SALON: No active seats configured")

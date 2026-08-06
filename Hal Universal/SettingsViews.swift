@@ -68,6 +68,7 @@ enum SettingsDestination: Hashable {
     case lab
     case maintenance
     case modelLibrary
+    case about
 
     /// Stable string the antenna uses for this screen, matching the SET_UI_STATE target verbs
     /// (SET_UI_STATE:poweruser, :salonsettings, ...). Exposed in GET_UI_STATE's `settingsPath`
@@ -82,6 +83,7 @@ enum SettingsDestination: Hashable {
         case .lab:          return "lab"
         case .maintenance:  return "maintenance"
         case .modelLibrary: return "modellibrary"
+        case .about:        return "about"
         }
     }
 }
@@ -139,9 +141,11 @@ struct ActionsView: View {
                 // text). One row matching the studio pattern; the version lives
                 // inside the screen now (AboutView reads it from the bundle).
                 Section {
-                    NavigationLink {
-                        AboutView.hal(chatViewModel: chatViewModel)
-                    } label: {
+                    // Value-based push (like the other Settings sub-screens) so the
+                    // antenna can reach it via SET_UI_STATE:about. The destination
+                    // (HalAboutView, a live wrapper) is declared in the shared
+                    // navigationDestination switch above.
+                    NavigationLink(value: SettingsDestination.about) {
                         // Explicit icon color so the Form doesn't accent-tint the "i" blue.
                         Label {
                             Text("About Hal Universal")
@@ -193,6 +197,8 @@ struct ActionsView: View {
                     ModelLibraryView()
                         .environmentObject(chatViewModel)
                         .environmentObject(mlxDownloader)
+                case .about:
+                    HalAboutView(chatViewModel: chatViewModel)
                 }
             }
             .onChange(of: chatViewModel.apiScrollSettingsTarget) { _, newTarget in
@@ -654,7 +660,7 @@ struct ActionsView: View {
                         modelStatusDot(
                             for: chatViewModel.selectedModel,
                             downloader: mlxDownloader,
-                            activeModelID: chatViewModel.selectedModelID
+                            activeModelIDs: chatViewModel.activeModelIDs
                         )
                         Text(chatViewModel.selectedModel.displayName)
                             .font(.subheadline)
@@ -1467,16 +1473,6 @@ struct SalonModeView: View {
     @EnvironmentObject var chatViewModel: ChatViewModel
     @Environment(\.dismiss) var dismiss
 
-    // Seats 3 and 4 — gate verified open per Strategic §6/§13 (May 13, 2026).
-    // The smart MLX→MLX swap in MLXWrapper.setupLLM (unload + GPU.clearCache +
-    // 500ms reclaim sleep) keeps peak memory at one MLX model at a time
-    // regardless of seat count. The schema migration v2 (§9) ensures every
-    // seat's storage write has its own UNIQUE row even when multiple seats
-    // share a (turn, position) tuple. Both fixes together unblock 3- and
-    // 4-seat salons; verified on iPhone 16 Plus on the May-13 build by
-    // running multi-seat turns and confirming no OOM crashes + no row loss.
-    static let exposeSeatsThreeAndFour: Bool = true
-
     var body: some View {
         // Pushed inside the Settings NavigationStack (2026-08-05 nav migration): no own
         // NavigationView / Done — the parent stack owns the bar and the back chevron.
@@ -1510,43 +1506,32 @@ struct SalonModeView: View {
                         }
                     }
 
-                    // Seats 3 and 4 are deliberately hidden in this release.
-                    // 3+ seats with multiple MLX models exceeds iPhone 16 Plus
-                    // memory headroom — iOS OOM-kills the app mid-turn during
-                    // the second MLX-to-MLX model swap. The seats remain in
-                    // the data model (and `runSalonTurn` will still execute
-                    // any persisted values from an upgrader), so we can
-                    // re-expose them once option-2's smart MLX-swap (explicit
-                    // unload + GPU cache clear + memory-reclaim delay) is in
-                    // place. Until then we cap salon at 2 seats — verified
-                    // safe with AFM + Gemma in earlier testing.
-                    if Self.exposeSeatsThreeAndFour {
-                        Picker("Seat 3 (Third)", selection: Binding(
-                            get: { chatViewModel.salonConfig.seat3 },
-                            set: { newID in chatViewModel.setSalonSeat(position: 3, modelID: newID) }
-                        )) {
-                            Text("Empty").tag(nil as String?)
-                            ForEach(chatViewModel.usableModels, id: \.id) { model in
-                                Text(model.displayName).tag(model.id as String?)
-                            }
+                    // Seat 3
+                    Picker("Seat 3 (Third)", selection: Binding(
+                        get: { chatViewModel.salonConfig.seat3 },
+                        set: { newID in chatViewModel.setSalonSeat(position: 3, modelID: newID) }
+                    )) {
+                        Text("Empty").tag(nil as String?)
+                        ForEach(chatViewModel.usableModels, id: \.id) { model in
+                            Text(model.displayName).tag(model.id as String?)
                         }
-                        Picker("Seat 4 (Fourth)", selection: Binding(
-                            get: { chatViewModel.salonConfig.seat4 },
-                            set: { newID in chatViewModel.setSalonSeat(position: 4, modelID: newID) }
-                        )) {
-                            Text("Empty").tag(nil as String?)
-                            ForEach(chatViewModel.usableModels, id: \.id) { model in
-                                Text(model.displayName).tag(model.id as String?)
-                            }
+                    }
+
+                    // Seat 4
+                    Picker("Seat 4 (Fourth)", selection: Binding(
+                        get: { chatViewModel.salonConfig.seat4 },
+                        set: { newID in chatViewModel.setSalonSeat(position: 4, modelID: newID) }
+                    )) {
+                        Text("Empty").tag(nil as String?)
+                        ForEach(chatViewModel.usableModels, id: \.id) { model in
+                            Text(model.displayName).tag(model.id as String?)
                         }
                     }
 
                 } header: {
                     Label("Active Seats", systemImage: "person.3")
                 } footer: {
-                    Text(Self.exposeSeatsThreeAndFour
-                         ? "Each seat selects a model or Empty. Order is fixed by seat number."
-                         : "Two seats let two AI voices speak in turn. More seats will be available once memory management for multi-MLX-model swapping is finished.")
+                    Text("Each seat selects a model or Empty. Order is fixed by seat number.")
                         .font(.caption)
                 }
                 

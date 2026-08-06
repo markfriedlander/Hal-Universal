@@ -1472,6 +1472,8 @@ class HalTestConsole: ObservableObject {
                 setSettingsPush(vm, value ? .salon : nil)
             case "modellibrary":
                 setSettingsPush(vm, value ? .modelLibrary : nil)
+            case "about":
+                setSettingsPush(vm, value ? .about : nil)
             case "maintenance":
                 setSettingsPush(vm, value ? .maintenance : nil)
             case "lab":

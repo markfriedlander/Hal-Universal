@@ -493,32 +493,77 @@ extension AboutView {
     }
 }
 
-/// The models Hal is ACTUALLY running right now — the selected chat model and the
-/// active embedder — mapped to their terms. Built from live state, so the section
-/// changes as the user switches models. Apple's on-device models (AFM, NLContextual)
+/// Live wrapper for Hal's About screen.
+///
+/// `AboutView` is generic and takes a FROZEN `models: [ModelCredit]` array. If we
+/// pushed `AboutView.hal(...)` directly, that array is computed once at push time
+/// and never recomputed — so a section literally titled "Models in use" would show
+/// a stale snapshot from the moment the screen opened, quietly lying the moment the
+/// user changes a seat, switches models, or swaps embedders. "In use" is a LIVE
+/// claim; in a transparency app it has to actually be live.
+///
+/// This wrapper is the reactive boundary. It observes the chat view model (salon
+/// seats + selected model) and the embedder coordinator (active backend), so its
+/// body re-evaluates on any of those changes and hands `AboutView` a freshly
+/// computed model list each time. Because the observation lives HERE (the pushed
+/// view), the on-screen content actually updates — the shared `AboutView` stays
+/// generic and app-agnostic.
+struct HalAboutView: View {
+    @ObservedObject var chatViewModel: ChatViewModel
+    // Observed so an embedder switch re-renders this screen too. Read inside
+    // halActiveModels via EmbedderMigrationCoordinator.shared; the subscription is
+    // established by holding it here, independent of where the value is read.
+    @ObservedObject private var embedderCoordinator = EmbedderMigrationCoordinator.shared
+
+    var body: some View {
+        AboutView.hal(chatViewModel: chatViewModel)
+    }
+}
+
+/// The models Hal is ACTUALLY running right now — in single-model mode the selected
+/// chat model, in Salon Mode every active seat — plus the active embedder, mapped to
+/// their terms. Built from live state, so the section changes as the user switches
+/// models or reconfigures seats. Apple's on-device models (AFM, NLContextual)
 /// carry no third-party terms. We distribute only the framework; the user chose and
 /// accepted each downloaded model's license, so this is informational transparency,
 /// not a redistribution claim by us.
 private func halActiveModels(chatViewModel: ChatViewModel) -> [ModelCredit] {
     var credits: [ModelCredit] = []
 
-    // 1. The active chat model.
-    let model = chatViewModel.selectedModel
-    if model.source == .appleFoundation {
-        credits.append(ModelCredit(
-            name: model.displayName,
-            terms: "Apple Foundation Models, built into iOS/macOS, no separate license",
-            attribution: nil, url: nil))
+    // 1. The chat model(s) in use. In Salon Mode (enabled with at least one seat)
+    //    that's every seated model, in seat order, de-duplicated (the same model
+    //    can sit in two seats); otherwise the single selected model. Mirrors
+    //    ChatViewModel.activeModelIDs so this section and the Model Library's
+    //    green dots always agree on what's "in use."
+    let chatModels: [ModelConfiguration]
+    if chatViewModel.salonConfig.isEnabled && !chatViewModel.salonConfig.activeSeats.isEmpty {
+        var seen = Set<String>()
+        chatModels = chatViewModel.salonConfig.activeSeats.compactMap { seat in
+            guard seen.insert(seat.modelID).inserted else { return nil }
+            return ModelCatalogService.shared.getModel(byID: seat.modelID)
+        }
     } else {
-        credits.append(ModelCredit(
-            name: model.displayName,
-            terms: halModelLicenseName(model.license),
-            attribution: nil,
-            url: "https://huggingface.co/\(model.id)"))
+        chatModels = [chatViewModel.selectedModel]
+    }
+    for model in chatModels {
+        if model.source == .appleFoundation {
+            credits.append(ModelCredit(
+                name: model.displayName,
+                terms: "Apple Foundation Models, built into iOS/macOS, no separate license",
+                attribution: nil, url: nil))
+        } else {
+            credits.append(ModelCredit(
+                name: model.displayName,
+                terms: halModelLicenseName(model.license),
+                attribution: nil,
+                url: "https://huggingface.co/\(model.id)"))
+        }
     }
 
-    // 2. The active embedder.
-    switch EmbeddingBackend.current() {
+    // 2. The active embedder — read from the observable coordinator (not the
+    //    static EmbeddingBackend.current()) so switching embedders refreshes
+    //    this section live along with the chat model(s) above.
+    switch EmbedderMigrationCoordinator.shared.activeBackend {
     case .nlContextual:
         credits.append(ModelCredit(
             name: "Apple NLContextual Embedding",

@@ -7861,10 +7861,12 @@ struct TextSummarizer {
 func modelStatusDot(
     for model: ModelConfiguration,
     downloader: MLXModelDownloader,
-    activeModelID: String
+    activeModelIDs: Set<String>
 ) -> some View {
     let isDownloaded = model.source == .appleFoundation || downloader.isModelDownloaded(model.id)
-    let isActive = activeModelID == model.id
+    // Green = in use in the CURRENT mode. In Salon that's every seated model;
+    // in single-model mode it's the one selected model. See ChatViewModel.activeModelIDs.
+    let isActive = activeModelIDs.contains(model.id)
     if isDownloaded {
         Circle()
             .fill(isActive ? Color.green : Color.gray.opacity(0.5))
@@ -7932,7 +7934,7 @@ struct ModelLibraryView: View {
                             model: model,
                             isActive: chatViewModel.selectedModelID == model.id,
                             downloader: mlxDownloader,
-                            activeModelID: chatViewModel.selectedModelID,
+                            activeModelIDs: chatViewModel.activeModelIDs,
                             includeModelCard: true,
                             apiExpandRowID: chatViewModel.apiExpandRowID,
                             onSelect: { selectModel(model) },
@@ -8041,7 +8043,7 @@ struct ModelLibraryView: View {
                                 model: model,
                                 isActive: chatViewModel.selectedModelID == model.id,
                                 downloader: mlxDownloader,
-                                activeModelID: chatViewModel.selectedModelID,
+                                activeModelIDs: chatViewModel.activeModelIDs,
                                 includeModelCard: false,
                                 apiExpandRowID: chatViewModel.apiExpandRowID,
                                 onSelect: { selectModel(model) },
@@ -8309,9 +8311,12 @@ struct ModelLibraryView: View {
 // others — no need for a parent-owned expanded-set or selection state.
 struct ModelLibraryRow: View {
     let model: ModelConfiguration
+    // `isActive` = this is the single selected model (drives the Select/Active
+    // button + delete-guard). Distinct from `activeModelIDs`, which is every
+    // model in use in the current mode (Salon seats included) and drives the dot.
     let isActive: Bool
     @ObservedObject var downloader: MLXModelDownloader
-    let activeModelID: String
+    let activeModelIDs: Set<String>
     let includeModelCard: Bool
     // Mirror of ChatViewModel.apiExpandRowID (test/screenshot automation). When it
     // equals this row's model.id, the row expands; anything else collapses it. The
@@ -8356,7 +8361,7 @@ struct ModelLibraryRow: View {
                             .foregroundColor(.secondary)
                             .monospacedDigit()
                     }
-                    modelStatusDot(for: model, downloader: downloader, activeModelID: activeModelID)
+                    modelStatusDot(for: model, downloader: downloader, activeModelIDs: activeModelIDs)
                     Image(systemName: isExpanded ? "chevron.up" : "chevron.down")
                         .font(.caption2)
                         .foregroundColor(.secondary)
@@ -10207,7 +10212,23 @@ class ChatViewModel: ObservableObject {
         // Look up model from catalog, fallback to Apple Foundation if not found
         return ModelCatalogService.shared.getModel(byID: selectedModelID) ?? ModelConfiguration.appleFoundation
     }
-    
+
+    /// The model IDs currently IN USE for the app's active mode — the single
+    /// source of truth for the Model Library's green status dots and About's
+    /// "Models in use" section. In Salon Mode (enabled with at least one seat)
+    /// that's every seated model; otherwise it's just the one selected model.
+    /// `selectedModelID` is stored independently of Salon, so leaving Salon
+    /// restores "in use" to exactly the model that was running before — it is
+    /// never reset to Apple Intelligence. Reads @Published salonConfig +
+    /// @AppStorage selectedModelID, so any view observing the VM re-renders
+    /// (dots relight) the instant seats or the selected model change.
+    var activeModelIDs: Set<String> {
+        if salonConfig.isEnabled && !salonConfig.activeSeats.isEmpty {
+            return Set(salonConfig.activeSeats.map { $0.modelID })
+        }
+        return [selectedModelID]
+    }
+
     // MARK: - Salon Mode Configuration
     // Persistent storage of Salon Mode settings
     @AppStorage("salonConfigData") private var salonConfigData: Data = Data()
@@ -13692,28 +13713,16 @@ class ChatViewModel: ObservableObject {
                                                                 
                                                                 // Salon Mode turn execution
                                                                 private func runSalonTurn(userInput: String) async {
-                                                                    // Cap to the first 2 active seats while
-                                                                    // SalonModeView.exposeSeatsThreeAndFour is false.
-                                                                    // An iPhone 16 Plus crashed last night during a
-                                                                    // 3-seat salon (AFM + Gemma + Dolphin) when iOS
-                                                                    // OOM-killed Hal during the second MLX-to-MLX
-                                                                    // model swap. The UI hides seats 3/4, but an
-                                                                    // upgrader with persisted seat3/seat4 values
-                                                                    // would still pass them through here without this
-                                                                    // safety. The cap will be removed once option-2's
-                                                                    // smart MLX-swap (explicit unload + GPU cache
-                                                                    // clear + memory-reclaim delay) is verified at
-                                                                    // 3+ seats.
-                                                                    let fullActiveSeats = salonConfig.activeSeats
-                                                                    let activeSeats: [(position: Int, modelID: String)]
-                                                                    if SalonModeView.exposeSeatsThreeAndFour {
-                                                                        activeSeats = fullActiveSeats
-                                                                    } else {
-                                                                        activeSeats = Array(fullActiveSeats.prefix(2))
-                                                                        if fullActiveSeats.count > 2 {
-                                                                            halLog("HALDEBUG-SALON: Capping salon turn from \(fullActiveSeats.count) active seats to 2 (3+ seats temporarily disabled — see SalonModeView.exposeSeatsThreeAndFour)")
-                                                                        }
-                                                                    }
+                                                                    // All configured seats run. Peak memory stays at a single
+                                                                    // MLX model regardless of seat count because setupLLM's
+                                                                    // smart MLX→MLX swap tears the previous model down (unload
+                                                                    // + GPU.clearCache) and waits for iOS to reclaim headroom
+                                                                    // before loading the next — so two large MLX models are
+                                                                    // never resident at once. (A former 2-seat cap guarded an
+                                                                    // OOM from before that swap logic existed; it was retired
+                                                                    // once the swap was verified, and the dead flag was
+                                                                    // removed 2026-08-06.)
+                                                                    let activeSeats = salonConfig.activeSeats
 
                                                                     guard !activeSeats.isEmpty else {
                                                                         halLog("HALDEBUG-SALON: No active seats configured")
@@ -26743,6 +26752,8 @@ class HalTestConsole: ObservableObject {
                 setSettingsPush(vm, value ? .salon : nil)
             case "modellibrary":
                 setSettingsPush(vm, value ? .modelLibrary : nil)
+            case "about":
+                setSettingsPush(vm, value ? .about : nil)
             case "maintenance":
                 setSettingsPush(vm, value ? .maintenance : nil)
             case "lab":
@@ -29739,6 +29750,7 @@ enum SettingsDestination: Hashable {
     case lab
     case maintenance
     case modelLibrary
+    case about
 
     /// Stable string the antenna uses for this screen, matching the SET_UI_STATE target verbs
     /// (SET_UI_STATE:poweruser, :salonsettings, ...). Exposed in GET_UI_STATE's `settingsPath`
@@ -29753,6 +29765,7 @@ enum SettingsDestination: Hashable {
         case .lab:          return "lab"
         case .maintenance:  return "maintenance"
         case .modelLibrary: return "modellibrary"
+        case .about:        return "about"
         }
     }
 }
@@ -29810,9 +29823,11 @@ struct ActionsView: View {
                 // text). One row matching the studio pattern; the version lives
                 // inside the screen now (AboutView reads it from the bundle).
                 Section {
-                    NavigationLink {
-                        AboutView.hal(chatViewModel: chatViewModel)
-                    } label: {
+                    // Value-based push (like the other Settings sub-screens) so the
+                    // antenna can reach it via SET_UI_STATE:about. The destination
+                    // (HalAboutView, a live wrapper) is declared in the shared
+                    // navigationDestination switch above.
+                    NavigationLink(value: SettingsDestination.about) {
                         // Explicit icon color so the Form doesn't accent-tint the "i" blue.
                         Label {
                             Text("About Hal Universal")
@@ -29864,6 +29879,8 @@ struct ActionsView: View {
                     ModelLibraryView()
                         .environmentObject(chatViewModel)
                         .environmentObject(mlxDownloader)
+                case .about:
+                    HalAboutView(chatViewModel: chatViewModel)
                 }
             }
             .onChange(of: chatViewModel.apiScrollSettingsTarget) { _, newTarget in
@@ -30325,7 +30342,7 @@ struct ActionsView: View {
                         modelStatusDot(
                             for: chatViewModel.selectedModel,
                             downloader: mlxDownloader,
-                            activeModelID: chatViewModel.selectedModelID
+                            activeModelIDs: chatViewModel.activeModelIDs
                         )
                         Text(chatViewModel.selectedModel.displayName)
                             .font(.subheadline)
@@ -31138,16 +31155,6 @@ struct SalonModeView: View {
     @EnvironmentObject var chatViewModel: ChatViewModel
     @Environment(\.dismiss) var dismiss
 
-    // Seats 3 and 4 — gate verified open per Strategic §6/§13 (May 13, 2026).
-    // The smart MLX→MLX swap in MLXWrapper.setupLLM (unload + GPU.clearCache +
-    // 500ms reclaim sleep) keeps peak memory at one MLX model at a time
-    // regardless of seat count. The schema migration v2 (§9) ensures every
-    // seat's storage write has its own UNIQUE row even when multiple seats
-    // share a (turn, position) tuple. Both fixes together unblock 3- and
-    // 4-seat salons; verified on iPhone 16 Plus on the May-13 build by
-    // running multi-seat turns and confirming no OOM crashes + no row loss.
-    static let exposeSeatsThreeAndFour: Bool = true
-
     var body: some View {
         // Pushed inside the Settings NavigationStack (2026-08-05 nav migration): no own
         // NavigationView / Done — the parent stack owns the bar and the back chevron.
@@ -31181,43 +31188,32 @@ struct SalonModeView: View {
                         }
                     }
 
-                    // Seats 3 and 4 are deliberately hidden in this release.
-                    // 3+ seats with multiple MLX models exceeds iPhone 16 Plus
-                    // memory headroom — iOS OOM-kills the app mid-turn during
-                    // the second MLX-to-MLX model swap. The seats remain in
-                    // the data model (and `runSalonTurn` will still execute
-                    // any persisted values from an upgrader), so we can
-                    // re-expose them once option-2's smart MLX-swap (explicit
-                    // unload + GPU cache clear + memory-reclaim delay) is in
-                    // place. Until then we cap salon at 2 seats — verified
-                    // safe with AFM + Gemma in earlier testing.
-                    if Self.exposeSeatsThreeAndFour {
-                        Picker("Seat 3 (Third)", selection: Binding(
-                            get: { chatViewModel.salonConfig.seat3 },
-                            set: { newID in chatViewModel.setSalonSeat(position: 3, modelID: newID) }
-                        )) {
-                            Text("Empty").tag(nil as String?)
-                            ForEach(chatViewModel.usableModels, id: \.id) { model in
-                                Text(model.displayName).tag(model.id as String?)
-                            }
+                    // Seat 3
+                    Picker("Seat 3 (Third)", selection: Binding(
+                        get: { chatViewModel.salonConfig.seat3 },
+                        set: { newID in chatViewModel.setSalonSeat(position: 3, modelID: newID) }
+                    )) {
+                        Text("Empty").tag(nil as String?)
+                        ForEach(chatViewModel.usableModels, id: \.id) { model in
+                            Text(model.displayName).tag(model.id as String?)
                         }
-                        Picker("Seat 4 (Fourth)", selection: Binding(
-                            get: { chatViewModel.salonConfig.seat4 },
-                            set: { newID in chatViewModel.setSalonSeat(position: 4, modelID: newID) }
-                        )) {
-                            Text("Empty").tag(nil as String?)
-                            ForEach(chatViewModel.usableModels, id: \.id) { model in
-                                Text(model.displayName).tag(model.id as String?)
-                            }
+                    }
+
+                    // Seat 4
+                    Picker("Seat 4 (Fourth)", selection: Binding(
+                        get: { chatViewModel.salonConfig.seat4 },
+                        set: { newID in chatViewModel.setSalonSeat(position: 4, modelID: newID) }
+                    )) {
+                        Text("Empty").tag(nil as String?)
+                        ForEach(chatViewModel.usableModels, id: \.id) { model in
+                            Text(model.displayName).tag(model.id as String?)
                         }
                     }
 
                 } header: {
                     Label("Active Seats", systemImage: "person.3")
                 } footer: {
-                    Text(Self.exposeSeatsThreeAndFour
-                         ? "Each seat selects a model or Empty. Order is fixed by seat number."
-                         : "Two seats let two AI voices speak in turn. More seats will be available once memory management for multi-MLX-model swapping is finished.")
+                    Text("Each seat selects a model or Empty. Order is fixed by seat number.")
                         .font(.caption)
                 }
                 
@@ -34257,32 +34253,77 @@ extension AboutView {
     }
 }
 
-/// The models Hal is ACTUALLY running right now — the selected chat model and the
-/// active embedder — mapped to their terms. Built from live state, so the section
-/// changes as the user switches models. Apple's on-device models (AFM, NLContextual)
+/// Live wrapper for Hal's About screen.
+///
+/// `AboutView` is generic and takes a FROZEN `models: [ModelCredit]` array. If we
+/// pushed `AboutView.hal(...)` directly, that array is computed once at push time
+/// and never recomputed — so a section literally titled "Models in use" would show
+/// a stale snapshot from the moment the screen opened, quietly lying the moment the
+/// user changes a seat, switches models, or swaps embedders. "In use" is a LIVE
+/// claim; in a transparency app it has to actually be live.
+///
+/// This wrapper is the reactive boundary. It observes the chat view model (salon
+/// seats + selected model) and the embedder coordinator (active backend), so its
+/// body re-evaluates on any of those changes and hands `AboutView` a freshly
+/// computed model list each time. Because the observation lives HERE (the pushed
+/// view), the on-screen content actually updates — the shared `AboutView` stays
+/// generic and app-agnostic.
+struct HalAboutView: View {
+    @ObservedObject var chatViewModel: ChatViewModel
+    // Observed so an embedder switch re-renders this screen too. Read inside
+    // halActiveModels via EmbedderMigrationCoordinator.shared; the subscription is
+    // established by holding it here, independent of where the value is read.
+    @ObservedObject private var embedderCoordinator = EmbedderMigrationCoordinator.shared
+
+    var body: some View {
+        AboutView.hal(chatViewModel: chatViewModel)
+    }
+}
+
+/// The models Hal is ACTUALLY running right now — in single-model mode the selected
+/// chat model, in Salon Mode every active seat — plus the active embedder, mapped to
+/// their terms. Built from live state, so the section changes as the user switches
+/// models or reconfigures seats. Apple's on-device models (AFM, NLContextual)
 /// carry no third-party terms. We distribute only the framework; the user chose and
 /// accepted each downloaded model's license, so this is informational transparency,
 /// not a redistribution claim by us.
 private func halActiveModels(chatViewModel: ChatViewModel) -> [ModelCredit] {
     var credits: [ModelCredit] = []
 
-    // 1. The active chat model.
-    let model = chatViewModel.selectedModel
-    if model.source == .appleFoundation {
-        credits.append(ModelCredit(
-            name: model.displayName,
-            terms: "Apple Foundation Models, built into iOS/macOS, no separate license",
-            attribution: nil, url: nil))
+    // 1. The chat model(s) in use. In Salon Mode (enabled with at least one seat)
+    //    that's every seated model, in seat order, de-duplicated (the same model
+    //    can sit in two seats); otherwise the single selected model. Mirrors
+    //    ChatViewModel.activeModelIDs so this section and the Model Library's
+    //    green dots always agree on what's "in use."
+    let chatModels: [ModelConfiguration]
+    if chatViewModel.salonConfig.isEnabled && !chatViewModel.salonConfig.activeSeats.isEmpty {
+        var seen = Set<String>()
+        chatModels = chatViewModel.salonConfig.activeSeats.compactMap { seat in
+            guard seen.insert(seat.modelID).inserted else { return nil }
+            return ModelCatalogService.shared.getModel(byID: seat.modelID)
+        }
     } else {
-        credits.append(ModelCredit(
-            name: model.displayName,
-            terms: halModelLicenseName(model.license),
-            attribution: nil,
-            url: "https://huggingface.co/\(model.id)"))
+        chatModels = [chatViewModel.selectedModel]
+    }
+    for model in chatModels {
+        if model.source == .appleFoundation {
+            credits.append(ModelCredit(
+                name: model.displayName,
+                terms: "Apple Foundation Models, built into iOS/macOS, no separate license",
+                attribution: nil, url: nil))
+        } else {
+            credits.append(ModelCredit(
+                name: model.displayName,
+                terms: halModelLicenseName(model.license),
+                attribution: nil,
+                url: "https://huggingface.co/\(model.id)"))
+        }
     }
 
-    // 2. The active embedder.
-    switch EmbeddingBackend.current() {
+    // 2. The active embedder — read from the observable coordinator (not the
+    //    static EmbeddingBackend.current()) so switching embedders refreshes
+    //    this section live along with the chat model(s) above.
+    switch EmbedderMigrationCoordinator.shared.activeBackend {
     case .nlContextual:
         credits.append(ModelCredit(
             name: "Apple NLContextual Embedding",
