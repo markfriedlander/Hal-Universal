@@ -119,6 +119,9 @@ extension DocumentImportManager {
     /// Import a document from a plain file-system path. Safe on Mac Catalyst;
     /// on iOS the file must already be inside the app sandbox.
     func importFromPath(_ path: String, chatViewModel: ChatViewModel) async -> (success: Bool, message: String) {
+        guard DocumentImportFeature.isEnabled else {
+            return (false, "Document import is currently disabled.")
+        }
         let url = URL(fileURLWithPath: path)
         guard FileManager.default.fileExists(atPath: path) else {
             return (false, "File not found: \(path)")

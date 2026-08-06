@@ -38,6 +38,25 @@ import UniformTypeIdentifiers
 import Compression  // libcompression — raw-deflate used by DocxParser/MiniZip
 
 // ==== LEGO START: 45 DocumentImportManager (Ingest & Entities) ====
+
+/// Master on/off for the whole document-import feature (Mark, 2026-08-06).
+///
+/// Turned OFF for the 3.0 ship. All of today's import + extraction work — OCR, real HTML
+/// extraction, the tiered PDF path, the first-person error messages, the summarization
+/// option — stays compiled and in the source, but every ENTRY POINT checks this flag and
+/// stays dark: the "Upload Document to Memory" button, the summarization toggle, the UI
+/// import path (`importDocuments`), and the antenna path (`importFromPath`). A compile-time
+/// `false` means nothing a user or an API call can do will activate it in a shipped build.
+///
+/// Why off: extraction is solid, but *recall* isn't reliable yet — RAG scores document
+/// chunks so low they get gated out of the prompt, so Hal often can't discuss what he
+/// imported. We revisit deliberately (likely a Help-Mode-style document scope, and possibly
+/// a stronger embedder than NLContextual). To develop it again, flip this to `true` locally
+/// (do not commit the `true`).
+enum DocumentImportFeature {
+    static let isEnabled = false
+}
+
 // MARK: - DocumentImportManager (MODIFIED FOR iOS - Aligned with Hal10000App.swift)
 @MainActor
 class DocumentImportManager: ObservableObject {
@@ -79,6 +98,10 @@ class DocumentImportManager: ObservableObject {
 
     // ENHANCED: Main Import Function with Entity Extraction (from Hal10000App.swift)
     func importDocuments(from urls: [URL], chatViewModel: ChatViewModel) async {
+        guard DocumentImportFeature.isEnabled else {
+            print("HALDEBUG-IMPORT: import path invoked while the feature is disabled — ignoring")
+            return
+        }
         print("HALDEBUG-IMPORT: Starting enhanced document import for \(urls.count) items with entity extraction")
 
         isImporting = true

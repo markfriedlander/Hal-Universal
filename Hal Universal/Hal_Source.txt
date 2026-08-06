@@ -25413,6 +25413,9 @@ extension DocumentImportManager {
     /// Import a document from a plain file-system path. Safe on Mac Catalyst;
     /// on iOS the file must already be inside the app sandbox.
     func importFromPath(_ path: String, chatViewModel: ChatViewModel) async -> (success: Bool, message: String) {
+        guard DocumentImportFeature.isEnabled else {
+            return (false, "Document import is currently disabled.")
+        }
         let url = URL(fileURLWithPath: path)
         guard FileManager.default.fileExists(atPath: path) else {
             return (false, "File not found: \(path)")
@@ -28809,6 +28812,25 @@ import UniformTypeIdentifiers
 import Compression  // libcompression — raw-deflate used by DocxParser/MiniZip
 
 // ==== LEGO START: 45 DocumentImportManager (Ingest & Entities) ====
+
+/// Master on/off for the whole document-import feature (Mark, 2026-08-06).
+///
+/// Turned OFF for the 3.0 ship. All of today's import + extraction work — OCR, real HTML
+/// extraction, the tiered PDF path, the first-person error messages, the summarization
+/// option — stays compiled and in the source, but every ENTRY POINT checks this flag and
+/// stays dark: the "Upload Document to Memory" button, the summarization toggle, the UI
+/// import path (`importDocuments`), and the antenna path (`importFromPath`). A compile-time
+/// `false` means nothing a user or an API call can do will activate it in a shipped build.
+///
+/// Why off: extraction is solid, but *recall* isn't reliable yet — RAG scores document
+/// chunks so low they get gated out of the prompt, so Hal often can't discuss what he
+/// imported. We revisit deliberately (likely a Help-Mode-style document scope, and possibly
+/// a stronger embedder than NLContextual). To develop it again, flip this to `true` locally
+/// (do not commit the `true`).
+enum DocumentImportFeature {
+    static let isEnabled = false
+}
+
 // MARK: - DocumentImportManager (MODIFIED FOR iOS - Aligned with Hal10000App.swift)
 @MainActor
 class DocumentImportManager: ObservableObject {
@@ -28850,6 +28872,10 @@ class DocumentImportManager: ObservableObject {
 
     // ENHANCED: Main Import Function with Entity Extraction (from Hal10000App.swift)
     func importDocuments(from urls: [URL], chatViewModel: ChatViewModel) async {
+        guard DocumentImportFeature.isEnabled else {
+            print("HALDEBUG-IMPORT: import path invoked while the feature is disabled — ignoring")
+            return
+        }
         print("HALDEBUG-IMPORT: Starting enhanced document import for \(urls.count) items with entity extraction")
 
         isImporting = true
@@ -30350,11 +30376,15 @@ struct ActionsView: View {
 
     private var importExportSection: some View {
         Section {
-            Button("Upload Document to Memory") {
-                dismiss()
-                showingDocumentPicker = true
+            // Document import is turned off for now (see DocumentImportFeature). The button is
+            // hidden so the feature can't be reached; Export Thread stays.
+            if DocumentImportFeature.isEnabled {
+                Button("Upload Document to Memory") {
+                    dismiss()
+                    showingDocumentPicker = true
+                }
+                .foregroundColor(.primary)
             }
-            .foregroundColor(.primary)
 
             Button("Export Thread") {
                 showingExportSheet = true
@@ -30674,7 +30704,10 @@ struct PowerUserView: View {
                 .opacity(helpActive ? 0.45 : 1.0)
 
                 // Global (not per-model), so it stays enabled during Salon / Help Mode.
-                documentsSection
+                // Hidden while document import is turned off (see DocumentImportFeature).
+                if DocumentImportFeature.isEnabled {
+                    documentsSection
+                }
                 #if DEBUG
                 // Pipeline Test Console: superseded dev scaffolding (a file-based input.txt/
                 // output.json harness). The antenna + hal CLI + RoboRunner replace it, so it is

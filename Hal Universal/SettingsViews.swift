@@ -590,11 +590,15 @@ struct ActionsView: View {
 
     private var importExportSection: some View {
         Section {
-            Button("Upload Document to Memory") {
-                dismiss()
-                showingDocumentPicker = true
+            // Document import is turned off for now (see DocumentImportFeature). The button is
+            // hidden so the feature can't be reached; Export Thread stays.
+            if DocumentImportFeature.isEnabled {
+                Button("Upload Document to Memory") {
+                    dismiss()
+                    showingDocumentPicker = true
+                }
+                .foregroundColor(.primary)
             }
-            .foregroundColor(.primary)
 
             Button("Export Thread") {
                 showingExportSheet = true
@@ -914,7 +918,10 @@ struct PowerUserView: View {
                 .opacity(helpActive ? 0.45 : 1.0)
 
                 // Global (not per-model), so it stays enabled during Salon / Help Mode.
-                documentsSection
+                // Hidden while document import is turned off (see DocumentImportFeature).
+                if DocumentImportFeature.isEnabled {
+                    documentsSection
+                }
                 #if DEBUG
                 // Pipeline Test Console: superseded dev scaffolding (a file-based input.txt/
                 // output.json harness). The antenna + hal CLI + RoboRunner replace it, so it is
