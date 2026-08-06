@@ -275,17 +275,17 @@ class DocumentImportManager: ObservableObject {
         nonisolated var errorDescription: String? {
             switch self {
             case .pdfExtractionFailed(let filename):
-                return "Couldn't read the PDF \(filename). The file may be damaged or password-protected."
+                return "I couldn't open the PDF \(filename). It may be damaged or password-protected."
             case .rtfExtractionFailed(let filename):
-                return "Couldn't read the RTF file \(filename). It may be damaged."
+                return "I couldn't read the RTF file \(filename). It may be damaged."
             case .unsupportedFileFormat(let filename):
-                return "\(filename) is a file type Hal can't read yet. Supported: TXT, MD, RTF, PDF, CSV, JSON, XML, HTML, DOCX."
+                return "I can't read \(filename) yet. It's a file type I don't handle. I can read TXT, MD, RTF, PDF, CSV, JSON, XML, HTML, and DOCX."
             case .fileTooLarge(let filename, let sizeMB):
-                return "\(filename) is too large (\(String(format: "%.1f", sizeMB)) MB). The maximum is 25 MB."
+                return "\(filename) is too big for me at \(String(format: "%.1f", sizeMB)) MB. I can take files up to 25 MB."
             case .legacyDocFormat(let filename):
-                return "\(filename) is the old .doc format, which Hal can't read on this device. Open it in Word, Pages, or any modern editor and save as .docx, then re-import."
+                return "I can't read the old .doc format (\(filename)). If you save it as .docx and send it again, I'll read it."
             case .noReadableText(let filename):
-                return "No readable text found in \(filename). If it's a scanned document or images, Hal can't extract the text yet."
+                return "I couldn't find any readable text in \(filename). If it's a scanned document or photos, I can't pull the text out yet."
             }
         }
     }
@@ -602,29 +602,37 @@ class DocumentImportManager: ObservableObject {
                                 chatViewModel: ChatViewModel) async {
         print("HALDEBUG-IMPORT: Generating import conversation messages (processed: \(totalProcessed), skipped: \(skipped.count))")
 
-        // A note naming any files Hal couldn't take, with the reason for each. The reasons
-        // come straight from the extractor (each names the file and says why + how to fix),
-        // so the user finally sees WHAT failed instead of a silent no-op.
+        // Hal's own first-person note about any files he couldn't take, appended to a PARTIAL
+        // import. The reasons are already written in Hal's voice (see DocumentProcessingError),
+        // so the user finally hears WHAT failed and HOW to fix it, from Hal, instead of a
+        // silent no-op.
         let skippedNote: String
         switch skipped.count {
         case 0:  skippedNote = ""
-        case 1:  skippedNote = "\n\nOne file couldn't be imported: \(skipped[0].reason)"
+        case 1:  skippedNote = "\n\nThere was one I couldn't take, though: \(skipped[0].reason)"
         default:
             let lines = skipped.map { "• \($0.reason)" }.joined(separator: "\n")
-            skippedNote = "\n\n\(skipped.count) files couldn't be imported:\n\(lines)"
+            skippedNote = "\n\nA few I couldn't take, though:\n\(lines)"
         }
 
-        // Every file failed — be honest rather than reporting a phantom "processed 0 documents".
+        // Every file failed. Apologize in character and say why, rather than reporting a
+        // phantom "processed 0 documents".
         if totalProcessed == 0 {
             guard !skipped.isEmpty else {
-                print("HALDEBUG-IMPORT: nothing processed and nothing skipped — no import turn emitted")
+                print("HALDEBUG-IMPORT: nothing processed and nothing skipped - no import turn emitted")
                 return
             }
             let names = skipped.map { $0.name }.joined(separator: ", ")
             let user = skipped.count == 1
                 ? "Hal, I tried to import \(names)."
                 : "Hal, I tried to import \(skipped.count) files: \(names)."
-            let hal = (skipped.count == 1 ? "I wasn't able to read that one." : "I wasn't able to read those.") + skippedNote
+            let hal: String
+            if skipped.count == 1 {
+                hal = "Sorry about that. \(skipped[0].reason)"
+            } else {
+                let lines = skipped.map { "• \($0.reason)" }.joined(separator: "\n")
+                hal = "Sorry, I couldn't take any of those:\n\(lines)"
+            }
             appendImportTurn(user: user, hal: hal, chatViewModel: chatViewModel)
             print("HALDEBUG-IMPORT: Emitted all-skipped import turn")
             return
