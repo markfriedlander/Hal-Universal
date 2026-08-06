@@ -868,6 +868,11 @@ struct PowerUserView: View {
 
     @State private var sliderStartValues: [String: Double] = [:]
 
+    /// Optional per-document LLM summary on import (Mark 2026-08-06). Off by default —
+    /// it's the heaviest per-import step (a full generation on the active model). See
+    /// DocumentImportManager. Mirrored by the SET_IMPORT_SUMMARY antenna verb.
+    @AppStorage("importGenerateSummary") private var importGenerateSummary: Bool = false
+
     /// Per Mark's May-15 directive — per-model controls (memory depth,
     /// RAG thresholds, etc.) are visible but disabled while Salon Mode
     /// is active, because the "active model" is then an ensemble rather
@@ -907,6 +912,9 @@ struct PowerUserView: View {
                 }
                 .disabled(helpActive)
                 .opacity(helpActive ? 0.45 : 1.0)
+
+                // Global (not per-model), so it stays enabled during Salon / Help Mode.
+                documentsSection
                 #if DEBUG
                 // Pipeline Test Console: superseded dev scaffolding (a file-based input.txt/
                 // output.json harness). The antenna + hal CLI + RoboRunner replace it, so it is
@@ -917,6 +925,19 @@ struct PowerUserView: View {
                 #endif
             }
             .navigationTitle("Single LLM Settings")
+    }
+
+    // MARK: - Documents Section
+
+    private var documentsSection: some View {
+        Section {
+            Toggle("Summarize documents on import", isOn: $importGenerateSummary)
+        } header: {
+            Label("Documents", systemImage: "doc.text")
+        } footer: {
+            Text("When on, Hal writes a one-sentence summary of each document you import, using the active model. That makes imports slower (a full generation per document) but gives Hal a running description of what you shared. When off, imports are quick, and the document's text still goes into Hal's memory to talk about.")
+                .font(.caption2)
+        }
     }
 
 

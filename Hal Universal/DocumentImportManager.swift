@@ -116,15 +116,22 @@ class DocumentImportManager: ObservableObject {
 
         print("HALDEBUG-IMPORT: Processed \(processedFiles.count) documents, skipped \(skippedFiles.count), found \(totalEntitiesFound) entities")
 
-        importProgress = "Analyzing content with AI..."
+        // Per-document LLM summary is OPTIONAL (Mark 2026-08-06). It's the single
+        // heaviest per-import step — a full generation on the active chat model (e.g.
+        // Bonsai 8B) that, on the @MainActor path, starves the UI + antenna while it runs.
+        // Off by default so imports stay light; the toggle (Settings, or SET_IMPORT_SUMMARY)
+        // turns it on so we can compare how Hal works with a rich summary vs the plain
+        // filename. When off, the chat just names the file (the chunks are in RAG either way).
+        let generateSummaries = UserDefaults.standard.object(forKey: "importGenerateSummary") as? Bool ?? false
+        importProgress = generateSummaries ? "Summarizing with the active model..." : "Preparing documents..."
         var documentSummaries: [String] = []
 
         for processed in processedFiles {
-            // PRIVACY FIX: Pass chatViewModel to use active model
-            if let summary = await generateDocumentSummary(processed, chatViewModel: chatViewModel) {
-                documentSummaries.append(summary)
+            if generateSummaries {
+                // PRIVACY FIX: Pass chatViewModel to use active model
+                documentSummaries.append(await generateDocumentSummary(processed, chatViewModel: chatViewModel) ?? processed.filename)
             } else {
-                documentSummaries.append("Document: \(processed.filename)")
+                documentSummaries.append(processed.filename)
             }
         }
 

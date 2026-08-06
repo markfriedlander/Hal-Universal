@@ -26952,6 +26952,15 @@ class HalTestConsole: ObservableObject {
             let status = ok ? "ok" : "error"
             return "{\"status\":\"\(status)\",\"message\":\"\(jsonStringEscape(msg))\"}"
 
+        } else if trimmed.hasPrefix("SET_IMPORT_SUMMARY:") {
+            // Toggle the OPTIONAL per-document LLM summary on import (Mark 2026-08-06). Off
+            // by default (the light path); on = Hal writes a one-sentence summary per doc
+            // with the active model. Mirrors the Settings toggle; lets CC compare on vs off.
+            let on = String(trimmed.dropFirst("SET_IMPORT_SUMMARY:".count)).trimmingCharacters(in: .whitespaces).lowercased()
+            let val = (on == "true" || on == "1")
+            UserDefaults.standard.set(val, forKey: "importGenerateSummary")
+            return "{\"status\":\"ok\",\"command\":\"SET_IMPORT_SUMMARY\",\"importGenerateSummary\":\(val)}"
+
         } else if trimmed == "LIST_DOCUMENTS" {
             let docs = vm.memoryStore.listDocuments()
             let entries = docs.map { d -> String in
@@ -28878,15 +28887,22 @@ class DocumentImportManager: ObservableObject {
 
         print("HALDEBUG-IMPORT: Processed \(processedFiles.count) documents, skipped \(skippedFiles.count), found \(totalEntitiesFound) entities")
 
-        importProgress = "Analyzing content with AI..."
+        // Per-document LLM summary is OPTIONAL (Mark 2026-08-06). It's the single
+        // heaviest per-import step — a full generation on the active chat model (e.g.
+        // Bonsai 8B) that, on the @MainActor path, starves the UI + antenna while it runs.
+        // Off by default so imports stay light; the toggle (Settings, or SET_IMPORT_SUMMARY)
+        // turns it on so we can compare how Hal works with a rich summary vs the plain
+        // filename. When off, the chat just names the file (the chunks are in RAG either way).
+        let generateSummaries = UserDefaults.standard.object(forKey: "importGenerateSummary") as? Bool ?? false
+        importProgress = generateSummaries ? "Summarizing with the active model..." : "Preparing documents..."
         var documentSummaries: [String] = []
 
         for processed in processedFiles {
-            // PRIVACY FIX: Pass chatViewModel to use active model
-            if let summary = await generateDocumentSummary(processed, chatViewModel: chatViewModel) {
-                documentSummaries.append(summary)
+            if generateSummaries {
+                // PRIVACY FIX: Pass chatViewModel to use active model
+                documentSummaries.append(await generateDocumentSummary(processed, chatViewModel: chatViewModel) ?? processed.filename)
             } else {
-                documentSummaries.append("Document: \(processed.filename)")
+                documentSummaries.append(processed.filename)
             }
         }
 
@@ -30612,6 +30628,11 @@ struct PowerUserView: View {
 
     @State private var sliderStartValues: [String: Double] = [:]
 
+    /// Optional per-document LLM summary on import (Mark 2026-08-06). Off by default —
+    /// it's the heaviest per-import step (a full generation on the active model). See
+    /// DocumentImportManager. Mirrored by the SET_IMPORT_SUMMARY antenna verb.
+    @AppStorage("importGenerateSummary") private var importGenerateSummary: Bool = false
+
     /// Per Mark's May-15 directive — per-model controls (memory depth,
     /// RAG thresholds, etc.) are visible but disabled while Salon Mode
     /// is active, because the "active model" is then an ensemble rather
@@ -30651,6 +30672,9 @@ struct PowerUserView: View {
                 }
                 .disabled(helpActive)
                 .opacity(helpActive ? 0.45 : 1.0)
+
+                // Global (not per-model), so it stays enabled during Salon / Help Mode.
+                documentsSection
                 #if DEBUG
                 // Pipeline Test Console: superseded dev scaffolding (a file-based input.txt/
                 // output.json harness). The antenna + hal CLI + RoboRunner replace it, so it is
@@ -30661,6 +30685,19 @@ struct PowerUserView: View {
                 #endif
             }
             .navigationTitle("Single LLM Settings")
+    }
+
+    // MARK: - Documents Section
+
+    private var documentsSection: some View {
+        Section {
+            Toggle("Summarize documents on import", isOn: $importGenerateSummary)
+        } header: {
+            Label("Documents", systemImage: "doc.text")
+        } footer: {
+            Text("When on, Hal writes a one-sentence summary of each document you import, using the active model. That makes imports slower (a full generation per document) but gives Hal a running description of what you shared. When off, imports are quick, and the document's text still goes into Hal's memory to talk about.")
+                .font(.caption2)
+        }
     }
 
 

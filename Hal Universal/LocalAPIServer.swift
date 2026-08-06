@@ -1658,6 +1658,15 @@ class HalTestConsole: ObservableObject {
             let status = ok ? "ok" : "error"
             return "{\"status\":\"\(status)\",\"message\":\"\(jsonStringEscape(msg))\"}"
 
+        } else if trimmed.hasPrefix("SET_IMPORT_SUMMARY:") {
+            // Toggle the OPTIONAL per-document LLM summary on import (Mark 2026-08-06). Off
+            // by default (the light path); on = Hal writes a one-sentence summary per doc
+            // with the active model. Mirrors the Settings toggle; lets CC compare on vs off.
+            let on = String(trimmed.dropFirst("SET_IMPORT_SUMMARY:".count)).trimmingCharacters(in: .whitespaces).lowercased()
+            let val = (on == "true" || on == "1")
+            UserDefaults.standard.set(val, forKey: "importGenerateSummary")
+            return "{\"status\":\"ok\",\"command\":\"SET_IMPORT_SUMMARY\",\"importGenerateSummary\":\(val)}"
+
         } else if trimmed == "LIST_DOCUMENTS" {
             let docs = vm.memoryStore.listDocuments()
             let entries = docs.map { d -> String in
