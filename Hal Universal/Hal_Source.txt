@@ -25421,16 +25421,23 @@ extension DocumentImportManager {
 
         let (processed, skipped) = await processURLImmediatelyWithEntities(url)
         if processed.isEmpty {
-            return (false, "Could not process file (skipped: \(skipped))")
+            // Surface the real reason(s) instead of the old opaque "Could not process file".
+            let reasons = skipped.map { $0.reason }.joined(separator: "; ")
+            return (false, reasons.isEmpty ? "Could not import \(url.lastPathComponent)." : reasons)
         }
         await storeDocumentsInMemoryWithEntities(processed)
         await generateImportMessages(
             documentSummaries: processed.map { $0.filename },
             totalProcessed: processed.count,
             totalEntities: processed.reduce(0) { $0 + $1.entities.count },
+            skipped: skipped,
             chatViewModel: chatViewModel
         )
-        return (true, "Imported \(processed.count) document(s): \(processed.map(\.filename).joined(separator: ", "))")
+        var message = "Imported \(processed.count) document(s): \(processed.map(\.filename).joined(separator: ", "))"
+        if !skipped.isEmpty {
+            message += " | Skipped \(skipped.count): " + skipped.map { $0.reason }.joined(separator: "; ")
+        }
+        return (true, message)
     }
 }
 
@@ -28826,7 +28833,7 @@ class DocumentImportManager: ObservableObject {
         importProgress = "Processing documents with entity extraction..."
 
         var processedFiles: [ProcessedDocument] = []
-        var skippedFiles: [String] = []
+        var skippedFiles: [SkippedFile] = []
         var totalFilesFound = 0
         var totalEntitiesFound = 0
 
@@ -28836,7 +28843,7 @@ class DocumentImportManager: ObservableObject {
             let hasAccess = url.startAccessingSecurityScopedResource()
             if !hasAccess {
                 print("HALDEBUG-IMPORT: Failed to gain security access to: \(url.lastPathComponent)")
-                skippedFiles.append(url.lastPathComponent)
+                skippedFiles.append(SkippedFile(name: url.lastPathComponent, reason: "Hal couldn't get permission to open \(url.lastPathComponent)."))
                 continue
             }
 
@@ -28875,6 +28882,7 @@ class DocumentImportManager: ObservableObject {
         await generateImportMessages(documentSummaries: documentSummaries,
                                    totalProcessed: processedFiles.count,
                                    totalEntities: totalEntitiesFound,
+                                   skipped: skippedFiles,
                                    chatViewModel: chatViewModel)
 
         lastImportSummary = DocumentImportSummary(
@@ -28896,14 +28904,14 @@ class DocumentImportManager: ObservableObject {
     // Visibility broadened from `private` to module-internal on 2026-05-26
     // when the API-helper extension that calls this method moved to
     // LocalAPIServer.swift. Still target-internal; no public surface.
-    func processURLImmediatelyWithEntities(_ url: URL) async -> ([ProcessedDocument], [String]) {
+    func processURLImmediatelyWithEntities(_ url: URL) async -> ([ProcessedDocument], [SkippedFile]) {
         var processedFiles: [ProcessedDocument] = []
-        var skippedFiles: [String] = []
+        var skippedFiles: [SkippedFile] = []
 
         var isDirectory: ObjCBool = false
         guard FileManager.default.fileExists(atPath: url.path, isDirectory: &isDirectory) else {
             print("HALDEBUG-IMPORT: File doesn't exist: \(url.path)")
-            skippedFiles.append(url.lastPathComponent)
+            skippedFiles.append(SkippedFile(name: url.lastPathComponent, reason: "\(url.lastPathComponent) couldn't be found."))
             return (processedFiles, skippedFiles)
         }
 
@@ -28918,96 +28926,87 @@ class DocumentImportManager: ObservableObject {
                 print("HALDEBUG-IMPORT: Processed directory \(url.lastPathComponent): \(processedFiles.count) files")
             } catch {
                 print("HALDEBUG-IMPORT: Error reading directory \(url.path): \(error)")
-                skippedFiles.append(url.lastPathComponent)
+                skippedFiles.append(SkippedFile(name: url.lastPathComponent, reason: "Couldn't read the contents of the folder \(url.lastPathComponent)."))
             }
         } else {
-            if let processed = await processDocumentImmediatelyWithEntities(url) {
+            do {
+                let processed = try await processDocumentImmediatelyWithEntities(url)
                 processedFiles.append(processed)
                 print("HALDEBUG-IMPORT: Successfully processed: \(url.lastPathComponent) with \(processed.entities.count) entities")
-            } else {
-                skippedFiles.append(url.lastPathComponent)
-                print("HALDEBUG-IMPORT: Skipped: \(url.lastPathComponent)")
+            } catch {
+                // Keep the extractor's specific, user-facing reason (it names the file).
+                let reason = (error as? DocumentProcessingError)?.errorDescription
+                    ?? "\(url.lastPathComponent) couldn't be read (\(error.localizedDescription))."
+                skippedFiles.append(SkippedFile(name: url.lastPathComponent, reason: reason))
+                print("HALDEBUG-IMPORT: Skipped \(url.lastPathComponent): \(reason)")
             }
         }
         return (processedFiles, skippedFiles)
     }
 
-    // ENHANCED: Process document immediately with entity extraction and tiered size limits
-    private func processDocumentImmediatelyWithEntities(_ url: URL) async -> ProcessedDocument? {
+    // ENHANCED: Process document immediately with entity extraction and tiered size limits.
+    // THROWS a DocumentProcessingError on any failure (unsupported type, too large, no
+    // readable text, extraction error) so the caller can surface the REASON to the user,
+    // instead of the old silent `return nil` that collapsed every failure into an
+    // anonymous skipped-filename with no explanation.
+    private func processDocumentImmediatelyWithEntities(_ url: URL) async throws -> ProcessedDocument {
         print("HALDEBUG-IMPORT: Processing document with entity extraction: \(url.lastPathComponent)")
 
         let fileExtension = url.pathExtension.lowercased()
-        
-        // UPDATED: Use platform-aware format checking
-        guard isFormatSupported(fileExtension) else {
-            print("HALDEBUG-IMPORT: Unsupported format on this platform: \(fileExtension)")
-            return nil
+
+        // Format check. .doc is allowed through to extractContent's switch, which throws
+        // the actionable "save as .docx" message rather than a generic unsupported error.
+        guard isFormatSupported(fileExtension) || fileExtension == "doc" else {
+            print("HALDEBUG-IMPORT: Unsupported format: \(fileExtension)")
+            throw DocumentProcessingError.unsupportedFileFormat(url.lastPathComponent)
         }
 
-        // NEW: Tiered file size checking (15MB warning, 25MB hard limit)
-        do {
-            let fileAttributes = try FileManager.default.attributesOfItem(atPath: url.path)
-            if let fileSize = fileAttributes[.size] as? Int64 {
-                let fileSizeMB = Double(fileSize) / 1_048_576.0 // Convert to MB
-                
-                print("HALDEBUG-IMPORT: File size: \(String(format: "%.1f", fileSizeMB)) MB")
-                
-                // Hard limit: 25MB
-                if fileSizeMB > 25.0 {
-                    await MainActor.run {
-                        self.importProgress = "ÃƒÂ¢Ã…Â¡Ã‚ ÃƒÂ¯Ã‚Â¸Ã‚Â File too large: \(url.lastPathComponent) (\(String(format: "%.1f", fileSizeMB)) MB). Maximum size is 25 MB."
-                    }
-                    print("HALDEBUG-IMPORT: ÃƒÂ¢Ã‚ÂÃ…â€™ Rejected file exceeding 25MB limit: \(url.lastPathComponent)")
-                    return nil
+        // Tiered file size checking (15 MB warning, 25 MB hard limit). Best-effort: if the
+        // size can't be read, skip the check and let extraction proceed.
+        if let fileSize = (try? FileManager.default.attributesOfItem(atPath: url.path))?[.size] as? Int64 {
+            let fileSizeMB = Double(fileSize) / 1_048_576.0
+            print("HALDEBUG-IMPORT: File size: \(String(format: "%.1f", fileSizeMB)) MB")
+            if fileSizeMB > 25.0 {
+                print("HALDEBUG-IMPORT: Rejected file exceeding 25MB limit: \(url.lastPathComponent)")
+                throw DocumentProcessingError.fileTooLarge(url.lastPathComponent, fileSizeMB)
+            }
+            if fileSizeMB > 15.0 {
+                await MainActor.run {
+                    self.importProgress = "Processing large file: \(url.lastPathComponent) (\(String(format: "%.1f", fileSizeMB)) MB). This may take a minute or two..."
                 }
-                
-                // Warning threshold: 15MB
-                if fileSizeMB > 15.0 {
-                    await MainActor.run {
-                        self.importProgress = "ÃƒÂ¢Ã‚ÂÃ‚Â³ Processing large file: \(url.lastPathComponent) (\(String(format: "%.1f", fileSizeMB)) MB). This may take 1-2 minutes..."
-                    }
-                    print("HALDEBUG-IMPORT: ÃƒÂ¢Ã…Â¡Ã‚ ÃƒÂ¯Ã‚Â¸Ã‚Â Large file warning: \(url.lastPathComponent) - \(String(format: "%.1f", fileSizeMB)) MB")
-                }
+                print("HALDEBUG-IMPORT: Large file warning: \(url.lastPathComponent) - \(String(format: "%.1f", fileSizeMB)) MB")
             }
-        } catch {
-            print("HALDEBUG-IMPORT: Could not determine file size for \(url.lastPathComponent): \(error)")
-            // Continue processing - size check is best-effort
+        } else {
+            print("HALDEBUG-IMPORT: Could not determine file size for \(url.lastPathComponent) - continuing")
         }
 
-        do {
-            let content = try extractContent(from: url, fileExtension: fileExtension)
-            guard !content.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
-                print("HALDEBUG-IMPORT: Skipping empty document: \(url.lastPathComponent)")
-                return nil
-            }
-
-            // Corrected: Call extractNamedEntities on MemoryStore.shared
-            let documentEntities = memoryStore.extractNamedEntities(from: content)
-            print("HALDEBUG-IMPORT: Extracted \(documentEntities.count) entities from \(url.lastPathComponent)")
-
-            let entityBreakdown = memoryStore.summarizeEntities(documentEntities)
-            print("HALDEBUG-IMPORT: Entity breakdown for \(url.lastPathComponent):")
-            for (type, count) in entityBreakdown.byType {
-                print("HALDEBUG-IMPORT:   \(type.displayName): \(count)")
-            }
-
-            let chunks = createMentatChunks(from: content)
-
-            print("HALDEBUG-IMPORT: Processed \(url.lastPathComponent): \(content.count) chars, \(chunks.count) chunks, \(documentEntities.count) entities")
-
-            return ProcessedDocument(
-                url: url,
-                filename: url.lastPathComponent,
-                content: content,
-                chunks: chunks,
-                entities: documentEntities,
-                fileExtension: fileExtension
-            )
-
-        } catch {
-            print("HALDEBUG-IMPORT: Error processing \(url.lastPathComponent): \(error)")
-            return nil
+        // extractContent throws a specific DocumentProcessingError on failure; propagate it.
+        let content = try extractContent(from: url, fileExtension: fileExtension)
+        guard !content.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            print("HALDEBUG-IMPORT: No readable text in: \(url.lastPathComponent)")
+            throw DocumentProcessingError.noReadableText(url.lastPathComponent)
         }
+
+        let documentEntities = memoryStore.extractNamedEntities(from: content)
+        print("HALDEBUG-IMPORT: Extracted \(documentEntities.count) entities from \(url.lastPathComponent)")
+
+        let entityBreakdown = memoryStore.summarizeEntities(documentEntities)
+        print("HALDEBUG-IMPORT: Entity breakdown for \(url.lastPathComponent):")
+        for (type, count) in entityBreakdown.byType {
+            print("HALDEBUG-IMPORT:   \(type.displayName): \(count)")
+        }
+
+        let chunks = createMentatChunks(from: content)
+        print("HALDEBUG-IMPORT: Processed \(url.lastPathComponent): \(content.count) chars, \(chunks.count) chunks, \(documentEntities.count) entities")
+
+        return ProcessedDocument(
+            url: url,
+            filename: url.lastPathComponent,
+            content: content,
+            chunks: chunks,
+            entities: documentEntities,
+            fileExtension: fileExtension
+        )
     }
 
     @MainActor // Applied @MainActor to the enum
@@ -29018,22 +29017,34 @@ class DocumentImportManager: ObservableObject {
         case unsupportedFileFormat(String)
         case fileTooLarge(String, Double) // filename, size in MB
         case legacyDocFormat(String)      // .doc binary format
+        case noReadableText(String)       // extraction ran but found no text (e.g. a scanned/image PDF)
 
         // Added nonisolated to errorDescription to satisfy LocalizedError protocol
         nonisolated var errorDescription: String? {
             switch self {
             case .pdfExtractionFailed(let filename):
-                return "Failed to extract text from PDF: \(filename)"
+                return "Couldn't read the PDF \(filename). The file may be damaged or password-protected."
             case .rtfExtractionFailed(let filename):
-                return "Failed to extract text from RTF: \(filename)"
+                return "Couldn't read the RTF file \(filename). It may be damaged."
             case .unsupportedFileFormat(let filename):
-                return "Unsupported file format: \(filename)"
+                return "\(filename) is a file type Hal can't read yet. Supported: TXT, MD, RTF, PDF, CSV, JSON, XML, HTML, DOCX."
             case .fileTooLarge(let filename, let sizeMB):
-                return "File too large: \(filename) (\(String(format: "%.1f", sizeMB)) MB). Maximum size is 25 MB."
+                return "\(filename) is too large (\(String(format: "%.1f", sizeMB)) MB). The maximum is 25 MB."
             case .legacyDocFormat(let filename):
-                return "Legacy .doc format not supported on this device: \(filename). Please open the file in Word, Pages, or any modern editor and save as .docx, then re-import."
+                return "\(filename) is the old .doc format, which Hal can't read on this device. Open it in Word, Pages, or any modern editor and save as .docx, then re-import."
+            case .noReadableText(let filename):
+                return "No readable text found in \(filename). If it's a scanned document or images, Hal can't extract the text yet."
             }
         }
+    }
+
+    /// A file the import couldn't take, paired with the human-readable reason why.
+    /// The reason is the extractor's own `DocumentProcessingError` message (which names
+    /// the file), so it can be shown to the user verbatim. Replaces the old bare-filename
+    /// `[String]` skip list that discarded the reason before it reached anyone.
+    struct SkippedFile {
+        let name: String
+        let reason: String
     }
 
     private func extractContent(from url: URL, fileExtension: String) throws -> String {
@@ -29335,9 +29346,39 @@ class DocumentImportManager: ObservableObject {
     func generateImportMessages(documentSummaries: [String],
                                 totalProcessed: Int,
                                 totalEntities: Int,
+                                skipped: [SkippedFile] = [],
                                 chatViewModel: ChatViewModel) async {
-        print("HALDEBUG-IMPORT: Generating import conversation messages with entity context")
+        print("HALDEBUG-IMPORT: Generating import conversation messages (processed: \(totalProcessed), skipped: \(skipped.count))")
 
+        // A note naming any files Hal couldn't take, with the reason for each. The reasons
+        // come straight from the extractor (each names the file and says why + how to fix),
+        // so the user finally sees WHAT failed instead of a silent no-op.
+        let skippedNote: String
+        switch skipped.count {
+        case 0:  skippedNote = ""
+        case 1:  skippedNote = "\n\nOne file couldn't be imported: \(skipped[0].reason)"
+        default:
+            let lines = skipped.map { "• \($0.reason)" }.joined(separator: "\n")
+            skippedNote = "\n\n\(skipped.count) files couldn't be imported:\n\(lines)"
+        }
+
+        // Every file failed — be honest rather than reporting a phantom "processed 0 documents".
+        if totalProcessed == 0 {
+            guard !skipped.isEmpty else {
+                print("HALDEBUG-IMPORT: nothing processed and nothing skipped — no import turn emitted")
+                return
+            }
+            let names = skipped.map { $0.name }.joined(separator: ", ")
+            let user = skipped.count == 1
+                ? "Hal, I tried to import \(names)."
+                : "Hal, I tried to import \(skipped.count) files: \(names)."
+            let hal = (skipped.count == 1 ? "I wasn't able to read that one." : "I wasn't able to read those.") + skippedNote
+            appendImportTurn(user: user, hal: hal, chatViewModel: chatViewModel)
+            print("HALDEBUG-IMPORT: Emitted all-skipped import turn")
+            return
+        }
+
+        // At least one file imported.
         let userMessageContent: String
         if documentSummaries.count == 1 {
             let entityText = totalEntities > 0 ? " containing \(totalEntities) named entities" : ""
@@ -29350,35 +29391,35 @@ class DocumentImportManager: ObservableObject {
             userMessageContent = "Hal, here are \(documentSummaries.count) documents for you\(entityText): \(numberedList)"
         }
 
-        let currentTurnNumber = chatViewModel.memoryStore.getCurrentTurnNumber(conversationId: chatViewModel.conversationId) + 1
-        let userChatMessage = ChatMessage(content: userMessageContent, isFromUser: true, recordedByModel: "user", turnNumber: currentTurnNumber)
-        chatViewModel.messages.append(userChatMessage)
+        let baseResponse = documentSummaries.count == 1
+            ? "Understood! I've processed the document you shared. I'm ready for your questions."
+            : "Got it! I've processed those \(documentSummaries.count) documents. What would you like to discuss about them?"
+        // Append the skipped-file note so a PARTIAL import (some in, some failed) tells the
+        // truth about both halves in one turn.
+        let halResponse = baseResponse + skippedNote
 
-        // --- MODIFIED HAL RESPONSE TO BE MORE CONCISE AND LESS REPETITIVE ---
-        let halResponse: String
-        if documentSummaries.count == 1 {
-            halResponse = "Understood! I've processed the document you shared. I'm ready for your questions."
-        } else {
-            halResponse = "Got it! I've processed those \(documentSummaries.count) documents. What would you like to discuss about them?"
-        }
-        // --- END MODIFIED HAL RESPONSE ---
+        appendImportTurn(user: userMessageContent, hal: halResponse, chatViewModel: chatViewModel)
+        print("HALDEBUG-IMPORT: Generated import conversation messages with entity context")
+    }
 
-        let halChatMessage = ChatMessage(content: halResponse, isFromUser: false, recordedByModel: chatViewModel.selectedModel.id, turnNumber: currentTurnNumber)
-        chatViewModel.messages.append(halChatMessage)
-
+    /// Appends a user+Hal message pair for a document import to the chat and persists the
+    /// turn. Shared by the success, partial-skip, and all-skipped paths so they store
+    /// identically. Synchronous; the caller is already @MainActor.
+    private func appendImportTurn(user: String, hal: String, chatViewModel: ChatViewModel) {
+        let turn = chatViewModel.memoryStore.getCurrentTurnNumber(conversationId: chatViewModel.conversationId) + 1
+        chatViewModel.messages.append(ChatMessage(content: user, isFromUser: true, recordedByModel: "user", turnNumber: turn))
+        chatViewModel.messages.append(ChatMessage(content: hal, isFromUser: false, recordedByModel: chatViewModel.selectedModel.id, turnNumber: turn))
         chatViewModel.memoryStore.storeTurn(
             conversationId: chatViewModel.conversationId,
-            userMessage: userMessageContent,
-            assistantMessage: halResponse,
+            userMessage: user,
+            assistantMessage: hal,
             systemPrompt: chatViewModel.systemPrompt,
-            turnNumber: currentTurnNumber,
-            halFullPrompt: nil, // No specific prompt for import messages
-            halUsedContext: nil, // No specific context for import messages
+            turnNumber: turn,
+            halFullPrompt: nil,
+            halUsedContext: nil,
             thinkingDuration: nil,
             recordedByModel: chatViewModel.selectedModel.id
         )
-
-        print("HALDEBUG-IMPORT: Generated enhanced import conversation messages with entity context")
     }
 }
 // ==== LEGO END: 45 DocumentImportManager (Ingest & Entities) ====

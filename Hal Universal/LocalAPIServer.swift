@@ -141,16 +141,23 @@ extension DocumentImportManager {
 
         let (processed, skipped) = await processURLImmediatelyWithEntities(url)
         if processed.isEmpty {
-            return (false, "Could not process file (skipped: \(skipped))")
+            // Surface the real reason(s) instead of the old opaque "Could not process file".
+            let reasons = skipped.map { $0.reason }.joined(separator: "; ")
+            return (false, reasons.isEmpty ? "Could not import \(url.lastPathComponent)." : reasons)
         }
         await storeDocumentsInMemoryWithEntities(processed)
         await generateImportMessages(
             documentSummaries: processed.map { $0.filename },
             totalProcessed: processed.count,
             totalEntities: processed.reduce(0) { $0 + $1.entities.count },
+            skipped: skipped,
             chatViewModel: chatViewModel
         )
-        return (true, "Imported \(processed.count) document(s): \(processed.map(\.filename).joined(separator: ", "))")
+        var message = "Imported \(processed.count) document(s): \(processed.map(\.filename).joined(separator: ", "))"
+        if !skipped.isEmpty {
+            message += " | Skipped \(skipped.count): " + skipped.map { $0.reason }.joined(separator: "; ")
+        }
+        return (true, message)
     }
 }
 
